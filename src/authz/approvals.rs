@@ -2437,7 +2437,16 @@ pub(crate) async fn check_operation(
             if start_read && !increment {
                 return Ok(None);
             }
-            if (start_write_first || start_write_retry) && !increment {
+            if start_write_first && !increment {
+                // Live authority was just verified above. If another caller under the same claim
+                // already advanced `dispatched_attempts` from 0 to >= 1, return `Pending` (never
+                // issuing a second first-send permit and never falsely revoking the run).
+                if attempts.is_some_and(|n| n >= 1) {
+                    return Ok(Some(ReplayEffect::Pending));
+                }
+                return Ok(Some(ReplayEffect::Exhausted));
+            }
+            if start_write_retry && !increment {
                 return Ok(Some(ReplayEffect::Exhausted));
             }
             if !increment && action != ReplayAction::RefreshUnstarted {

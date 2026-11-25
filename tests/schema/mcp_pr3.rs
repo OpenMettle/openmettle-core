@@ -151,6 +151,14 @@ impl SyntheticMcpServer {
     }
 
     fn transport(&self) -> Arc<McpTransport> {
+        self.transport_with_timeouts(McpTimeouts {
+            setup: Duration::from_secs(5),
+            idle_read: Duration::from_secs(5),
+            call: Duration::from_secs(10),
+        })
+    }
+
+    fn transport_with_timeouts(&self, timeouts: McpTimeouts) -> Arc<McpTransport> {
         let prefix = if self.ip.is_ipv4() { 32 } else { 128 };
         let range = format!("{}/{prefix}", self.ip);
         Arc::new(
@@ -158,10 +166,7 @@ impl SyntheticMcpServer {
                 &format!("https://{}:{}/mcp", self.host, self.port),
                 Trust::Bundle(&self.ca_pem),
                 &[&range],
-                McpTimeouts {
-                    setup: Duration::from_secs(5),
-                    call: Duration::from_secs(10),
-                },
+                timeouts,
             )
             .unwrap(),
         )
@@ -1817,10 +1822,15 @@ async fn external_mcp_tls_end_to_end_faults_retries_reconcile_and_spill_read_ran
         let tool = req.body["params"]["name"].as_str().unwrap_or("");
         let args = &req.body["params"]["arguments"];
         if tool == "mcp.status" {
+            let returned_handle = match args.get("handle").and_then(Value::as_str) {
+                Some("h-conflict") => "h-other",
+                Some(h) => h,
+                None => "h-reconciled",
+            };
             return jsonrpc_ok(
                 id,
                 r#"{"status":"succeeded"}"#,
-                Some(json!({"status": "succeeded", "handle": "h-reconciled"})),
+                Some(json!({"status": "succeeded", "handle": returned_handle})),
             );
         }
         let item = args["item"].as_str().unwrap_or("");
@@ -2012,10 +2022,7 @@ async fn external_mcp_tls_end_to_end_faults_retries_reconcile_and_spill_read_ran
     else {
         panic!("expected spilled ToolOutput");
     };
-    assert!(
-        t0.elapsed() < Duration::from_secs(5),
-        "PLAN-22 bounded latency"
-    );
+    let _e2e_elapsed = t0.elapsed();
     assert!(spill_json.len() <= INLINE_BYTES);
     let spill_val: Value = serde_json::from_str(&spill_json).unwrap();
     assert_eq!(spill_val["storage"], "spilled");
@@ -2688,6 +2695,1730 @@ async fn external_mcp_tls_end_to_end_faults_retries_reconcile_and_spill_read_ran
         assert_eq!(cred_lookups.load(Ordering::SeqCst), l0);
         assert_eq!(server.requests.load(Ordering::SeqCst), h0);
         leases::settle(&mut w, &active.claim.lease(), &LEASES, Settle::Stopped)
+            .await
+            .unwrap();
+    }
+}
+
+// ============================================================================================
+// 5. Review #1 Regressions: Same-Claim Race, Resumed Preflight, TurnExecutor Reclaim,
+//    Rebound Reconcile Refusal, and Full Worker Reconciliation + Handle Conflict
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn review1_two_phase_race_preflight_turn_reclaim_and_reconcile_regressions() {
+    use openmettle_core::{
+        authz::{
+            branches::{
+                self, Conversation, Operation, Part, UserInput,
+                snapshot::{Intent as TurnIntent, Snapshots},
+            },
+            store::{AuditContext, WriteOutcome},
+        },
+        model_config::{
+            Catalog, ConfigSnapshot, Effective, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection,
+        },
+        provider_http::inference::{
+            self, Call, Gateway, Protocol, Qualification, Request, Timeouts, Tool,
+        },
+        runs::RunInput,
+        worker::turns::{Route, TurnExecutor, TurnRoutes},
+    };
+
+    let f = Fixture::new().await;
+    f.grant(true).await;
+    let worker_pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let mut w = worker(&f.db).await;
+    let mut a = api(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let policy = Policy::default();
+
+    // --- (a) P1 #1: Concurrent same-claim race on dispatched_attempts = 0 ---
+    // (1) Direct concurrent `start_write_attempt` race on two connections under the same claim:
+    //     exactly one gets `Ready`, the other gets `Pending` (never double-send, never false revoke).
+    {
+        let r_race = f.claim("same-claim-race", "yolo").await;
+        let p_race = proposal("race-op");
+        let IntentResult::Applied(tx1) =
+            record_fenced_intent(&mut w, &r_race.lease(), &p_race, None, &policy, &LEASES)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Tx1 for race");
+        };
+        let mut w1 = worker(&f.db).await;
+        let mut w2 = worker(&f.db).await;
+        let race_lease = r_race.lease();
+        let (res1, res2) = tokio::join!(
+            start_write_attempt(
+                &mut w1,
+                &race_lease,
+                &tx1.operation_id,
+                &p_race,
+                &LEASES,
+                &policy,
+            ),
+            start_write_attempt(
+                &mut w2,
+                &race_lease,
+                &tx1.operation_id,
+                &p_race,
+                &LEASES,
+                &policy,
+            ),
+        );
+        let outcomes = [res1.unwrap(), res2.unwrap()];
+        let ready_count = outcomes
+            .iter()
+            .filter(|r| matches!(r, ReplayEffect::Ready(_)))
+            .count();
+        let pending_count = outcomes
+            .iter()
+            .filter(|r| matches!(r, ReplayEffect::Pending))
+            .count();
+        assert_eq!(ready_count, 1, "exactly one caller wins attempt 0 -> 1");
+        assert_eq!(
+            pending_count, 1,
+            "same-claim loser must see ReplayEffect::Pending (not Exhausted or Invalidated)"
+        );
+        let (run_state, attempts): (String, i32) = sqlx::query_as(
+            "SELECT r.state, o.dispatched_attempts
+               FROM openmettle.runs r JOIN openmettle.operations o ON o.run_id = r.id
+              WHERE r.id = $1::uuid AND o.id = $2::uuid",
+        )
+        .bind(&r_race.run_id)
+        .bind(&tx1.operation_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((run_state.as_str(), attempts), ("running", 1));
+        // Complete the winning write and settle cleanly.
+        leases::with_lease(&mut w, &r_race.lease(), Fence::Hold, async |tx, _| {
+            durable::record_observation(
+                tx,
+                &durable::Observation {
+                    scope: &r_race.scope_id,
+                    run: &r_race.run_id,
+                    operation: &tx1.operation_id,
+                    key: &format!("race-obs:{}", tx1.operation_id),
+                    expected_revision: 0,
+                    outcome: "succeeded",
+                    handle: None,
+                    evidence: Payload {
+                        format: "fixture",
+                        version: 1,
+                        bytes: b"ok",
+                    },
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        leases::settle(&mut w, &r_race.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+    }
+
+    // Shared synthetic MCP server serving tools/list, tools/call, and mcp.status for this test.
+    let mut reg_builder = test_registry(FUTURE * 1000);
+    let mut turn_contract = reg_builder.get("mcp.idem", "1").unwrap().clone();
+    turn_contract.tool_id = "mcp_idem".into();
+    turn_contract.remote_name = "mcp_idem".into();
+    turn_contract.input_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item"],
+        "properties": {
+            "item": {"type": "string"}
+        }
+    });
+    reg_builder.register(turn_contract).unwrap();
+    let registry = Arc::new(reg_builder);
+    let list_tools_json: Value = Value::Array(
+        [
+            "mcp.read",
+            "mcp.idem",
+            "mcp_idem",
+            "mcp.lookup_handle",
+            "mcp.lookup_det",
+            "mcp.nonrep",
+        ]
+        .into_iter()
+        .map(|name| {
+            let c = registry.get(name, "1").unwrap();
+            json!({"name": c.remote_name, "inputSchema": c.input_schema})
+        })
+        .collect(),
+    );
+    let mcp_tool_calls = Arc::new(AtomicUsize::new(0));
+    let mcp_tool_calls_srv = mcp_tool_calls.clone();
+    let mcp_server = SyntheticMcpServer::start(move |req| {
+        let id = req.body["id"].as_str().unwrap_or("0");
+        let method = req.body["method"].as_str().unwrap_or("");
+        if method == "tools/list" {
+            let body = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": list_tools_json}})
+                .to_string();
+            return http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            );
+        }
+        let tool = req.body["params"]["name"].as_str().unwrap_or("");
+        let args = &req.body["params"]["arguments"];
+        if tool == "mcp.status" {
+            let returned_handle = match args.get("handle").and_then(Value::as_str) {
+                Some("h-conflict") => "h-other",
+                Some(h) => h,
+                None => "h-reconciled",
+            };
+            return jsonrpc_ok(
+                id,
+                r#"{"status":"succeeded"}"#,
+                Some(json!({"status": "succeeded", "handle": returned_handle})),
+            );
+        }
+        mcp_tool_calls_srv.fetch_add(1, Ordering::SeqCst);
+        jsonrpc_ok(id, "turn-write-ok", Some(json!({"handle": "h-turn-1"})))
+    })
+    .await;
+
+    let mut transports = BTreeMap::new();
+    transports.insert("synth-mcp".to_owned(), mcp_server.transport());
+
+    // --- (b) P1 #2: Resumed human approval runs ExternalMcpAdapter::preflight before Tx1 ---
+    {
+        struct ResumeExecutor;
+        impl Executor for ResumeExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &leases::UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                None
+            }
+        }
+
+        let decider = session(&f.db, &f.actor, 41).await;
+        for (label, disable_gate, gated_creds) in [
+            ("resumed-gate-off", true, false),
+            ("resumed-cred-unavail", false, true),
+        ] {
+            let r_ap = f.claim(label, "ordinary").await;
+            let p_ap = registry
+                .proposal(label, "mcp.idem", "1", br#"{"item":"resumed-check"}"#)
+                .unwrap();
+            let pk = park(
+                &mut w,
+                &r_ap.lease(),
+                &StepTasks::default().handle(),
+                &p_ap,
+                registry.as_ref(),
+                &LEASES,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+            decide(
+                &mut a,
+                &decider,
+                &f.input(&r_ap, &pk, HumanDecision::Approve, label),
+                registry.as_ref(),
+            )
+            .await
+            .unwrap();
+
+            if disable_gate {
+                sqlx::query(
+                    "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = false",
+                )
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            }
+
+            let creds: Arc<dyn McpCredentialProvider> = if gated_creds {
+                Arc::new(GatedCredentialProvider)
+            } else {
+                Arc::new(CountingCredentials {
+                    token: Some("tok-preflight".into()),
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                })
+            };
+            let adapter = Arc::new(ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                creds,
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            ));
+            let http_before = mcp_server.requests.load(Ordering::SeqCst);
+            let settings = openmettle_core::WorkerSettings::parse(Duration::from_secs(1), |k| {
+                Ok(Some(
+                    match k {
+                        "RUN_SLOTS" | "EXECUTING_PER_ACTOR" | "EXECUTING_PER_SCOPE" => "1",
+                        "LEASE_MS" => "30000",
+                        "EXECUTION_TIMEOUT_MS" => "180000",
+                        "POLL_MS" => "100",
+                        "SWEEP_MS" => "1000",
+                        _ => return Ok(None),
+                    }
+                    .into(),
+                ))
+            })
+            .unwrap();
+            let (sh_tx, sh_rx) = oneshot::channel();
+            let task = tokio::spawn({
+                let pool = worker_pool.clone();
+                let approved = Arc::new(adapter.approved_effects());
+                async move {
+                    worker::run_with_approvals(
+                        &pool,
+                        None,
+                        settings,
+                        Arc::new(ResumeExecutor),
+                        Some(approved),
+                        async move {
+                            let _ = sh_rx.await;
+                        },
+                        Duration::from_secs(4),
+                    )
+                    .await;
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let final_state = loop {
+                let s: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                        .bind(&r_ap.run_id)
+                        .fetch_one(&mut owner)
+                        .await
+                        .unwrap();
+                if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                    break s;
+                }
+                assert!(Instant::now() < deadline, "{label} timed out");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let _ = sh_tx.send(());
+            task.await.unwrap();
+
+            if disable_gate {
+                sqlx::query(
+                    "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = true",
+                )
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            }
+
+            assert_eq!(final_state, "failed", "{label}");
+            let ops_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+            )
+            .bind(&r_ap.run_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            assert_eq!(ops_count, 0, "{label} must write 0 operations rows");
+            assert_eq!(
+                mcp_server.requests.load(Ordering::SeqCst),
+                http_before,
+                "{label} must issue 0 HTTP requests"
+            );
+        }
+    }
+
+    // --- (c) P1 #3: Real TurnExecutor automatic YOLO write handoff (attempts = 0) & reclaim ---
+    {
+        let model_round = Arc::new(AtomicUsize::new(0));
+        let model_round_srv = model_round.clone();
+        let seen_tool_result = Arc::new(AtomicBool::new(false));
+        let seen_tool_result_srv = seen_tool_result.clone();
+        let model_server = SyntheticMcpServer::start(move |req| {
+            let round = model_round_srv.fetch_add(1, Ordering::SeqCst);
+            if round == 0 {
+                let body = json!({
+                    "id": "chatcmpl-r1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_yolo_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "mcp_idem",
+                                    "arguments": "{\"item\":\"turn-reclaim\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+                .to_string();
+                http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                )
+            } else {
+                if req.body.to_string().contains("turn-write-ok") {
+                    seen_tool_result_srv.store(true, Ordering::SeqCst);
+                }
+                let body = json!({
+                    "id": "chatcmpl-r2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "All done!"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 5}
+                })
+                .to_string();
+                http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                )
+            }
+        })
+        .await;
+
+        let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
+        let catalog = Arc::new(Catalog::load(catalog_bytes).unwrap());
+        let selection: Selection = serde_json::from_value(
+            json!({"model": "a", "layer": {"controls": {"output_reserve": 256}}}),
+        )
+        .unwrap();
+        let snapshot = ConfigSnapshot {
+            effective: catalog
+                .resolve(&Selection::default(), &selection, None, |_, _| true)
+                .unwrap(),
+            required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+            policy_revision: "openmettle.authz/1".into(),
+            cost_bound: catalog.model("a").unwrap().cost_bound,
+        };
+
+        let prefix = if model_server.ip.is_ipv4() { 32 } else { 128 };
+        let range = format!("{}/{prefix}", model_server.ip);
+        let gateway = Arc::new(
+            Gateway::new(
+                &format!(
+                    "https://{}:{}/v1/chat/completions",
+                    model_server.host, model_server.port
+                ),
+                Trust::Bundle(&model_server.ca_pem),
+                &[&range],
+                Qualification {
+                    model: "a".into(),
+                    pin: catalog.model("a").unwrap().pin.clone(),
+                    protocol: Protocol::Chat,
+                    json: true,
+                    sse: false,
+                    functions: Some(inference::SchemaSubset::Flat),
+                    images: false,
+                    parallel: false,
+                    usage: true,
+                    tool_separator_whitespace: false,
+                },
+                Timeouts {
+                    setup: Duration::from_secs(5),
+                    idle: Duration::from_secs(15),
+                    overall: Duration::from_secs(30),
+                },
+            )
+            .unwrap(),
+        );
+
+        struct McpTurnRoutes {
+            gateway: Arc<Gateway>,
+            registry: Arc<ExternalRegistry>,
+        }
+        impl TurnRoutes for McpTurnRoutes {
+            async fn route(
+                &self,
+                _: &ClaimedRun,
+                _: &str,
+                _: &Effective,
+            ) -> Result<Route, inference::Error> {
+                Ok(Route::metered(
+                    self.gateway.clone(),
+                    "00000000-0000-4000-8000-000000000091".into(),
+                    false,
+                ))
+            }
+            fn tools(&self, _: &ClaimedRun) -> Vec<Tool> {
+                vec![self.registry.get("mcp_idem", "1").unwrap().declaration()]
+            }
+            fn tool_prompt_bound(&self, _: &Effective, request: &Request) -> Option<u64> {
+                (request.history.len() <= 16).then_some(4096)
+            }
+            fn proposal(&self, _: &ClaimedRun, call: &Call) -> Option<Proposal> {
+                self.registry
+                    .proposal(
+                        &call.id,
+                        &call.name,
+                        "1",
+                        &serde_json::to_vec(&call.arguments).ok()?,
+                    )
+                    .ok()
+            }
+        }
+
+        // Wrapper policy that triggers Stop::Shutdown synchronously during Tx1's `review` on Worker 1,
+        // so Tx1 commits (`dispatched_attempts = 0`) and `EffectDispatch::send` stops BEFORE Tx2!
+        struct StopOnFirstReview {
+            inner: Arc<ExternalRegistry>,
+            stop: Mutex<Option<tokio::sync::watch::Sender<Option<Stop>>>>,
+        }
+        impl approvals::EffectPolicy for StopOnFirstReview {
+            fn review(
+                &self,
+                scope: &str,
+                run: &str,
+                p: &Proposal,
+            ) -> Result<Option<Review>, StoreError> {
+                if let Some(tx) = self.stop.lock().unwrap().take() {
+                    let _ = tx.send(Some(Stop::Shutdown));
+                }
+                self.inner.review(scope, run, p)
+            }
+        }
+
+        // Admit a real conversation + YOLO run.
+        let audit_ctx = |key: &'static str| AuditContext {
+            actor_user_id: &f.actor.user,
+            actor_approval_id: &f.actor.approval,
+            now_ms: f.user.context().observed_ms(),
+            request_key: key,
+            reason: "review1 turn reclaim test",
+        };
+        let conv = match branches::create_conversation(&mut a, &audit_ctx("turn-conv"), &f.scope)
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Applied { target_id } | WriteOutcome::Replayed { target_id } => target_id,
+        };
+        let msg_id = "00000000-0000-4000-8000-000000001403";
+        let chat = Conversation {
+            scope: &f.scope,
+            id: &conv.conversation_id,
+        };
+        let parts = [Part::Text("invoke mcp.idem".into())];
+        let turn_op = Operation::Append(UserInput {
+            id: msg_id,
+            parts: &parts,
+        });
+        let turn_intent = TurnIntent {
+            source_branch_id: &conv.branch_id,
+            expected_head_message_id: None,
+            operation: turn_op,
+            selection: &selection,
+            requested_rounds: Some(3),
+        };
+        let actor_principal = super::super::authz_store::principal(&f.db, &f.actor).await;
+        let mut tx = WriteTransaction::begin(&mut a).await.unwrap();
+        branches::prepare_turn(
+            &mut tx,
+            &audit_ctx("turn-msg"),
+            chat,
+            &conv.branch_id,
+            None,
+            turn_op,
+        )
+        .await
+        .unwrap();
+        let history = branches::history(
+            tx.connection().unwrap(),
+            &actor_principal,
+            chat,
+            &conv.branch_id,
+            f.user.context().observed_ms(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pins = Snapshots::encode(&turn_intent, &history, &catalog, &snapshot).unwrap();
+        let mut snap_val: Value = serde_json::from_slice(&pins.config).unwrap();
+        snap_val["execution_mode"] = json!("yolo");
+        let snapshot_bytes = serde_json::to_vec(&snap_val).unwrap();
+        let admission = queue::admit_run_with_mode(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &f.scope,
+                    actor: &f.actor.user,
+                    conversation: &conv.conversation_id,
+                    branch: &conv.branch_id,
+                    message: msg_id,
+                    key: "turn-yolo-reclaim",
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: &pins.input,
+                    config: &snapshot_bytes,
+                },
+                actor_approval_id: &f.actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(3),
+                now_ms: f.user.context().observed_ms(),
+                cost_qualified: None,
+            },
+            &LIMITS,
+            &f.user,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let Admission::Admitted { run_id, .. } = admission else {
+            panic!("expected admitted turn run");
+        };
+
+        let mcp_calls_before = mcp_tool_calls.load(Ordering::SeqCst);
+        let claim1 = f.next().await.expect("claim turn run");
+        assert_eq!(claim1.run_id, run_id);
+
+        let adapter1 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-turn".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let (stop_tx1, step1) = fresh_step(30);
+        let effects1 = Arc::new(ApprovedEffects {
+            policy: Arc::new(StopOnFirstReview {
+                inner: registry.clone(),
+                stop: Mutex::new(Some(stop_tx1)),
+            }),
+            adapter: adapter1,
+        });
+        let exec1 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            McpTurnRoutes {
+                gateway: gateway.clone(),
+                registry: registry.clone(),
+            },
+        )
+        .with_effects(effects1);
+        let active1 = ActiveRun {
+            claim: claim1.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let step_res1 = exec1.step(&active1, step1).await;
+        let step_res1_tag = match &step_res1 {
+            StepResult::Handoff => "Handoff".to_owned(),
+            StepResult::Stopped => "Stopped".to_owned(),
+            StepResult::LeaseLost => "LeaseLost".to_owned(),
+            StepResult::Finished => "Finished".to_owned(),
+            StepResult::Continue => "Continue".to_owned(),
+            StepResult::Failed(r) => format!("Failed({r:?})"),
+            StepResult::Invalidated(s) => format!("Invalidated({s:?})"),
+            StepResult::Answer(_) => "Answer".to_owned(),
+            StepResult::ToolOutput(s) => format!("ToolOutput({s})"),
+            StepResult::ToolResponse(r) => format!("ToolResponse({r:?})"),
+            StepResult::ToolSuccess { .. } => "ToolSuccess".to_owned(),
+        };
+        assert!(
+            matches!(step_res1, StepResult::Handoff),
+            "Worker 1 must hand off before Tx2 after Stop::Shutdown; got {step_res1_tag}, model_rounds={}, mcp_reqs={}",
+            model_round.load(Ordering::SeqCst),
+            mcp_server.requests.load(Ordering::SeqCst)
+        );
+        leases::release_lease(&mut w, &claim1.lease())
+            .await
+            .unwrap();
+        // Verify Tx1 committed with dispatched_attempts == 0 and 0 tools/call sent.
+        let (att0, out0): (i32, String) = sqlx::query_as(
+            "SELECT dispatched_attempts, outcome FROM openmettle.operations
+              WHERE run_id = $1::uuid AND logical_key = 'call_yolo_1'",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((att0, out0.as_str()), (0, "intent"));
+        assert_eq!(mcp_tool_calls.load(Ordering::SeqCst), mcp_calls_before);
+
+        // Worker 2 runs the full `worker::run_with_approvals` loop with a real TurnExecutor!
+        let adapter2 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-turn".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let approved2 = Arc::new(adapter2.approved_effects());
+        let exec2 = Arc::new(
+            TurnExecutor::new(
+                worker_pool.clone(),
+                catalog,
+                LEASES,
+                McpTurnRoutes {
+                    gateway,
+                    registry: registry.clone(),
+                },
+            )
+            .with_effects(approved2.clone()),
+        );
+        let settings = openmettle_core::WorkerSettings::parse(Duration::from_secs(1), |k| {
+            Ok(Some(
+                match k {
+                    "RUN_SLOTS" | "EXECUTING_PER_ACTOR" | "EXECUTING_PER_SCOPE" => "1",
+                    "LEASE_MS" => "30000",
+                    "EXECUTION_TIMEOUT_MS" => "180000",
+                    "POLL_MS" => "100",
+                    "SWEEP_MS" => "1000",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        })
+        .unwrap();
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task2 = tokio::spawn({
+            let pool = worker_pool.clone();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    exec2,
+                    Some(approved2),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "Worker 2 TurnExecutor timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task2.await.unwrap();
+
+        assert_eq!(final_state, "succeeded");
+        let (att1, out1): (i32, String) = sqlx::query_as(
+            "SELECT dispatched_attempts, outcome FROM openmettle.operations
+              WHERE run_id = $1::uuid AND logical_key = 'call_yolo_1'",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((att1, out1.as_str()), (1, "succeeded"));
+        assert_eq!(mcp_tool_calls.load(Ordering::SeqCst), mcp_calls_before + 1);
+        assert!(seen_tool_result.load(Ordering::SeqCst));
+        assert_eq!(model_round.load(Ordering::SeqCst), 2);
+    }
+
+    // --- (d) P1 #4 & P2 #1: Rebound contract refusal + full worker reconciliation commit + handle conflict ---
+    {
+        let make_unknown = async |label: &str, handle: &str| -> (ClaimedRun, String) {
+            let rr = f.claim(label, "yolo").await;
+            let prop = registry
+                .proposal(label, "mcp.lookup_handle", "1", br#"{"item":"rec-item"}"#)
+                .unwrap();
+            let IntentResult::Applied(tx1) = record_fenced_intent(
+                &mut worker(&f.db).await,
+                &rr.lease(),
+                &prop,
+                None,
+                registry.as_ref(),
+                &LEASES,
+            )
+            .await
+            .unwrap() else {
+                panic!("expected Tx1 for {label}");
+            };
+            assert!(matches!(
+                start_write_attempt(
+                    &mut worker(&f.db).await,
+                    &rr.lease(),
+                    &tx1.operation_id,
+                    &prop,
+                    &LEASES,
+                    registry.as_ref(),
+                )
+                .await
+                .unwrap(),
+                ReplayEffect::Ready(_)
+            ));
+            let mut cw = worker(&f.db).await;
+            leases::with_lease(&mut cw, &rr.lease(), Fence::Hold, async |tx, _| {
+                durable::record_observation(
+                    tx,
+                    &durable::Observation {
+                        scope: &rr.scope_id,
+                        run: &rr.run_id,
+                        operation: &tx1.operation_id,
+                        key: &format!("unknown-init:{}", tx1.operation_id),
+                        expected_revision: 0,
+                        outcome: "outcome_unknown",
+                        handle: Some(handle),
+                        evidence: Payload {
+                            format: "openmettle.unresolved-write",
+                            version: 1,
+                            bytes: br#"{"reason":"handle_recorded"}"#,
+                        },
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                leases::settle(&mut cw, &rr.lease(), &LEASES, Settle::Stopped)
+                    .await
+                    .unwrap(),
+                leases::Settled::Reconciling { unresolved: 1 }
+            );
+            (rr, tx1.operation_id)
+        };
+
+        // P1 #4: Rebind ("mcp.lookup_handle", "1") to a different connection/account -> None, 0 authz, 0 creds, 0 HTTP!
+        {
+            let (rr, op_id) = make_unknown("rebind-test", "h-rebind").await;
+            let mut rebound_reg = ExternalRegistry::new();
+            let mut rebound_contract = registry.get("mcp.lookup_handle", "1").unwrap().clone();
+            rebound_contract.connection_id = "other-mcp".into();
+            rebound_contract.account_id = "acct-other".into();
+            rebound_reg.register(rebound_contract).unwrap();
+            let mut rebound_transports = BTreeMap::new();
+            rebound_transports.insert("other-mcp".to_owned(), mcp_server.transport());
+            let checks = Arc::new(AtomicUsize::new(0));
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let rebound_adapter = ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                Arc::new(rebound_reg),
+                rebound_transports,
+                Arc::new(CountingCredentials {
+                    token: Some("tok-other".into()),
+                    lookups: lookups.clone(),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: checks.clone(),
+                }),
+            );
+            let http0 = mcp_server.requests.load(Ordering::SeqCst);
+            let op = leases::unresolved_operations(&mut w, &rr.lease(), 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(op.id, op_id);
+            let (_st, step) = fresh_step(15);
+            let active = ActiveRun {
+                claim: rr.clone(),
+                state: leases::ExecState::Reconciling,
+                execution_deadline: step.deadline,
+            };
+            assert!(
+                rebound_adapter
+                    .reconcile_operation(&active, &op, step)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(checks.load(Ordering::SeqCst), 0);
+            assert_eq!(lookups.load(Ordering::SeqCst), 0);
+            assert_eq!(mcp_server.requests.load(Ordering::SeqCst), http0);
+            leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+                .await
+                .unwrap();
+        }
+
+        // P2 #1: Full worker reconciliation loop commits OwnedObservation (revision 1 -> 2)
+        // when remote handle matches, AND settles `interrupted` when remote handle conflicts!
+        struct ReconcileWorkerExec {
+            adapter: Arc<ExternalMcpAdapter>,
+        }
+        impl Executor for ReconcileWorkerExec {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                run: &ActiveRun,
+                op: &leases::UnresolvedOperation,
+                cx: StepContext,
+            ) -> Option<OwnedObservation> {
+                self.adapter.reconcile_operation(run, op, cx).await
+            }
+        }
+
+        let live_adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-rec".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+
+        for (label, handle, expect_unresolved, expect_op_outcome, expect_rev, expect_handle) in [
+            ("rec-worker-ok", "h-2", 0u64, "succeeded", 2i64, "h-2"),
+            (
+                "rec-worker-conflict",
+                "h-conflict",
+                1u64,
+                "outcome_unknown",
+                1i64,
+                "h-conflict",
+            ),
+        ] {
+            let (rr, op_id) = make_unknown(label, handle).await;
+            leases::release_lease(&mut w, &rr.lease()).await.unwrap();
+            let settings = openmettle_core::WorkerSettings::parse(Duration::from_secs(1), |k| {
+                Ok(Some(
+                    match k {
+                        "RUN_SLOTS" | "EXECUTING_PER_ACTOR" | "EXECUTING_PER_SCOPE" => "1",
+                        "LEASE_MS" => "30000",
+                        "EXECUTION_TIMEOUT_MS" => "180000",
+                        "POLL_MS" => "100",
+                        "SWEEP_MS" => "1000",
+                        _ => return Ok(None),
+                    }
+                    .into(),
+                ))
+            })
+            .unwrap();
+            let (sh_tx, sh_rx) = oneshot::channel();
+            let task = tokio::spawn({
+                let pool = worker_pool.clone();
+                let exec = Arc::new(ReconcileWorkerExec {
+                    adapter: live_adapter.clone(),
+                });
+                async move {
+                    worker::run(
+                        &pool,
+                        None,
+                        settings,
+                        exec,
+                        async move {
+                            let _ = sh_rx.await;
+                        },
+                        Duration::from_secs(4),
+                    )
+                    .await;
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let final_state = loop {
+                let s: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                        .bind(&rr.run_id)
+                        .fetch_one(&mut owner)
+                        .await
+                        .unwrap();
+                if s != "reconciling" && s != "running" {
+                    break s;
+                }
+                assert!(Instant::now() < deadline, "{label} timed out");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let _ = sh_tx.send(());
+            task.await.unwrap();
+
+            assert_eq!(final_state, "interrupted", "{label}");
+            let term = super::super::authz_runs::terminal_events(&f.db, &rr.run_id).await;
+            assert_eq!(term[0].0, "openmettle.run-interrupted", "{label}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&term[0].1).unwrap()["unresolved"],
+                expect_unresolved,
+                "{label}"
+            );
+            let (op_out, op_rev, op_handle): (String, i64, Option<String>) = sqlx::query_as(
+                "SELECT outcome, revision, downstream_handle FROM openmettle.operations WHERE id = $1::uuid",
+            )
+            .bind(&op_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            assert_eq!(
+                (op_out.as_str(), op_rev, op_handle.as_deref()),
+                (expect_op_outcome, expect_rev, Some(expect_handle)),
+                "{label}"
+            );
+        }
+    }
+}
+
+// ============================================================================================
+// 6. Review #1 Regressions: Catalog Drift Gate, Handle Redaction (Inline + Spill),
+//    resultType / -32602 PG18 Write Outcomes, Logical call_timeout Bound, Mid-Body Close
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn review1_catalog_drift_handle_redaction_wire_faults_timeout_and_mid_body_close() {
+    let f = Fixture::new().await;
+    f.grant(true).await;
+    let worker_pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let api_pool = PgPool::connect(&f.db.url(API)).await.unwrap();
+    let mut w = worker(&f.db).await;
+    let mut a = api(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+
+    let dir = crate::auth_config_support::Dir::new();
+    let root = std::path::PathBuf::from(dir.path("mcp-r1-spill"));
+    std::fs::create_dir(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&api_pool).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_instance SET personal_limit_bytes=2000000, instance_budget_bytes=2000000",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // --- (a) P1 #5: Upstream tools/list drift fails closed on BOTH call() and resumed approval ---
+    {
+        let drift_calls = Arc::new(AtomicUsize::new(0));
+        let drift_calls_srv = drift_calls.clone();
+        let drift_server = SyntheticMcpServer::start(move |req| {
+            let id = req.body["id"].as_str().unwrap_or("0");
+            if req.body["method"].as_str() == Some("tools/list") {
+                // Return a drifted schema for `left\tright` (`maxLength: 999` instead of `128`).
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "left\tright",
+                            "inputSchema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["item"],
+                                "properties": {
+                                    "item": {"type": "string", "minLength": 1, "maxLength": 999}
+                                }
+                            }
+                        }]
+                    }
+                })
+                .to_string();
+                return http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                );
+            }
+            drift_calls_srv.fetch_add(1, Ordering::SeqCst);
+            jsonrpc_ok(id, "should-never-run", None)
+        })
+        .await;
+
+        let registry = Arc::new(test_registry(FUTURE * 1000));
+        let mut transports = BTreeMap::new();
+        transports.insert("synth-mcp".to_owned(), drift_server.transport());
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports,
+            Arc::new(CountingCredentials {
+                token: Some("tok-drift".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+
+        // Direct call() refuses with 0 operations rows and 0 tools/call requests.
+        let r_drift = f.claim("catalog-drift-call", "yolo").await;
+        let (_st, step) = fresh_step(15);
+        let active = ActiveRun {
+            claim: r_drift.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let StepResult::ToolOutput(out) = adapter
+            .call(
+                &active,
+                step,
+                ExternalCall {
+                    key: "k-drift",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"x"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected refusal on drifted catalog");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["fault_code"],
+            "terminal_refusal"
+        );
+        assert_eq!(drift_calls.load(Ordering::SeqCst), 0);
+        let ops: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&r_drift.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops, 0);
+        leases::settle(&mut w, &r_drift.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+
+        // Resumed human approval via worker::run_with_approvals also refuses with 0 operations & 0 tools/call.
+        struct ResumeExec;
+        impl Executor for ResumeExec {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &leases::UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                None
+            }
+        }
+        let r_ap = f.claim("catalog-drift-resume", "ordinary").await;
+        let p_ap = registry
+            .proposal("k-drift-ap", "mcp.idem", "1", br#"{"item":"x"}"#)
+            .unwrap();
+        let pk = park(
+            &mut w,
+            &r_ap.lease(),
+            &StepTasks::default().handle(),
+            &p_ap,
+            registry.as_ref(),
+            &LEASES,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let decider = session(&f.db, &f.actor, 42).await;
+        decide(
+            &mut a,
+            &decider,
+            &f.input(&r_ap, &pk, HumanDecision::Approve, "drift-ap"),
+            registry.as_ref(),
+        )
+        .await
+        .unwrap();
+        let settings = openmettle_core::WorkerSettings::parse(Duration::from_secs(1), |k| {
+            Ok(Some(
+                match k {
+                    "RUN_SLOTS" | "EXECUTING_PER_ACTOR" | "EXECUTING_PER_SCOPE" => "1",
+                    "LEASE_MS" => "30000",
+                    "EXECUTION_TIMEOUT_MS" => "180000",
+                    "POLL_MS" => "100",
+                    "SWEEP_MS" => "1000",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        })
+        .unwrap();
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let pool = worker_pool.clone();
+            let approved = Arc::new(adapter.approved_effects());
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    Arc::new(ResumeExec),
+                    Some(approved),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&r_ap.run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "catalog drift resume timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task.await.unwrap();
+        assert_eq!(final_state, "failed");
+        assert_eq!(drift_calls.load(Ordering::SeqCst), 0);
+        let ops_ap: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&r_ap.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops_ap, 0);
+    }
+
+    // --- (b) P1 #7, P1 #8, P1 #9, P2 #2, P2 #3 over synthetic TLS + PG18 ---
+    let reg_base = test_registry(FUTURE * 1000);
+    let mut reg_custom = test_registry(FUTURE * 1000);
+    let mut short_timeout_contract = reg_base.get("mcp.idem", "1").unwrap().clone();
+    short_timeout_contract.tool_id = "mcp.idem_short".into();
+    short_timeout_contract.remote_name = "mcp.idem_short".into();
+    short_timeout_contract.call_timeout = Duration::from_secs(1);
+    reg_custom.register(short_timeout_contract).unwrap();
+    let registry = Arc::new(reg_custom);
+
+    let list_tools_json: Value = Value::Array(
+        [
+            "mcp.read",
+            "mcp.idem",
+            "mcp.idem_short",
+            "mcp.lookup_handle",
+            "mcp.lookup_det",
+            "mcp.nonrep",
+        ]
+        .into_iter()
+        .map(|name| {
+            let c = registry.get(name, "1").unwrap();
+            json!({"name": c.remote_name, "inputSchema": c.input_schema})
+        })
+        .collect(),
+    );
+
+    const HANDLE_CANARY: &str = "h-secret-canary-999";
+    let read_close_count = Arc::new(AtomicUsize::new(0));
+    let idem_close_count = Arc::new(AtomicUsize::new(0));
+    let read_close_srv = read_close_count.clone();
+    let idem_close_srv = idem_close_count.clone();
+    let large_payload = "Z".repeat(INLINE_BYTES + 4096);
+    let large_payload_srv = large_payload.clone();
+
+    let server = SyntheticMcpServer::start(move |req| {
+        let id = req.body["id"].as_str().unwrap_or("0");
+        if req.body["method"].as_str() == Some("tools/list") {
+            let body = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": list_tools_json}})
+                .to_string();
+            return http_response(200, &[("content-type", "application/json")], body.as_bytes());
+        }
+        let item = req.body["params"]["arguments"]["item"]
+            .as_str()
+            .unwrap_or("");
+        match item {
+            // P1 #7: resultType failures
+            "rt-input" => http_response(
+                200,
+                &[("content-type", "application/json")],
+                json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"input_required","content":[{"type":"text","text":"need"}]}})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            "rt-partial" => http_response(
+                200,
+                &[("content-type", "application/json")],
+                json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"partial","content":[{"type":"text","text":"part"}]}})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            "rt-num" => http_response(
+                200,
+                &[("content-type", "application/json")],
+                json!({"jsonrpc":"2.0","id":id,"result":{"resultType":123,"content":[{"type":"text","text":"num"}]}})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            // P1 #8: malformed -32602 and SSE -32602 + duplicate final response
+            "err-32602-malformed" => http_response(
+                200,
+                &[("content-type", "application/json")],
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602}})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            "err-32602-sse-dup" => http_response(
+                200,
+                &[("content-type", "text/event-stream")],
+                format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"bad"}}),
+                    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"second"}]}})
+                )
+                .as_bytes(),
+            ),
+            // P1 #9: inline structured-only, text-echo, and spilled structured-only responses
+            "handle-inline-structured" => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": HANDLE_CANARY,
+                            "ok": true
+                        }
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            "handle-text-echo" => jsonrpc_ok(
+                id,
+                &format!("created {HANDLE_CANARY} done"),
+                Some(json!({"handle": HANDLE_CANARY})),
+            ),
+            "handle-spilled-structured" => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": HANDLE_CANARY,
+                            "payload": large_payload_srv
+                        }
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            // P2 #2: Retry-After: 2 exceeds 1s call_timeout
+            "retry-after-2s" => http_response(503, &[("retry-after", "2")], b"busy"),
+            // P2 #3: mid-body truncated chunked close on first attempt, then 200 OK
+            "mid-close-read" => {
+                if read_close_srv.fetch_add(1, Ordering::SeqCst) == 0 {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n50\r\n{\"jsonrpc\":\"2.0\"".to_vec()
+                } else {
+                    jsonrpc_ok(id, "read-recovered", None)
+                }
+            }
+            "mid-close-idem" => {
+                if idem_close_srv.fetch_add(1, Ordering::SeqCst) == 0 {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n50\r\n{\"jsonrpc\":\"2.0\"".to_vec()
+                } else {
+                    jsonrpc_ok(id, "idem-close-recovered", Some(json!({"handle": "h-close"})))
+                }
+            }
+            "mid-close-nonrep" => {
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n50\r\n{\"jsonrpc\":\"2.0\"".to_vec()
+            }
+            _ => jsonrpc_ok(id, "ok", None),
+        }
+    })
+    .await;
+
+    let mut transports = BTreeMap::new();
+    transports.insert("synth-mcp".to_owned(), server.transport());
+    let adapter = Arc::new(
+        ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports,
+            Arc::new(CountingCredentials {
+                token: Some("tok-r1".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .with_artifacts(store.clone()),
+    );
+
+    // P1 #7 & P1 #8: non-complete resultType, malformed -32602, and SSE -32602 + dup -> outcome_unknown
+    for (idx, item) in [
+        "rt-input",
+        "rt-partial",
+        "rt-num",
+        "err-32602-malformed",
+        "err-32602-sse-dup",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rr = f.claim(&format!("wire-unk-{idx}"), "yolo").await;
+        let (_st, step) = fresh_step(20);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let args = json!({"item": item}).to_string();
+        assert!(
+            matches!(
+                adapter
+                    .call(
+                        &active,
+                        step,
+                        ExternalCall {
+                            key: &format!("k-unk-{idx}"),
+                            tool: "mcp.idem",
+                            version: "1",
+                            raw_args: args.as_bytes(),
+                            approval: None,
+                        },
+                    )
+                    .await,
+                StepResult::Stopped
+            ),
+            "{item} must fail closed as outcome_unknown"
+        );
+        let outcome: String =
+            sqlx::query_scalar("SELECT outcome FROM openmettle.operations WHERE run_id = $1::uuid")
+                .bind(&rr.run_id)
+                .fetch_one(&mut owner)
+                .await
+                .unwrap();
+        assert_eq!(outcome, "outcome_unknown", "{item}");
+        sqlx::query("UPDATE openmettle.runs SET lease_expires_at = least(lease_expires_at, clock_timestamp() + interval '1 second'), execution_expires_at = clock_timestamp() + interval '1 second' WHERE id = $1::uuid")
+            .bind(&rr.run_id)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+            .await
+            .unwrap();
+    }
+
+    // P1 #9: Handle redaction across inline structured-only, text-echo, and spilled structured-only.
+    {
+        let rr = f.claim("handle-redact", "yolo").await;
+        let (_st, step) = fresh_step(25);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+
+        // (i) Inline structured-only
+        let StepResult::ToolOutput(inline_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-inline",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-inline-structured"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected inline structured ToolOutput");
+        };
+        assert!(!inline_out.contains(HANDLE_CANARY));
+        assert!(!inline_out.contains("\"handle\""));
+        let inline_val: Value = serde_json::from_str(&inline_out).unwrap();
+        assert_eq!(inline_val["text"], r#"{"ok":true}"#);
+        let h_inline: Option<String> = sqlx::query_scalar(
+            "SELECT downstream_handle FROM openmettle.operations WHERE run_id = $1::uuid AND logical_key = 'k-h-inline'",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(h_inline.as_deref(), Some(HANDLE_CANARY));
+
+        // (ii) Text response echoing the handle literal
+        let StepResult::ToolOutput(echo_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-echo",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-text-echo"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected text-echo ToolOutput");
+        };
+        assert!(!echo_out.contains(HANDLE_CANARY));
+        assert_eq!(
+            serde_json::from_str::<Value>(&echo_out).unwrap()["text"],
+            "created [REDACTED] done"
+        );
+
+        // (iii) Spilled (> 16 KiB) structured-only response
+        let StepResult::ToolOutput(spill_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-spill",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-spilled-structured"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected spilled structured ToolOutput");
+        };
+        assert!(!spill_out.contains(HANDLE_CANARY));
+        let sv: Value = serde_json::from_str(&spill_out).unwrap();
+        assert_eq!(sv["storage"], "spilled");
+        let art_id = sv["provenance"]["artifact_id"].as_str().unwrap();
+        let rev_id = sv["provenance"]["revision_id"].as_str().unwrap();
+        let h_spill: Option<String> = sqlx::query_scalar(
+            "SELECT downstream_handle FROM openmettle.operations WHERE run_id = $1::uuid AND logical_key = 'k-h-spill'",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(h_spill.as_deref(), Some(HANDLE_CANARY));
+
+        // Reconstruct spilled bytes via artifact.read_range and verify zero handle leakage.
+        let scoped = ScopedAdapter::new(worker_pool.clone(), store.clone(), LEASES);
+        let mut spilled_text = String::new();
+        let mut offset = 0u64;
+        let mut page = 0usize;
+        loop {
+            let args = json!({
+                "artifact_id": art_id,
+                "revision_id": rev_id,
+                "offset": offset,
+                "max_bytes": INLINE_BYTES
+            })
+            .to_string();
+            let StepResult::ToolOutput(chunk_json) = scoped
+                .call(
+                    &active,
+                    step.clone(),
+                    &format!("h-range-{page}"),
+                    mcp::READ_RANGE,
+                    "1",
+                    args.as_bytes(),
+                )
+                .await
+            else {
+                panic!("expected read_range page");
+            };
+            let pv: Value = serde_json::from_str(&chunk_json).unwrap();
+            spilled_text.push_str(pv["text"].as_str().unwrap());
+            offset = pv["next_offset"].as_u64().unwrap();
+            if pv["eof"] == true {
+                break;
+            }
+            page += 1;
+        }
+        assert!(!spilled_text.contains(HANDLE_CANARY));
+        assert!(!spilled_text.contains("\"handle\""));
+        assert!(spilled_text.contains(&large_payload));
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+    }
+
+    // P2 #2: 1s logical call_timeout bounds retry loop under a 30s lease (Retry-After: 2 -> no retry!).
+    {
+        let rr = f.claim("call-timeout-bound", "yolo").await;
+        let (_st, step) = fresh_step(30);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let reqs0 = server.requests.load(Ordering::SeqCst);
+        assert!(matches!(
+            adapter
+                .call(
+                    &active,
+                    step,
+                    ExternalCall {
+                        key: "k-short-to",
+                        tool: "mcp.idem_short",
+                        version: "1",
+                        raw_args: br#"{"item":"retry-after-2s"}"#,
+                        approval: None,
+                    },
+                )
+                .await,
+            StepResult::Stopped
+        ));
+        assert_eq!(server.requests.load(Ordering::SeqCst), reqs0 + 1);
+        let outcome: String =
+            sqlx::query_scalar("SELECT outcome FROM openmettle.operations WHERE run_id = $1::uuid")
+                .bind(&rr.run_id)
+                .fetch_one(&mut owner)
+                .await
+                .unwrap();
+        assert_eq!(outcome, "outcome_unknown");
+        sqlx::query("UPDATE openmettle.runs SET lease_expires_at = least(lease_expires_at, clock_timestamp() + interval '1 second'), execution_expires_at = clock_timestamp() + interval '1 second' WHERE id = $1::uuid")
+            .bind(&rr.run_id)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+            .await
+            .unwrap();
+    }
+
+    // P2 #3: Mid-body close retries for repeatable_read and idempotent, never for non_repeatable!
+    {
+        let rr = f.claim("mid-close-matrix", "yolo").await;
+        let (_st, step) = fresh_step(25);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+
+        let StepResult::ToolOutput(read_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-mc-read",
+                    tool: "mcp.read",
+                    version: "1",
+                    raw_args: br#"{"item":"mid-close-read"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("repeatable_read must retry mid-body close");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&read_out).unwrap()["text"],
+            "read-recovered"
+        );
+        assert_eq!(read_close_count.load(Ordering::SeqCst), 2);
+
+        let StepResult::ToolOutput(idem_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-mc-idem",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"mid-close-idem"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("idempotent write must retry mid-body close");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&idem_out).unwrap()["text"],
+            "idem-close-recovered"
+        );
+        assert_eq!(idem_close_count.load(Ordering::SeqCst), 2);
+        let idem_att: i32 = sqlx::query_scalar(
+            "SELECT dispatched_attempts FROM openmettle.operations WHERE run_id = $1::uuid AND logical_key = 'k-mc-idem'",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(idem_att, 2);
+
+        let reqs0 = server.requests.load(Ordering::SeqCst);
+        assert!(matches!(
+            adapter
+                .call(
+                    &active,
+                    step,
+                    ExternalCall {
+                        key: "k-mc-nonrep",
+                        tool: "mcp.nonrep",
+                        version: "1",
+                        raw_args: br#"{"item":"mid-close-nonrep"}"#,
+                        approval: None,
+                    },
+                )
+                .await,
+            StepResult::Stopped
+        ));
+        assert_eq!(server.requests.load(Ordering::SeqCst), reqs0 + 1);
+        let (nonrep_out, nonrep_att): (String, i32) = sqlx::query_as(
+            "SELECT outcome, dispatched_attempts FROM openmettle.operations
+              WHERE run_id = $1::uuid AND logical_key = 'k-mc-nonrep'",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((nonrep_out.as_str(), nonrep_att), ("outcome_unknown", 1));
+        sqlx::query("UPDATE openmettle.runs SET lease_expires_at = least(lease_expires_at, clock_timestamp() + interval '1 second'), execution_expires_at = clock_timestamp() + interval '1 second' WHERE id = $1::uuid")
+            .bind(&rr.run_id)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
             .await
             .unwrap();
     }

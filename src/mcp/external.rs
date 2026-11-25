@@ -9,8 +9,8 @@ use super::{
 use crate::{
     artifact_fs::Store,
     authz::{
-        RunContinuation,
-        approvals::{self, EffectClass, EndpointKey, Proposal, Review},
+        DenialReason, PolicyReason, RunContinuation,
+        approvals::{self, EffectClass, EffectPolicy, EndpointKey, Proposal, Review},
         leases::{self, ExecState, Fence, LeaseError, LeaseSettings, UnresolvedOperation},
         runs::{CapabilityUse, RunRecheckRequest, recheck_decision},
         store::StoreError,
@@ -27,7 +27,14 @@ use crate::{
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Row};
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::time::{Instant, sleep_until};
 
 /// Redacted MCP outbound credential. `Debug` never emits secret bytes.
@@ -138,6 +145,7 @@ pub struct ExternalMcpAdapter {
     credentials: Arc<dyn McpCredentialProvider>,
     reconcile_auth: Arc<dyn DestinationAuthorizer>,
     artifacts: Option<Store>,
+    verified_catalogs: Mutex<BTreeSet<(String, String, [u8; 32])>>,
 }
 
 impl ExternalMcpAdapter {
@@ -157,6 +165,7 @@ impl ExternalMcpAdapter {
             credentials,
             reconcile_auth,
             artifacts: None,
+            verified_catalogs: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -173,11 +182,100 @@ impl ExternalMcpAdapter {
         }
     }
 
+    async fn admit_pre_intent(
+        &self,
+        run: &ActiveRun,
+        proposal: &Proposal,
+        step: &StepContext,
+    ) -> Result<(), StoreError> {
+        const REFUSED: StoreError =
+            StoreError::Denied(DenialReason::Policy(PolicyReason::CapabilityDenied));
+        let Some(contract) = self.registry.get(&proposal.tool, &proposal.version) else {
+            return Err(REFUSED);
+        };
+        let Some(transport) = self.transports.get(&contract.connection_id) else {
+            return Err(REFUSED);
+        };
+        let Some(fingerprint) = self
+            .registry
+            .connection_fingerprint(&contract.connection_id)
+        else {
+            return Err(REFUSED);
+        };
+        let Ok(expected) = contract.proposal(
+            &proposal.logical_key,
+            proposal.arguments().to_string().as_bytes(),
+        ) else {
+            return Err(REFUSED);
+        };
+        if expected.arguments() != proposal.arguments()
+            || expected.destination() != proposal.destination()
+        {
+            return Err(REFUSED);
+        }
+        if step.stop.borrow().is_some() {
+            return Err(REFUSED);
+        }
+        let actor_user_id = {
+            let mut c = self.pool.acquire().await?;
+            if !approvals::two_phase_effect_intents_enabled(&mut c).await? {
+                return Err(REFUSED);
+            }
+            sqlx::query_scalar::<_, String>(
+                "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
+            )
+            .bind(&run.claim.scope_id)
+            .bind(&run.claim.run_id)
+            .fetch_one(&mut *c)
+            .await?
+        };
+        let CredentialOutcome::Ready(credential) = self
+            .credentials
+            .resolve(CredentialRequest {
+                connection_id: &contract.connection_id,
+                account_id: &contract.account_id,
+                scope_id: &run.claim.scope_id,
+                actor_user_id: &actor_user_id,
+            })
+            .await
+        else {
+            return Err(REFUSED);
+        };
+        let cache_key = (
+            contract.connection_id.clone(),
+            contract.account_id.clone(),
+            fingerprint,
+        );
+        let already_verified = self
+            .verified_catalogs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&cache_key);
+        if !already_verified {
+            let mut stop = step.stop.clone();
+            let list_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
+            let req_id = format!("tools-list:{}", run.claim.run_id);
+            let remote = transport
+                .tools_list(&req_id, credential.bearer_token(), list_deadline, &mut stop)
+                .await
+                .map_err(|_| REFUSED)?;
+            self.registry
+                .verify_tools_list(&contract.connection_id, &remote)
+                .map_err(|_| REFUSED)?;
+            self.verified_catalogs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(cache_key);
+        }
+        Ok(())
+    }
+
     /// Execute a reviewed external MCP call through the two-phase effect ledger.
     ///
     /// Fails closed with zero `operations` rows when `two_phase_effect_intents_enabled = false`,
-    /// the proposal violates the reviewed contract, the connection transport is unconfigured, or
-    /// the credential provider reports [`CredentialOutcome::Unavailable`].
+    /// the proposal violates the reviewed contract, the connection transport is unconfigured,
+    /// upstream `tools/list` drifts from the pinned contracts, or the credential provider reports
+    /// [`CredentialOutcome::Unavailable`].
     pub async fn call(
         self: &Arc<Self>,
         run: &ActiveRun,
@@ -195,56 +293,20 @@ impl ExternalMcpAdapter {
         let Some(contract) = self.registry.get(tool, version) else {
             return refused();
         };
-        if !self.transports.contains_key(&contract.connection_id) {
-            return refused();
-        }
         let Ok(proposal) = contract.proposal(key, raw_args) else {
             return refused();
         };
         if let Some(stop) = *step.stop.borrow() {
             return stopped_step(stop);
         }
-        let (two_phase_enabled, actor_user_id) = {
-            let Ok(mut c) = self.pool.acquire().await else {
-                return StepResult::LeaseLost;
-            };
-            let Ok(enabled) = approvals::two_phase_effect_intents_enabled(&mut c).await else {
-                return StepResult::LeaseLost;
-            };
-            if !enabled {
-                return refused();
-            }
-            let Ok(actor) = sqlx::query_scalar::<_, String>(
-                "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
-            )
-            .bind(&run.claim.scope_id)
-            .bind(&run.claim.run_id)
-            .fetch_one(&mut *c)
-            .await
-            else {
-                return StepResult::LeaseLost;
-            };
-            (enabled, actor)
-        };
-        if !two_phase_enabled {
-            return refused();
-        }
-        // Fail closed before Transaction 1 (zero `operations` rows) when credential is unavailable.
-        if matches!(
-            self.credentials
-                .resolve(CredentialRequest {
-                    connection_id: &contract.connection_id,
-                    account_id: &contract.account_id,
-                    scope_id: &run.claim.scope_id,
-                    actor_user_id: &actor_user_id,
-                })
-                .await,
-            CredentialOutcome::Unavailable
-        ) {
-            return refused();
-        }
+        let preflight = self.admit_pre_intent(run, &proposal, &step).await;
         if let Some(stop) = *step.stop.borrow() {
             return stopped_step(stop);
+        }
+        match preflight {
+            Ok(()) => {}
+            Err(StoreError::Denied(_) | StoreError::InvalidInput(_)) => return refused(),
+            Err(_) => return StepResult::LeaseLost,
         }
         let intent = {
             let Ok(mut c) = self.pool.acquire().await else {
@@ -347,13 +409,30 @@ impl ExternalMcpAdapter {
             .await
             .ok()??
         };
-        let contract = self.registry.get(&proposal.tool, &proposal.version);
+        if op.target != proposal.destination() {
+            return None;
+        }
+        let (committed_conn, committed_acct, committed_action, _committed_resource) =
+            parse_committed_destination(proposal.destination())?;
+        let contract = self.registry.get(&proposal.tool, &proposal.version)?;
+        if !contract_matches_committed(
+            self.registry.as_ref(),
+            run,
+            contract,
+            &proposal,
+            &review,
+            &committed_conn,
+            &committed_acct,
+            &committed_action,
+        ) {
+            return None;
+        }
 
         // Non-repeatable writes and lookup/idempotent writes without any reconcilable lookup query
         // resolve deterministically to `outcome_unknown` with zero credential lookups and zero HTTP.
-        let lookup_plan = contract
-            .and_then(|c| build_reconcile_lookup(c, op, &proposal, &review).map(|args| (c, args)));
-        let Some((contract, (lookup_tool, lookup_args))) = lookup_plan else {
+        let Some((lookup_tool, lookup_args)) =
+            build_reconcile_lookup(contract, op, &proposal, &review)
+        else {
             return Some(OwnedObservation {
                 key: format!("reconcile-unknown:{}", op.id),
                 outcome: "outcome_unknown".into(),
@@ -448,8 +527,13 @@ impl ExternalMcpAdapter {
             .ok()?;
         let reconcile_spec = contract.reconcile.as_ref()?;
         let status = extract_reconcile_status(&response, &reconcile_spec.status_field)?;
-        let handle = extract_downstream_handle(&response, contract.handle_field.as_deref())
-            .or_else(|| op.downstream_handle.clone());
+        let remote_handle = extract_downstream_handle(&response, contract.handle_field.as_deref());
+        let handle = match (&op.downstream_handle, remote_handle) {
+            // Never overwrite an already-recorded downstream handle with a conflicting one.
+            (Some(existing), Some(remote)) if remote != *existing => return None,
+            (Some(existing), _) => Some(existing.clone()),
+            (None, remote) => remote,
+        };
         match status.as_str() {
             "succeeded" => Some(OwnedObservation {
                 key: format!("reconciled:{}", op.id),
@@ -470,6 +554,78 @@ impl ExternalMcpAdapter {
             _ => None,
         }
     }
+}
+
+fn parse_committed_destination(destination: &str) -> Option<(String, String, String, String)> {
+    let Value::Array(items) = serde_json::from_str(destination).ok()? else {
+        return None;
+    };
+    if items.len() != 5 || items[0].as_str() != Some("v1") {
+        return None;
+    }
+    Some((
+        items[1].as_str()?.to_owned(),
+        items[2].as_str()?.to_owned(),
+        items[3].as_str()?.to_owned(),
+        items[4].as_str()?.to_owned(),
+    ))
+}
+
+fn endpoint_key_matches(current: &EndpointKey, committed: &EndpointKey) -> bool {
+    match (current, committed) {
+        (EndpointKey::Unsupported, EndpointKey::Unsupported) => true,
+        (
+            EndpointKey::Supported {
+                namespace: cn,
+                field: cf,
+                key: ck,
+                ..
+            },
+            EndpointKey::Supported {
+                namespace: mn,
+                field: mf,
+                key: mk,
+                ..
+            },
+        ) => cn == mn && cf == mf && ck == mk,
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contract_matches_committed(
+    registry: &ExternalRegistry,
+    run: &ActiveRun,
+    contract: &ExternalToolContract,
+    proposal: &Proposal,
+    committed_review: &Review,
+    committed_conn: &str,
+    committed_acct: &str,
+    committed_action: &str,
+) -> bool {
+    if contract.connection_id != committed_conn
+        || contract.account_id != committed_acct
+        || contract.action != committed_action
+        || contract.endpoint_id != committed_review.endpoint_id
+        || contract.endpoint_version != committed_review.endpoint_version
+        || contract.capability != committed_review.capability
+    {
+        return false;
+    }
+    let Ok(Some(current_review)) =
+        registry.review(&run.claim.scope_id, &run.claim.run_id, proposal)
+    else {
+        return false;
+    };
+    current_review.endpoint_id == committed_review.endpoint_id
+        && current_review.endpoint_version == committed_review.endpoint_version
+        && current_review.destination_policy == committed_review.destination_policy
+        && current_review.tool_policy == committed_review.tool_policy
+        && current_review.capability == committed_review.capability
+        && current_review.gate == committed_review.gate
+        && current_review.class == committed_review.class
+        && current_review.authoritative_lookup == committed_review.authoritative_lookup
+        && endpoint_key_matches(&current_review.endpoint_key, &committed_review.endpoint_key)
 }
 
 fn build_reconcile_lookup(
@@ -529,7 +685,40 @@ fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) ->
     Some(candidate.to_owned())
 }
 
+fn sanitize_tool_success(
+    success: &ToolCallSuccess,
+    handle_field: Option<&str>,
+) -> (String, Option<String>) {
+    let handle = extract_downstream_handle(success, handle_field);
+    let raw_text = if let Some(text) = &success.content_text {
+        text.clone()
+    } else if let Some(structured) = &success.structured {
+        let mut sanitized = structured.clone();
+        if let (Some(field), Some(map)) = (handle_field, sanitized.as_object_mut()) {
+            map.remove(field);
+        }
+        sanitized.sort_all_objects();
+        sanitized.to_string()
+    } else {
+        success.text.clone()
+    };
+    let text = match handle.as_deref() {
+        Some(h) => raw_text.replace(h, "[REDACTED]"),
+        None => raw_text,
+    };
+    (text, handle)
+}
+
 impl ApprovedAdapter for ExternalMcpAdapter {
+    fn preflight<'a>(
+        &'a self,
+        run: &'a ActiveRun,
+        proposal: &'a Proposal,
+        step: &'a StepContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move { self.admit_pre_intent(run, proposal, step).await })
+    }
+
     fn send<'a>(
         &'a self,
         run: &'a ActiveRun,
@@ -574,8 +763,18 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             // an uncertain write as a known failure.
             let mut sent_uncertain = false;
             let mut prior_attempt_ambiguous = false;
+            // Whole logical tool call budget across all attempts and retry backoffs (PLAN-10).
+            let logical_call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
 
             loop {
+                let call_deadline = logical_call_deadline.min(step.deadline);
+                if Instant::now() >= call_deadline {
+                    return if !is_read && sent_uncertain {
+                        observe_unknown(&self.pool, &lease, &step, &operation_id).await
+                    } else {
+                        StepResult::ToolResponse(Err(ToolFault::Transient))
+                    };
+                }
                 let CredentialOutcome::Ready(credential) = self
                     .credentials
                     .resolve(CredentialRequest {
@@ -596,7 +795,6 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                 let (idem_header, idem_meta) =
                     idempotency_wire_fields(contract, &review.endpoint_key);
                 let req_id = format!("{operation_id}:{attempt}");
-                let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
                 let call_result = transport
                     .tools_call(
                         &ToolCallRequest {
@@ -614,12 +812,9 @@ impl ApprovedAdapter for ExternalMcpAdapter {
 
                 match call_result {
                     Ok(success) => {
-                        let handle =
-                            extract_downstream_handle(&success, contract.handle_field.as_deref());
-                        return StepResult::ToolSuccess {
-                            text: success.text,
-                            handle,
-                        };
+                        let (text, handle) =
+                            sanitize_tool_success(&success, contract.handle_field.as_deref());
+                        return StepResult::ToolSuccess { text, handle };
                     }
                     Err(TransportFault {
                         kind: FaultKind::Stopped(why),
@@ -692,7 +887,8 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         };
                         backoff_ms = 500;
                         let wake = Instant::now() + delay;
-                        if wake >= step.deadline {
+                        let effective_deadline = logical_call_deadline.min(step.deadline);
+                        if wake >= effective_deadline {
                             if !is_read && sent_uncertain {
                                 return observe_unknown(&self.pool, &lease, &step, &operation_id)
                                     .await;
@@ -715,6 +911,13 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                                     .await;
                             }
                             return stopped_step(why);
+                        }
+                        if Instant::now() >= logical_call_deadline.min(step.deadline) {
+                            if !is_read && sent_uncertain {
+                                return observe_unknown(&self.pool, &lease, &step, &operation_id)
+                                    .await;
+                            }
+                            return StepResult::ToolResponse(Err(ToolFault::Transient));
                         }
 
                         // Acquire a fresh Transaction 2 permit (`dispatched_attempts` increment +

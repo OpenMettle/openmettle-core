@@ -173,6 +173,18 @@ pub trait Executor: Send + Sync + 'static {
 
 /// A reviewed adapter receives only committed bytes. It records observations with a Hold fence.
 pub trait ApprovedAdapter: Send + Sync {
+    /// Pre-intent server-side gate run strictly before `record_fenced_intent` commits any
+    /// `openmettle.operations` row (rollout gates, verified upstream `tools/list` catalog, and
+    /// credential availability). Defaults to `Ok(())`.
+    fn preflight<'a>(
+        &'a self,
+        _run: &'a ActiveRun,
+        _proposal: &'a Proposal,
+        _step: &'a StepContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn send<'a>(
         &'a self,
         run: &'a ActiveRun,
@@ -588,6 +600,7 @@ async fn execute<E: Executor>(
                     &run.claim.lease(),
                 )
                 .await?
+                .filter(|proposal| adapters.executor.can_resume_approved(proposal))
                 .map(|proposal| (None, proposal)),
                 None => None,
             };
@@ -597,6 +610,19 @@ async fn execute<E: Executor>(
         let result = if let Some((id, proposal)) = pending {
             if !adapters.executor.can_resume_approved(&proposal) {
                 return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+            }
+            if let Some(effects) = adapters.approved {
+                let preflight_step = context.step();
+                let preflight = effects
+                    .adapter
+                    .preflight(run, &proposal, &preflight_step)
+                    .await;
+                if let Some(why) = context.stopped() {
+                    return Ok(WorkEnd::Stop(why));
+                }
+                if preflight.is_err() {
+                    return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+                }
             }
             let intent = approvals::record_fenced_intent(
                 &mut *connection(pool).await?,
@@ -844,7 +870,14 @@ impl EffectDispatch<'_> {
                 approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
                     .await
             }
-            Ok((_, Some(0))) if fresh.is_some() => {
+            // Only legacy single-phase rows (`dispatched_attempts IS NULL`, created while
+            // `two_phase_effect_intents_enabled = false`) may bypass Transaction 2.
+            Ok((_, None)) if fresh.is_some() => Ok(ReplayEffect::Ready(fresh.unwrap())),
+            // Any unproven-sent two-phase write (`dispatched_attempts = 0`, whether freshly
+            // inserted or reclaimed via `IntentResult::Replayed`), and any two-phase write with a
+            // fresh first-phase permit (even if a same-claim peer already advanced attempts >= 1),
+            // MUST go through Transaction 2 (`start_write_attempt`).
+            Ok((_, Some(attempts))) if attempts == 0 || fresh.is_some() => {
                 if let Some(why) = *step.stop.borrow() {
                     return stopped_step(why);
                 }
@@ -854,15 +887,12 @@ impl EffectDispatch<'_> {
                 approvals::start_write_attempt(&mut c, &lease, &op, proposal, settings, &policy)
                     .await
             }
-            Ok(_) => match fresh {
-                Some(i) => Ok(ReplayEffect::Ready(i)),
-                None => {
-                    approvals::recheck_replay_effect_authority(
-                        &mut c, &lease, &op, proposal, settings, &policy,
-                    )
-                    .await
-                }
-            },
+            Ok(_) => {
+                approvals::recheck_replay_effect_authority(
+                    &mut c, &lease, &op, proposal, settings, &policy,
+                )
+                .await
+            }
         };
         let bytes = match start_permit(
             &mut c,
@@ -1034,7 +1064,7 @@ pub(crate) async fn start_permit(
                 });
             }
             Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
-            Ok(ReplayEffect::Handoff) => return Err(StepResult::Handoff),
+            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => return Err(StepResult::Handoff),
             Ok(ReplayEffect::Exhausted) => return Err(StepResult::Stopped),
             Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
             Err(e) => return Err(turns::lease_step(e)),

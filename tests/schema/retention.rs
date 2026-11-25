@@ -508,7 +508,7 @@ async fn purge_recheck_defers_attachments_holds_and_unfinished_runs() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    sqlx::query("UPDATE openmettle.runs SET state = 'succeeded' WHERE id = $1::uuid")
+    sqlx::query("UPDATE openmettle.runs SET state = 'interrupted' WHERE id = $1::uuid")
         .bind(&run)
         .execute(&mut owner)
         .await
@@ -518,7 +518,7 @@ async fn purge_recheck_defers_attachments_holds_and_unfinished_runs() {
         Err(Error::NotEligible)
     ));
     sqlx::query(
-        "UPDATE openmettle.operations SET outcome = 'failed', revision = 1,
+        "UPDATE openmettle.operations SET outcome = 'failed', revision = revision + 1,
              observation_format = 'fixture', observation_version = 1, evidence = '\\x01'
           WHERE id = $1::uuid",
     )

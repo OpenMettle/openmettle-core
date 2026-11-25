@@ -10,14 +10,17 @@ use crate::{
     },
     provider_http::{
         inference::Tool,
-        mcp::{RemoteToolDeclaration, is_allowed_idempotency_header_name},
+        mcp::{MAX_CALL_TIMEOUT, RemoteToolDeclaration, is_allowed_idempotency_header_name},
     },
     provider_keys::documents::unique,
     runs,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 const MAX_SCHEMA_BYTES: usize = 65_536;
 const MAX_ARG_BYTES: usize = 65_536;
@@ -124,7 +127,11 @@ impl ExternalToolContract {
             || self.action.is_empty()
             || self.fixed_resource.is_empty()
             || self.call_timeout.is_zero()
+            || self.call_timeout > MAX_CALL_TIMEOUT
         {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        if self.input_schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(ToolFault::TerminalRefusal);
         }
         validate_schema(&self.input_schema, 0)?;
@@ -221,7 +228,7 @@ impl ExternalToolContract {
             return EndpointKey::Unsupported;
         };
         let field = match &idem.carrier {
-            IdempotencyCarrier::Header(name) => name.clone(),
+            IdempotencyCarrier::Header(_) => "Idempotency-Key".to_owned(),
             IdempotencyCarrier::Meta(field) => field.clone(),
             IdempotencyCarrier::None => return EndpointKey::Unsupported,
         };
@@ -286,6 +293,30 @@ impl ExternalRegistry {
         self.get(tool_id, version)
             .ok_or(ToolFault::TerminalRefusal)?
             .proposal(key, raw_args)
+    }
+
+    /// Deterministic SHA-256 fingerprint of every contract pinned to `connection_id`.
+    /// Returns `None` when no contracts are registered for `connection_id`.
+    pub fn connection_fingerprint(&self, connection_id: &str) -> Option<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"openmettle/mcp-connection-catalog/1\0");
+        let mut matched_any = false;
+        for contract in self.contracts.values() {
+            if contract.connection_id != connection_id {
+                continue;
+            }
+            matched_any = true;
+            for part in [
+                contract.tool_id.as_bytes(),
+                contract.version.as_bytes(),
+                contract.remote_name.as_bytes(),
+                &contract.schema_digest,
+            ] {
+                hasher.update((part.len() as u64).to_be_bytes());
+                hasher.update(part);
+            }
+        }
+        matched_any.then(|| hasher.finalize().into())
     }
 
     /// Verify upstream `tools/list` declarations for `connection_id`.
@@ -363,6 +394,24 @@ impl EffectPolicy for ExternalRegistry {
     }
 }
 
+fn validate_schema_metadata(obj: &Map<String, Value>) -> Result<(), ToolFault> {
+    for key in ["description", "title"] {
+        if let Some(val) = obj.get(key)
+            && !val.is_string()
+        {
+            return Err(ToolFault::TerminalRefusal);
+        }
+    }
+    Ok(())
+}
+
+fn check_allowed_schema_keys(obj: &Map<String, Value>, allowed: &[&str]) -> Result<(), ToolFault> {
+    if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return Err(ToolFault::TerminalRefusal);
+    }
+    validate_schema_metadata(obj)
+}
+
 fn validate_schema(schema: &Value, depth: usize) -> Result<(), ToolFault> {
     if depth > MAX_DEPTH || contains_x_mcp_header(schema) {
         return Err(ToolFault::TerminalRefusal);
@@ -374,6 +423,17 @@ fn validate_schema(schema: &Value, depth: usize) -> Result<(), ToolFault> {
         .ok_or(ToolFault::TerminalRefusal)?;
     match kind {
         "object" => {
+            check_allowed_schema_keys(
+                obj,
+                &[
+                    "type",
+                    "properties",
+                    "required",
+                    "additionalProperties",
+                    "description",
+                    "title",
+                ],
+            )?;
             if obj.get("additionalProperties") != Some(&Value::Bool(false)) {
                 return Err(ToolFault::TerminalRefusal);
             }
@@ -384,14 +444,18 @@ fn validate_schema(schema: &Value, depth: usize) -> Result<(), ToolFault> {
             if props.len() > MAX_OBJECT_PROPERTIES {
                 return Err(ToolFault::TerminalRefusal);
             }
-            for prop in props.values() {
+            for (name, prop) in props {
+                if name.is_empty() {
+                    return Err(ToolFault::TerminalRefusal);
+                }
                 validate_schema(prop, depth + 1)?;
             }
             if let Some(required) = obj.get("required") {
                 let reqs = required.as_array().ok_or(ToolFault::TerminalRefusal)?;
+                let mut seen = BTreeSet::new();
                 for req in reqs {
                     let name = req.as_str().ok_or(ToolFault::TerminalRefusal)?;
-                    if !props.contains_key(name) {
+                    if !props.contains_key(name) || !seen.insert(name) {
                         return Err(ToolFault::TerminalRefusal);
                     }
                 }
@@ -399,17 +463,171 @@ fn validate_schema(schema: &Value, depth: usize) -> Result<(), ToolFault> {
             Ok(())
         }
         "string" => {
+            check_allowed_schema_keys(
+                obj,
+                &[
+                    "type",
+                    "description",
+                    "title",
+                    "default",
+                    "minLength",
+                    "maxLength",
+                    "enum",
+                    "format",
+                ],
+            )?;
+            let min = match obj.get("minLength") {
+                Some(v) => {
+                    let n = v.as_u64().ok_or(ToolFault::TerminalRefusal)?;
+                    if n > MAX_STRING_BYTES as u64 {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    Some(n)
+                }
+                None => None,
+            };
+            let max = match obj.get("maxLength") {
+                Some(v) => {
+                    let n = v.as_u64().ok_or(ToolFault::TerminalRefusal)?;
+                    if n > MAX_STRING_BYTES as u64 {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    Some(n)
+                }
+                None => None,
+            };
+            if let (Some(lo), Some(hi)) = (min, max)
+                && lo > hi
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
             if let Some(fmt) = obj.get("format")
                 && fmt.as_str() != Some("uuid")
             {
                 return Err(ToolFault::TerminalRefusal);
             }
+            if let Some(allowed) = obj.get("enum") {
+                let items = allowed.as_array().ok_or(ToolFault::TerminalRefusal)?;
+                if items.is_empty() {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+                for item in items {
+                    if !item.is_string() {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    validate_value_against_schema(item, schema, depth)?;
+                }
+            }
+            if let Some(default) = obj.get("default") {
+                validate_value_against_schema(default, schema, depth)?;
+            }
             Ok(())
         }
-        "integer" | "boolean" => Ok(()),
+        "integer" => {
+            check_allowed_schema_keys(
+                obj,
+                &[
+                    "type",
+                    "description",
+                    "title",
+                    "default",
+                    "minimum",
+                    "maximum",
+                    "enum",
+                ],
+            )?;
+            let min = match obj.get("minimum") {
+                Some(v) => Some(v.as_i64().ok_or(ToolFault::TerminalRefusal)?),
+                None => None,
+            };
+            let max = match obj.get("maximum") {
+                Some(v) => Some(v.as_i64().ok_or(ToolFault::TerminalRefusal)?),
+                None => None,
+            };
+            if let (Some(lo), Some(hi)) = (min, max)
+                && lo > hi
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(allowed) = obj.get("enum") {
+                let items = allowed.as_array().ok_or(ToolFault::TerminalRefusal)?;
+                if items.is_empty() {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+                for item in items {
+                    if item.as_i64().is_none() {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    validate_value_against_schema(item, schema, depth)?;
+                }
+            }
+            if let Some(default) = obj.get("default") {
+                validate_value_against_schema(default, schema, depth)?;
+            }
+            Ok(())
+        }
+        "boolean" => {
+            check_allowed_schema_keys(obj, &["type", "description", "title", "default", "enum"])?;
+            if let Some(allowed) = obj.get("enum") {
+                let items = allowed.as_array().ok_or(ToolFault::TerminalRefusal)?;
+                if items.is_empty() {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+                for item in items {
+                    if item.as_bool().is_none() {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                }
+            }
+            if let Some(default) = obj.get("default") {
+                validate_value_against_schema(default, schema, depth)?;
+            }
+            Ok(())
+        }
         "array" => {
+            check_allowed_schema_keys(
+                obj,
+                &[
+                    "type",
+                    "description",
+                    "title",
+                    "default",
+                    "items",
+                    "minItems",
+                    "maxItems",
+                ],
+            )?;
+            let min = match obj.get("minItems") {
+                Some(v) => {
+                    let n = v.as_u64().ok_or(ToolFault::TerminalRefusal)?;
+                    if n > MAX_ARRAY_ITEMS as u64 {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    Some(n)
+                }
+                None => None,
+            };
+            let max = match obj.get("maxItems") {
+                Some(v) => {
+                    let n = v.as_u64().ok_or(ToolFault::TerminalRefusal)?;
+                    if n > MAX_ARRAY_ITEMS as u64 {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                    Some(n)
+                }
+                None => None,
+            };
+            if let (Some(lo), Some(hi)) = (min, max)
+                && lo > hi
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
             let items = obj.get("items").ok_or(ToolFault::TerminalRefusal)?;
-            validate_schema(items, depth + 1)
+            validate_schema(items, depth + 1)?;
+            if let Some(default) = obj.get("default") {
+                validate_value_against_schema(default, schema, depth)?;
+            }
+            Ok(())
         }
         _ => Err(ToolFault::TerminalRefusal),
     }
@@ -506,15 +724,30 @@ fn validate_value_against_schema(
             {
                 return Err(ToolFault::TerminalRefusal);
             }
+            if let Some(allowed) = obj.get("enum").and_then(Value::as_array)
+                && !allowed.iter().any(|v| v.as_i64() == Some(n))
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
             Ok(Value::Number(n.into()))
         }
         "boolean" => {
             let b = value.as_bool().ok_or(ToolFault::TerminalRefusal)?;
+            if let Some(allowed) = obj.get("enum").and_then(Value::as_array)
+                && !allowed.iter().any(|v| v.as_bool() == Some(b))
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
             Ok(Value::Bool(b))
         }
         "array" => {
             let items = value.as_array().ok_or(ToolFault::TerminalRefusal)?;
             if items.len() > MAX_ARRAY_ITEMS {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(min) = obj.get("minItems").and_then(Value::as_u64)
+                && (items.len() as u64) < min
+            {
                 return Err(ToolFault::TerminalRefusal);
             }
             if let Some(max) = obj.get("maxItems").and_then(Value::as_u64)
@@ -679,6 +912,121 @@ mod tests {
             assert_eq!(
                 registry.proposal("k1", "docs.append", "1", bad).err(),
                 Some(ToolFault::TerminalRefusal)
+            );
+        }
+    }
+
+    #[test]
+    fn closed_schema_subset_enforces_enum_min_items_timeout_and_idempotency_header_allowlist() {
+        // Supported integer/boolean enums and array minItems are enforced at runtime.
+        let mut strict = sample_contract();
+        strict.input_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["doc_id", "mode", "tags"],
+            "properties": {
+                "doc_id": {"type": "string", "minLength": 1, "maxLength": 32},
+                "mode": {"type": "integer", "enum": [1, 3]},
+                "confirm": {"type": "boolean", "enum": [true], "default": true},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0},
+                    "minItems": 2,
+                    "maxItems": 4
+                }
+            }
+        });
+        let mut registry = ExternalRegistry::new();
+        registry.register(strict).unwrap();
+        assert!(
+            registry
+                .proposal(
+                    "ok-1",
+                    "docs.append",
+                    "1",
+                    br#"{"doc_id":"d1","mode":3,"tags":[0,1]}"#
+                )
+                .is_ok()
+        );
+        for bad in [
+            br#"{"doc_id":"d1","mode":2,"tags":[0,1]}"#.as_slice(),
+            br#"{"doc_id":"d1","mode":1,"confirm":false,"tags":[0,1]}"#,
+            br#"{"doc_id":"d1","mode":1,"tags":[0]}"#,
+            br#"{"doc_id":"d1","mode":1,"tags":[0,1,2,3,4]}"#,
+        ] {
+            assert_eq!(
+                registry.proposal("bad", "docs.append", "1", bad).err(),
+                Some(ToolFault::TerminalRefusal)
+            );
+        }
+
+        // Unsupported JSON Schema keywords or malformed bounds fail closed at registration.
+        for bad_schema in [
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"doc_id": {"type": "string", "pattern": "^[a-z]+$"}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "oneOf": [{"required": ["doc_id"]}],
+                "properties": {"doc_id": {"type": "string"}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"n": {"type": "integer", "multipleOf": 2}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "array", "items": {"type": "string"}, "additionalItems": false}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"doc_id": {"$ref": "#/$defs/id"}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"doc_id": {"type": "string", "const": "fixed"}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"n": {"type": "integer", "minimum": 1.5}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"n": {"type": "integer", "enum": [1, 3], "default": 2}}
+            }),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 2}}
+            }),
+        ] {
+            let mut c = sample_contract();
+            c.input_schema = bad_schema;
+            assert_eq!(c.validate(), Err(ToolFault::TerminalRefusal));
+        }
+
+        // `call_timeout` above 300s is rejected at registration.
+        let mut slow = sample_contract();
+        slow.call_timeout = Duration::from_secs(301);
+        assert_eq!(slow.validate(), Err(ToolFault::TerminalRefusal));
+
+        // Only `Idempotency-Key` (case-insensitive) is accepted as an idempotency HTTP header.
+        let mut lower_idem = sample_contract();
+        lower_idem.idempotency.as_mut().unwrap().carrier =
+            IdempotencyCarrier::Header("idempotency-key".into());
+        assert!(lower_idem.validate().is_ok());
+        for forbidden in [
+            "Expect",
+            "Content-Encoding",
+            "X-Custom-Key",
+            "Mcp-Session-Id",
+        ] {
+            let mut c = sample_contract();
+            c.idempotency.as_mut().unwrap().carrier = IdempotencyCarrier::Header(forbidden.into());
+            assert_eq!(
+                c.validate(),
+                Err(ToolFault::TerminalRefusal),
+                "header {forbidden} must fail closed"
             );
         }
     }

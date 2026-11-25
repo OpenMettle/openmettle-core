@@ -31,7 +31,7 @@ use std::{
 };
 use tokio::{
     sync::{Notify, Semaphore, watch},
-    time::{Instant, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 
 /// Pinned MCP Streamable HTTP protocol revision (ADR 0039).
@@ -52,13 +52,18 @@ pub const MAX_INTERIM_RESPONSES: usize = 4;
 pub const MAX_RETRY_AFTER_SECS: u64 = 60;
 /// Default setup (DNS + TCP + TLS) timeout.
 pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-read idle timeout while awaiting response headers or body/SSE frames.
+pub const DEFAULT_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default whole-call timeout.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum allowed whole-call timeout (ADR 0039 / PLAN-10: 300 seconds).
+pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 const MAX_READ_BUFFER: usize = 8 * 1024;
 const HEADER_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
 const HEADER_MCP_METHOD: HeaderName = HeaderName::from_static("mcp-method");
 const HEADER_MCP_NAME: HeaderName = HeaderName::from_static("mcp-name");
+const HEADER_IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 
 /// Dedicated process-wide DNS lookup slot pool isolated from OIDC and gateway inference.
 static MCP_DNS_SLOTS: LazyLock<Arc<Semaphore>> =
@@ -155,6 +160,7 @@ impl std::error::Error for TransportFault {}
 #[derive(Clone, Copy, Debug)]
 pub struct McpTimeouts {
     pub setup: Duration,
+    pub idle_read: Duration,
     pub call: Duration,
 }
 
@@ -162,6 +168,7 @@ impl Default for McpTimeouts {
     fn default() -> Self {
         Self {
             setup: DEFAULT_SETUP_TIMEOUT,
+            idle_read: DEFAULT_IDLE_READ_TIMEOUT,
             call: DEFAULT_CALL_TIMEOUT,
         }
     }
@@ -194,6 +201,8 @@ pub struct ToolCallRequest<'a> {
 /// Normalized successful MCP `tools/call` payload. `Debug` is redacted.
 pub struct ToolCallSuccess {
     pub text: String,
+    /// Present only when text `content` blocks were returned; `None` for structured-only replies.
+    pub content_text: Option<String>,
     pub structured: Option<Value>,
     pub meta: Option<Value>,
 }
@@ -248,8 +257,11 @@ impl McpTransport {
     ) -> Result<Self, Error> {
         if private_ranges.len() > MAX_PRIVATE_RANGES
             || timeouts.setup.is_zero()
+            || timeouts.idle_read.is_zero()
             || timeouts.call.is_zero()
+            || timeouts.call > MAX_CALL_TIMEOUT
             || Instant::now().checked_add(timeouts.setup).is_none()
+            || Instant::now().checked_add(timeouts.idle_read).is_none()
             || Instant::now().checked_add(timeouts.call).is_none()
         {
             return Err(Error::Configuration);
@@ -413,7 +425,14 @@ impl McpTransport {
         let work = async {
             let connection = route.connect(setup).await.map_err(map_pre_send_error)?;
             bytes_sent.store(true, Ordering::SeqCst);
-            exchange_mcp(connection, outbound, expected_id, total).await
+            exchange_mcp(
+                connection,
+                outbound,
+                expected_id,
+                total,
+                self.timeouts.idle_read,
+            )
+            .await
         };
         tokio::select! {
             biased;
@@ -499,41 +518,15 @@ fn build_headers(
     }
     if let Some(idem) = idempotency {
         validate_idempotency_header(idem)?;
-        let header_name = HeaderName::from_bytes(idem.name.as_bytes())
-            .map_err(|_| pre_send(FaultKind::TerminalRefusal))?;
         let header_value =
             HeaderValue::from_str(idem.value).map_err(|_| pre_send(FaultKind::TerminalRefusal))?;
-        headers.insert(header_name, header_value);
+        headers.insert(HEADER_IDEMPOTENCY_KEY, header_value);
     }
     Ok(headers)
 }
 
 pub(crate) fn is_allowed_idempotency_header_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 {
-        return false;
-    }
-    let lower = name.to_ascii_lowercase();
-    if lower == "mcp-session-id"
-        || lower.starts_with("mcp-param-")
-        || matches!(
-            lower.as_str(),
-            "host"
-                | "connection"
-                | "content-length"
-                | "transfer-encoding"
-                | "authorization"
-                | "content-type"
-                | "accept"
-                | "mcp-protocol-version"
-                | "mcp-method"
-                | "mcp-name"
-                | "cookie"
-                | "proxy-authorization"
-        )
-    {
-        return false;
-    }
-    HeaderName::from_bytes(lower.as_bytes()).is_ok()
+    name.eq_ignore_ascii_case("idempotency-key")
 }
 
 fn validate_idempotency_header(idem: IdempotencyHeader<'_>) -> Result<(), TransportFault> {
@@ -552,15 +545,20 @@ async fn exchange_mcp(
     mut outbound: hyper::Request<Full<Bytes>>,
     expected_id: &str,
     deadline: Instant,
+    idle_read: Duration,
 ) -> Result<Value, TransportFault> {
     let interim_count = Arc::new(AtomicUsize::new(0));
     let interim_overflow = Arc::new(Notify::new());
+    let interim_activity = Arc::new(Notify::new());
     {
         let count = interim_count.clone();
         let overflow = interim_overflow.clone();
+        let activity = interim_activity.clone();
         hyper::ext::on_informational(&mut outbound, move |_res| {
             if count.fetch_add(1, Ordering::SeqCst) + 1 > MAX_INTERIM_RESPONSES {
                 overflow.notify_one();
+            } else {
+                activity.notify_one();
             }
         });
     }
@@ -573,21 +571,33 @@ async fn exchange_mcp(
         .map_err(|e| post_send_hyper_error(&e))?;
 
     let response_fut = async {
-        let res = tokio::select! {
-            biased;
-            _ = interim_overflow.notified() => {
-                return Err(post_send(FaultKind::TerminalRefusal));
+        let send_fut = sender.send_request(outbound);
+        tokio::pin!(send_fut);
+        let res = loop {
+            let step_deadline = deadline.min(Instant::now() + idle_read);
+            tokio::select! {
+                biased;
+                _ = interim_overflow.notified() => {
+                    return Err(post_send(FaultKind::TerminalRefusal));
+                }
+                sent = &mut send_fut => match sent {
+                    Err(e) => return Err(post_send_hyper_error(&e)),
+                    Ok(r) => break r,
+                },
+                _ = interim_activity.notified() => {
+                    if Instant::now() >= deadline {
+                        return Err(post_send(FaultKind::Transient(RetryAfter::None)));
+                    }
+                }
+                _ = sleep_until(step_deadline) => {
+                    return Err(post_send(FaultKind::Transient(RetryAfter::None)));
+                }
             }
-            sent = timeout_at(deadline, sender.send_request(outbound)) => match sent {
-                Err(_) => return Err(post_send(FaultKind::Transient(RetryAfter::None))),
-                Ok(Err(e)) => return Err(post_send_hyper_error(&e)),
-                Ok(Ok(r)) => r,
-            },
         };
         if interim_count.load(Ordering::SeqCst) > MAX_INTERIM_RESPONSES {
             return Err(post_send(FaultKind::TerminalRefusal));
         }
-        decode_response(res, expected_id, deadline).await
+        decode_response(res, expected_id, deadline, idle_read).await
     };
 
     tokio::pin!(conn, response_fut);
@@ -678,10 +688,24 @@ fn parse_media_type(headers: &HeaderMap) -> Result<ResponseMedia, TransportFault
     Ok(media)
 }
 
+fn map_body_frame_error(err: Box<dyn std::error::Error + Send + Sync>) -> TransportFault {
+    if err
+        .downcast_ref::<http_body_util::LengthLimitError>()
+        .is_some()
+    {
+        return post_send(FaultKind::TerminalRefusal);
+    }
+    if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+        return post_send_hyper_error(hyper_err);
+    }
+    post_send(FaultKind::TerminalRefusal)
+}
+
 async fn decode_response(
     response: hyper::Response<hyper::body::Incoming>,
     expected_id: &str,
     deadline: Instant,
+    idle_read: Duration,
 ) -> Result<Value, TransportFault> {
     let (head, body) = response.into_parts();
     if head.status == StatusCode::SWITCHING_PROTOCOLS {
@@ -705,11 +729,15 @@ async fn decode_response(
     match media {
         ResponseMedia::Json => {
             let mut buf = Vec::with_capacity(length.unwrap_or(0).min(65_536) as usize);
-            while let Some(frame) = timeout_at(deadline, limited.frame())
-                .await
-                .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
-            {
-                let frame = frame.map_err(|_| post_send(FaultKind::TerminalRefusal))?;
+            loop {
+                let read_deadline = deadline.min(Instant::now() + idle_read);
+                let Some(frame) = timeout_at(read_deadline, limited.frame())
+                    .await
+                    .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
+                else {
+                    break;
+                };
+                let frame = frame.map_err(map_body_frame_error)?;
                 let data = frame
                     .into_data()
                     .map_err(|_| post_send(FaultKind::TerminalRefusal))?;
@@ -721,18 +749,27 @@ async fn decode_response(
             }
             let value = unique(&buf).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
             match classify_jsonrpc_message(value, expected_id, false)? {
-                JsonRpcFrame::Final(result) => Ok(result),
+                JsonRpcFrame::Final(FinalPayload::Result(result)) => Ok(result),
+                JsonRpcFrame::Final(FinalPayload::InvalidParams) => {
+                    Err(post_send(FaultKind::Semantic {
+                        is_tool_error: false,
+                    }))
+                }
                 JsonRpcFrame::Progress => Err(post_send(FaultKind::TerminalRefusal)),
             }
         }
         ResponseMedia::Sse => {
             let mut parser = McpSseParser::default();
-            let mut final_result: Option<Value> = None;
-            while let Some(frame) = timeout_at(deadline, limited.frame())
-                .await
-                .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
-            {
-                let frame = frame.map_err(|_| post_send(FaultKind::TerminalRefusal))?;
+            let mut final_payload: Option<FinalPayload> = None;
+            loop {
+                let read_deadline = deadline.min(Instant::now() + idle_read);
+                let Some(frame) = timeout_at(read_deadline, limited.frame())
+                    .await
+                    .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
+                else {
+                    break;
+                };
+                let frame = frame.map_err(map_body_frame_error)?;
                 let data = frame
                     .into_data()
                     .map_err(|_| post_send(FaultKind::TerminalRefusal))?;
@@ -746,28 +783,39 @@ async fn decode_response(
                     {
                         return Err(post_send(FaultKind::TerminalRefusal));
                     }
-                    if final_result.is_some() {
+                    if final_payload.is_some() {
                         return Err(post_send(FaultKind::TerminalRefusal));
                     }
                     let value =
                         unique(&event.data).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
                     match classify_jsonrpc_message(value, expected_id, true)? {
                         JsonRpcFrame::Progress => {}
-                        JsonRpcFrame::Final(result) => final_result = Some(result),
+                        JsonRpcFrame::Final(payload) => final_payload = Some(payload),
                     }
                 }
             }
             if length.is_some_and(|n| n != total as u64) || !parser.ended() {
                 return Err(post_send(FaultKind::TerminalRefusal));
             }
-            final_result.ok_or_else(|| post_send(FaultKind::TerminalRefusal))
+            match final_payload {
+                Some(FinalPayload::Result(result)) => Ok(result),
+                Some(FinalPayload::InvalidParams) => Err(post_send(FaultKind::Semantic {
+                    is_tool_error: false,
+                })),
+                None => Err(post_send(FaultKind::TerminalRefusal)),
+            }
         }
     }
 }
 
+enum FinalPayload {
+    Result(Value),
+    InvalidParams,
+}
+
 enum JsonRpcFrame {
     Progress,
-    Final(Value),
+    Final(FinalPayload),
 }
 
 fn classify_jsonrpc_message(
@@ -791,6 +839,12 @@ fn classify_jsonrpc_message(
         }
         return Err(post_send(FaultKind::TerminalRefusal));
     }
+    if !obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "jsonrpc" | "id" | "result" | "error"))
+    {
+        return Err(post_send(FaultKind::TerminalRefusal));
+    }
     if obj.get("id").and_then(Value::as_str) != Some(expected_id) {
         return Err(post_send(FaultKind::TerminalRefusal));
     }
@@ -800,24 +854,33 @@ fn classify_jsonrpc_message(
         return Err(post_send(FaultKind::TerminalRefusal));
     }
     if let Some(err) = obj.get("error") {
-        let code = err
+        let err_obj = err
             .as_object()
-            .and_then(|m| m.get("code"))
+            .ok_or_else(|| post_send(FaultKind::TerminalRefusal))?;
+        if !err_obj
+            .keys()
+            .all(|k| matches!(k.as_str(), "code" | "message" | "data"))
+        {
+            return Err(post_send(FaultKind::TerminalRefusal));
+        }
+        let code = err_obj
+            .get("code")
             .and_then(Value::as_i64)
             .ok_or_else(|| post_send(FaultKind::TerminalRefusal))?;
+        if err_obj.get("message").and_then(Value::as_str).is_none() {
+            return Err(post_send(FaultKind::TerminalRefusal));
+        }
         return if code == -32602 {
-            Err(post_send(FaultKind::Semantic {
-                is_tool_error: false,
-            }))
+            Ok(JsonRpcFrame::Final(FinalPayload::InvalidParams))
         } else {
             Err(post_send(FaultKind::TerminalRefusal))
         };
     }
-    Ok(JsonRpcFrame::Final(
+    Ok(JsonRpcFrame::Final(FinalPayload::Result(
         obj.get("result")
             .cloned()
             .ok_or_else(|| post_send(FaultKind::TerminalRefusal))?,
-    ))
+    )))
 }
 
 struct SseEvent {
@@ -885,8 +948,27 @@ impl McpSseParser {
     }
 }
 
+fn check_stateless_result_envelope(obj: &Map<String, Value>) -> Result<(), FaultKind> {
+    // Reject MCP `2026-07-28` non-complete `resultType` (`input_required`, `partial`, non-string,
+    // etc.) and interactive elicitation indicators under the stateless profile.
+    if let Some(result_type) = obj.get("resultType")
+        && result_type.as_str() != Some("complete")
+    {
+        return Err(FaultKind::TerminalRefusal);
+    }
+    if obj.get("status").and_then(Value::as_str) == Some("input_required")
+        || obj.get("input_required") == Some(&Value::Bool(true))
+        || obj.get("inputRequired") == Some(&Value::Bool(true))
+    {
+        return Err(FaultKind::TerminalRefusal);
+    }
+    Ok(())
+}
+
 fn parse_tools_list(result: &Value) -> Option<Vec<RemoteToolDeclaration>> {
-    let tools = result.as_object()?.get("tools")?.as_array()?;
+    let obj = result.as_object()?;
+    check_stateless_result_envelope(obj).ok()?;
+    let tools = obj.get("tools")?.as_array()?;
     let mut out = Vec::with_capacity(tools.len());
     for entry in tools {
         let obj = entry.as_object()?;
@@ -905,13 +987,7 @@ fn parse_tools_list(result: &Value) -> Option<Vec<RemoteToolDeclaration>> {
 
 fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> {
     let obj = result.as_object().ok_or(FaultKind::TerminalRefusal)?;
-    // Reject interactive `input_required` elicitation results under the stateless profile.
-    if obj.get("status").and_then(Value::as_str) == Some("input_required")
-        || obj.get("input_required") == Some(&Value::Bool(true))
-        || obj.get("inputRequired") == Some(&Value::Bool(true))
-    {
-        return Err(FaultKind::TerminalRefusal);
-    }
+    check_stateless_result_envelope(obj)?;
     if let Some(is_error) = obj.get("isError") {
         match is_error.as_bool() {
             Some(true) => {
@@ -946,10 +1022,11 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
             }
         }
     }
-    let text = if !chunks.is_empty() {
-        chunks.join("\n")
+    let (content_text, text) = if !chunks.is_empty() {
+        let joined = chunks.join("\n");
+        (Some(joined.clone()), joined)
     } else if let Some(ref s) = structured {
-        s.to_string()
+        (None, s.to_string())
     } else {
         return Err(FaultKind::TerminalRefusal);
     };
@@ -958,6 +1035,7 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
     }
     Ok(ToolCallSuccess {
         text,
+        content_text,
         structured,
         meta,
     })
@@ -999,6 +1077,7 @@ mod tests {
             &[],
             McpTimeouts {
                 setup: Duration::from_secs(3),
+                idle_read: Duration::from_secs(3),
                 call: Duration::from_secs(5),
             },
         )
@@ -1354,8 +1433,17 @@ mod tests {
             ),
             (
                 "chunked-trailer",
-                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n4d\r\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\r\n0\r\nX-Trailer: forbidden\r\n\r\n"
-                    .to_vec(),
+                {
+                    let payload = br#"{"jsonrpc":"2.0","id":"c2","result":{"content":[{"type":"text","text":"ok"}]}}"#;
+                    let mut raw = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                        payload.len()
+                    )
+                    .into_bytes();
+                    raw.extend_from_slice(payload);
+                    raw.extend_from_slice(b"\r\n0\r\nX-Trailer: forbidden\r\n\r\n");
+                    raw
+                },
                 FaultKind::TerminalRefusal,
             ),
             (
@@ -1568,8 +1656,17 @@ mod tests {
             }
         );
 
-        // Forbidden header name `Mcp-Session-Id` or `Mcp-Param-Foo` rejected pre-send.
-        for bad_hdr in ["Mcp-Session-Id", "Mcp-Param-Foo", "Authorization"] {
+        // Forbidden header names (`Mcp-Session-Id`, `Mcp-Param-*`, `Authorization`, `Expect`,
+        // `Content-Encoding`, `X-Custom-Key`) are rejected pre-send; only `Idempotency-Key`
+        // (case-insensitive) is accepted.
+        for bad_hdr in [
+            "Mcp-Session-Id",
+            "Mcp-Param-Foo",
+            "Authorization",
+            "Expect",
+            "Content-Encoding",
+            "X-Custom-Key",
+        ] {
             let err = bad_tls
                 .tools_call(
                     &ToolCallRequest {
@@ -1589,9 +1686,40 @@ mod tests {
                 TransportFault {
                     kind: FaultKind::TerminalRefusal,
                     bytes_may_have_left: false,
-                }
+                },
+                "header {bad_hdr} must fail pre-send"
             );
         }
+
+        // Whole-call timeout > 300s or zero idle_read rejected at construction.
+        assert_eq!(
+            McpTransport::new(
+                &format!("https://{HOST}/mcp"),
+                Trust::Bundle(&ca.pem()),
+                &[],
+                McpTimeouts {
+                    setup: Duration::from_secs(5),
+                    idle_read: Duration::from_secs(15),
+                    call: Duration::from_secs(301),
+                },
+            )
+            .unwrap_err(),
+            Error::Configuration
+        );
+        assert_eq!(
+            McpTransport::new(
+                &format!("https://{HOST}/mcp"),
+                Trust::Bundle(&ca.pem()),
+                &[],
+                McpTimeouts {
+                    setup: Duration::from_secs(5),
+                    idle_read: Duration::ZERO,
+                    call: Duration::from_secs(30),
+                },
+            )
+            .unwrap_err(),
+            Error::Configuration
+        );
 
         // Plain http:// and IP literals rejected at construction.
         assert_eq!(
@@ -1626,6 +1754,7 @@ mod tests {
             &[],
             McpTimeouts {
                 setup: Duration::from_millis(50),
+                idle_read: Duration::from_millis(50),
                 call: Duration::from_millis(100),
             },
         )
@@ -1642,6 +1771,300 @@ mod tests {
             TransportFault {
                 kind: FaultKind::Transient(RetryAfter::None),
                 bytes_may_have_left: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_positive_control_result_type_error_structure_sse_32602_idle_and_mid_body_close()
+     {
+        let ca = Ca::new();
+        let ok_chunked_payload =
+            br#"{"jsonrpc":"2.0","id":"chunk-ok","result":{"content":[{"type":"text","text":"ok"}]}}"#;
+        let mut ok_chunked = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+            ok_chunked_payload.len()
+        )
+        .into_bytes();
+        ok_chunked.extend_from_slice(ok_chunked_payload);
+        ok_chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut trailer_chunked = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+            ok_chunked_payload.len()
+        )
+        .into_bytes();
+        trailer_chunked.extend_from_slice(ok_chunked_payload);
+        trailer_chunked.extend_from_slice(b"\r\n0\r\nX-Trailer: forbidden\r\n\r\n");
+
+        // Mid-body close (truncated chunked stream) -> Transient (`bytes_may_have_left: true`).
+        let truncated_chunked =
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n50\r\n{\"jsonrpc\":\"2.0\""
+                .to_vec();
+        // Corrupt chunk framing -> TerminalRefusal.
+        let corrupt_chunked =
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\nZZ\r\nnot-hex\r\n"
+                .to_vec();
+
+        let script_idx = Arc::new(AtomicUsize::new(0));
+        let idx_srv = script_idx.clone();
+        let ok_chunked_srv = ok_chunked.clone();
+        let trailer_chunked_srv = trailer_chunked.clone();
+        let server = Server::start(ca.leaf(HOST, false), move |req| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let id = body["id"].as_str().unwrap().to_owned();
+            match idx_srv.fetch_add(1, Ordering::SeqCst) {
+                // 0: valid chunked positive control (no trailers)
+                0 => Reply::Bytes(ok_chunked_srv.clone()),
+                // 1: identical chunked body WITH trailers -> TerminalRefusal
+                1 => Reply::Bytes(trailer_chunked_srv.clone()),
+                // 2: `resultType: "complete"` -> allowed
+                2 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}]}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 3: `resultType: "input_required"` -> TerminalRefusal
+                3 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"input_required","content":[{"type":"text","text":"need"}]}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 4: `resultType: "partial"` -> TerminalRefusal
+                4 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"partial","content":[{"type":"text","text":"part"}]}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 5: non-string `resultType: 123` -> TerminalRefusal
+                5 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"resultType":123,"content":[{"type":"text","text":"bad"}]}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 6: `tools/list` with `resultType: "input_required"` -> TerminalRefusal
+                6 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"input_required","tools":[]}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 7: malformed `-32602` missing `message` -> TerminalRefusal
+                7 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 8: malformed `-32602` with extra unknown field -> TerminalRefusal
+                8 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"bad","extra":true}})
+                        .to_string()
+                        .as_bytes(),
+                )),
+                // 9: SSE `-32602` followed by duplicate final event -> TerminalRefusal
+                9 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "text/event-stream")],
+                    format!(
+                        "data: {}\n\ndata: {}\n\n",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"bad"}}),
+                        json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"second"}]}})
+                    )
+                    .as_bytes(),
+                )),
+                // 10: SSE `-32602` followed by trailing corrupt/unterminated bytes -> TerminalRefusal
+                10 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "text/event-stream")],
+                    format!(
+                        "data: {}\n\ndata: {{corrupt",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"bad"}})
+                    )
+                    .as_bytes(),
+                )),
+                // 11: clean SSE `-32602` with EOF -> Semantic { is_tool_error: false }
+                11 => Reply::Bytes(response(
+                    200,
+                    &[("content-type", "text/event-stream")],
+                    format!(
+                        "data: {}\n\n",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"bad"}})
+                    )
+                    .as_bytes(),
+                )),
+                // 12: mid-body truncated chunked close -> Transient (bytes_may_have_left: true)
+                12 => Reply::Bytes(truncated_chunked.clone()),
+                // 13: corrupt chunked framing -> TerminalRefusal
+                13 => Reply::Bytes(corrupt_chunked.clone()),
+                // 14: stalled SSE stream after progress event -> idle_read Transient
+                _ => {
+                    let ev = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+                    let mut raw = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                        ev.len()
+                    )
+                    .into_bytes();
+                    raw.extend_from_slice(ev);
+                    raw.extend_from_slice(b"\r\n");
+                    Reply::Stall(raw)
+                }
+            }
+        })
+        .await;
+
+        let transport = mcp_transport(server.port, &ca);
+        let (_tx, mut stop) = stop_rx();
+        let args = json!({});
+        let call = |id: &'static str| ToolCallRequest {
+            request_id: id,
+            tool_name: "execute_sql",
+            arguments: &args,
+            bearer_token: None,
+            idempotency_header: Some(IdempotencyHeader {
+                name: "idempotency-key",
+                value: "idem-lower",
+            }),
+            idempotency_meta: None,
+        };
+        let deadline = || Instant::now() + Duration::from_secs(5);
+
+        // 0: valid chunked without trailers succeeds (also verifies lowercase `idempotency-key`).
+        assert_eq!(
+            transport
+                .tools_call(&call("chunk-ok"), deadline(), &mut stop)
+                .await
+                .unwrap()
+                .text,
+            "ok"
+        );
+        // 1: identical chunked body WITH trailers fails closed.
+        assert_eq!(
+            transport
+                .tools_call(&call("chunk-ok"), deadline(), &mut stop)
+                .await
+                .unwrap_err(),
+            TransportFault {
+                kind: FaultKind::TerminalRefusal,
+                bytes_may_have_left: true,
+            }
+        );
+        // 2: `resultType: "complete"` succeeds.
+        assert_eq!(
+            transport
+                .tools_call(&call("rt-ok"), deadline(), &mut stop)
+                .await
+                .unwrap()
+                .text,
+            "done"
+        );
+        // 3-5: non-complete `resultType` fails closed.
+        for id in ["rt-input", "rt-partial", "rt-num"] {
+            assert_eq!(
+                transport
+                    .tools_call(&call(id), deadline(), &mut stop)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                FaultKind::TerminalRefusal,
+                "case {id}"
+            );
+        }
+        // 6: `tools/list` with `resultType: "input_required"` fails closed.
+        assert_eq!(
+            transport
+                .tools_list("list-rt", None, deadline(), &mut stop)
+                .await
+                .unwrap_err()
+                .kind,
+            FaultKind::TerminalRefusal
+        );
+        // 7-10: malformed `-32602` & SSE `-32602` + duplicate/trailing bytes -> TerminalRefusal.
+        for id in ["err-nomsg", "err-extra", "sse-dup", "sse-corrupt"] {
+            assert_eq!(
+                transport
+                    .tools_call(&call(id), deadline(), &mut stop)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                FaultKind::TerminalRefusal,
+                "case {id}"
+            );
+        }
+        // 11: clean SSE `-32602` -> Semantic { is_tool_error: false }.
+        assert_eq!(
+            transport
+                .tools_call(&call("sse-ok-32602"), deadline(), &mut stop)
+                .await
+                .unwrap_err(),
+            TransportFault {
+                kind: FaultKind::Semantic {
+                    is_tool_error: false,
+                },
+                bytes_may_have_left: true,
+            }
+        );
+        // 12: mid-body close -> Transient (`bytes_may_have_left: true`).
+        assert_eq!(
+            transport
+                .tools_call(&call("mid-close"), deadline(), &mut stop)
+                .await
+                .unwrap_err(),
+            TransportFault {
+                kind: FaultKind::Transient(RetryAfter::None),
+                bytes_may_have_left: true,
+            }
+        );
+        // 13: corrupt chunk framing -> TerminalRefusal.
+        assert_eq!(
+            transport
+                .tools_call(&call("corrupt-chunk"), deadline(), &mut stop)
+                .await
+                .unwrap_err(),
+            TransportFault {
+                kind: FaultKind::TerminalRefusal,
+                bytes_may_have_left: true,
+            }
+        );
+        // 14: idle_read timeout aborts stalled SSE stream well before `call` timeout.
+        let fast_idle = McpTransport::new(
+            &format!("https://{HOST}:{}/mcp", server.port),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            McpTimeouts {
+                setup: Duration::from_secs(3),
+                idle_read: Duration::from_millis(120),
+                call: Duration::from_secs(10),
+            },
+        )
+        .unwrap()
+        .with_lookup(loopback)
+        .allow_loopback_fixture();
+        let err = fast_idle
+            .tools_call(
+                &call("sse-stall"),
+                Instant::now() + Duration::from_secs(10),
+                &mut stop,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TransportFault {
+                kind: FaultKind::Transient(RetryAfter::None),
+                bytes_may_have_left: true,
             }
         );
     }
