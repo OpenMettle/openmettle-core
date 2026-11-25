@@ -990,6 +990,7 @@ pub(crate) struct Routing {
     pub source: String,
     pub principal: String,
     pub model: String,
+    pub cache_owner: Option<String>,
 }
 
 /// What presenting a round bearer established.
@@ -1004,12 +1005,15 @@ pub(crate) enum Consumed {
 }
 
 /// Spend the one dispatch of a handed-off request for the caller presenting its round bearer
-/// (`openmettle.gateway_dispatch`), as an `openmettle_gateway` login. It returns `Ok` only after
-/// the commit, so nothing is forwarded on a consume that did not become durable.
+/// (`openmettle.gateway_dispatch_scoped`, with pre-36 fallback to `openmettle.gateway_dispatch`),
+/// as an `openmettle_gateway` login. It returns `Ok` only after the commit, so nothing is
+/// forwarded on a consume that did not become durable.
 ///
 /// Only the SHA-256 of the bearer is sent, which is what the handoff stored in the request row.
 /// The bearer itself never crosses the database connection, so a server that logs statement
-/// parameters records nothing a caller could present.
+/// parameters records nothing a caller could present. On pre-36 schemas lacking
+/// `gateway_dispatch_scoped`, `cache_owner` fails safe to `Some(principal)` so distinct users
+/// never share a prefix-cache salt across a rolling upgrade.
 pub(crate) async fn consume(
     pool: &PgPool,
     request: &str,
@@ -1017,24 +1021,49 @@ pub(crate) async fn consume(
 ) -> Result<Consumed, Error> {
     let hash = Sha256::digest(bearer);
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let row = sqlx::query(
-        "SELECT replayed,installation,scope,source,principal,model \
-         FROM openmettle.gateway_dispatch($1::uuid,$2)",
+    let has_scoped: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.gateway_dispatch_scoped(uuid,bytea)') IS NOT NULL",
     )
-    .bind(request)
-    .bind(hash.as_slice())
-    .fetch_optional(tx.connection()?)
+    .fetch_one(tx.connection()?)
     .await?;
+    let row = if has_scoped {
+        sqlx::query(
+            "SELECT replayed,installation,scope,source,principal,model,cache_owner \
+             FROM openmettle.gateway_dispatch_scoped($1::uuid,$2)",
+        )
+        .bind(request)
+        .bind(hash.as_slice())
+        .fetch_optional(tx.connection()?)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT replayed,installation,scope,source,principal,model \
+             FROM openmettle.gateway_dispatch($1::uuid,$2)",
+        )
+        .bind(request)
+        .bind(hash.as_slice())
+        .fetch_optional(tx.connection()?)
+        .await?
+    };
     let consumed = match row {
         None => Consumed::Refused,
         Some(row) if row.try_get("replayed")? => Consumed::Replay,
-        Some(row) => Consumed::Once(Routing {
-            installation: row.try_get("installation")?,
-            scope: row.try_get("scope")?,
-            source: row.try_get("source")?,
-            principal: row.try_get("principal")?,
-            model: row.try_get("model")?,
-        }),
+        Some(row) => {
+            let principal: String = row.try_get("principal")?;
+            let cache_owner = if has_scoped {
+                row.try_get("cache_owner")?
+            } else {
+                Some(principal.clone())
+            };
+            Consumed::Once(Routing {
+                installation: row.try_get("installation")?,
+                scope: row.try_get("scope")?,
+                source: row.try_get("source")?,
+                principal,
+                model: row.try_get("model")?,
+                cache_owner,
+            })
+        }
     };
     tx.commit().await?;
     Ok(consumed)

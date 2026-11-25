@@ -52,24 +52,42 @@ policy is provisioned for it.
   `403 policy`. The body must be one JSON object whose top-level `model` is that model,
   without a repeated `model` key, or it is refused with `400 validation`. SGLang answers any
   model name from its loaded model, so nothing else checks it.
-- **Forwarding.** The request body (at most 2 MiB, read within 10 s) is sent upstream byte
-  for byte on a new connection, with only `Content-Type`, `Accept`, `Accept-Encoding:
-  identity` and the request ID. `Authorization`, cookies, other caller headers and any field
-  the caller names in `Connection` are not forwarded.
+- **Forwarding and prefix-cache isolation.** The request body (at most 2 MiB, read within 10 s)
+  is validated as one unique-key JSON object naming the served model and setting none of SGLang's
+  proxy-owned top-level cache or routing fields (`cache_salt`, `extra_key`, `session_id`, `rid`,
+  `lora_path`; any of those keys—even `null`—is refused with `400 validation` and closes the
+  spent hold as `request_body` without contacting the upstream). Nested occurrences inside
+  `messages` content are allowed. For valid requests the proxy derives a 64-character lowercase
+  hex `cache_salt` (scoped per `(installation, scope, model)` for personal scopes and effectively
+  shared project conversations under ADR 0027, per `(installation, scope, owner, model)` for
+  private project conversations, or fresh random per request under `CACHE_MODE=per_request`;
+  never logged, exported or returned in proxy/non-`200` problem responses) and splices it directly
+  before the JSON object's closing `}`, preserving all caller bytes (including trailing RFC 8259
+  whitespace) verbatim. The request goes upstream on a new
+  connection with only `Content-Type`, `Accept`, `Accept-Encoding: identity` and the request ID.
+  `Authorization`, cookies, other caller headers and any field the caller names in `Connection`
+  are not forwarded.
 - **HTTP/1.1 only.** Any other version is refused with `505 http_version_not_supported`
   before anything else: an HTTP/1.0 caller could not tell a cut stream from a complete one.
 - **Identity bodies only.** A request with a `Content-Encoding` other than `identity`, or a
   `Transfer-Encoding` other than one `chunked`, is refused with `415 unsupported_media_type`
-  before anything is sent upstream. An upstream answer with either is not relayed: the caller
-  gets `502 provider_failure` and the upstream connection is closed without reading the
-  body.
-- **Relay.** The upstream status, `Content-Type` (unless the upstream names it in
-  `Connection`) and body are relayed chunk by chunk as they arrive. A server-sent event
+  before anything is sent upstream. A `200 OK` upstream answer with either is not relayed: the
+  caller gets `502 provider_failure` and the upstream connection is closed without reading the
+  body (non-`200` upstream answers take the status-mapping path below first and likewise close the
+  body without reading it).
+- **Relay.** For `200 OK`, the upstream `Content-Type` (unless the upstream names it in
+  `Connection`) and body—including any in-band SSE payload—are relayed chunk by chunk as they
+  arrive without rewriting (the upstream model server must not echo the injected `cache_salt`
+  inside `200 OK` JSON or SSE payloads; the recorded SGLang responses omit it). A server-sent event
   reaches the caller before the upstream has finished. The caller's response ends cleanly only
   if the upstream body completed and the caller received every chunk. Otherwise the caller
   receives a prefix of the upstream bytes and an unclean end of the HTTP body (no terminal
   chunk, or fewer bytes than `Content-Length`); how much of that prefix arrives is not
-  promised.
+  promised. Any non-`200` upstream status closes the upstream body without relaying it and
+  answers with a value-free `application/problem+json` response (`429 rate_limited` with an
+  end-to-end validated numeric `Retry-After` if `Connection` is readable, `503 unavailable`,
+  `504 timeout`, or `502 provider_failure`) so a non-`200` upstream validation error cannot echo
+  the injected `cache_salt`.
 - **Usage.** A copy of each chunk is read for the usage object. When the upstream answered
   200, the body completed (a JSON document, or a stream ending with `data: [DONE]`) and a
   valid usage object arrived, one final report is written. In a stream, only a usage object
@@ -136,12 +154,12 @@ one alone:
 | --- | --- | --- |
 | `model_not_served` | No | The request was reserved for a model other than `MODEL` (`403 policy`) |
 | `model_mismatch` | No | The body was not a JSON object naming the reserved model exactly once (`400 validation`) |
-| `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`) |
+| `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, the caller left while sending it, or the body set a proxy-owned top-level cache or routing field (`cache_salt`, `extra_key`, `session_id`, `rid`, `lora_path`) (`400 validation`) |
 | `upstream_connect` | No | No connection to the upstream was made, in time or at all (`502 provider_failure` or `504 timeout`), or the caller left before one was |
 | `not_dispatched` | No (worker sweep, revision 0) | The request was handed off without a binding, never dispatched, and its run can no longer dispatch it (failed, cancelled, reclaimed, or past its lease or execution deadline) |
 | `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
 | `upstream_timeout` | Yes or unknown | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
-| `upstream_status` | Yes | The upstream answered with a status other than 200; its response is still relayed |
+| `upstream_status` | Yes | The upstream answered with a status other than 200; the upstream body is closed without relaying and the caller receives a value-free problem document (`429`, `503`, `504` or `502`) |
 | `upstream_encoding` | Yes | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (`502 provider_failure`) |
 | `incomplete` | Yes | The body broke off, or a stream ended without `[DONE]` |
 | `caller_disconnected` | Yes or unknown | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
@@ -179,6 +197,7 @@ The gateway reads the same process settings as the API and the worker under the
 | --- | --- | --- |
 | `UPSTREAM_URL` | `http://host[:port]` with at most a `/` path | Required |
 | `MODEL` | The catalog model ID the upstream serves, 1–128 bytes | Required |
+| `CACHE_MODE` | `scoped` (scope/owner-isolated deterministic `cache_salt`) or `per_request` (fresh random `cache_salt` per request) | `scoped` |
 | `UPSTREAM_CONNECT_TIMEOUT_MS` | 1–30,000 ms | 5,000 |
 | `UPSTREAM_IDLE_TIMEOUT_MS` | 1–3,600,000 ms | 120,000 |
 
@@ -191,10 +210,22 @@ chunk (it is then treated as gone), and how long the relay reads on once the cal
 `MODEL` must equal the model ID that run admission stores, which is the catalog's. One
 gateway process serves one model.
 
+`CACHE_MODE` defaults to `scoped`, sharing prefix cache within a user's personal scope, within
+each owner's unshared conversations inside a project, and across a project's effectively shared
+conversations (migration 36). `per_request` emits a fresh random `cache_salt` per request, which
+prevents cross-request prefix reuse **only on an upstream tier verified to partition its prefix
+cache on `cache_salt`**. If a backend or elastic KV tier ignores `cache_salt`, `per_request` at the
+proxy cannot stop backend prefix reuse: disable prefix caching at the backend (for example
+`--disable-radix-cache` on SGLang) or keep an unqualified tier out of multi-user service until
+owner-gated live qualification passes (`#7` / `#9`). During a rolling upgrade before migration 36,
+`gateway::consume` falls back to per-principal isolation (`cache_owner = Some(principal)`) only for
+traffic served by upgraded `openmettle-gateway` binaries; pre-Increment-5 gateway binaries emit no
+`cache_salt`.
+
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
 required`, `configuration error: UPSTREAM_URL must use http://`, `configuration error:
-invalid UPSTREAM_URL`, `configuration error: MODEL is required` or `configuration error:
-invalid MODEL`. The line never contains the value.
+invalid UPSTREAM_URL`, `configuration error: MODEL is required`, `configuration error:
+invalid MODEL` or `configuration error: invalid CACHE_MODE`. The line never contains the value.
 
 ## Bounds
 
@@ -229,6 +260,12 @@ on a connection that stopped answering: the pool waits for every connection when
 - **Chat completions only.** The Responses API is not routed.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.
+- **Live upstream `cache_salt` qualification pending.** Proxy-side derivation, sanitation and wire
+  injection are tested against the stand-in SGLang; live verification of `cache_salt` isolation
+  on the deployment's patched SGLang build and elastic KV tail (`0031–0033`) remains an
+  owner-gated live check (`#7` / `#9`). `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` prevents
+  cross-request reuse only on tiers that honor `cache_salt`; disable prefix caching at the backend
+  or keep an unqualified tier out of multi-user service until live qualification passes.
 
 ## Testing
 

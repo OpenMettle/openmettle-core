@@ -198,13 +198,37 @@ impl Fixture {
         reserved_only: bool,
         cost_bound: Option<openmettle_core::model_config::CostBound>,
     ) -> String {
-        let actor = &self.actor;
+        let chat = authz_runs::chat(&self.db, scope, scope_kind, &self.actor).await;
+        self.request_on_conversation(
+            &self.actor,
+            scope,
+            scope_kind,
+            &chat,
+            model,
+            reserved_only,
+            cost_bound,
+        )
+        .await
+    }
+
+    /// Admits, claims, reserves, and optionally hands off a round on an explicit conversation
+    /// for `actor`.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_on_conversation(
+        &self,
+        actor: &authz_store::Account,
+        scope: &str,
+        scope_kind: &'static str,
+        chat: &str,
+        model: &str,
+        reserved_only: bool,
+        cost_bound: Option<openmettle_core::model_config::CostBound>,
+    ) -> String {
         let cost_micros = cost_bound.map(|cb| {
             u128::from(cb.fixed_micros) + u128::from(UNITS as u64) * u128::from(cb.micros_per_token)
         });
-        let chat = authz_runs::chat(&self.db, scope, scope_kind, actor).await;
         let mut api = connect(&self.db.0, API).await;
-        let (branch, message) = quotas::branch_and_message(&mut api, scope, &chat).await;
+        let (branch, message) = quotas::branch_and_message(&mut api, scope, chat).await;
         let key = format!("proxy-{}", self.runs.fetch_add(1, Ordering::SeqCst));
         let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
         let admitted = queue::admit_run(
@@ -213,7 +237,7 @@ impl Fixture {
                 input: RunInput {
                     scope,
                     actor: &actor.user,
-                    conversation: &chat,
+                    conversation: chat,
                     branch: &branch,
                     message: &message,
                     key: &key,
@@ -645,14 +669,44 @@ fn recorded_script(case: &str, hold: bool) -> Script {
     }
 }
 
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Strips the `,"cache_salt":"<64 lowercase hex>"` member spliced by `openmettle-gateway`
+/// immediately before the closing `}` of a forwarded JSON object (preserving any trailing RFC 8259
+/// whitespace after `}`), returning `(restored_json, salt_hex)`.
+fn strip_injected_cache_salt(body: &[u8]) -> Option<(Vec<u8>, String)> {
+    const PREFIX: &[u8] = br#","cache_salt":""#;
+    let close = body
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))?;
+    if body[close] != b'}' || close < PREFIX.len() + 64 + 1 || body[close - 1] != b'"' {
+        return None;
+    }
+    let salt_start = close - 1 - 64;
+    let salt = std::str::from_utf8(&body[salt_start..close - 1]).ok()?;
+    if !is_hex64(salt) {
+        return None;
+    }
+    let head = body[..salt_start].strip_suffix(PREFIX)?;
+    let mut restored = Vec::with_capacity(head.len() + body.len() - close);
+    restored.extend_from_slice(head);
+    restored.extend_from_slice(&body[close..]);
+    Some((restored, salt.to_owned()))
+}
+
 /// A recorded answer for its recorded request, a synthetic one for a body naming one in
 /// `synthetic`, and otherwise none.
 fn script(body: &[u8]) -> Option<Script> {
+    let candidate = strip_injected_cache_salt(body)
+        .map(|(restored, _)| restored)
+        .unwrap_or_else(|| body.to_vec());
     let recorded_case = SETTLED
         .iter()
         .map(|(case, ..)| *case)
         .chain([ABORTED, UPSTREAM_500])
-        .find(|case| recorded::file(case, "request.json") == body);
+        .find(|case| recorded::file(case, "request.json") == candidate);
     if let Some(case) = recorded_case {
         return Some(recorded_script(case, true));
     }
@@ -715,6 +769,95 @@ fn script(body: &[u8]) -> Option<Script> {
                 );
                 let writes = vec![head.into_bytes(), response];
                 (Box::new(writes.into_iter()), false, Duration::ZERO, false)
+            }
+            // An upstream validation error that echoes the submitted request JSON (including the
+            // proxy-injected `cache_salt`) back in its 422 response body.
+            "echo-422" => {
+                let mut echoed =
+                    br#"{"detail":[{"msg":"Extra inputs are not permitted","input":"#.to_vec();
+                echoed.extend_from_slice(body);
+                echoed.extend_from_slice(b"}]}");
+                let head = format!(
+                    "HTTP/1.1 422 Unprocessable Entity\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\n\r\n",
+                    echoed.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), echoed].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-429" => {
+                let body = b"rate limited by upstream".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\n\
+                     content-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-429-hop" => {
+                let body = b"rate limited hop-by-hop".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nconnection: close, Retry-After\r\n\
+                     retry-after: 7\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-429-bad-conn" => {
+                let body = b"rate limited unreadable connection".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nconnection: close,\tX-Test\r\n\
+                     retry-after: 7\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-503" => {
+                let body = b"upstream overloaded".to_vec();
+                let head = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\n\
+                     content-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-504" => {
+                let body = b"upstream gateway timeout".to_vec();
+                let head = format!(
+                    "HTTP/1.1 504 Gateway Timeout\r\ncontent-type: text/plain\r\n\
+                     content-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
             }
             _ => return None,
         };
@@ -1174,7 +1317,7 @@ impl Harness {
         socket.write_all(body).await.unwrap();
         let gate = &self.upstream.gate;
         let mut raw = Vec::new();
-        let mut read = [0; 65536];
+        let mut read = vec![0u8; 65536];
         let mut waiting = match then {
             Then::Read | Then::Stall(None) => None,
             Then::Release(first)
@@ -1278,6 +1421,11 @@ impl Harness {
                 "logged the credential of {id}"
             );
         }
+        for received in upstream.received.lock().unwrap().iter() {
+            if let Some((_, salt)) = strip_injected_cache_salt(&received.body) {
+                assert!(!stderr.contains(&salt), "logged cache_salt {salt}");
+            }
+        }
         let mut events: Vec<_> = stderr
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -1358,6 +1506,7 @@ async fn eventually(limit: Duration, what: &str, mut done: impl FnMut() -> bool)
 async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gateway() {
     let h = Harness::start().await;
     let mut ids = Vec::new();
+    let mut personal_salt: Option<String> = None;
     for (n, (case, ..)) in SETTLED.into_iter().enumerate() {
         let id = h.fixture.request(false).await;
         let reply = h.send_case(case, &id).await;
@@ -1376,10 +1525,21 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
         {
             let log = h.upstream.received.lock().unwrap();
             let received = &log[n];
-            assert!(
-                received.body == recorded::file(case, "request.json"),
-                "{case}: the upstream receives the caller's bytes"
+            let (restored, salt) = strip_injected_cache_salt(&received.body)
+                .unwrap_or_else(|| panic!("{case}: missing injected 64-hex cache_salt"));
+            assert_eq!(
+                restored,
+                recorded::file(case, "request.json"),
+                "{case}: removing cache_salt recovers the exact caller bytes including trailing whitespace"
             );
+            if let Some(expected) = &personal_salt {
+                assert_eq!(
+                    &salt, expected,
+                    "{case}: same personal scope reuses cache_salt"
+                );
+            } else {
+                personal_salt = Some(salt);
+            }
             for (name, value) in [
                 ("x-request-id", id.as_str()),
                 ("content-type", "application/json"),
@@ -1474,11 +1634,8 @@ async fn closes_the_hold_with_the_reason_when_the_upstream_reported_no_usage() {
         "the caller's response is cut like the upstream's"
     );
     let reply = h.send_case(UPSTREAM_500, &failed).await;
-    assert_eq!(
-        (reply.status, content_type(&reply.head).as_deref()),
-        (500, Some("text/plain; charset=utf-8"))
-    );
-    assert!(reply.body == recorded::body(UPSTREAM_500) && reply.complete);
+    assert_eq!(refusal(&reply), (502, "provider_failure".to_owned(), None));
+    assert!(reply.complete);
     // Both streams reach the caller whole: only their accounting is incomplete.
     for (name, id) in [("no-usage", &silent), ("garbled", &garbled)] {
         let reply = h.send_synthetic(name, id, Then::Read).await;
@@ -2360,7 +2517,7 @@ async fn a_late_begin_never_leaves_a_pooled_connection_in_a_transaction() {
 }
 
 /// Text of the statement that spends a dispatch.
-const DISPATCH: &[u8] = b"gateway_dispatch";
+const DISPATCH: &[u8] = b"FROM openmettle.gateway_dispatch";
 
 /// A dispatch whose database exchange never answers is not forwarded: the caller gets 503
 /// after the proxy stops waiting (five `DB_TIMEOUT_MS`), and the request is logged because its
@@ -3799,7 +3956,10 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         .request_with_pricing(MODEL, false, Some(pricing))
         .await;
     let err_reply = h.send_case(UPSTREAM_500, &err_id).await;
-    assert_eq!(err_reply.status, 500);
+    assert_eq!(
+        refusal(&err_reply),
+        (502, "provider_failure".to_owned(), None)
+    );
 
     // Stop the proxy to drain all three report writes cleanly before reading DB state.
     let (f, _upstream, events) = h.stop().await;
@@ -3979,4 +4139,485 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
     );
     assert_eq!(budget_of(Some(&f.scope)).await, (240 + 1090 + 240 + 240, 0));
     assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// End-to-end prefix-cache separation (`ADR 0044`, increment 5):
+/// - Same personal scope reuses one deterministic 64-hex `cache_salt`; another user's personal
+///   scope carries a distinct `cache_salt`.
+/// - Within one project, Alice's two unshared conversations share Alice's project-owner salt,
+///   Bob's unshared conversation gets Bob's distinct project-owner salt, sharing Alice's
+///   conversation switches both Alice and Bob to the project-shared salt (distinct from both
+///   private salts), and unsharing switches Alice's next round immediately back to Alice's private
+///   project-owner salt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn cache_salt_isolates_personal_private_and_shared_project_conversations() {
+    use openmettle_core::authz::{Grantee, ProjectRole, ResourceAccess, ResourceKind, projects};
+
+    let h = Harness::start().await;
+    let alice = h.fixture.actor.clone();
+    let bob = {
+        let mut owner = connect(&h.fixture.db.0, OWNER).await;
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await
+    };
+    let bob_scope = authz_runs::personal_of(&h.fixture.db, &bob).await;
+    let (project_id, project_scope) =
+        run_admission::new_project(&h.fixture.db, &alice, "proxy-cache-proj").await;
+    authz_store::applied(
+        projects::set_project_member_role(
+            &mut connect(&h.fixture.db.0, API).await,
+            &authz_store::ctx(&alice, "proxy-cache-bob-editor"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+
+    async fn send_and_salt(h: &Harness, id: &str, idx: usize) -> String {
+        let reply = Box::pin(h.send_case("02-chat-plain", id)).await;
+        assert_eq!(reply.status, 200);
+        let received = h.upstream.body(idx);
+        let (_, salt) = strip_injected_cache_salt(&received)
+            .expect("forwarded body must carry valid 64-hex cache_salt");
+        salt
+    }
+
+    // 1. Two turns in Alice's personal scope -> identical salt; Bob's personal scope -> distinct.
+    let alice_p1 = h.fixture.request(false).await;
+    let salt_alice_p1 = send_and_salt(&h, &alice_p1, 0).await;
+    let alice_p2 = h.fixture.request(false).await;
+    let salt_alice_p2 = send_and_salt(&h, &alice_p2, 1).await;
+    assert_eq!(salt_alice_p1, salt_alice_p2);
+
+    let bob_p_chat = authz_runs::chat(&h.fixture.db, &bob_scope, "personal", &bob).await;
+    let bob_p1 = h
+        .fixture
+        .request_on_conversation(
+            &bob,
+            &bob_scope,
+            "personal",
+            &bob_p_chat,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_bob_p = send_and_salt(&h, &bob_p1, 2).await;
+    assert_ne!(salt_alice_p1, salt_bob_p);
+
+    // 2. Project private conversations: Alice conv1 & conv2 share Alice's project-owner salt;
+    //    Bob conv gets a distinct project-owner salt.
+    let alice_c1 = authz_runs::chat(&h.fixture.db, &project_scope, "project", &alice).await;
+    let alice_c2 = authz_runs::chat(&h.fixture.db, &project_scope, "project", &alice).await;
+    let bob_c = authz_runs::chat(&h.fixture.db, &project_scope, "project", &bob).await;
+
+    let req_ac1 = h
+        .fixture
+        .request_on_conversation(
+            &alice,
+            &project_scope,
+            "project",
+            &alice_c1,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_alice_priv_1 = send_and_salt(&h, &req_ac1, 3).await;
+    let req_ac2 = h
+        .fixture
+        .request_on_conversation(
+            &alice,
+            &project_scope,
+            "project",
+            &alice_c2,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_alice_priv_2 = send_and_salt(&h, &req_ac2, 4).await;
+    assert_eq!(salt_alice_priv_1, salt_alice_priv_2);
+    assert_ne!(salt_alice_priv_1, salt_alice_p1);
+
+    let req_bc = h
+        .fixture
+        .request_on_conversation(&bob, &project_scope, "project", &bob_c, MODEL, false, None)
+        .await;
+    let salt_bob_priv = send_and_salt(&h, &req_bc, 5).await;
+    assert_ne!(salt_bob_priv, salt_alice_priv_1);
+    assert_ne!(salt_bob_priv, salt_bob_p);
+
+    // 3. Share `alice_c1` with Bob (`Write`) -> both Alice and Bob get the project-shared salt,
+    //    distinct from both private salts.
+    authz_store::applied(
+        projects::share_resource(
+            &mut connect(&h.fixture.db.0, API).await,
+            &authz_store::ctx(&alice, "proxy-cache-share-c1"),
+            ResourceKind::Conversation,
+            &alice_c1,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let req_shared_alice = h
+        .fixture
+        .request_on_conversation(
+            &alice,
+            &project_scope,
+            "project",
+            &alice_c1,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_shared_alice = send_and_salt(&h, &req_shared_alice, 6).await;
+    let req_shared_bob = h
+        .fixture
+        .request_on_conversation(
+            &bob,
+            &project_scope,
+            "project",
+            &alice_c1,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_shared_bob = send_and_salt(&h, &req_shared_bob, 7).await;
+    assert_eq!(salt_shared_alice, salt_shared_bob);
+    assert_ne!(salt_shared_alice, salt_alice_priv_1);
+    assert_ne!(salt_shared_alice, salt_bob_priv);
+
+    // 4. Unshare `alice_c1` -> next round by Alice switches immediately back to Alice's private
+    //    project-owner salt.
+    authz_store::applied(
+        projects::unshare_resource(
+            &mut connect(&h.fixture.db.0, API).await,
+            &authz_store::ctx(&alice, "proxy-cache-unshare-c1"),
+            ResourceKind::Conversation,
+            &alice_c1,
+            &Grantee::User(bob.user.clone()),
+        )
+        .await,
+    );
+    let req_after_unshare = h
+        .fixture
+        .request_on_conversation(
+            &alice,
+            &project_scope,
+            "project",
+            &alice_c1,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let salt_after_unshare = send_and_salt(&h, &req_after_unshare, 8).await;
+    assert_eq!(salt_after_unshare, salt_alice_priv_1);
+
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(events, []);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` emits a fresh 64-hex `cache_salt` on every round,
+/// even within the exact same personal conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn per_request_cache_mode_generates_distinct_salts_for_the_same_conversation() {
+    let settings = [("CACHE_MODE", "per_request".to_owned())];
+    let h = Harness::launch(Fixture::new().await, StandIn::start().await, &settings).await;
+    let chat = authz_runs::chat(
+        &h.fixture.db,
+        &h.fixture.scope,
+        "personal",
+        &h.fixture.actor,
+    )
+    .await;
+    let req1 = h
+        .fixture
+        .request_on_conversation(
+            &h.fixture.actor,
+            &h.fixture.scope,
+            "personal",
+            &chat,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    let req2 = h
+        .fixture
+        .request_on_conversation(
+            &h.fixture.actor,
+            &h.fixture.scope,
+            "personal",
+            &chat,
+            MODEL,
+            false,
+            None,
+        )
+        .await;
+    assert_eq!(h.send_case("02-chat-plain", &req1).await.status, 200);
+    assert_eq!(h.send_case("02-chat-plain", &req2).await.status, 200);
+    let (_, salt1) =
+        strip_injected_cache_salt(&h.upstream.body(0)).expect("first per_request salt");
+    let (_, salt2) =
+        strip_injected_cache_salt(&h.upstream.body(1)).expect("second per_request salt");
+    assert_ne!(salt1, salt2);
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(events, []);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Caller bodies containing any top-level reserved SGLang cache/routing key (`cache_salt`,
+/// `extra_key`, `session_id`, `rid`, `lora_path`, including `null` and unicode-escaped spellings)
+/// are refused with `400 validation`, send zero requests upstream, log `request_body`, and settle
+/// both token and cost holds at `0` with zero accounting drift. Nested occurrences in `messages`
+/// remain allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn refuses_reserved_cache_and_routing_keys_without_forwarding_and_closes_holds() {
+    use openmettle_core::model_config::CostBound;
+
+    let f = Fixture::new().await;
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros', hard_limit=500000
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+    let pricing = CostBound {
+        fixed_micros: 50,
+        micros_per_token: 10,
+    };
+    let h = Harness::launch(f, StandIn::answering("02-chat-plain").await, &[]).await;
+
+    let mut refused_ids = Vec::new();
+    for body in [
+        format!(r#"{{"model":"{MODEL}","cache_salt":"attacker","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","cache_salt":null,"messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","\u0063ache_salt":"attacker","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","extra_key":"attacker","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","session_id":"sess-1","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","rid":"rid-1","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","lora_path":"/tmp/lora","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","lora_path":null,"messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","cache_salt":"a","cache_salt":"b","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","messages":[],"messages":[],"extra_key":"attacker"}}"#),
+        r#"{"model":"wrong-model","session_id":"sess-1","messages":[]}"#.to_owned(),
+        r#"{"rid":"rid-1","messages":[]}"#.to_owned(),
+    ] {
+        let id = h
+            .fixture
+            .request_with_pricing(MODEL, false, Some(pricing))
+            .await;
+        let reply = h.send(Some(&id), body.as_bytes(), "", Then::Read).await;
+        assert_eq!(
+            refusal(&reply),
+            (400, "validation".to_owned(), None),
+            "{body}"
+        );
+        let problem: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            problem["detail"].as_str(),
+            Some("The request body must not set proxy-owned cache or routing fields."),
+            "{body}"
+        );
+        refused_ids.push(id);
+    }
+    assert_eq!(
+        h.upstream.count(),
+        0,
+        "no reserved-field request reaches upstream"
+    );
+
+    // Nested mention inside `messages` content is NOT rejected and gets the proxy's own salt.
+    let nested_id = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let nested_body = format!(
+        r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"mention cache_salt and extra_key safely"}}]}}"#
+    );
+    let reply = h
+        .send(Some(&nested_id), nested_body.as_bytes(), "", Then::Read)
+        .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(h.upstream.count(), 1);
+    let (restored, _) =
+        strip_injected_cache_salt(&h.upstream.body(0)).expect("nested mention gets cache_salt");
+    assert_eq!(restored, nested_body.as_bytes());
+
+    let (fixture, _, events) = h.stop().await;
+    let mut expected_events = Vec::new();
+    for id in &refused_ids {
+        assert!(fixture.dispatched(id).await);
+        fixture.assert_closed(id, "request_body").await;
+        assert_eq!(
+            fixture.hold_of(id, "usage_cost_micros").await,
+            ("settled".to_owned(), 0, "0".to_owned()),
+            "cost hold must settle at 0 on reserved-key refusal"
+        );
+        expected_events.push(unrecorded(id, "request_body"));
+    }
+    expected_events.sort();
+    assert_eq!(events, expected_events);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Rolling-upgrade compatibility: when connected to a pre-36 schema lacking
+/// `openmettle.gateway_dispatch_scoped`, `openmettle-gateway` falls back to 6-column
+/// `openmettle.gateway_dispatch` and isolates `cache_salt` per principal (`Some(principal)`),
+/// never sharing prefixes across distinct users in a project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn pre_36_schema_falls_back_to_per_principal_cache_isolation() {
+    use openmettle_core::authz::{Grantee, ProjectRole, ResourceAccess, ResourceKind, projects};
+
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..35])
+        .await
+        .unwrap();
+    db.admin()
+        .await
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_tokens',1000000)",
+        )
+        .await
+        .unwrap();
+    let mut c = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut c).await;
+    let alice =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let bob = authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    let fixture = Fixture {
+        owner: pool(&db, OWNER),
+        worker: pool(&db, WORKER),
+        route: TurnHandoffFixture::chat(INSTALL, MODEL, UNITS, None, false),
+        other_route: TurnHandoffFixture::chat(INSTALL, OTHER_MODEL, UNITS, None, false),
+        runs: AtomicUsize::new(0),
+        issued: Mutex::default(),
+        db,
+        actor: alice.clone(),
+        scope,
+    };
+    let (project_id, project_scope) =
+        run_admission::new_project(&fixture.db, &alice, "pre-36-proj").await;
+    authz_store::applied(
+        projects::set_project_member_role(
+            &mut connect(&fixture.db.0, API).await,
+            &authz_store::ctx(&alice, "pre36-bob-ed"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    let chat = authz_runs::chat(&fixture.db, &project_scope, "project", &alice).await;
+    authz_store::applied(
+        projects::share_resource(
+            &mut connect(&fixture.db.0, API).await,
+            &authz_store::ctx(&alice, "pre36-share"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+
+    let h = Harness::launch(fixture, StandIn::start().await, &[]).await;
+    let req_alice = h
+        .fixture
+        .request_on_conversation(&alice, &project_scope, "project", &chat, MODEL, false, None)
+        .await;
+    let req_bob = h
+        .fixture
+        .request_on_conversation(&bob, &project_scope, "project", &chat, MODEL, false, None)
+        .await;
+    assert_eq!(h.send_case("02-chat-plain", &req_alice).await.status, 200);
+    assert_eq!(h.send_case("02-chat-plain", &req_bob).await.status, 200);
+    let (_, salt_alice) =
+        strip_injected_cache_salt(&h.upstream.body(0)).expect("pre-36 alice salt");
+    let (_, salt_bob) = strip_injected_cache_salt(&h.upstream.body(1)).expect("pre-36 bob salt");
+    assert_ne!(
+        salt_alice, salt_bob,
+        "pre-36 fallback must isolate per principal and never share across distinct users"
+    );
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(events, []);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Review #1 P2: when an upstream answers with a non-200 status whose body echoes the submitted
+/// request (including the injected `cache_salt`), the proxy returns a value-free problem body
+/// without relaying the upstream body or leaking `cache_salt`, preserves retryable status
+/// classifications (`429`, `503`, `504`), and settles every case as `upstream_status` at `0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_upstream_status() {
+    let h = Harness::start().await;
+    let cases = [
+        ("echo-422", 502, "provider_failure", None),
+        ("status-429", 429, "rate_limited", Some("7")),
+        ("status-429-hop", 429, "rate_limited", None),
+        ("status-429-bad-conn", 429, "rate_limited", None),
+        ("status-503", 503, "unavailable", None),
+        ("status-504", 504, "timeout", None),
+    ];
+    let mut ids = Vec::new();
+    for (idx, (name, expected_status, expected_code, expected_retry_after)) in
+        cases.into_iter().enumerate()
+    {
+        let id = h.fixture.request(false).await;
+        let reply = h.send_synthetic(name, &id, Then::Read).await;
+        assert_eq!(
+            refusal(&reply),
+            (expected_status, expected_code.to_owned(), None),
+            "{name}"
+        );
+        assert_eq!(
+            header(&reply.head, "retry-after"),
+            expected_retry_after,
+            "{name}: retry-after"
+        );
+        assert!(reply.complete, "{name}");
+        let (_, salt) = strip_injected_cache_salt(&h.upstream.body(idx))
+            .expect("upstream received injected cache_salt");
+        let body_text = String::from_utf8_lossy(&reply.body);
+        assert!(
+            !reply.head.contains(&salt) && !body_text.contains(&salt),
+            "{name}: response must never leak derived cache_salt"
+        );
+        assert!(
+            !body_text.contains("Extra inputs are not permitted"),
+            "{name}: upstream error body must not be relayed"
+        );
+        ids.push(id);
+    }
+    let (fixture, _, events) = h.stop().await;
+    let mut expected_events = Vec::new();
+    for id in &ids {
+        fixture.assert_closed(id, "upstream_status").await;
+        expected_events.push(unrecorded(id, "upstream_status"));
+    }
+    expected_events.sort();
+    assert_eq!(events, expected_events);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }

@@ -33,6 +33,9 @@
 -- `family_policy_permits` (API and worker only), and replaces `gateway_round_authority`,
 -- `gateway_handoff_round` (6-arg) and `gateway_dispatch` with unchanged signatures, security
 -- and privileges (ADR 0044, increment 4).
+-- Version 36 adds `gateway_dispatch_scoped` (gateway only) for prefix-cache owner isolation and
+-- delegates 6-column `gateway_dispatch` to it with unchanged signature, security and privileges
+-- (ADR 0044, increment 5).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -248,6 +251,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.enforce_family_policy_model_writer()',false,ARRAY[]::text[]),
         ('openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.family_policy_permits(uuid,uuid,text,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[])) AS f WHERE $1 >= 35
+    UNION ALL SELECT 'openmettle.gateway_dispatch_scoped(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 36
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),

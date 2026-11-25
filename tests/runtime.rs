@@ -2167,6 +2167,15 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
             &[database, upstream, model, ("UPSTREAM_IDLE_TIMEOUT_MS", "0")],
             "configuration outside allowed range",
         ),
+        (
+            &[
+                database,
+                upstream,
+                model,
+                ("CACHE_MODE", "bogus-cache-mode-canary"),
+            ],
+            "invalid CACHE_MODE",
+        ),
     ];
     for (settings, line) in cases {
         let mut command = gateway();

@@ -320,6 +320,13 @@ async fn settles_through_the_gateway(
         (&body["model"], &body["stream"]),
         (&json!(MODEL), &json!(stream))
     );
+    let salt = body["cache_salt"]
+        .as_str()
+        .expect("forwarded worker request must carry a string cache_salt");
+    assert!(
+        salt.len() == 64 && salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "expected 64-char lowercase hex cache_salt, got {salt:?}"
+    );
     // The stored usage is the recorded answer's, reported under the request's installation.
     assert_eq!(
         reports(&chat, &id).await,
