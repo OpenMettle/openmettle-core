@@ -210,6 +210,7 @@ async fn resolve(
     view: &ResourceView,
     catalog: &Catalog,
     selection: &Selection,
+    now_ms: i64,
 ) -> Result<ConfigSnapshot, Problem> {
     let (project, rev) = if let Some(id) = &view.project_id {
         let settings = projects::load_project_settings(c, id)
@@ -228,7 +229,7 @@ async fn resolve(
         &actor.user_id,
         ctx.approval_id(),
         &resolved.model,
-        ctx.observed_ms(),
+        now_ms,
     )
     .await?;
     let effective = if permitted {
@@ -242,7 +243,7 @@ async fn resolve(
             &actor.user_id,
             ctx.approval_id(),
             &models,
-            ctx.observed_ms(),
+            now_ms,
         )
         .await?;
         catalog.resolve_with_fallback(
@@ -390,7 +391,16 @@ pub(super) async fn preview(
         }
     };
     let catalog = catalog.ok_or(PROVISIONING)?;
-    let config = resolve(c, call.context, actor, view, catalog, &proposal.selection).await?;
+    let config = resolve(
+        c,
+        call.context,
+        actor,
+        view,
+        catalog,
+        &proposal.selection,
+        now,
+    )
+    .await?;
     let e = &config.effective;
     let path = history
         .turns
@@ -440,7 +450,7 @@ pub(super) async fn submit(
     r: &Request,
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
-) -> Result<(StatusCode, String), Problem> {
+) -> Result<(StatusCode, String, i64), Problem> {
     let ctx = call.context;
     let actor = principal(c, ctx).await?;
     let visible = projects::read_resource(
@@ -453,14 +463,15 @@ pub(super) async fn submit(
     .await?;
     let mut tx = WriteTransaction::begin_bounded(c, false).await?;
     let result = admission(&mut tx, &visible.scope_id, call, r, limits, catalog).await;
-    if matches!(result, Ok((_, true))) {
+    if matches!(result, Ok((_, true, _))) {
         tx.commit().await?
     } else {
         tx.rollback().await?
     }
-    match result?.0 {
-        Admission::Admitted { run_id, .. } => Ok((StatusCode::CREATED, run_id)),
-        Admission::Replayed { run_id, .. } => Ok((StatusCode::OK, run_id)),
+    let (outcome, _, verified_now_ms) = result?;
+    match outcome {
+        Admission::Admitted { run_id, .. } => Ok((StatusCode::CREATED, run_id, verified_now_ms)),
+        Admission::Replayed { run_id, .. } => Ok((StatusCode::OK, run_id, verified_now_ms)),
         Admission::Refused(RunLimit::ActorLimit | RunLimit::ScopeLimit) => Err(problem(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -505,17 +516,19 @@ async fn admission(
     r: &Request,
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
-) -> Result<(Admission, bool), Problem> {
+) -> Result<(Admission, bool, i64), Problem> {
     let c = tx.connection()?;
     let ctx = call.context;
-    queue::lock_scope_actor(c, scope, ctx.user_id()).await?;
-    let actor = principal(c, ctx).await?;
+    let (personal_owner, project_id) =
+        queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;
+    let mut now_ms = store::post_lock_clock_ms(c, ctx.observed_ms()).await?;
+    let actor = principal_at(c, ctx, now_ms).await?;
     let view = projects::resource_view(
         c,
         &actor,
         ResourceKind::Conversation,
         &r.conversation_id,
-        ctx.observed_ms(),
+        now_ms,
         authz::Action::RunExecute,
     )
     .await?;
@@ -542,6 +555,8 @@ async fn admission(
     let (
         branch,
         message,
+        input_attachments,
+        replay_approval_id,
         format,
         version,
         snapshots,
@@ -549,6 +564,7 @@ async fn admission(
         per_round_ceiling,
         per_round_cost_micros,
         requires_device_slot,
+        selected_model,
     ) = if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
         let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
         let mode: StoredMode =
@@ -577,6 +593,8 @@ async fn admission(
         (
             found.branch_id,
             found.input_message_id,
+            Vec::new(),
+            Some(found.actor_approval_id),
             found.snapshot_format,
             found.snapshot_version,
             Snapshots {
@@ -587,9 +605,11 @@ async fn admission(
             config.effective.ceiling.value,
             round_cost,
             device_slot,
+            Some(config.effective.model),
         )
     } else {
         let audit = AuditContext {
+            now_ms,
             request_key: &key,
             ..call.audit()
         };
@@ -603,14 +623,16 @@ async fn admission(
         )
         .await?;
         let c = tx.connection()?;
+        now_ms = store::post_lock_clock_ms(c, now_ms).await?;
+        let actor = principal_at(c, ctx, now_ms).await?;
         let catalog = catalog.ok_or(PROVISIONING)?;
-        let mut config = resolve(c, ctx, &actor, &view, catalog, intent.selection).await?;
+        let mut config = resolve(c, ctx, &actor, &view, catalog, intent.selection, now_ms).await?;
         if r.execution_mode == ExecutionMode::Yolo {
             config
                 .required_capabilities
                 .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
         }
-        let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
+        let history = branches::history(c, &actor, chat, &target.branch_id, now_ms)
             .await?
             .ok_or(NOT_FOUND)?;
         let path = history
@@ -622,6 +644,7 @@ async fn admission(
         let profile = catalog.target(&config.effective)?;
         let round_cost = catalog.round_cost_ceiling(&config.effective)?;
         let device_slot = profile.requires_device_slot;
+        let selected_model = config.effective.model.clone();
         let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
         snapshots.config = serde_json::to_vec(&AdmissionConfig {
             config: &config,
@@ -631,6 +654,8 @@ async fn admission(
         (
             target.branch_id,
             target.input_message_id,
+            target.attachment_revisions,
+            None,
             SNAPSHOT_FORMAT.to_owned(),
             SNAPSHOT_VERSION,
             snapshots,
@@ -638,37 +663,36 @@ async fn admission(
             config.effective.ceiling.value,
             round_cost,
             device_slot,
+            Some(selected_model),
         )
     };
     let caps = gates
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    let admitted = queue::admit_run_with_mode(
-        tx,
-        &queue::RunAdmission {
-            input: RunInput {
-                scope,
-                actor: ctx.user_id(),
-                conversation: chat.id,
-                branch: &branch,
-                message: &message,
-                key: &key,
-                format: &format,
-                version,
-                input: &snapshots.input,
-                config: &snapshots.config,
-            },
-            actor_approval_id: ctx.approval_id(),
-            capabilities: &caps,
-            requested_rounds: intent.requested_rounds,
-            now_ms: ctx.observed_ms(),
-            cost_qualified: Some(per_round_cost_micros.is_some()),
+    let mut admission_req = queue::RunAdmission {
+        input: RunInput {
+            scope,
+            actor: ctx.user_id(),
+            conversation: chat.id,
+            branch: &branch,
+            message: &message,
+            key: &key,
+            format: &format,
+            version,
+            input: &snapshots.input,
+            config: &snapshots.config,
         },
-        limits,
-        ctx,
-    )
-    .await?;
+        actor_approval_id: ctx.approval_id(),
+        capabilities: &caps,
+        requested_rounds: intent.requested_rounds,
+        now_ms,
+        cost_qualified: Some(per_round_cost_micros.is_some()),
+    };
+    let (admitted, admit_now_ms) =
+        queue::admit_run_with_mode_at(tx, &admission_req, limits, ctx).await?;
+    now_ms = now_ms.max(admit_now_ms);
+    admission_req.now_ms = now_ms;
     let build_token_units = |round_limit: i32| -> Result<i64, Problem> {
         let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
         per_round
@@ -683,7 +707,7 @@ async fn admission(
             round_limit,
         } => {
             let token_units = build_token_units(*round_limit)?;
-            if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
+            let refusal = crate::quotas::reserve_admitted_run_budget(
                 tx,
                 &crate::quotas::RunBudgetReservation {
                     scope_id: scope,
@@ -697,11 +721,37 @@ async fn admission(
                     requires_device_slot,
                 },
             )
-            .await?
-            {
-                return Ok((Admission::Refused(limit), false));
+            .await?;
+            let c = tx.connection()?;
+            let (fresh_actor, _, _, post_reserve_ms) = queue::verify_admission_authority(
+                c,
+                &admission_req,
+                personal_owner.as_deref(),
+                project_id.as_deref(),
+                Some(ctx.locator()),
+                now_ms,
+            )
+            .await?;
+            if let Some(limit) = refusal {
+                return Ok((Admission::Refused(limit), false, post_reserve_ms));
             }
-            Ok((admitted, true))
+            for revision in &input_attachments {
+                branches::readable_revision(c, &fresh_actor, scope, revision, post_reserve_ms)
+                    .await?;
+            }
+            if let Some(model) = selected_model.as_deref()
+                && !authz::gateway::family::permits_at(
+                    c,
+                    ctx.user_id(),
+                    ctx.approval_id(),
+                    model,
+                    post_reserve_ms,
+                )
+                .await?
+            {
+                return Err(crate::model_config::Error::Unauthorized.into());
+            }
+            Ok((admitted, true, post_reserve_ms))
         }
         Admission::Replayed {
             run_id,
@@ -709,36 +759,81 @@ async fn admission(
             round_limit,
         } if state == "queued" => {
             let effective_rounds = round_limit.unwrap_or(limits.round_cap);
-            let Ok(token_units) = build_token_units(effective_rounds) else {
-                return Ok((admitted, false));
+            let (committed, refusal) = match build_token_units(effective_rounds) {
+                Ok(token_units) => {
+                    crate::quotas::backfill_replayed_run_budget(
+                        tx,
+                        &crate::quotas::RunBudgetReservation {
+                            scope_id: scope,
+                            scope_kind,
+                            actor_user_id: ctx.user_id(),
+                            actor_approval_id: ctx.approval_id(),
+                            run_id,
+                            token_units,
+                            per_round_cost_micros,
+                            round_limit: effective_rounds,
+                            requires_device_slot,
+                        },
+                    )
+                    .await?
+                }
+                Err(_) => (false, None),
             };
-            let (committed, refusal) = crate::quotas::backfill_replayed_run_budget(
-                tx,
-                &crate::quotas::RunBudgetReservation {
-                    scope_id: scope,
-                    scope_kind,
-                    actor_user_id: ctx.user_id(),
-                    actor_approval_id: ctx.approval_id(),
-                    run_id,
-                    token_units,
-                    per_round_cost_micros,
-                    round_limit: effective_rounds,
-                    requires_device_slot,
-                },
+            let c = tx.connection()?;
+            let (_, _, _, post_backfill_ms) = queue::verify_admission_authority(
+                c,
+                &admission_req,
+                personal_owner.as_deref(),
+                project_id.as_deref(),
+                Some(ctx.locator()),
+                now_ms,
             )
             .await?;
-            if refusal.is_some() {
-                return Ok((admitted, false));
-            }
-            Ok((admitted, committed))
+            let stored_approval_id = match replay_approval_id {
+                Some(stored) => stored,
+                None => sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT actor_approval_id::text
+                       FROM openmettle.runs
+                      WHERE scope_id = $1::uuid AND id = $2::uuid AND actor_user_id = $3::uuid",
+                )
+                .bind(scope)
+                .bind(run_id)
+                .bind(ctx.user_id())
+                .fetch_optional(&mut *c)
+                .await
+                .map_err(Problem::from)?
+                .flatten(),
+            };
+            let should_commit = if committed && refusal.is_none() {
+                match (selected_model.as_deref(), stored_approval_id.as_deref()) {
+                    (Some(model), Some(approval_id)) => {
+                        authz::gateway::family::permits_at(
+                            c,
+                            ctx.user_id(),
+                            approval_id,
+                            model,
+                            post_backfill_ms,
+                        )
+                        .await?
+                    }
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+            } else {
+                false
+            };
+            Ok((admitted, should_commit, post_backfill_ms))
         }
-        _ => Ok((admitted, false)),
+        _ => {
+            let verified_ms = store::post_lock_clock_ms(tx.connection()?, now_ms).await?;
+            Ok((admitted, false, verified_ms))
+        }
     }
 }
 pub(super) async fn cancel(
     c: &mut PgConnection,
     call: Call<'_>,
-) -> Result<(StatusCode, String), Problem> {
+) -> Result<(StatusCode, String, i64), Problem> {
     let ctx = call.context;
     let actor = principal(c, ctx).await?;
     let (scope, conversation): (String, String) = sqlx::query_as(
@@ -763,5 +858,6 @@ pub(super) async fn cancel(
         queue::CancelOutcome::Requested { .. } => StatusCode::ACCEPTED,
         _ => StatusCode::OK,
     };
-    Ok((status, call.target.to_owned()))
+    let verified_ms = store::post_lock_clock_ms(c, ctx.observed_ms()).await?;
+    Ok((status, call.target.to_owned(), verified_ms))
 }

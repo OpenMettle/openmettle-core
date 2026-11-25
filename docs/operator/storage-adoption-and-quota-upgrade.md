@@ -187,6 +187,13 @@ openmettle-admin family clear-policy --oidc-group Family \
 
 In `set-model`, `--enable` activates the specified rule (`active = true`: `family_policy.model_study_allow` for `--kind study_allow`, `family_policy.model_disable` for `--kind disabled`) and `--disable` deactivates it (`active = false`: `family_policy.model_study_revoke` or `family_policy.model_enable`).
 
+## Upgrade from 0037 to 0038 (administrative write serialization)
+
+Migration `0038` ([ADR 0027](../adr/0027-authorization-and-private-projects.md), issue `#160`) needs no activation step and no backfill:
+
+- Replaces `openmettle.quota_lock_override(uuid, uuid, text)` with the same signature, invoker security, `search_path` and privileges, keeping a fast pre-target administrator check under `account_admin_lock` so non-admins never wait on contended scope locks, locking personal-scope owner and actor in ascending `users.id` order, re-checking administrator status under the actor's `users` lock, and placing `run_dispatch_lock` after the actor lock so SQL and Rust follow one canonical lock order (`account_admin_lock -> projects -> login_providers -> local_identity_approvals -> users (ascending id) -> storage_volume_control -> run_dispatch_lock -> storage_accounts | quota_budgets`). Previous-release API binaries calling `quota_upsert_scope_override` and `quota_revoke_scope_override` continue working unchanged.
+- Replaces the unexposed 4-argument `openmettle.retention_set_grace(uuid, integer, text, text)` (no route or runtime caller existed in any prior release) with the 5-argument approval-bound `openmettle.retention_set_grace(p_actor uuid, p_approval uuid, p_grace_seconds integer, p_reason text, p_request_key text)` (`SECURITY DEFINER`, `openmettle_api` only), serializing under `account_admin_lock -> login_providers -> local_identity_approvals -> users -> retention_policy` and verifying full live authority at `clock_timestamp()` both before target locking and after the final `authorization_audit` insert.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

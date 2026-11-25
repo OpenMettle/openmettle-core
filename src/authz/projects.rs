@@ -15,8 +15,9 @@ use super::{
     Origin, PROJECT_ROLE, Principal, Project, ProjectRole, RESOURCE_GRANT, Resource,
     ResourceAccess, ResourceKind, Scope, ShareRecipient,
     store::{
-        self, AuditContext, Change, StoreError, UNCHANGED, WriteOutcome, acting, check, record,
-        transact, uuid,
+        self, AuditContext, Change, StoreError, UNCHANGED, UserLock, WriteOutcome, check,
+        lock_actor_approval, lock_actor_authority, lock_actor_authority_with, post_lock_acting,
+        record, transact, uuid,
     },
 };
 use crate::{
@@ -287,6 +288,7 @@ pub(crate) fn resource_kind(kind: ResourceKind) -> Result<&'static str, StoreErr
 }
 
 /// Where a conversation or artifact lives, without its grants.
+#[derive(Clone)]
 struct Located {
     scope_id: String,
     creator_user_id: String,
@@ -557,76 +559,140 @@ pub(crate) async fn create_project_checked(
     };
     transact(c, ctx, async |tx| {
         let c = tx.connection()?;
-        let actor = acting(c, ctx).await?;
-        let outcome = record(c, ctx, &change).await?;
-        let WriteOutcome::Applied { target_id: project } = &outcome else {
-            return Ok(outcome);
-        };
-        check_defaults(c, &actor).await?;
-        // The project and scope reference each other through deferred foreign keys.
-        let scope: String = sqlx::query_scalar(
-            "WITH s AS (INSERT INTO openmettle.scopes (id, kind, project_id)
-                        VALUES (gen_random_uuid(), 'project', $1::uuid) RETURNING id)
-             INSERT INTO openmettle.projects (id, scope_id, created_by_user_id)
-             SELECT $1::uuid, s.id, $2::uuid FROM s RETURNING scope_id::text",
-        )
-        .bind(project)
-        .bind(ctx.actor_user_id)
-        .fetch_one(&mut *c)
-        .await?;
-        sqlx::query(
-            "INSERT INTO openmettle.project_settings
-                 (project_id, scope_id, name, instructions, defaults, updated_by_user_id)
-             VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid)",
-        )
-        .bind(project)
-        .bind(&scope)
-        .bind(settings.name)
-        .bind(settings.instructions)
-        .bind(settings.defaults.to_string())
-        .bind(ctx.actor_user_id)
-        .execute(&mut *c)
-        .await
-        .map_err(settings_error)?;
-        let owner = Grantee::User(ctx.actor_user_id.to_owned());
-        let assignment = direct(&scope, Target::Project(project), &owner, PROJECT_ROLE);
-        set_direct(tx, ctx, assignment, &ROLE_KEYS, Some("owner")).await?;
+        lock_actor_authority(c, ctx).await?;
+        let (_, post_lock_ctx) = post_lock_acting(c, ctx).await?;
+        let outcome = record(c, &post_lock_ctx, &change).await?;
+        if let WriteOutcome::Applied { target_id: project } = &outcome {
+            // The project and scope reference each other through deferred foreign keys.
+            let scope: String = sqlx::query_scalar(
+                "WITH s AS (INSERT INTO openmettle.scopes (id, kind, project_id)
+                            VALUES (gen_random_uuid(), 'project', $1::uuid) RETURNING id)
+                 INSERT INTO openmettle.projects (id, scope_id, created_by_user_id)
+                 SELECT $1::uuid, s.id, $2::uuid FROM s RETURNING scope_id::text",
+            )
+            .bind(project)
+            .bind(ctx.actor_user_id)
+            .fetch_one(&mut *c)
+            .await?;
+            sqlx::query(
+                "INSERT INTO openmettle.project_settings
+                     (project_id, scope_id, name, instructions, defaults, updated_by_user_id)
+                 VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid)",
+            )
+            .bind(project)
+            .bind(&scope)
+            .bind(settings.name)
+            .bind(settings.instructions)
+            .bind(settings.defaults.to_string())
+            .bind(ctx.actor_user_id)
+            .execute(&mut *c)
+            .await
+            .map_err(settings_error)?;
+            let owner = Grantee::User(ctx.actor_user_id.to_owned());
+            let assignment = direct(&scope, Target::Project(project), &owner, PROJECT_ROLE);
+            set_direct(tx, &post_lock_ctx, assignment, &ROLE_KEYS, Some("owner")).await?;
+        }
+        let c = tx.connection()?;
+        let (fresh_actor, _) = post_lock_acting(c, &post_lock_ctx).await?;
+        if matches!(outcome, WriteOutcome::Applied { .. }) {
+            check_defaults(c, &fresh_actor).await?;
+        }
         Ok(outcome)
     })
     .await
 }
 
-/// The project write protocol: lock the project, re-hydrate the actor and the project, decide
-/// with `authorize`, record the audit row, then `apply` with the project's scope ID. A
-/// `frozen` change is refused with [`ARCHIVED`] while the project is archived.
+/// Restore only the direct grants for `grantee` from `pre_apply` into `fresh`, keeping all
+/// post-write mapped grants and every other grantee's live state untouched.
+fn restore_direct_grantee<P>(
+    mut fresh: Vec<Grant<P>>,
+    pre_apply: Vec<Grant<P>>,
+    grantee: &Grantee,
+) -> Vec<Grant<P>> {
+    fresh.retain(|g| !(g.origin == Origin::Direct && &g.grantee == grantee));
+    fresh.extend(
+        pre_apply
+            .into_iter()
+            .filter(|g| g.origin == Origin::Direct && &g.grantee == grantee),
+    );
+    fresh
+}
+
+/// The project write protocol: lock the project (taking `account_admin_lock FOR SHARE` first on
+/// distinct two-user writes for rolling-upgrade safety), lock and re-hydrate the actor at
+/// post-lock time, hydrate the project, decide with `authorize`, record the audit row, `apply`
+/// with the project's scope ID, and re-verify the complete live authorization predicate (including
+/// OIDC `membership_observations`, local groups, approval/provider/user liveness, and any
+/// post-write check) immediately before commit. A `frozen` change is refused with [`ARCHIVED`]
+/// while the project is archived.
+#[allow(clippy::too_many_arguments)]
 async fn project_write(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     project_id: &str,
     (change, frozen): (Change, bool),
-    authorize: impl FnOnce(&Principal, Project) -> Decision,
+    target_user: Option<(&str, UserLock)>,
+    changed_grantee: Option<&Grantee>,
+    authorize: impl Fn(&Principal, Project) -> Decision,
     apply: impl AsyncFnOnce(&mut WriteTransaction<'_>, &str, &Principal) -> Result<(), StoreError>,
+    post_check: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     uuid(project_id, "project_id")?;
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
+        if target_user.is_some_and(|(id, _)| id != ctx.actor_user_id) {
+            sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR SHARE")
+                .fetch_one(&mut *c)
+                .await?;
+        }
         let Some(locked) = lock_project(c, project_id).await? else {
-            acting(c, ctx).await?;
+            lock_actor_authority(c, ctx).await?;
+            post_lock_acting(c, ctx).await?;
             return Err(CONCEALED);
         };
-        let actor = acting(c, ctx).await?;
-        let project = project_in(c, project_id, &locked.scope, ctx.now_ms).await?;
+        lock_actor_authority_with(c, ctx, UserLock::Share, target_user).await?;
+        let (actor, post_lock_ctx) = post_lock_acting(c, ctx).await?;
+        let project = project_in(c, project_id, &locked.scope, post_lock_ctx.now_ms).await?;
+        let pre_apply_project = changed_grantee.is_some().then(|| project.clone());
         let decision = authorize(&actor, project);
         if locked.deleted {
-            return deleted_replay(c, ctx, &change, decision).await;
+            return deleted_replay(c, &post_lock_ctx, &change, decision).await;
         }
         check(decision)?;
         if frozen && locked.archived {
             return Err(ARCHIVED);
         }
-        let outcome = record(c, ctx, &change).await?;
+        let outcome = record(c, &post_lock_ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
             apply(tx, &locked.scope, &actor).await?;
+        }
+        let c = tx.connection()?;
+        let (fresh_actor, fresh_ctx) = post_lock_acting(c, &post_lock_ctx).await?;
+        let fresh_project = project_in(c, project_id, &locked.scope, fresh_ctx.now_ms).await?;
+        let check_project = if let (Some(grantee), Some(pre_apply), true) = (
+            changed_grantee,
+            pre_apply_project,
+            matches!(outcome, WriteOutcome::Applied { .. }),
+        ) {
+            // Restore only the direct role grant of the grantee this transaction just mutated
+            // under the locked project row:
+            // - A newly written direct role (for the actor or a group the actor belongs to) cannot
+            //   self-authorize the write if the actor's pre-write role expired during apply.
+            // - A still-authorized actor may self-demote or demote/revoke a group that granted
+            //   their own role when another direct owner remains.
+            // - Fresh approval/user/provider, local-group memberships, OIDC observations, mapped
+            //   grants, and every other grantee's live grants are still re-evaluated at post-write
+            //   clock_timestamp().
+            Project {
+                id: fresh_project.id,
+                grants: restore_direct_grantee(fresh_project.grants, pre_apply.grants, grantee),
+            }
+        } else {
+            fresh_project
+        };
+        check(authorize(&fresh_actor, check_project))?;
+        if matches!(outcome, WriteOutcome::Applied { .. }) {
+            post_check(c, &fresh_actor).await?;
         }
         Ok(outcome)
     })
@@ -680,7 +746,7 @@ fn project_change(action: &'static str, project_id: &str, details: Value) -> Cha
     }
 }
 
-fn manages(action: Action) -> impl FnOnce(&Principal, Project) -> Decision {
+fn manages(action: Action) -> impl Fn(&Principal, Project) -> Decision {
     move |actor, project| super::authorize_scope(actor, &Scope::Project(project), action)
 }
 
@@ -692,7 +758,15 @@ pub async fn update_project_settings(
     project_id: &str,
     settings: &ProjectSettingsInput<'_>,
 ) -> Result<WriteOutcome, StoreError> {
-    update_project_settings_checked(c, ctx, project_id, settings, async |_, _| Ok(())).await
+    update_project_settings_checked(
+        c,
+        ctx,
+        project_id,
+        settings,
+        async |_, _| Ok(()),
+        async |_, _| Ok(()),
+    )
+    .await
 }
 
 pub(crate) async fn update_project_settings_checked(
@@ -701,6 +775,7 @@ pub(crate) async fn update_project_settings_checked(
     project_id: &str,
     settings: &ProjectSettingsInput<'_>,
     check_defaults: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
+    recheck_defaults: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     settings.validate()?;
     let change = project_change("project.settings_update", project_id, settings.details());
@@ -748,7 +823,18 @@ pub(crate) async fn update_project_settings_checked(
         .ok_or(UNCHANGED)
     };
     let authorize = manages(Action::ManageProjectSettings);
-    project_write(c, ctx, project_id, (change, true), authorize, apply).await
+    project_write(
+        c,
+        ctx,
+        project_id,
+        (change, true),
+        None,
+        None,
+        authorize,
+        apply,
+        recheck_defaults,
+    )
+    .await
 }
 
 /// One `archived_at` or `deleted_at` transition of an existing settings row. Archive and delete
@@ -790,7 +876,18 @@ async fn lifecycle(
         })
     };
     let authorize = manages(required);
-    project_write(c, ctx, project_id, (change, false), authorize, apply).await
+    project_write(
+        c,
+        ctx,
+        project_id,
+        (change, false),
+        None,
+        None,
+        authorize,
+        apply,
+        async |_, _| Ok(()),
+    )
+    .await
 }
 
 pub async fn archive_project(
@@ -889,7 +986,22 @@ async fn member_change(
     };
     // Revocation stays available in an archived project; a new role does not.
     let frozen = role.is_some();
-    project_write(c, ctx, project_id, (change, frozen), authorize, apply).await
+    let target_user = match (role.is_some(), grantee) {
+        (true, Grantee::User(id)) => Some((id.as_str(), UserLock::Share)),
+        _ => None,
+    };
+    project_write(
+        c,
+        ctx,
+        project_id,
+        (change, frozen),
+        target_user,
+        Some(grantee),
+        authorize,
+        apply,
+        async |_, _| Ok(()),
+    )
+    .await
 }
 
 /// A user or local group recipient must exist and be enabled; it stays locked FOR SHARE.
@@ -940,6 +1052,34 @@ pub async fn unshare_resource(
     share_change(c, ctx, kind, resource_id, grantee, None).await
 }
 
+async fn check_share_recipient(
+    c: &mut PgConnection,
+    actor: &Principal,
+    resource: &Resource,
+    grantee: &Grantee,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    let project = match &resource.scope {
+        Scope::Project(project) => Some(project),
+        Scope::Personal { .. } => None,
+    };
+    let decision = match grantee {
+        Grantee::User(id) => {
+            let recipient = recipient_principal(c, id, project, now_ms).await?;
+            super::authorize_share(actor, resource, ShareRecipient::User(&recipient))
+        }
+        Grantee::LocalGroup(id) => {
+            recipient_enabled(c, grantee).await?;
+            super::authorize_share(actor, resource, ShareRecipient::LocalGroup(id))
+        }
+        Grantee::OidcGroup(id) => {
+            super::authorize_share(actor, resource, ShareRecipient::OidcGroup(id))
+        }
+        Grantee::Project => super::authorize_share(actor, resource, ShareRecipient::Project),
+    };
+    check(decision)
+}
+
 async fn share_change(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -964,69 +1104,96 @@ async fn share_change(
     transact(c, ctx, async |tx| {
         let c = tx.connection()?;
         let Some(located) = locate(c, kind, resource_id).await? else {
-            acting(c, ctx).await?;
+            lock_actor_authority(c, ctx).await?;
+            post_lock_acting(c, ctx).await?;
             return Err(CONCEALED);
         };
-        // Share changes on one scope serialize: on the project row, or on the personal owner.
-        // An item in a deleted project is concealed like a missing one.
+        // Share changes on one scope serialize in canonical order:
+        // projects -> login_providers -> local_identity_approvals -> users.
+        // Personal shares lock at most one user row (the owner when actor == owner, else only the
+        // actor FOR SHARE since non-owners cannot manage personal shares).
         let archived = match (&located.personal_owner, &located.project_id) {
             (_, Some(project)) => match lock_project(c, project).await? {
-                Some(locked) if !locked.deleted => locked.archived,
+                Some(locked) if !locked.deleted => {
+                    lock_actor_authority(c, ctx).await?;
+                    locked.archived
+                }
                 _ => {
-                    acting(c, ctx).await?;
+                    lock_actor_authority(c, ctx).await?;
+                    post_lock_acting(c, ctx).await?;
                     return Err(CONCEALED);
                 }
             },
             (Some(owner), _) => {
-                sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+                lock_actor_approval(c, ctx.actor_approval_id).await?;
+                if owner == ctx.actor_user_id {
+                    sqlx::query(
+                        "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE",
+                    )
                     .bind(owner)
                     .fetch_one(&mut *c)
                     .await?;
+                } else {
+                    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+                        .bind(ctx.actor_user_id)
+                        .execute(&mut *c)
+                        .await?;
+                }
                 false
             }
             (None, None) => {
-                acting(c, ctx).await?;
+                lock_actor_authority(c, ctx).await?;
+                post_lock_acting(c, ctx).await?;
                 return Err(CONCEALED);
             }
         };
-        let actor = acting(c, ctx).await?;
+        let (actor, post_lock_ctx) = post_lock_acting(c, ctx).await?;
         let scope = located.scope_id.clone();
-        let resource = hydrate_located(c, kind, resource_id, located, ctx.now_ms).await?;
+        let located_for_recheck = located.clone();
+        let resource = hydrate_located(c, kind, resource_id, located, post_lock_ctx.now_ms).await?;
+        let pre_apply_shares = resource.shares.clone();
         check(super::authorize_revoke(&actor, &resource))?;
         if access.is_some() {
             if archived {
                 return Err(ARCHIVED);
             }
-            let project = match &resource.scope {
-                Scope::Project(project) => Some(project),
-                Scope::Personal { .. } => None,
-            };
-            let decision = match grantee {
-                Grantee::User(id) => {
-                    let recipient = recipient_principal(c, id, project, ctx.now_ms).await?;
-                    super::authorize_share(&actor, &resource, ShareRecipient::User(&recipient))
-                }
-                Grantee::LocalGroup(id) => {
-                    recipient_enabled(c, grantee).await?;
-                    super::authorize_share(&actor, &resource, ShareRecipient::LocalGroup(id))
-                }
-                Grantee::OidcGroup(id) => {
-                    super::authorize_share(&actor, &resource, ShareRecipient::OidcGroup(id))
-                }
-                Grantee::Project => {
-                    super::authorize_share(&actor, &resource, ShareRecipient::Project)
-                }
-            };
-            check(decision)?;
+            check_share_recipient(c, &actor, &resource, grantee, post_lock_ctx.now_ms).await?;
         }
-        let outcome = record(c, ctx, &change).await?;
+        let outcome = record(c, &post_lock_ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
             let target = match kind {
                 ResourceKind::Conversation => Target::Conversation(resource_id),
                 _ => Target::Artifact(resource_id),
             };
             let assignment = direct(&scope, target, grantee, RESOURCE_GRANT);
-            set_direct(tx, ctx, assignment, &ACCESS_KEYS, access.map(access_key)).await?;
+            set_direct(
+                tx,
+                &post_lock_ctx,
+                assignment,
+                &ACCESS_KEYS,
+                access.map(access_key),
+            )
+            .await?;
+        }
+        let c = tx.connection()?;
+        let (fresh_actor, fresh_ctx) = post_lock_acting(c, &post_lock_ctx).await?;
+        let mut fresh_resource =
+            hydrate_located(c, kind, resource_id, located_for_recheck, fresh_ctx.now_ms).await?;
+        if matches!(outcome, WriteOutcome::Applied { .. }) {
+            // Restore only the specific direct share assignment this transaction changed:
+            // - On `share`, a newly written share (e.g. `Grantee::Project` or a local group the
+            //   actor belongs to) cannot supply the actor's own visibility if their pre-write
+            //   visibility (such as an OIDC-group share) expired during the write.
+            // - On `unshare`, a still-authorized project owner may retire a share that supplied
+            //   their own visibility while fresh_actor, fresh_resource.scope, and every other
+            //   live share are still re-verified at post-write clock_timestamp().
+            fresh_resource.shares =
+                restore_direct_grantee(fresh_resource.shares, pre_apply_shares, grantee);
+        }
+        check(super::authorize_revoke(&fresh_actor, &fresh_resource))?;
+        if access.is_some() {
+            check_share_recipient(c, &fresh_actor, &fresh_resource, grantee, fresh_ctx.now_ms)
+                .await?;
         }
         Ok(outcome)
     })

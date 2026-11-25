@@ -275,6 +275,47 @@ async fn wait_for_blocked_peer(db: &TestDb, holder: i32) {
     .expect("expected a peer to wait on the fixture lock");
 }
 
+async fn backend_pid(c: &mut PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(c)
+        .await
+        .unwrap()
+}
+
+/// The one session waiting on a lock that `holder` holds.
+async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
+    wait_for_blocked_peer(db, holder).await;
+    sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+    )
+    .bind(holder)
+    .fetch_one(&mut db.admin().await)
+    .await
+    .unwrap()
+}
+
+/// Wait until PostgreSQL's `clock_timestamp()` advances strictly past `target_ms`.
+async fn wait_past_db_ms(c: &mut PgConnection, target_ms: i64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *c)
+        .await
+        .unwrap();
+        if now_ms > target_ms {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "clock_timestamp() {now_ms} did not advance past {target_ms}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn sqlstate<T: std::fmt::Debug>(result: Result<T, sqlx::Error>) -> String {
     match result {
         Err(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
@@ -1215,6 +1256,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "ed518dd9b187d34053dc16444c8c9d50ba1947a75bb0986e960502acb1fb51d3",
         "911d89606c1f322b82dc5085bedae506c210b59c69c36ee1a46a8647d403bee7",
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
+        "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

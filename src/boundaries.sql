@@ -42,6 +42,9 @@
 -- round-level `gateway_requests`/`gateway_release`/`quota_recover_lost_handoff` privileges, adds
 -- `gateway_settle_report` (`openmettle_gateway` only), and revokes all table, column, and internal
 -- quota-settlement helper privileges from `openmettle_gateway` (ADR 0044, increment 6).
+-- Version 38 replaces `quota_lock_override` with the same signature, security and privileges, and
+-- replaces the unexposed 4-arg `retention_set_grace` with the approval-bound 5-arg overload
+-- (`openmettle_api` only) (ADR 0027, issue #160).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -237,12 +240,12 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.capacity_reconcile(uuid,bytea,bigint,uuid,text,uuid[])',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 27
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.retention_policy_bump_revision()',false,ARRAY[]::text[]),
-        ('openmettle.retention_set_grace(uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.retention_stamp_deadline()',true,ARRAY[]::text[]),
         ('openmettle.retention_lock_referenced_revision()',false,ARRAY[]::text[]),
         ('openmettle.artifact_revision_pinned(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.retention_guard_purge_claim()',true,ARRAY[]::text[]),
         ('openmettle.deletion_journal_append_purge()',true,ARRAY[]::text[])) AS f WHERE $1 >= 28
+    UNION ALL SELECT 'openmettle.retention_set_grace(uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 BETWEEN 28 AND 37
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.gateway_round_authority(uuid,uuid,timestamptz)',false,ARRAY[]::text[]),
         ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea)',true,ARRAY['openmettle_worker']::text[]),
@@ -265,6 +268,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.family_policy_permits(uuid,uuid,text,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[])) AS f WHERE $1 >= 35
     UNION ALL SELECT 'openmettle.gateway_dispatch_scoped(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 36
     UNION ALL SELECT 'openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 37
+    UNION ALL SELECT 'openmettle.retention_set_grace(uuid,uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 38
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES

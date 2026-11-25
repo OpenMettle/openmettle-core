@@ -242,14 +242,16 @@ async fn authorize(
     c: &mut PgConnection,
     context: &sessions::Context,
     row: &PgRow,
+    min_now_ms: i64,
 ) -> Result<(), StoreError> {
-    let principal = principal(c, context).await?;
+    let now_ms = authz::store::post_lock_clock_ms(c, min_now_ms.max(context.observed_ms())).await?;
+    let principal = principal_at(c, context, now_ms).await?;
     let conversation = projects::read_resource(
         c,
         &principal,
         ResourceKind::Conversation,
         row.get("conversation_id"),
-        context.observed_ms(),
+        now_ms,
     )
     .await?;
     if conversation.scope_id != row.get::<&str, _>("scope_id") {
@@ -287,7 +289,8 @@ impl Api {
             .get::<Arc<CursorKeys>>()
             .ok_or(PROVISIONING)?;
         let context = self.authenticate(&session).await?;
-        self.run_response(&context, keys, run, StatusCode::OK).await
+        self.run_response(&context, keys, run, StatusCode::OK, context.observed_ms())
+            .await
     }
 
     pub(super) async fn run_response(
@@ -296,6 +299,7 @@ impl Api {
         keys: &CursorKeys,
         run: &str,
         status: StatusCode,
+        min_now_ms: i64,
     ) -> Result<Response, Problem> {
         let row = self
             .database(async |c| {
@@ -304,7 +308,7 @@ impl Api {
                     .fetch_optional(&mut *c)
                     .await?
                     .ok_or(StoreError::NotFound)?;
-                authorize(c, context, &row).await?;
+                authorize(c, context, &row, min_now_ms).await?;
                 Ok(row)
             })
             .await?;
@@ -472,7 +476,7 @@ impl Subscription {
                     return Err(UNAUTHENTICATED);
                 }
                 self.api
-                    .database(async |c| authorize(c, &context, &row).await)
+                    .database(async |c| authorize(c, &context, &row, context.observed_ms()).await)
                     .await?;
                 self.authorized_at = Instant::now();
             }

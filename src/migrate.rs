@@ -211,6 +211,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway remove superseded",
         sql: include_str!("../migrations/0037_gateway_remove_superseded.sql"),
     },
+    Source {
+        version: 38,
+        description: "admin write serialization",
+        sql: include_str!("../migrations/0038_admin_write_serialization.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

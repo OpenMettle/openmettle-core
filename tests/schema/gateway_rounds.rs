@@ -490,13 +490,6 @@ const SETTLED_NOT_DISPATCHED: [&str; 2] = [
      VALUES ($1::uuid,0,true,NULL,0)",
 ];
 
-async fn backend_pid(c: &mut PgConnection) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(c)
-        .await
-        .unwrap()
-}
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_run_round_is_handed_off_without_a_binding_generation_or_policy() {

@@ -603,7 +603,7 @@ pub async fn disable_user(
         let next = expected_generation.checked_add(1).filter(|_| expected_generation >= 0).ok_or(Error::Rejected)?;
         let mut tx = transaction(c).await?;
         let result: Result<(), Error> = async {
-        let generation: i64 = sqlx::query_scalar("SELECT session_generation FROM openmettle.users WHERE id=$1::uuid FOR UPDATE")
+        let generation: i64 = sqlx::query_scalar("SELECT session_generation FROM openmettle.users WHERE id=$1::uuid FOR NO KEY UPDATE")
             .bind(user).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         if generation != expected_generation { return Err(Error::Rejected); }
         sqlx::query("UPDATE openmettle.users SET disabled_at=GREATEST(created_at,clock_timestamp()),session_generation=$2 WHERE id=$1::uuid")

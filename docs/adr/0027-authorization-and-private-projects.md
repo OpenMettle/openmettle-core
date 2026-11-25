@@ -160,6 +160,79 @@ Five guardrails apply:
 5. **Content isolation** as above, covered by negative tests for every resource kind and
    action.
 
+### Canonical lock order and serialization for administrative writes
+
+Every `openmettle_api` administrative write (`src/authz/store.rs`, `src/quotas.rs` scope
+overrides, and `openmettle.retention_set_grace` from migration 38) and every concurrent
+project, share, conversation, branch, run, session or gateway path acquires row locks in one
+strict global order so administrative writes serialize with demotion, user disablement,
+approval withdrawal and provider retirement without wait cycles:
+
+```text
+account_admin_lock
+  -> projects
+  -> login_providers
+  -> local_identity_approvals
+  -> users (ascending id when locking two rows)
+  -> domain targets (local_groups | family_policies | retention_policy | storage_volume_control -> run_dispatch_lock -> storage_accounts | quota_budgets)
+  -> runs (ORDER BY id)
+```
+
+Each path takes only the prefix it needs:
+
+| Path | Row-lock sequence |
+| --- | --- |
+| `authz::store` writes (account admins, user lifecycle, local groups, platform/user capability flags, family policies) | `account_admin_lock FOR UPDATE` -> actor `login_providers FOR SHARE` -> actor `local_identity_approvals FOR SHARE` -> `users` (actor `FOR SHARE` plus any target user `FOR SHARE` or `FOR NO KEY UPDATE` in ascending `id` order; same-user disable/enable locks once `FOR NO KEY UPDATE`) -> target `local_groups` / `family_policies` -> `runs ORDER BY id FOR NO KEY UPDATE` (user disable only) |
+| `quotas::set_scope_override`, `quotas::revoke_scope_override` (and SQL `quota_lock_override` from migration 38) | `account_admin_lock FOR UPDATE` (`FOR NO KEY UPDATE` in SQL) -> fast fail-closed admin pre-check (no target locks held for non-admins) -> `projects FOR NO KEY UPDATE` (project scope only) -> actor `login_providers FOR SHARE` -> actor `local_identity_approvals FOR SHARE` -> `users` (personal scope owner `FOR NO KEY UPDATE` and actor `FOR SHARE` in ascending `id` order, or once `FOR NO KEY UPDATE` when identical) -> `storage_volume_control FOR SHARE` (`storage_lock_not_adopting`) -> `run_dispatch_lock FOR NO KEY UPDATE` (`executing_runs_*` only) -> `storage_accounts FOR UPDATE` or `quota_budgets ORDER BY window_start, id FOR NO KEY UPDATE` |
+| `openmettle.retention_set_grace` (migration 38, 5-arg approval-bound) | `account_admin_lock FOR UPDATE` -> actor `login_providers FOR SHARE` -> actor `local_identity_approvals FOR SHARE` -> actor `users FOR SHARE` -> `retention_policy FOR UPDATE` -> `authorization_audit` insert -> final live authority check |
+| Project, share and conversation writes (`authz::projects`, `authz::branches`, `authz::runs`) | `[account_admin_lock FOR SHARE]` (two-user non-admin paths: `set_project_member_role` for distinct user grantee, and `lock_scope_actor` when `actor != personal_owner`) -> `projects FOR NO KEY UPDATE` (project scope only) -> actor `login_providers FOR SHARE` -> actor `local_identity_approvals FOR SHARE` -> `users` (ascending `id` order when locking two rows: actor `FOR SHARE` plus target user `FOR SHARE` on `set_project_member_role`; owner `FOR NO KEY UPDATE` plus actor `FOR SHARE` on `create_branch` / `prepare_turn` in personal scope; owner `FOR NO KEY UPDATE` when actor is owner else actor `FOR SHARE` for personal shares and conversation creates) -> target `local_groups` / `branch_heads FOR NO KEY UPDATE` / `runs ORDER BY id FOR NO KEY UPDATE` (archive/delete) / `quota_budgets` (run admission) |
+| Gateway handoff and proxy dispatch (`gateway_handoff_round`, `gateway_dispatch_scoped`) | `account_admin_lock FOR SHARE` -> `projects FOR SHARE` -> `login_providers FOR SHARE` -> `local_identity_approvals FOR SHARE` -> `users FOR SHARE` -> `runs FOR SHARE` -> `gateway_reservations` -> `gateway_requests` |
+| Standalone revocations and session paths | `sessions::disable_user`: single `users FOR NO KEY UPDATE`; `identity-approval-change.psql`: single `local_identity_approvals FOR UPDATE`; provider retirement/recovery: single `login_providers FOR UPDATE`; `sessions::validate`: `login_providers -> local_identity_approvals -> users -> local_sessions` (all `FOR SHARE`) |
+
+Four invariants make this order deadlock-free and race-free:
+
+1. **Multi-row `users` locks follow ascending UUID order, and rolling upgrades serialize two-user non-admin paths on `account_admin_lock FOR SHARE`.**
+   Every write that locks two `users` rows (`authz::store` user-targeted writes, personal-scope
+   quota overrides in both Rust and `quota_lock_override`, `projects::set_project_member_role` for
+   user grantees, and `runs::lock_scope_actor` for collaborator branch writes on shared personal
+   conversations) acquires them in ascending `users.id` order (taking the stronger lock once when
+   both sides name the same user). Two-user non-admin writes (`actor != second_user`) also acquire
+   `account_admin_lock FOR SHARE` first so concurrent collaborator writes run in parallel with each
+   other while serializing cleanly against `N-1` (schema-37) API binaries running unordered
+   `disable_user` during a rolling upgrade.
+2. **`openmettle.users` lifecycle writers use `FOR NO KEY UPDATE`, never `FOR UPDATE`.**
+   Account lifecycle mutations (`store::disable_user`, `store::enable_user`, `sessions::disable_user`)
+   never update or delete primary key `users.id`. Using `FOR NO KEY UPDATE` still conflicts with
+   `FOR SHARE`, `FOR NO KEY UPDATE` and `FOR UPDATE` (preserving full serialization with authority
+   and scope locks) while admitting PostgreSQL's `FOR KEY SHARE` foreign-key checks from concurrent
+   `grant_assignments` and `storage_reservations` inserts (`projects::share_change`, fenced worker
+   tool spills holding `runs`).
+3. **Project locks precede actor authority locks, and quota overrides fail fast for non-admins.**
+   Quota overrides on a project scope lock `projects FOR NO KEY UPDATE` before
+   `login_providers -> local_identity_approvals -> users(actor)`, matching `authz::projects`,
+   `authz::branches`, `runs::admit_run` and gateway handoff/dispatch so an administrator modifying
+   quotas on a project while acting inside that project cannot form a `projects`/`users` cycle.
+   Both Rust `quotas.rs` and SQL `quota_lock_override` perform a fast read-only administrator check
+   under `account_admin_lock` before locking any target `projects` or personal `users` row so
+   unprivileged callers fail immediately (`42501` / `Denied`) without stalling `account_admin_lock`
+   on contended target locks.
+4. **Post-lock and post-write full authority re-verification.**
+   Every administrative, project, share, conversation, branch, quota-override and run-admission
+   write advances its decision clock monotonically to the primary's post-lock `clock_timestamp()`
+   (`caller_now_ms.max(post_lock_ms)` in Rust and session-bound run admission; `clock_timestamp()`
+   directly in SQL `retention_set_grace`) before judging authority, and re-verifies the **complete
+   live authorization predicate** (active user, active unexpired approval, non-retired provider,
+   live local groups, live OIDC `membership_observations`, project role, resource share and
+   recipient eligibility, input attachment readability, required capabilities, originating session,
+   and family policy for new run admissions and newly backfilled queued replay holds) after the
+   **very last blocking SQL write** in the transaction (`apply`, `set_direct`, `insert_branch`,
+   `publish`, `authorization_audit` insert, `quota_upsert_scope_override` /
+   `quota_revoke_scope_override`, `reserve_admitted_run_budget` / `backfill_replayed_run_budget`,
+   including when a queued replay backfill hits a quota refusal) immediately before commit.
+   Role and share mutations restore only the changed grantee's pre-write direct assignment when
+   re-checking post-write authority so newly written roles or shares cannot self-authorize while
+   valid self-demotions, group self-demotions and share revocations remain permitted.
+
 ## Capabilities and explicit denies
 
 Explicit denies exist only at **platform and user capability level**, for example family
@@ -237,20 +310,19 @@ roles. It adds no migration, route or dependency.
   `now_ms`, using the same SQL predicate as `membership::current`. The worker variant never
   selects `account_admins` and reports `account_admin = false`.
   `load_platform_capabilities` returns the platform denies for either role.
-- **Writes** run only as `openmettle_api`, each in one READ COMMITTED transaction:
-  1. Account-administrator changes and user disable or enable first lock
-     `account_admin_lock`, matching `docs/operator/grant-account-admin.psql`.
-  2. The actor's user row is locked `FOR SHARE`, so a disable in flight (including
-     `sessions::disable_user`, which locks only that row) is waited for and seen, and a later
-     disable waits for the write. A user disable or enable of the actor itself takes the
-     `FOR UPDATE` it needs here instead, so it never upgrades while another write by the same
-     actor waits on its audit key. The actor is then re-hydrated inside the transaction and
-     must pass `require` and `authorize_admin`.
+- **Writes** run only as `openmettle_api`, each in one READ COMMITTED transaction following the
+  [canonical lock order and serialization rules](#canonical-lock-order-and-serialization-for-administrative-writes):
+  1. Every administrative write locks `account_admin_lock FOR UPDATE`, then the actor's
+     `login_providers` and `local_identity_approvals` rows `FOR SHARE`, then the actor's `users`
+     row `FOR SHARE` (or `FOR UPDATE` on a self-disable or self-enable so it never upgrades).
+  2. The primary's `clock_timestamp()` is re-read after the locks, and the actor is re-hydrated
+     at the post-lock instant and must pass `require` and `authorize_admin`.
   3. The `authorization_audit` row is inserted next with `ON CONFLICT DO NOTHING` on
      `(actor_user_id, request_key)`. A recorded key with the same action, target and details
      returns `Replayed` without writing. A different change returns `Conflict`.
-  4. The target is checked and the change applied. Removing an enabled administrator is
-     re-decided with the enabled count taken under the lock (`LastAccountAdmin`).
+  4. The target is checked and the change applied (re-deciding last-admin removal under
+     `account_admin_lock`), and approval expiry is re-checked against `clock_timestamp()` after
+     any target lock wait before committing.
 - A change that would not alter the current state returns `Conflict` and writes no audit
   row. Rows are never deleted. Every update advances `revision` and records
   `updated_at = clock_timestamp()` and the actor. Disabling a user also advances

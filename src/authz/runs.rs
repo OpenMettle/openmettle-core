@@ -891,6 +891,7 @@ pub struct RunReplay {
     pub run_id: String,
     pub state: String,
     pub round_limit: Option<i32>,
+    pub actor_approval_id: Option<String>,
     pub conversation_id: String,
     pub branch_id: String,
     /// Reuse it on retry: the input message is part of the run identity (ADR 0004).
@@ -944,8 +945,8 @@ async fn lookup(
     idempotency_key: &str,
 ) -> Result<Option<RunReplay>, StoreError> {
     let row = sqlx::query(
-        "SELECT id::text, state, round_limit, conversation_id::text, branch_id::text,
-                input_message_id::text, request_identity, request_digest,
+        "SELECT id::text, state, round_limit, actor_approval_id::text, conversation_id::text,
+                branch_id::text, input_message_id::text, request_identity, request_digest,
                 snapshot_format, snapshot_version, input_snapshot, config_snapshot
            FROM openmettle.runs
           WHERE scope_id = $1::uuid AND actor_user_id = $2::uuid AND idempotency_key = $3",
@@ -960,6 +961,7 @@ async fn lookup(
             run_id: row.try_get("id")?,
             state: row.try_get("state")?,
             round_limit: row.try_get("round_limit")?,
+            actor_approval_id: row.try_get("actor_approval_id")?,
             conversation_id: row.try_get("conversation_id")?,
             branch_id: row.try_get("branch_id")?,
             input_message_id: row.try_get("input_message_id")?,
@@ -990,13 +992,15 @@ const LIVE_COUNTS: &str = concat!(
     " AND state = 'queued' LIMIT $5) q)"
 );
 
-const LOCK_USER: &str = "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE";
-
-/// Scope and actor locks shared with graph writers. Acquire these before a run or branch head.
+/// Scope and actor locks shared with graph writers in canonical order:
+/// `[account_admin_lock FOR SHARE] -> [projects] -> login_providers ->
+/// local_identity_approvals -> users` (ascending `id`).
+/// Acquire these before a run or branch head.
 pub(crate) async fn lock_scope_actor(
     c: &mut PgConnection,
     scope: &str,
     actor: &str,
+    approval: &str,
 ) -> Result<(Option<String>, Option<String>), StoreError> {
     let (personal_owner, project_id): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
@@ -1006,85 +1010,65 @@ pub(crate) async fn lock_scope_actor(
     .fetch_optional(&mut *c)
     .await?
     .unwrap_or_default();
-    // Steps 1 and 2: the scope row, then the actor's row. In a personal scope the owner is the
-    // only actor `RunExecute` admits, so the first lock covers both.
-    if let Some(owner) = &personal_owner {
-        sqlx::query(LOCK_USER).bind(owner).execute(&mut *c).await?;
-    } else if let Some(project) = &project_id {
+    // On the two-user personal path (e.g. a collaborator creating a branch on another user's
+    // personal conversation), acquire account_admin_lock FOR SHARE before touching users so an
+    // N-1 schema-37 API running unordered disable_user(owner, collaborator) during a rolling
+    // upgrade serializes on account_admin_lock instead of deadlocking on users.
+    if personal_owner
+        .as_deref()
+        .is_some_and(|owner| owner != actor)
+    {
+        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR SHARE")
+            .fetch_one(&mut *c)
+            .await?;
+    }
+    if let Some(project) = &project_id {
         sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
             .bind(project)
             .execute(&mut *c)
             .await?;
-        sqlx::query(LOCK_USER).bind(actor).execute(&mut *c).await?;
+    }
+    store::lock_actor_approval(c, approval).await?;
+    // Lock `users` in canonical ascending UUID order (`ORDER BY id`) so personal scope writes by a
+    // collaborator (`branches::create_branch`) serialize with both owner unshares and collaborator
+    // disablement without forming a two-user wait cycle. When `owner == actor` the row is locked
+    // once `FOR NO KEY UPDATE`.
+    match (&personal_owner, &project_id) {
+        (Some(owner), _) => {
+            store::lock_users_ordered(
+                c,
+                (owner, store::UserLock::NoKeyUpdate),
+                Some((actor, store::UserLock::Share)),
+            )
+            .await?;
+        }
+        (_, Some(_)) => {
+            store::lock_users_ordered(c, (actor, store::UserLock::NoKeyUpdate), None).await?;
+        }
+        (None, None) => {
+            store::lock_users_ordered(c, (actor, store::UserLock::Share), None).await?;
+        }
     }
     Ok((personal_owner, project_id))
 }
 
-/// Admit one run in the caller's READ COMMITTED transaction (ADR 0032): lock the scope and the
-/// actor, authorize, replay, check the lifecycle and the limits, then insert the `queued` run
-/// with its approval, effective round limit and queue deadline, and its `run-created` event.
-///
-/// A missing scope, a deleted or invisible project or conversation is `Denied(NotFound)`; an
-/// inactive actor, a missing role or capability is `Denied`; another request under a recorded
-/// key is `Conflict(KEY_REUSED)`; an archived project is `Conflict(ARCHIVED)`. Sets
-/// `lock_timeout` and `statement_timeout` for the rest of the caller's transaction.
-pub async fn admit_run(
-    tx: &mut WriteTransaction<'_>,
+/// Evaluate the full live admission authorization predicate (session if present, primary clock,
+/// active principal, OIDC/local groups, project role, conversation share, and platform/user
+/// capabilities) under the already-held scope/actor locks. Used both before and immediately after
+/// every blocking write (run insert, quota reservation, or replay hold backfill).
+pub(crate) async fn verify_admission_authority(
+    c: &mut PgConnection,
     request: &RunAdmission<'_>,
-    limits: &AdmissionLimits,
-) -> Result<Admission, StoreError> {
-    admit(tx, request, limits, None).await
-}
-
-/// Capture ADR 0035 evidence under the admission locks. The mode comes from the immutable
-/// configuration snapshot. The caller supplies the locator from its authenticated session.
-pub async fn admit_run_with_mode(
-    tx: &mut WriteTransaction<'_>,
-    request: &RunAdmission<'_>,
-    limits: &AdmissionLimits,
-    session: &super::approvals::EffectSession,
-) -> Result<Admission, StoreError> {
-    if request.input.actor != session.context().user_id()
-        || request.actor_approval_id != session.context().approval_id()
-    {
-        return Err(StoreError::Denied(DenialReason::NotFound));
-    }
-    admit(tx, request, limits, Some(session.locator())).await
-}
-
-async fn admit(
-    tx: &mut WriteTransaction<'_>,
-    request: &RunAdmission<'_>,
-    limits: &AdmissionLimits,
+    personal_owner: Option<&str>,
+    project_id: Option<&str>,
     session: Option<&str>,
-) -> Result<Admission, StoreError> {
-    limits.validate()?;
-    request.validate()?;
-    // Validate requested_rounds before any database work; final capping uses effective round_cap.
-    let _ = effective_round_limit(request.requested_rounds, limits.round_cap)?;
+    min_now_ms: i64,
+) -> Result<(Principal, PlatformPolicy, bool, i64), StoreError> {
     let r = &request.input;
-    let c = tx.connection()?;
-    // Exact limits rely on each statement after a lock seeing every earlier commit.
-    let (_, _, isolation): (String, String, String) = sqlx::query_as(
-        "SELECT set_config('lock_timeout', '2s', true), set_config('statement_timeout', '3s', true),
-                current_setting('transaction_isolation')",
-    )
-    .fetch_one(&mut *c)
-    .await?;
-    if isolation != "read committed" {
-        return Err(StoreError::InvalidInput("transaction isolation"));
-    }
-    let (personal_owner, project_id) = lock_scope_actor(c, r.scope, r.actor).await?;
-    let scope_kind = if personal_owner.is_some() {
-        "personal"
-    } else {
-        "project"
-    };
     let now = match session {
-        Some(locator) => super::approvals::admission_time(c, request, locator).await?,
-        None => request.now_ms,
+        Some(locator) => super::approvals::admission_time(c, request, locator, min_now_ms).await?,
+        None => store::post_lock_clock_ms(c, min_now_ms).await?,
     };
-    // Step 3: authorize after the locks with the recheck's decision.
     let principal =
         store::hydrate_api_principal(c, r.actor, request.actor_approval_id, now).await?;
     let platform = store::load_platform_capabilities(c).await?;
@@ -1092,13 +1076,13 @@ async fn admit(
         (Some(owner_user_id), _) => (
             Some(Scope::Personal {
                 scope_id: r.scope.to_owned(),
-                owner_user_id,
+                owner_user_id: owner_user_id.to_owned(),
             }),
             false,
         ),
-        (None, Some(project)) => match projects::load_project_settings(c, &project).await? {
+        (None, Some(project)) => match projects::load_project_settings(c, project).await? {
             Some(settings) if !settings.deleted => (
-                projects::hydrate_project(c, &project, now)
+                projects::hydrate_project(c, project, now)
                     .await?
                     .map(Scope::Project),
                 settings.archived,
@@ -1125,19 +1109,107 @@ async fn admit(
     if let RunContinuation::Invalidate(reason) = decision {
         return Err(StoreError::Denied(reason));
     }
+    let principal = principal.ok_or(StoreError::NotFound)?;
+    Ok((principal, platform, archived, now))
+}
+
+/// Admit one run in the caller's READ COMMITTED transaction (ADR 0032): lock the scope and the
+/// actor, authorize, replay, check the lifecycle and the limits, then insert the `queued` run
+/// with its approval, effective round limit and queue deadline, and its `run-created` event.
+///
+/// A missing scope, a deleted or invisible project or conversation is `Denied(NotFound)`; an
+/// inactive actor, a missing role or capability is `Denied`; another request under a recorded
+/// key is `Conflict(KEY_REUSED)`; an archived project is `Conflict(ARCHIVED)`. Sets
+/// `lock_timeout` and `statement_timeout` for the rest of the caller's transaction.
+pub async fn admit_run(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+) -> Result<Admission, StoreError> {
+    admit(tx, request, limits, None)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// Capture ADR 0035 evidence under the admission locks. The mode comes from the immutable
+/// configuration snapshot. The caller supplies the locator from its authenticated session.
+pub async fn admit_run_with_mode(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: &super::approvals::EffectSession,
+) -> Result<Admission, StoreError> {
+    admit_run_with_mode_at(tx, request, limits, session)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// Like [`admit_run_with_mode`], also returning the latest verified primary-clock millisecond
+/// timestamp observed during admission (including the post-insert authority recheck) so downstream
+/// reservation, backfill, attachment, family-policy, and response checks preserve a monotonic
+/// decision floor even if the database clock steps backward.
+pub async fn admit_run_with_mode_at(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: &super::approvals::EffectSession,
+) -> Result<(Admission, i64), StoreError> {
+    if request.input.actor != session.context().user_id()
+        || request.actor_approval_id != session.context().approval_id()
+    {
+        return Err(StoreError::Denied(DenialReason::NotFound));
+    }
+    admit(tx, request, limits, Some(session.locator())).await
+}
+
+async fn admit(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: Option<&str>,
+) -> Result<(Admission, i64), StoreError> {
+    limits.validate()?;
+    request.validate()?;
+    // Validate requested_rounds before any database work; final capping uses effective round_cap.
+    let _ = effective_round_limit(request.requested_rounds, limits.round_cap)?;
+    let r = &request.input;
+    let c = tx.connection()?;
+    // Exact limits rely on each statement after a lock seeing every earlier commit.
+    let (_, _, isolation): (String, String, String) = sqlx::query_as(
+        "SELECT set_config('lock_timeout', '2s', true), set_config('statement_timeout', '3s', true),
+                current_setting('transaction_isolation')",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if isolation != "read committed" {
+        return Err(StoreError::InvalidInput("transaction isolation"));
+    }
+    let (personal_owner, project_id) =
+        lock_scope_actor(c, r.scope, r.actor, request.actor_approval_id).await?;
+    let scope_kind = if personal_owner.is_some() {
+        "personal"
+    } else {
+        "project"
+    };
+    // Step 3: authorize after the locks with the recheck's decision at post-lock time.
+    let (principal, platform, archived, now) = verify_admission_authority(
+        c,
+        request,
+        personal_owner.as_deref(),
+        project_id.as_deref(),
+        session,
+        request.now_ms,
+    )
+    .await?;
     // Step 4: an exact replay is returned whatever the lifecycle or the current limits.
     if let Some(replay) = lookup(c, r.scope, r.actor, r.key).await? {
-        return replayed(replay, r);
+        return replayed(replay, r).map(|outcome| (outcome, now));
     }
     // Steps 5 and 6.
     if archived {
         return Err(projects::ARCHIVED);
     }
-    let actor_scope_id = principal
-        .as_ref()
-        .ok_or(StoreError::NotFound)?
-        .personal_scope_id
-        .clone();
+    let actor_scope_id = principal.personal_scope_id.clone();
     let quota_schema = has_quota_schema(c).await?;
     let (eff_live_actor, eff_live_scope, eff_round_cap): (i64, i64, i64) = if quota_schema {
         sqlx::query_as(
@@ -1202,7 +1274,7 @@ async fn admit(
         ),
     ] {
         if count >= limit {
-            return Ok(Admission::Refused(refusal));
+            return Ok((Admission::Refused(refusal), now));
         }
     }
     if quota_schema
@@ -1215,20 +1287,16 @@ async fn admit(
         )
         .await?
     {
-        return Ok(Admission::Refused(refusal));
+        return Ok((Admission::Refused(refusal), now));
     }
-    let effect = match session {
-        Some(session) => Some(
-            super::approvals::admission(
-                c,
-                request,
-                session,
-                principal.as_ref().ok_or(StoreError::NotFound)?,
-                &platform,
-            )
-            .await?,
-        ),
-        None => None,
+    let (effect, pre_insert_now) = match session {
+        Some(session) => {
+            let (eff, snap_now) =
+                super::approvals::admission(c, request, session, &principal, &platform, now)
+                    .await?;
+            (Some(eff), now.max(snap_now))
+        }
+        None => (None, now),
     };
     // Step 7: the new row is the reservation of the run slot.
     let columns = AdmissionColumns {
@@ -1243,15 +1311,29 @@ async fn admit(
             Err(durable::Error::Conflict) => return Err(StoreError::Conflict(KEY_REUSED)),
             Err(error) => return Err(error.into()),
         };
+    let c = tx.connection()?;
+    let (_, _, _, post_insert_now) = verify_admission_authority(
+        c,
+        request,
+        personal_owner.as_deref(),
+        project_id.as_deref(),
+        session,
+        pre_insert_now,
+    )
+    .await?;
     if !inserted {
         // Only a writer outside these locks (bare `create_run`) can have recorded the key.
-        let replay = lookup(tx.connection()?, r.scope, r.actor, r.key).await?;
-        return replayed(replay.ok_or(StoreError::NotFound)?, r);
+        let replay = lookup(c, r.scope, r.actor, r.key).await?;
+        return replayed(replay.ok_or(StoreError::NotFound)?, r)
+            .map(|outcome| (outcome, post_insert_now));
     }
-    Ok(Admission::Admitted {
-        run_id,
-        round_limit,
-    })
+    Ok((
+        Admission::Admitted {
+            run_id,
+            round_limit,
+        },
+        post_insert_now,
+    ))
 }
 
 fn replayed(replay: RunReplay, input: &RunInput<'_>) -> Result<Admission, StoreError> {
@@ -2281,6 +2363,7 @@ mod tests {
             run_id: ID.into(),
             state: "queued".into(),
             round_limit: Some(5),
+            actor_approval_id: Some(ID.into()),
             conversation_id: ID.into(),
             branch_id: ID.into(),
             input_message_id: ID.into(),

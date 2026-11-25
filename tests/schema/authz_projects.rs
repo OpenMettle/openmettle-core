@@ -1816,3 +1816,976 @@ async fn create_in_scope_needs_an_editor_and_a_live_project() {
         );
     }
 }
+
+/// Issue #160: project, share and conversation writes follow the canonical
+/// `projects -> login_providers -> local_identity_approvals -> users` order and re-read
+/// `clock_timestamp()` after waiting on locks.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn project_share_and_conversation_writes_serialize_with_revocation_and_expiry() {
+    use openmettle_core::{authz::branches, runs::WriteTransaction};
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let p = create(&db, &alice, "proj").await;
+    let scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&p)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let alice_personal: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.scopes WHERE personal_user_id = $1::uuid AND kind = 'personal'",
+    )
+    .bind(&alice.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let chat = conversation(&mut owner, &alice_personal, "personal", &alice.user)
+        .await
+        .unwrap();
+
+    // 1. Approval withdrawal in flight blocks project role change, personal share and
+    //    conversation creation, and rejects each with InactivePrincipal after commit.
+    for op in [
+        "project.member_grant",
+        "resource.share",
+        "conversation.create",
+    ] {
+        let audited = audit(&db).await.len();
+        let mut withdrawer = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut withdrawer).await;
+        let mut tx = WriteTransaction::begin(&mut withdrawer).await.unwrap();
+        sqlx::query(
+            "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+        )
+        .bind(&alice.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals
+                SET active = false, revision = revision + 1,
+                    access_generation = access_generation + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&alice.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+
+        let writer = tokio::spawn({
+            let (db_name, alice, bob, p, scope, chat) = (
+                db.0.clone(),
+                alice.clone(),
+                bob.clone(),
+                p.clone(),
+                scope.clone(),
+                chat.clone(),
+            );
+            async move {
+                let mut c = connect(&db_name, API).await;
+                let audit_ctx = ctx(&alice, op);
+                match op {
+                    "project.member_grant" => projects::set_project_member_role(
+                        &mut c,
+                        &audit_ctx,
+                        &p,
+                        &user(&bob),
+                        ProjectRole::Editor,
+                    )
+                    .await
+                    .map(drop),
+                    "resource.share" => projects::share_resource(
+                        &mut c,
+                        &audit_ctx,
+                        CONVERSATION,
+                        &chat,
+                        &user(&bob),
+                        ResourceAccess::Read,
+                    )
+                    .await
+                    .map(drop),
+                    _ => branches::create_conversation(&mut c, &audit_ctx, &scope)
+                        .await
+                        .map(drop),
+                }
+            }
+        });
+        wait_for_blocked_peer(&db, holder_pid).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            denied(writer.await.unwrap()),
+            DenialReason::InactivePrincipal,
+            "{op}"
+        );
+        assert_eq!(audit(&db).await.len(), audited, "{op}");
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals
+                SET active = true, revision = revision + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&alice.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    // 2. Approval expiring while waiting on the project row lock is rejected with InactivePrincipal.
+    //    Complete all fixture setup, connection warming, and holder lock acquisition before arming
+    //    the short DB-clock TTL so setup latency cannot consume the window.
+    let expiring = account(&mut owner, PROVIDER, true, FUTURE).await;
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-expiring-owner",
+            &p,
+            &user(&expiring),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&p)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
+    )
+    .bind(expires_ms)
+    .bind(&expiring.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let writer = tokio::spawn({
+        let (expiring, bob, p) = (expiring.clone(), bob.clone(), p.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &expiring.user,
+                actor_approval_id: &expiring.approval,
+                now_ms: db_now_ms,
+                request_key: "proj-expiring",
+                reason: "approval expires waiting on project lock",
+            };
+            projects::set_project_member_role(
+                &mut writer_conn,
+                &audit_ctx,
+                &p,
+                &user(&bob),
+                ProjectRole::Editor,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+    assert_eq!(role_of(&db, &bob, &p).await, None);
+
+    // 3. Collaborator branch write on a shared personal conversation locks both owner and
+    //    collaborator in ascending users.id order, so an in-flight disable of the collaborator
+    //    blocks create_branch and rejects it with InactivePrincipal after commit.
+    applied(
+        projects::share_resource(
+            &mut api(&db).await,
+            &ctx(&alice, "share-personal-write-bob"),
+            CONVERSATION,
+            &chat,
+            &user(&bob),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let audited = audit(&db).await.len();
+    let mut disabler = connect(&db.0, OWNER).await;
+    let disable_pid = backend_pid(&mut disabler).await;
+    let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.users
+            SET disabled_at = clock_timestamp(), session_generation = session_generation + 1
+          WHERE id = $1::uuid",
+    )
+    .bind(&bob.user)
+    .execute(tx.connection().unwrap())
+    .await
+    .unwrap();
+    let writer = tokio::spawn({
+        let (db_name, bob, alice_personal, chat) = (
+            db.0.clone(),
+            bob.clone(),
+            alice_personal.clone(),
+            chat.clone(),
+        );
+        async move {
+            let mut c = connect(&db_name, API).await;
+            let audit_ctx = ctx(&bob, "collab-branch-create");
+            branches::create_branch(
+                &mut c,
+                &audit_ctx,
+                branches::Conversation {
+                    scope: &alice_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, disable_pid).await;
+    tx.commit().await.unwrap();
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+}
+
+/// Issue #160 (P1 #1): `project_write` re-evaluates the full live authorization predicate at
+/// post-write `clock_timestamp()`, rejecting and rolling back when an OIDC group
+/// `membership_observations` row supplying `Owner` expires while `apply` waits on a target lock
+/// even though `local_identity_approvals` remains valid far in the future.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn project_write_rejects_oidc_membership_expired_during_target_lock_wait() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    // Long-lived approval (year 2100); only the OIDC membership observation has a short TTL.
+    let oidc_actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let mut owner = present_membership(&db, &oidc_actor).await;
+    let p = create(&db, &alice, "proj-oidc-owner").await;
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-oidc-owner",
+            &p,
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+
+    // Complete all fixture setup, connection warming, and holder lock acquisition before arming
+    // the short DB-clock TTL on the OIDC observation.
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+
+    // Hold ONLY project_settings (not projects), so project_write passes its initial authorize()
+    // check while the OIDC Owner observation is still live and blocks inside apply().
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.project_settings WHERE project_id = $1::uuid FOR UPDATE")
+        .bind(&p)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&oidc_actor.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let writer = tokio::spawn({
+        let (oidc_actor, p) = (oidc_actor.clone(), p.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &oidc_actor.user,
+                actor_approval_id: &oidc_actor.approval,
+                now_ms: db_now_ms,
+                request_key: "oidc-expiring-settings",
+                reason: "oidc owner expires during settings lock wait",
+            };
+            let empty = json!({});
+            let updated = ProjectSettingsInput {
+                name: "Should Roll Back",
+                instructions: "expired oidc owner",
+                defaults: &empty,
+            };
+            projects::update_project_settings(&mut writer_conn, &audit_ctx, &p, &updated).await
+        }
+    });
+
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+
+    assert_eq!(denied(writer.await.unwrap()), DenialReason::NotFound);
+    assert_eq!(
+        projects::load_project_settings(&mut api(&db).await, &p)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "P"
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+}
+
+/// Issue #160 (P2 #1 & P2 #2):
+/// 1. `store::disable_user` takes `FOR NO KEY UPDATE` (not `FOR UPDATE`) on `openmettle.users`,
+///    so a personal `share_change` holding `owner` `FOR NO KEY UPDATE` can insert a
+///    `grant_assignments` row referencing `recipient` (`FOR KEY SHARE`) even when
+///    `recipient.user < owner.user` and `disable_user(owner, recipient)` holds `recipient`.
+/// 2. Two-user personal `branches::create_branch` (`collaborator != owner`) takes
+///    `account_admin_lock FOR SHARE` before `users`, so neither an `N-1` (schema-37) unordered
+///    `disable_user(owner, collaborator)` nor a schema-38 `store::disable_user` deadlocks when
+///    `collaborator.user < owner.user`.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn personal_share_and_two_user_branch_do_not_deadlock_with_disable_user() {
+    use openmettle_core::authz::branches;
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let backup_admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &backup_admin).await;
+    let u1 = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let u2 = account(&mut owner, PROVIDER, true, FUTURE).await;
+    // Order so `low.user < high.user` (the exact direction that triggers AB/BA cycles).
+    let (low, high) = if u1.user < u2.user {
+        (u1, u2)
+    } else {
+        (u2, u1)
+    };
+    make_admin(&mut owner, &high).await;
+
+    let high_personal: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.scopes
+          WHERE personal_user_id = $1::uuid AND kind = 'personal'",
+    )
+    .bind(&high.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let chat = conversation(&mut owner, &high_personal, "personal", &high.user)
+        .await
+        .unwrap();
+
+    // 1. P2 #1: personal share_change holds users(high) FOR NO KEY UPDATE while
+    //    store::disable_user(admin=high, target=low) locks users(low) FOR NO KEY UPDATE first
+    //    (low < high) and waits on users(high) FOR SHARE. Inserting grant_assignments with
+    //    grantee_user_id = low (FOR KEY SHARE on users(low)) must succeed without deadlock.
+    let mut sharer = connect(&db.0, OWNER).await;
+    let sharer_pid = backend_pid(&mut sharer).await;
+    sharer.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&high.user)
+        .execute(&mut sharer)
+        .await
+        .unwrap();
+
+    let mut dis_conn = connect(&db.0, API).await;
+    let disabler = tokio::spawn({
+        let (high, low) = (high.clone(), low.clone());
+        async move { store::disable_user(&mut dis_conn, &ctx(&high, "dis-low-1"), &low.user).await }
+    });
+    wait_for_blocked_peer(&db, sharer_pid).await;
+
+    sqlx::query(
+        "INSERT INTO openmettle.grant_assignments
+             (scope_id, target_kind, conversation_id, grantee_kind, grantee_user_id,
+              assignment_format, assignment_version, assignment_key, source_kind, created_by_user_id)
+         VALUES ($1::uuid, 'conversation', $2::uuid, 'user', $3::uuid,
+                 'openmettle.resource-access', 1, 'read', 'direct', $4::uuid)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&high_personal)
+    .bind(&chat)
+    .bind(&low.user)
+    .bind(&high.user)
+    .execute(&mut sharer)
+    .await
+    .expect("FOR NO KEY UPDATE on users(low) must admit grant_assignments FOR KEY SHARE");
+    sharer.execute("COMMIT").await.unwrap();
+    applied(disabler.await.unwrap());
+
+    // Re-enable `low` and grant Write share on `high`'s personal conversation.
+    applied(store::enable_user(&mut api(&db).await, &ctx(&high, "en-low"), &low.user).await);
+    applied(
+        projects::share_resource(
+            &mut api(&db).await,
+            &ctx(&high, "share-write-low"),
+            CONVERSATION,
+            &chat,
+            &user(&low),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+
+    // 2a. P2 #2: N-1 (schema-37) unordered disable_user(admin=high, target=low) holds
+    //     account_admin_lock FOR UPDATE -> users(high) FOR SHARE before locking users(low).
+    //     Collaborator create_branch (low < high) must block on account_admin_lock FOR SHARE
+    //     before touching users(low), so N-1's users(low) FOR UPDATE NOWAIT succeeds cleanly.
+    let mut n1_disabler = connect(&db.0, OWNER).await;
+    let n1_pid = backend_pid(&mut n1_disabler).await;
+    n1_disabler.execute("BEGIN").await.unwrap();
+    n1_disabler
+        .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        .await
+        .unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+        .bind(&high.user)
+        .execute(&mut n1_disabler)
+        .await
+        .unwrap();
+
+    let mut branch_conn = connect(&db.0, API).await;
+    let branch_writer = tokio::spawn({
+        let (low, high_personal, chat) = (low.clone(), high_personal.clone(), chat.clone());
+        async move {
+            branches::create_branch(
+                &mut branch_conn,
+                &ctx(&low, "collab-branch-n1"),
+                branches::Conversation {
+                    scope: &high_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, n1_pid).await;
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE NOWAIT")
+        .bind(&low.user)
+        .execute(&mut n1_disabler)
+        .await
+        .expect("two-user personal create_branch must block on account_admin_lock before locking users(low)");
+    sqlx::query(
+        "UPDATE openmettle.users
+            SET disabled_at = clock_timestamp(), session_generation = session_generation + 1
+          WHERE id = $1::uuid",
+    )
+    .bind(&low.user)
+    .execute(&mut n1_disabler)
+    .await
+    .unwrap();
+    n1_disabler.execute("COMMIT").await.unwrap();
+    assert_eq!(
+        denied(branch_writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+
+    // 2b. Schema-38 (N) store::disable_user(admin=high, target=low) also serializes cleanly with
+    //     collaborator create_branch when low < high.
+    applied(store::enable_user(&mut api(&db).await, &ctx(&high, "en-low-2"), &low.user).await);
+    let mut gate = connect(&db.0, OWNER).await;
+    let gate_pid = backend_pid(&mut gate).await;
+    gate.execute("BEGIN").await.unwrap();
+    gate.execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        .await
+        .unwrap();
+    let mut dis_conn_2 = connect(&db.0, API).await;
+    let dis_n = tokio::spawn({
+        let (high, low) = (high.clone(), low.clone());
+        async move { store::disable_user(&mut dis_conn_2, &ctx(&high, "dis-low-2"), &low.user).await }
+    });
+    let mut branch_conn_2 = connect(&db.0, API).await;
+    let br_n = tokio::spawn({
+        let (low, high_personal, chat) = (low.clone(), high_personal.clone(), chat.clone());
+        async move {
+            branches::create_branch(
+                &mut branch_conn_2,
+                &ctx(&low, "collab-branch-n"),
+                branches::Conversation {
+                    scope: &high_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, gate_pid).await;
+    gate.execute("ROLLBACK").await.unwrap();
+    applied(dis_n.await.unwrap());
+    // Whichever won account_admin_lock first, neither may deadlock (40P01).
+    match br_n.await.unwrap() {
+        Ok(WriteOutcome::Applied { .. })
+        | Err(StoreError::Denied(DenialReason::InactivePrincipal)) => {}
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+/// Issue #160 (Review #2 P1 #1):
+/// 1. An actor whose project `Owner` role comes from an expiring OIDC group cannot self-authorize
+///    by granting `Owner` to a local group the actor belongs to while the OIDC observation expires
+///    during the `local_groups` lock wait.
+/// 2. A still-authorized actor whose `Owner` role comes from a local group CAN demote or revoke
+///    that local group when another active direct user `Owner` remains.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn project_member_group_role_changes_recheck_without_self_authorization() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &alice).await;
+    let oidc_actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let mut owner = present_membership(&db, &oidc_actor).await;
+    let p = create(&db, &alice, "proj-group-recheck").await;
+
+    let g = applied(
+        store::create_local_group(&mut api(&db).await, &ctx(&alice, "grp-create"), "Owners").await,
+    );
+    applied(
+        store::add_local_group_member(
+            &mut api(&db).await,
+            &ctx(&alice, "grp-add-oidc"),
+            &g,
+            &oidc_actor.user,
+        )
+        .await,
+    );
+    applied(
+        store::add_local_group_member(
+            &mut api(&db).await,
+            &ctx(&alice, "grp-add-bob"),
+            &g,
+            &bob.user,
+        )
+        .await,
+    );
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-oidc-owner-p1",
+            &p,
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+
+    // 1. Hold local_groups(g) FOR UPDATE so set_project_member_role(LocalGroup(g), Owner) passes
+    //    pre-write authorize() while OIDC_TEAM is live, then stalls inside apply() ->
+    //    recipient_enabled() past OIDC observation expiry. The newly inserted LocalGroup(g) Owner
+    //    grant must NOT self-authorize the post-write recheck.
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.local_groups WHERE id = $1::uuid FOR UPDATE")
+        .bind(&g)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&oidc_actor.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let writer = tokio::spawn({
+        let (oidc_actor, p, g) = (oidc_actor.clone(), p.clone(), g.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &oidc_actor.user,
+                actor_approval_id: &oidc_actor.approval,
+                now_ms: db_now_ms,
+                request_key: "oidc-self-auth-local-group",
+                reason: "must not self-authorize via local group grant",
+            };
+            projects::set_project_member_role(
+                &mut writer_conn,
+                &audit_ctx,
+                &p,
+                &Grantee::LocalGroup(g),
+                ProjectRole::Owner,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+
+    assert_eq!(denied(writer.await.unwrap()), DenialReason::NotFound);
+    assert_eq!(role_of(&db, &bob, &p).await, None);
+    assert_eq!(audit(&db).await.len(), audited);
+
+    // 2. A valid group-backed Owner (bob via LocalGroup(g)) CAN demote and revoke LocalGroup(g)
+    //    because alice remains an active direct user Owner.
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-local-group-owner",
+            &p,
+            &Grantee::LocalGroup(g.clone()),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+    assert_eq!(role_of(&db, &bob, &p).await, Some(ProjectRole::Owner));
+    applied(
+        set_role(
+            &db,
+            &bob,
+            "bob-demote-own-group",
+            &p,
+            &Grantee::LocalGroup(g.clone()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    assert_eq!(role_of(&db, &bob, &p).await, Some(ProjectRole::Editor));
+
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "regrant-local-group-owner",
+            &p,
+            &Grantee::LocalGroup(g.clone()),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+    applied(
+        revoke(
+            &db,
+            &bob,
+            "bob-revoke-own-group",
+            &p,
+            &Grantee::LocalGroup(g.clone()),
+        )
+        .await,
+    );
+    assert_eq!(role_of(&db, &bob, &p).await, None);
+}
+
+/// Issue #160 (Review #2 P1 #2): a direct project `Owner` whose visibility of another member's
+/// item comes solely from an OIDC-group share cannot self-authorize a new `Grantee::Project` share
+/// when that OIDC observation expires while `set_direct` waits on a lock.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn share_resource_rejects_self_visibility_when_oidc_share_expires_during_write() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let mut owner = present_membership(&db, &alice).await;
+    let p = create(&db, &alice, "proj-share-self-vis").await;
+    let scope = scope_of(&db, &p).await;
+    applied(set_role(&db, &alice, "bob-ed", &p, &user(&bob), ProjectRole::Editor).await);
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "oidc-viewer",
+            &p,
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ProjectRole::Viewer,
+        )
+        .await,
+    );
+    // bob owns `conv`; alice can see `conv` ONLY through the OIDC_TEAM share.
+    let conv = chat(&db, &scope, "project", &bob).await;
+    applied(
+        share(
+            &db,
+            &bob,
+            "share-conv-oidc",
+            (CONVERSATION, &conv),
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    // Materialize a revoked Grantee::Project assignment row so `holder` can deterministically
+    // stall `share_resource(..., Grantee::Project, Read)` inside `set_direct`.
+    applied(
+        share(
+            &db,
+            &bob,
+            "seed-proj-share",
+            (CONVERSATION, &conv),
+            &Grantee::Project,
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    applied(
+        unshare(
+            &db,
+            &bob,
+            "seed-proj-unshare",
+            (CONVERSATION, &conv),
+            &Grantee::Project,
+        )
+        .await,
+    );
+
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.grant_assignments
+          WHERE scope_id = $1::uuid AND conversation_id = $2::uuid
+            AND grantee_kind = 'project' AND assignment_key = 'read'
+            FOR UPDATE",
+    )
+    .bind(&scope)
+    .bind(&conv)
+    .fetch_one(&mut holder)
+    .await
+    .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&alice.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let writer = tokio::spawn({
+        let (alice, conv) = (alice.clone(), conv.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                now_ms: db_now_ms,
+                request_key: "alice-self-visible-project-share",
+                reason: "must not self-authorize visibility via new project share",
+            };
+            projects::share_resource(
+                &mut writer_conn,
+                &audit_ctx,
+                CONVERSATION,
+                &conv,
+                &Grantee::Project,
+                ResourceAccess::Read,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+
+    assert_eq!(denied(writer.await.unwrap()), DenialReason::NotFound);
+    assert_eq!(audit(&db).await.len(), audited);
+    // Neither alice (after OIDC expiry) nor any other project member has the rolled-back share.
+    let project_share_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT FROM openmettle.grant_assignments a
+               JOIN openmettle.grant_changes h
+                 ON h.assignment_id = a.id AND h.revision = a.last_revision
+              WHERE a.scope_id = $1::uuid AND a.conversation_id = $2::uuid
+                AND a.grantee_kind = 'project' AND h.decision = 'grant'
+         )",
+    )
+    .bind(&scope)
+    .bind(&conv)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(!project_share_active);
+}
+
+/// Issue #160 (Review #2 P1 #3): `share_resource` re-hydrates the recipient and re-checks full
+/// `authorize_share` at post-write `clock_timestamp()`, rejecting and rolling back when the
+/// recipient's OIDC-backed project membership expires while `set_direct` waits on a lock.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn share_resource_rejects_recipient_whose_oidc_membership_expires_during_write() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let oidc_recipient = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let mut owner = present_membership(&db, &oidc_recipient).await;
+    let p = create(&db, &alice, "proj-share-recip-exp").await;
+    let scope = scope_of(&db, &p).await;
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "oidc-member-role",
+            &p,
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    let conv = chat(&db, &scope, "project", &alice).await;
+    // Materialize a revoked user share assignment row so `holder` stalls `set_direct` after
+    // pre-write recipient_principal() + authorize_share() pass.
+    applied(
+        share(
+            &db,
+            &alice,
+            "seed-recip-share",
+            (CONVERSATION, &conv),
+            &user(&oidc_recipient),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    applied(
+        unshare(
+            &db,
+            &alice,
+            "seed-recip-unshare",
+            (CONVERSATION, &conv),
+            &user(&oidc_recipient),
+        )
+        .await,
+    );
+
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.grant_assignments
+          WHERE scope_id = $1::uuid AND conversation_id = $2::uuid
+            AND grantee_user_id = $3::uuid AND assignment_key = 'read'
+            FOR UPDATE",
+    )
+    .bind(&scope)
+    .bind(&conv)
+    .bind(&oidc_recipient.user)
+    .fetch_one(&mut holder)
+    .await
+    .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&oidc_recipient.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let writer = tokio::spawn({
+        let (alice, oidc_recipient, conv) = (alice.clone(), oidc_recipient.clone(), conv.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                now_ms: db_now_ms,
+                request_key: "share-to-expiring-oidc-member",
+                reason: "recipient OIDC membership expires during write",
+            };
+            projects::share_resource(
+                &mut writer_conn,
+                &audit_ctx,
+                CONVERSATION,
+                &conv,
+                &user(&oidc_recipient),
+                ResourceAccess::Read,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        policy(PolicyReason::GranteeNotMember)
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+    let recipient_share_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT FROM openmettle.grant_assignments a
+               JOIN openmettle.grant_changes h
+                 ON h.assignment_id = a.id AND h.revision = a.last_revision
+              WHERE a.scope_id = $1::uuid AND a.conversation_id = $2::uuid
+                AND a.grantee_user_id = $3::uuid AND h.decision = 'grant'
+         )",
+    )
+    .bind(&scope)
+    .bind(&conv)
+    .bind(&oidc_recipient.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(!recipient_share_active);
+}

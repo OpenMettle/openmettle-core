@@ -2170,5 +2170,269 @@ async fn restore_preserves_receipts_and_unknown_intents_without_authorizing_a_se
     );
 }
 
+/// Issue #160 (Review #2 P2 #1): session-bound `admit_run_with_mode` honors the caller's monotonic
+/// `request.now_ms` floor against both `local_sessions`/`local_identity_approvals` expiry and
+/// OIDC `membership_observations` freshness, even when `request.now_ms` is ahead of the DB wall
+/// clock.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
+    use super::authz_store::{ctx, present_membership_at};
+    use openmettle_core::authz::{DenialReason, Grantee, ProjectRole, projects, store::StoreError};
+
+    let f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+
+    // 1. Session expires 60s in the future on the DB clock, but request.now_ms is 120s ahead
+    //    (simulating a monotonic floor after a backward clock step) -> must fail Unauthenticated.
+    sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
+        .bind(db_now_ms + 60_000)
+        .bind(f.user.locator())
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    {
+        let mut c = api(&f.db).await;
+        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+        let config = json!({"execution_mode": "ordinary"}).to_string();
+        let request = RunAdmission {
+            input: RunInput {
+                scope: &f.scope,
+                actor: &f.actor.user,
+                conversation: &f.conv,
+                branch: &f.branch,
+                message: &f.message,
+                key: "min-now-session-expired",
+                format: "synthetic.run",
+                version: 1,
+                input: b"message",
+                config: config.as_bytes(),
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: db_now_ms + 120_000,
+            cost_qualified: None,
+        };
+        let err = queue::admit_run_with_mode(&mut tx, &request, &LIMITS, &f.user)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(
+            matches!(err, StoreError::Denied(DenialReason::Unauthenticated)),
+            "expected Unauthenticated, got {err:?}"
+        );
+    }
+
+    // 2. Restore long-lived session; seed an OIDC-group-only project membership expiring at
+    //    db_now_ms + 60_000. Passing request.now_ms = db_now_ms + 120_000 must reject the stale
+    //    OIDC observation even though DB clock_timestamp() is still before expires_ms.
+    sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
+        .bind(FUTURE)
+        .bind(f.user.locator())
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let empty = json!({});
+    let proj_id = match projects::create_project(
+        &mut api(&f.db).await,
+        &ctx(&alice, "min-now-proj"),
+        &projects::ProjectSettingsInput {
+            name: "MinNow",
+            instructions: "",
+            defaults: &empty,
+        },
+    )
+    .await
+    .unwrap()
+    {
+        openmettle_core::authz::store::WriteOutcome::Applied { target_id } => target_id,
+        other => panic!("expected Applied, got {other:?}"),
+    };
+    let proj_scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&proj_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    projects::set_project_member_role(
+        &mut api(&f.db).await,
+        &ctx(&alice, "min-now-oidc-role"),
+        &proj_id,
+        &Grantee::OidcGroup("synthetic-team".into()),
+        ProjectRole::Editor,
+    )
+    .await
+    .unwrap();
+    drop(present_membership_at(&f.db, &f.actor, db_now_ms).await);
+    let proj_conv = chat(&f.db, &proj_scope, "project", &f.actor).await;
+    let proj_branch: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&proj_scope)
+    .bind(&proj_conv)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let proj_msg = message(&mut owner, &proj_scope, &proj_conv, None)
+        .await
+        .unwrap();
+
+    {
+        let mut c = api(&f.db).await;
+        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+        let config = json!({"execution_mode": "ordinary"}).to_string();
+        let request = RunAdmission {
+            input: RunInput {
+                scope: &proj_scope,
+                actor: &f.actor.user,
+                conversation: &proj_conv,
+                branch: &proj_branch,
+                message: &proj_msg,
+                key: "min-now-oidc-expired",
+                format: "synthetic.run",
+                version: 1,
+                input: b"message",
+                config: config.as_bytes(),
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: db_now_ms + 120_000,
+            cost_qualified: None,
+        };
+        let err = queue::admit_run_with_mode(&mut tx, &request, &LIMITS, &f.user)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(
+            matches!(err, StoreError::Denied(DenialReason::NotFound)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    let run_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.runs")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(run_count, 0);
+
+    // 3. Review #3 P2 #2 & Review #4 P3: `admit_run_with_mode_at` carries the post-insert verified
+    //    timestamp out of admission so a subsequent post-reservation check cannot step its decision
+    //    floor backward. Sample the DB clock ONLY AFTER observing the insert blocked on
+    //    `openmettle.runs` (after connection setup, Step 3, and `approvals::admission` have already
+    //    run), wait for the clock to advance past that post-block sample, then release the lock.
+    let pre_lock_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let mut lock_conn = connect(&f.db.0, OWNER).await;
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut lock_conn)
+        .await
+        .unwrap();
+    let mut lock_tx = lock_conn.begin().await.unwrap();
+    // SHARE ROW EXCLUSIVE allows SELECT (Steps 3, 4, 6 and approvals::admission) while blocking
+    // INSERT INTO openmettle.runs (Step 7) right before the post-insert authority check.
+    sqlx::query("LOCK TABLE openmettle.runs IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+
+    let scope_ref = &f.scope;
+    let actor_user = &f.actor.user;
+    let actor_approval = &f.actor.approval;
+    let conv_ref = &f.conv;
+    let branch_ref = &f.branch;
+    let msg_ref = &f.message;
+    let user_session = &f.user;
+    let mut admit_conn = api(&f.db).await;
+
+    let admit_fut = async {
+        let mut tx = WriteTransaction::begin(&mut admit_conn).await.unwrap();
+        let config = json!({"execution_mode": "ordinary"}).to_string();
+        let request = RunAdmission {
+            input: RunInput {
+                scope: scope_ref,
+                actor: actor_user,
+                conversation: conv_ref,
+                branch: branch_ref,
+                message: msg_ref,
+                key: "post-insert-floor-advance",
+                format: "synthetic.run",
+                version: 1,
+                input: b"message",
+                config: config.as_bytes(),
+            },
+            actor_approval_id: actor_approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: pre_lock_ms,
+            cost_qualified: None,
+        };
+        let res = queue::admit_run_with_mode_at(&mut tx, &request, &LIMITS, user_session).await;
+        tx.commit().await.unwrap();
+        res
+    };
+
+    let release_fut = async {
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(lock_pid)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "timed out waiting for insert_admitted to block on openmettle.runs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Every pre-insert DB read (`now` and `snap_now`) has already completed before `admit_fut`
+        // blocked on `INSERT INTO openmettle.runs`, so both are `<= blocked_at_ms`.
+        let blocked_at_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let target_post_insert_ms = blocked_at_ms + 50;
+        while sqlx::query_scalar::<_, i64>(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap()
+            <= target_post_insert_ms
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        lock_tx.rollback().await.unwrap();
+        target_post_insert_ms
+    };
+
+    let (admit_res, target_post_insert_ms) = tokio::join!(admit_fut, release_fut);
+    let (admitted, verified_post_insert_ms) = admit_res.unwrap();
+    assert!(matches!(admitted, Admission::Admitted { .. }));
+    assert!(
+        verified_post_insert_ms > target_post_insert_ms,
+        "admit_run_with_mode_at must return the post-insert verified timestamp ({verified_post_insert_ms} <= {target_post_insert_ms})"
+    );
+}
+
 #[path = "mcp.rs"]
 mod mcp_core;
