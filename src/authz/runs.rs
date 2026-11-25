@@ -365,7 +365,34 @@ fn conversation_snapshot_model(
     let Some(eff) = root.get("effective").and_then(serde_json::Value::as_object) else {
         return Err(());
     };
-    if !eff.get("profile").is_some_and(serde_json::Value::is_object)
+    if !eff.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "catalog_revision"
+                | "model"
+                | "model_source"
+                | "profile"
+                | "preset"
+                | "preset_source"
+                | "preset_revision"
+                | "project_revision"
+                | "reasoning_format"
+                | "instructions"
+                | "omissions"
+                | "temperature"
+                | "top_p"
+                | "reasoning_effort"
+                | "context_window"
+                | "ceiling"
+                | "output_reserve"
+        )
+    }) || !eff
+        .get("model_source")
+        .is_some_and(serde_json::Value::is_string)
+        || !eff
+            .get("preset_source")
+            .is_none_or(|v| v.is_null() || v.is_string())
+        || !eff.get("profile").is_some_and(serde_json::Value::is_object)
         || ![
             "temperature",
             "top_p",
@@ -375,24 +402,54 @@ fn conversation_snapshot_model(
             "output_reserve",
         ]
         .into_iter()
-        .all(|k| eff.get(k).is_some_and(serde_json::Value::is_object))
-        || !["instructions", "omissions"].into_iter().all(|k| {
+        .all(|k| {
             eff.get(k)
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| items.iter().all(serde_json::Value::is_object))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|f| {
+                    f.keys().all(|fk| matches!(fk.as_str(), "value" | "source"))
+                        && f.get("source").is_some_and(serde_json::Value::is_string)
+                })
         })
+        || !eff
+            .get("instructions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.as_object().is_some_and(|o| {
+                        o.keys().all(|ik| matches!(ik.as_str(), "source" | "text"))
+                            && o.get("source").is_some_and(serde_json::Value::is_string)
+                    })
+                })
+            })
+        || !eff
+            .get("omissions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.as_object().is_some_and(|o| {
+                        o.keys()
+                            .all(|ok| matches!(ok.as_str(), "source" | "control" | "reason"))
+                            && o.get("source").is_some_and(serde_json::Value::is_string)
+                    })
+                })
+            })
     {
         return Err(());
     }
-    if !root
+    let Some(caps) = root
         .get("required_capabilities")
-        .is_some_and(serde_json::Value::is_object)
-    {
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(());
+    };
+    if !caps.values().all(serde_json::Value::is_string) {
         return Err(());
     }
     if let Some(cb) = root.get("cost_bound")
         && !cb.is_null()
-        && !cb.is_object()
+        && !cb
+            .as_object()
+            .is_some_and(|o| o.values().all(serde_json::Value::is_u64))
     {
         return Err(());
     }

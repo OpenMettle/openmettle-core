@@ -3127,3 +3127,155 @@ async fn family_policy_review_2_snapshot_object_shape_and_execution_mode() {
         RunRecheckOutcome::Continue
     );
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_3_missing_latest_revision_from_other_claim_fails_closed() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+
+    let day_iso = "2027-01-15T12:00:00Z";
+    let day_ms: i64 = 1_800_014_400_000;
+
+    sqlx::query(
+        "INSERT INTO openmettle.family_policies
+             (grantee_kind, grantee_oidc_group_id, active, zone, quiet_start_minute, quiet_end_minute)
+         VALUES ('oidc_group', 'Family', true, 'UTC', 1320, 420)",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Enrolled under `'Other'` (permitted while revision 1 is current), then `last_revision` advances
+    // to 99 with no `grant_mapping_revisions` row (so whether revision 99 targets `'Family'` is unknown).
+    const RULE_OTHER: &str = "00000000-0000-4000-8000-00000000f005";
+    let child_other = account(&mut owner, PROVIDER, true, FUTURE).await;
+    enroll_oidc_group(&db, &child_other, RULE_OTHER, "Other", "present", day_ms).await;
+
+    let mut api = connect(&db.0, API).await;
+    assert!(permits_iso(&mut api, &child_other, "a", day_iso).await);
+
+    sqlx::query("UPDATE openmettle.grant_mapping_rules SET last_revision = 99 WHERE id = $1::uuid")
+        .bind(RULE_OTHER)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    assert!(
+        !permits_iso(&mut api, &child_other, "a", day_iso).await,
+        "missing latest mapping revision on an Other-enrolled rule must fail closed when any oidc_group policy is active"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_3_snapshot_rejects_enum_map_encodings() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &actor).await;
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let conv_id = chat(&db, &scope, "personal", &actor).await;
+
+    let catalog = openmettle_core::model_config::Catalog::load(CATALOG).unwrap();
+    let sel: openmettle_core::model_config::Selection =
+        serde_json::from_value(json!({"model": "a"})).unwrap();
+    let eff = catalog
+        .resolve(&Default::default(), &sel, None, |_, _| true)
+        .unwrap();
+    let base_doc = serde_json::to_value(openmettle_core::model_config::ConfigSnapshot {
+        effective: eff,
+        required_capabilities: Default::default(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: None,
+    })
+    .unwrap();
+
+    // Serde decodes unit-variant enums from `{"variant": null}` maps; SQL handoff requires strings.
+    let mut bad_cap_gate = base_doc.clone();
+    bad_cap_gate["required_capabilities"] = json!({"fixture.cap": {"on_by_default": null}});
+    assert!(
+        serde_json::from_value::<openmettle_core::model_config::ConfigSnapshot>(
+            bad_cap_gate.clone()
+        )
+        .is_ok()
+    );
+
+    let mut bad_model_source = base_doc.clone();
+    bad_model_source["effective"]["model_source"] = json!({"request": null});
+    assert!(
+        serde_json::from_value::<openmettle_core::model_config::ConfigSnapshot>(
+            bad_model_source.clone()
+        )
+        .is_ok()
+    );
+
+    let mut bad_field_source = base_doc;
+    bad_field_source["effective"]["ceiling"]["source"] = json!({"model": null});
+    assert!(
+        serde_json::from_value::<openmettle_core::model_config::ConfigSnapshot>(
+            bad_field_source.clone()
+        )
+        .is_ok()
+    );
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    for (idx, bad_doc) in [bad_cap_gate, bad_model_source, bad_field_source]
+        .into_iter()
+        .enumerate()
+    {
+        let (branch, msg) = quotas::branch_and_message(&mut api, &scope, &conv_id).await;
+        let bad_bytes = serde_json::to_vec(&bad_doc).unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &actor.user,
+                    conversation: &conv_id,
+                    branch: &branch,
+                    message: &msg,
+                    key: &format!("r3-enum-map-{idx}"),
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: b"{}",
+                    config: &bad_bytes,
+                },
+                actor_approval_id: &actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: NOW,
+                cost_qualified: None,
+            },
+            &LIMITS,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            queue::recheck_run(
+                &mut worker,
+                &RunRecheckRequest {
+                    scope_id: &scope,
+                    run_id: &run_id,
+                    actor_approval_id: &actor.approval,
+                    capabilities: &[],
+                    extra_target: None,
+                    now_ms: NOW,
+                },
+            )
+            .await
+            .unwrap(),
+            RunRecheckOutcome::Invalidated(DenialReason::Policy(PolicyReason::FamilyPolicy)),
+            "enum map case {idx} must be rejected"
+        );
+    }
+}

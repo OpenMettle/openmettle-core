@@ -279,7 +279,8 @@ BEGIN
           ) e ON true
          WHERE mo.approval_id = p_approval
            AND (
-               ((r.id IS NULL OR v_enrolled.rule_id IS NULL) AND EXISTS (
+               ((r.id IS NULL OR v_enrolled.rule_id IS NULL OR v_latest.rule_id IS NULL)
+                AND EXISTS (
                    SELECT 1
                      FROM openmettle.family_policies ofp
                     WHERE ofp.grantee_kind = 'oidc_group'
