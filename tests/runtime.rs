@@ -3520,34 +3520,115 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         drop_began.elapsed()
     );
 
-    // 9. Empty pipe closing at 65 ms within a 75 ms timeout succeeds without false timeout.
-    let (close_reader, close_writer) = std::io::pipe().unwrap();
-    let closer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(65));
-        drop(close_writer);
-    });
-    let closed_text = read_string_bounded(
-        close_reader,
-        Duration::from_millis(75),
-        "stderr",
-        "synthetic-close-before-deadline-read",
+    // 9. Empty pipe closing at 65 ms during the final polling wait before a 75 ms deadline
+    //    succeeds without false timeout (synchronized start + verified in-window close), while
+    //    `PipeDrain::finish_string` wakes an existing idle wait and rejects a late EOF.
+    let mut verified_read_close = false;
+    for _ in 0..5 {
+        let (close_reader, close_writer) = std::io::pipe().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let closer_barrier = Arc::clone(&barrier);
+        let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let closer_closed_at = Arc::clone(&closed_at);
+        let closer = thread::spawn(move || {
+            closer_barrier.wait();
+            thread::sleep(Duration::from_millis(65));
+            drop(close_writer);
+            *closer_closed_at.lock().unwrap() = Some(Instant::now());
+        });
+        barrier.wait();
+        let start = Instant::now();
+        let read_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_string_bounded(
+                close_reader,
+                Duration::from_millis(75),
+                "stderr",
+                "synthetic-close-before-deadline-read",
+            )
+        }));
+        closer.join().unwrap();
+        if closed_at.lock().unwrap().unwrap() < start + Duration::from_millis(72) {
+            assert_eq!(
+                read_outcome
+                    .expect("in-window 65ms/75ms close must succeed in read_string_bounded"),
+                ""
+            );
+            verified_read_close = true;
+            break;
+        }
+    }
+    assert!(
+        verified_read_close,
+        "failed to observe an in-window 65ms/75ms close across 5 attempts"
     );
-    closer.join().unwrap();
-    assert_eq!(closed_text, "");
 
-    let (drain_close_reader, drain_close_writer) = std::io::pipe().unwrap();
-    let drain_close = PipeDrain::start(
-        drain_close_reader,
-        "stderr",
-        "synthetic-close-before-deadline-drain",
+    let mut verified_drain_close = false;
+    for _ in 0..5 {
+        let (drain_close_reader, drain_close_writer) = std::io::pipe().unwrap();
+        let drain_close = PipeDrain::start(
+            drain_close_reader,
+            "stderr",
+            "synthetic-close-before-deadline-drain",
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let closer_barrier = Arc::clone(&barrier);
+        let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let closer_closed_at = Arc::clone(&closed_at);
+        let closer = thread::spawn(move || {
+            closer_barrier.wait();
+            thread::sleep(Duration::from_millis(65));
+            drop(drain_close_writer);
+            *closer_closed_at.lock().unwrap() = Some(Instant::now());
+        });
+        barrier.wait();
+        let start = Instant::now();
+        let drain_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_close.finish_string(Duration::from_millis(75))
+        }));
+        closer.join().unwrap();
+        if closed_at.lock().unwrap().unwrap() < start + Duration::from_millis(72) {
+            assert_eq!(
+                drain_outcome
+                    .expect("in-window 65ms/75ms close must succeed in PipeDrain::finish_string"),
+                ""
+            );
+            verified_drain_close = true;
+            break;
+        }
+    }
+    assert!(
+        verified_drain_close,
+        "failed to observe an in-window 65ms/75ms PipeDrain close across 5 attempts"
     );
-    let closer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(65));
-        drop(drain_close_writer);
+
+    let (late_reader, late_writer) = std::io::pipe().unwrap();
+    let late_drain = PipeDrain::start(late_reader, "stderr", "synthetic-late-eof-pipe-drain");
+    // Let `PipeDrain` reach its 25 ms polling interval before arming a short `finish_string`
+    // deadline while the writer stays open past that deadline.
+    thread::sleep(Duration::from_millis(40));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let closer_barrier = Arc::clone(&barrier);
+    let late_closer = thread::spawn(move || {
+        closer_barrier.wait();
+        thread::sleep(Duration::from_millis(60));
+        drop(late_writer);
     });
-    let drained_text = drain_close.finish_string(Duration::from_millis(75));
-    closer.join().unwrap();
-    assert_eq!(drained_text, "");
+    barrier.wait();
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        late_drain.finish_string(Duration::from_millis(5))
+    }))
+    .expect_err("PipeDrain::finish_string must reject EOF arriving after its deadline");
+    let elapsed = began.elapsed();
+    late_closer.join().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "PipeDrain::finish_string waited for pre-existing polling interval: {elapsed:?}"
+    );
+    assert!(
+        panic_text(err).contains("synthetic-late-eof-pipe-drain"),
+        "missing label on late-EOF PipeDrain failure"
+    );
 
     let mut continuous_child = Command::new("yes");
     continuous_child.arg("continuously-readable-marker");
