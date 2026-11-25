@@ -16,6 +16,7 @@ use std::{
 
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_READS_PER_PASS: usize = 8;
 const MAX_CAPTURED_BYTES: usize = 16 * 1024 * 1024;
 const TIMEOUT_OUTPUT_PREVIEW_CHARS: usize = 1024;
 
@@ -62,8 +63,8 @@ pub(crate) fn wait_output_bounded(
     let mut exited: Option<ExitStatus> = None;
 
     loop {
-        let progressed =
-            stdout.drain_available("stdout", context) | stderr.drain_available("stderr", context);
+        let progressed = stdout.drain_pass("stdout", context, Some(deadline))
+            | stderr.drain_pass("stderr", context, Some(deadline));
 
         if exited.is_none() {
             exited = process
@@ -73,8 +74,12 @@ pub(crate) fn wait_output_bounded(
         }
 
         if let Some(status) = exited {
-            stdout.drain_available("stdout", context);
-            stderr.drain_available("stderr", context);
+            if !stdout.eof {
+                stdout.drain_pass("stdout", context, Some(deadline));
+            }
+            if !stderr.eof {
+                stderr.drain_pass("stderr", context, Some(deadline));
+            }
             if stdout.eof && stderr.eof {
                 assert_eq!(
                     stdout.truncated_bytes, 0,
@@ -98,8 +103,8 @@ pub(crate) fn wait_output_bounded(
                 let _ = process.0.kill();
                 let _ = process.0.wait();
             }
-            stdout.drain_available("stdout", context);
-            stderr.drain_available("stderr", context);
+            stdout.drain_preview_once("stdout", context);
+            stderr.drain_preview_once("stderr", context);
             let stdout_preview = preview(&stdout.buf, stdout.truncated_bytes);
             let stderr_preview = preview(&stderr.buf, stderr.truncated_bytes);
             if let Some(status) = exited {
@@ -159,7 +164,7 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
     let mut collector = PipeCollector::new(Some(pipe), stream, context);
     let mut sleep = INITIAL_POLL_INTERVAL;
     loop {
-        let progressed = collector.drain_available(stream, context);
+        let progressed = collector.drain_pass(stream, context, Some(deadline));
         if collector.eof {
             assert_eq!(
                 collector.truncated_bytes, 0,
@@ -170,6 +175,7 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
         }
         let now = Instant::now();
         if now >= deadline {
+            collector.drain_preview_once(stream, context);
             let captured = preview(&collector.buf, collector.truncated_bytes);
             panic!(
                 "{stream} did not reach EOF within {timeout:?} for {context}; captured={captured:?}"
@@ -209,7 +215,10 @@ impl PipeDrain {
             let mut collector = PipeCollector::from_nonblocking(pipe);
             let mut sleep = INITIAL_POLL_INTERVAL;
             loop {
-                let progressed = collector.drain_available(stream, &thread_context);
+                let maybe_deadline = *thread_deadline
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                let progressed = collector.drain_pass(stream, &thread_context, maybe_deadline);
                 if collector.eof {
                     assert_eq!(
                         collector.truncated_bytes, 0,
@@ -217,20 +226,10 @@ impl PipeDrain {
                     );
                     return Ok(collector.buf);
                 }
-                let maybe_deadline = *thread_deadline
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner());
                 if let Some(deadline) = maybe_deadline {
                     let now = Instant::now();
                     if now >= deadline {
-                        collector.drain_available(stream, &thread_context);
-                        if collector.eof {
-                            assert_eq!(
-                                collector.truncated_bytes, 0,
-                                "{stream} exceeded {MAX_CAPTURED_BYTES} bytes for {thread_context}"
-                            );
-                            return Ok(collector.buf);
-                        }
+                        collector.drain_preview_once(stream, &thread_context);
                         return Err(preview(&collector.buf, collector.truncated_bytes));
                     }
                     if progressed {
@@ -398,13 +397,17 @@ impl<R: Read + AsFd> PipeCollector<R> {
         }
     }
 
-    fn drain_available(&mut self, stream: &str, context: &str) -> bool {
+    fn drain_pass(&mut self, stream: &str, context: &str, deadline: Option<Instant>) -> bool {
         let Some(pipe) = self.pipe.as_mut() else {
             return false;
         };
         let mut progressed = false;
         let mut chunk = [0u8; 8192];
-        loop {
+        let mut reads = 0;
+        while reads < MAX_READS_PER_PASS {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return progressed;
+            }
             match pipe.read(&mut chunk) {
                 Ok(0) => {
                     self.eof = true;
@@ -412,6 +415,7 @@ impl<R: Read + AsFd> PipeCollector<R> {
                     return true;
                 }
                 Ok(n) => {
+                    reads += 1;
                     progressed = true;
                     let remaining_cap = MAX_CAPTURED_BYTES.saturating_sub(self.buf.len());
                     let keep = n.min(remaining_cap);
@@ -419,6 +423,35 @@ impl<R: Read + AsFd> PipeCollector<R> {
                     self.truncated_bytes = self.truncated_bytes.saturating_add(n - keep);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return progressed,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("failed reading {stream} for {context}: {err}"),
+            }
+        }
+        progressed
+    }
+
+    fn drain_preview_once(&mut self, stream: &str, context: &str) {
+        if self.buf.len() >= TIMEOUT_OUTPUT_PREVIEW_CHARS * 4 {
+            return;
+        }
+        let Some(pipe) = self.pipe.as_mut() else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => {
+                    self.pipe = None;
+                    return;
+                }
+                Ok(n) => {
+                    let remaining_cap = MAX_CAPTURED_BYTES.saturating_sub(self.buf.len());
+                    let keep = n.min(remaining_cap);
+                    self.buf.extend_from_slice(&chunk[..keep]);
+                    self.truncated_bytes = self.truncated_bytes.saturating_add(n - keep);
+                    return;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => panic!("failed reading {stream} for {context}: {err}"),
             }

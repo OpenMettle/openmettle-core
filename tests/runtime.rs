@@ -2886,7 +2886,36 @@ fn json_with(document: &serde_json::Value, pointer: &str, value: &str) -> serde_
 #[test]
 fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct ReaderGuard {
+        abort: Arc<AtomicBool>,
+        stop_deadline: Arc<Mutex<Option<Instant>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+    impl ReaderGuard {
+        fn finish(mut self, timeout: Duration) {
+            *self.stop_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Instant::now() + timeout);
+            let handle = self.handle.take().expect("sweep reader handle missing");
+            handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        }
+    }
+    impl Drop for ReaderGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                self.abort.store(true, Ordering::Relaxed);
+                *self.stop_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now());
+                let _ = handle.join();
+            }
+        }
+    }
+
     let dir = auth_config_support::Dir::new();
     let root = dir.path("payloads");
     std::fs::create_dir(&root).unwrap();
@@ -2905,54 +2934,68 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
     let flags = fcntl_getfl(&pipe).unwrap();
     fcntl_setfl(&pipe, flags | OFlags::NONBLOCK).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
+    let abort = Arc::new(AtomicBool::new(false));
+    let reader_abort = Arc::clone(&abort);
     let stop_deadline = Arc::new(Mutex::new(None::<Instant>));
     let reader_deadline = Arc::clone(&stop_deadline);
-    let reader = thread::spawn(move || {
-        let mut pending = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let mut sleep = Duration::from_millis(2);
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => {
-                    assert!(pending.is_empty(), "trailing partial stderr line");
+    let reader = ReaderGuard {
+        abort,
+        stop_deadline,
+        handle: Some(thread::spawn(move || {
+            let mut pending = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut sleep = Duration::from_millis(2);
+            loop {
+                if reader_abort.load(Ordering::Relaxed) {
                     return;
                 }
-                Ok(n) => {
-                    pending.extend_from_slice(&chunk[..n]);
-                    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-                        let raw: Vec<u8> = pending.drain(..=pos).collect();
-                        let line = String::from_utf8(raw).unwrap();
-                        let line = line.trim_end_matches('\n');
-                        assert!(!line.contains("CANARY"));
-                        let event: serde_json::Value = serde_json::from_str(line).unwrap();
-                        if event["event"] == "worker.sweep.failed" {
-                            assert_eq!(event["level"], "WARN");
-                            assert_eq!(event["role"], "worker");
-                            let _ = tx.send(event["error.type"].as_str().unwrap().to_owned());
+                let maybe_deadline = *reader_deadline.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(deadline) = maybe_deadline {
+                    assert!(
+                        Instant::now() < deadline,
+                        "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
+                    );
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => {
+                        assert!(pending.is_empty(), "trailing partial stderr line");
+                        return;
+                    }
+                    Ok(n) => {
+                        pending.extend_from_slice(&chunk[..n]);
+                        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                            let raw: Vec<u8> = pending.drain(..=pos).collect();
+                            let line = String::from_utf8(raw).unwrap();
+                            let line = line.trim_end_matches('\n');
+                            assert!(!line.contains("CANARY"));
+                            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                            if event["event"] == "worker.sweep.failed" {
+                                assert_eq!(event["level"], "WARN");
+                                assert_eq!(event["role"], "worker");
+                                let _ = tx.send(event["error.type"].as_str().unwrap().to_owned());
+                            }
                         }
+                        sleep = Duration::from_millis(2);
                     }
-                    sleep = Duration::from_millis(2);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if let Some(deadline) =
-                        *reader_deadline.lock().unwrap_or_else(|e| e.into_inner())
-                    {
-                        let now = Instant::now();
-                        assert!(
-                            now < deadline,
-                            "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
-                        );
-                        thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
-                    } else {
-                        thread::sleep(sleep);
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Some(deadline) = maybe_deadline {
+                            let now = Instant::now();
+                            assert!(
+                                now < deadline,
+                                "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
+                            );
+                            thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+                        } else {
+                            thread::sleep(sleep);
+                        }
+                        sleep = (sleep * 2).min(Duration::from_millis(25));
                     }
-                    sleep = (sleep * 2).min(Duration::from_millis(25));
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => panic!("failed reading worker sweep stderr: {err}"),
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => panic!("failed reading worker sweep stderr: {err}"),
             }
-        }
-    });
+        })),
+    };
     for _ in 0..2 {
         for expected in [
             "expire_queued",
@@ -2965,8 +3008,7 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         }
     }
     stop(&mut process, "-TERM");
-    *stop_deadline.lock().unwrap() = Some(Instant::now() + PIPE_DRAIN_TIMEOUT);
-    reader.join().unwrap();
+    reader.finish(PIPE_DRAIN_TIMEOUT);
 }
 
 fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -3234,17 +3276,19 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     );
 
     // 6. Readiness probe (`wait_http_status_bounded`) fails promptly against a slow-drip peer
-    //    sending 1 byte every 200 ms with no newline or EOF.
+    //    sending 1 byte every 200 ms with no newline or EOF (with an independent 3 s server cutoff
+    //    beyond the 1.5 s assertion threshold so a read-until-EOF regression still terminates).
     let drip_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let drip_addr = drip_listener.local_addr().unwrap().to_string();
     drip_listener.set_nonblocking(true).unwrap();
     let stop_drip = Arc::new(AtomicBool::new(false));
     let drip_flag = Arc::clone(&stop_drip);
     let drip_server = thread::spawn(move || {
-        while !drip_flag.load(Ordering::Relaxed) {
+        let server_cutoff = Instant::now() + Duration::from_secs(3);
+        while !drip_flag.load(Ordering::Relaxed) && Instant::now() < server_cutoff {
             match drip_listener.accept() {
                 Ok((mut stream, _)) => {
-                    while !drip_flag.load(Ordering::Relaxed) {
+                    while !drip_flag.load(Ordering::Relaxed) && Instant::now() < server_cutoff {
                         if stream.write_all(b"H").is_err() {
                             break;
                         }
@@ -3301,4 +3345,91 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     assert!(output.status.success());
     assert_eq!(output.stdout.len(), 128 * 1024);
     assert_eq!(output.stderr.len(), 128 * 1024);
+
+    // 8. Continuously readable pipes cannot defeat deadlines in `read_string_bounded`,
+    //    `PipeDrain::finish_string`, or `run_bounded` / `wait_output_bounded`.
+    let spawn_continuous_pipe = |duration: Duration| {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let handle = thread::spawn(move || {
+            let until = Instant::now() + duration;
+            let buf = [b'x'; 4096];
+            while Instant::now() < until {
+                match writer.write(&buf) {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (reader, handle)
+    };
+
+    let (reader, writer_handle) = spawn_continuous_pipe(Duration::from_millis(250));
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            reader,
+            Duration::from_millis(30),
+            "stderr",
+            "synthetic-continuous-pipe-read",
+        )
+    }))
+    .expect_err("continuously readable pipe must time out in read_string_bounded");
+    let elapsed = began.elapsed();
+    writer_handle.join().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "read_string_bounded overrun on continuously readable pipe: {elapsed:?}"
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-pipe-read"),
+        "missing label in continuous pipe read panic: {message}"
+    );
+
+    let (reader, writer_handle) = spawn_continuous_pipe(Duration::from_millis(250));
+    let drain = PipeDrain::start(reader, "stderr", "synthetic-continuous-pipe-drain");
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain.finish_string(Duration::from_millis(30))
+    }))
+    .expect_err("continuously readable pipe must time out in PipeDrain::finish_string");
+    let elapsed = began.elapsed();
+    writer_handle.join().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "PipeDrain::finish_string overrun on continuously readable pipe: {elapsed:?}"
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-pipe-drain"),
+        "missing label in continuous PipeDrain panic: {message}"
+    );
+
+    let mut continuous_child = Command::new("yes");
+    continuous_child.arg("continuously-readable-marker");
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(
+            &mut continuous_child,
+            Duration::from_millis(60),
+            "synthetic-continuous-yes-case",
+        )
+    }))
+    .expect_err("yes child must time out promptly");
+    assert!(
+        began.elapsed() < Duration::from_millis(1000),
+        "run_bounded overrun on yes child: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-yes-case")
+            && message.contains("continuously-readable-marker"),
+        "missing label or marker in continuous yes panic: {message}"
+    );
 }
