@@ -263,7 +263,7 @@ async fn recheck_locked(
     Ok(RunRecheckOutcome::Continue)
 }
 
-pub(super) async fn recheck_decision(
+pub(crate) async fn recheck_decision(
     c: &mut PgConnection,
     r: &RunRecheckRequest<'_>,
     owner: &str,

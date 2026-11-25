@@ -429,6 +429,78 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         };
         let mut continuation = Vec::new();
         let mut prior_effects: Vec<(String, Proposal)> = Vec::new();
+        // Discover any open, proven-unsent automatic (`approval_id IS NULL`, `dispatched_attempts = 0`)
+        // write intent left by a prior claim that handed off before Transaction 2.
+        if let Some(effects) = self.effects.as_deref() {
+            loop {
+                if let Some(why) = *cx.stop.borrow() {
+                    return Err(stopped_step(why));
+                }
+                let pending = {
+                    let mut c = self
+                        .pool
+                        .acquire()
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?;
+                    approvals::pending_automatic_write(&mut c, &run.claim.lease())
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?
+                };
+                let Some(proposal) = pending else {
+                    break;
+                };
+                let intent = {
+                    let mut c = self
+                        .pool
+                        .acquire()
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?;
+                    approvals::record_fenced_intent(
+                        &mut c,
+                        &run.claim.lease(),
+                        &proposal,
+                        None,
+                        &Some(effects),
+                        &self.leases,
+                    )
+                    .await
+                    .map_err(lease_step)?
+                };
+                let id = match intent {
+                    IntentResult::Invalidated(settled) => {
+                        return Err(StepResult::Invalidated(settled));
+                    }
+                    IntentResult::ApprovalRequired => return Err(FAILED),
+                    IntentResult::Applied(ref i) => Some(i.operation_id.clone()),
+                    IntentResult::Replayed(ref id) => Some(id.clone()),
+                };
+                let step = StepContext {
+                    deadline: run.execution_deadline,
+                    ..cx.clone()
+                };
+                match (EffectDispatch {
+                    pool: &self.pool,
+                    artifacts: self.artifacts.as_ref(),
+                    effects,
+                    settings: &self.leases,
+                })
+                .send(run, &proposal, intent, step)
+                .await
+                {
+                    StepResult::ToolOutput(_) => {
+                        if let Some(id) = id {
+                            prior_effects.push((id, proposal));
+                        }
+                    }
+                    stopped @ (StepResult::Stopped
+                    | StepResult::Handoff
+                    | StepResult::LeaseLost
+                    | StepResult::Invalidated(_)
+                    | StepResult::Failed(_)) => return Err(stopped),
+                    _ => return Err(FAILED),
+                }
+            }
+        }
         let mut tools = self
             .effects
             .as_ref()
@@ -685,7 +757,12 @@ impl<R: TurnRoutes> Executor for TurnExecutor<R> {
         false
     }
 
-    async fn reconcile(&self, _: &UnresolvedOperation, _: StepContext) -> Option<OwnedObservation> {
+    async fn reconcile(
+        &self,
+        _: &ActiveRun,
+        _: &UnresolvedOperation,
+        _: StepContext,
+    ) -> Option<OwnedObservation> {
         // No authoritative downstream lookup was supplied. Never repeat an uncertain effect.
         None
     }

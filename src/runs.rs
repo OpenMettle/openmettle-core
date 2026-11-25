@@ -576,6 +576,25 @@ pub async fn record_observation(
     tx: &mut WriteTransaction<'_>,
     o: &Observation<'_>,
 ) -> Result<i64, Error> {
+    let mut outer = tx.take_active()?;
+    let mut sp = outer.begin().await?;
+    let result = async {
+        uuid(o.scope)?;
+        uuid(o.run)?;
+        lock_run(&mut sp, o.scope, o.run).await?;
+        record_observation_locked(&mut sp, o).await
+    }
+    .await;
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
+}
+
+/// Record an observation directly inside an already-open caller transaction (holding the run lock).
+pub(crate) async fn record_observation_locked(
+    c: &mut PgConnection,
+    o: &Observation<'_>,
+) -> Result<i64, Error> {
     uuid(o.scope)?;
     uuid(o.run)?;
     uuid(o.operation)?;
@@ -606,29 +625,50 @@ pub async fn record_observation(
             o.evidence.bytes,
         ],
     );
-    let mut outer = tx.take_active()?;
-    let mut sp = outer.begin().await?;
-    let result = async {
-        lock_run(&mut sp,o.scope,o.run).await?;
-        if existing_event(&mut sp,o.scope,o.run,o.key,&id,o.evidence).await?.is_some() { return Ok(o.expected_revision+1); }
-        let row = sqlx::query("SELECT revision,outcome,downstream_handle FROM openmettle.operations WHERE scope_id=$1::uuid AND
-             run_id=$2::uuid AND id=$3::uuid FOR UPDATE")
-            .bind(o.scope).bind(o.run).bind(o.operation).fetch_optional(&mut *sp).await?.ok_or(Error::NotFound)?;
-        if row.get::<i64,_>("revision") != o.expected_revision { return Err(Error::StaleRevision); }
-        if ["succeeded","failed"].contains(&row.get::<String,_>("outcome").as_str()) { return Err(Error::Conflict); }
-        // Once learned, retain the handle; a conflicting handle needs separate reconciliation.
-        let old_handle: Option<String> = row.get("downstream_handle");
-        if old_handle.as_deref().is_some_and(|h| Some(h) != o.handle) { return Err(Error::Conflict); }
-        sqlx::query("UPDATE openmettle.operations SET
+    if existing_event(c, o.scope, o.run, o.key, &id, o.evidence)
+        .await?
+        .is_some()
+    {
+        return Ok(o.expected_revision + 1);
+    }
+    let row = sqlx::query(
+        "SELECT revision,outcome,downstream_handle FROM openmettle.operations WHERE scope_id=$1::uuid AND
+             run_id=$2::uuid AND id=$3::uuid FOR UPDATE",
+    )
+    .bind(o.scope)
+    .bind(o.run)
+    .bind(o.operation)
+    .fetch_optional(&mut *c)
+    .await?
+    .ok_or(Error::NotFound)?;
+    if row.get::<i64, _>("revision") != o.expected_revision {
+        return Err(Error::StaleRevision);
+    }
+    if ["succeeded", "failed"].contains(&row.get::<String, _>("outcome").as_str()) {
+        return Err(Error::Conflict);
+    }
+    // Once learned, retain the handle; a conflicting handle needs separate reconciliation.
+    let old_handle: Option<String> = row.get("downstream_handle");
+    if old_handle.as_deref().is_some_and(|h| Some(h) != o.handle) {
+        return Err(Error::Conflict);
+    }
+    sqlx::query(
+        "UPDATE openmettle.operations SET
              revision=revision+1,outcome=$4,downstream_handle=$5,observation_format=$6,observation_version=$7,evidence=$8
-             WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid")
-            .bind(o.scope).bind(o.run).bind(o.operation).bind(o.outcome).bind(o.handle).bind(o.evidence.format).bind(o.evidence.version).bind(o.evidence.bytes).execute(&mut *sp).await?;
-        append_locked(&mut sp,o.scope,o.run,o.key,&id,o.evidence).await?;
-        Ok(o.expected_revision+1)
-    }.await;
-    let result = finish(sp, result).await?;
-    tx.inner = Some(outer);
-    result
+             WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid",
+    )
+    .bind(o.scope)
+    .bind(o.run)
+    .bind(o.operation)
+    .bind(o.outcome)
+    .bind(o.handle)
+    .bind(o.evidence.format)
+    .bind(o.evidence.version)
+    .bind(o.evidence.bytes)
+    .execute(&mut *c)
+    .await?;
+    append_locked(c, o.scope, o.run, o.key, &id, o.evidence).await?;
+    Ok(o.expected_revision + 1)
 }
 
 #[cfg(test)]

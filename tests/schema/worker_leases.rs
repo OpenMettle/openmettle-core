@@ -495,7 +495,18 @@ async fn uncertain_effects_reconcile_once_and_are_never_replayed() {
         let before = snapshot(&mut c, &tables).await;
         make_due(&f.db, &run).await;
         assert_eq!(settle_expired(&mut c, 1).await.unwrap(), [l.run_id]);
-        assert_eq!(before, snapshot(&mut c, &tables).await);
+        if unknown {
+            assert_eq!(before, snapshot(&mut c, &tables).await);
+        } else {
+            let (outcome, rev): (String, i64) = sqlx::query_as(
+                "SELECT outcome, revision FROM openmettle.operations WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            assert_eq!((outcome.as_str(), rev), ("outcome_unknown", 1));
+        }
         terminal(
             &f.db,
             l.run_id,
@@ -2040,7 +2051,7 @@ mod live_turns {
                 .await
                 .unwrap();
         assert_eq!(reason, "revoked");
-        assert_eq!(outcomes(&chat, &id).await, ["intent"]);
+        assert_eq!(outcomes(&chat, &id).await, ["outcome_unknown"]);
         assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
         assert!(server.requests.try_recv().is_err());
     }

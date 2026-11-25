@@ -6,8 +6,8 @@ pub use drift::{Drift, verify_accounting_drift};
 pub mod rebind;
 mod reclaim;
 mod spill;
-pub(crate) use spill::configure_slots;
 pub use spill::{SpillContext, publish_bytes};
+pub(crate) use spill::{configure_slots, publish_bytes_with_handle};
 mod staging;
 mod volume;
 use crate::{

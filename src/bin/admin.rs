@@ -55,6 +55,31 @@ async fn run() -> Result<(), &'static str> {
         }
         return Ok(());
     }
+    if command.0.as_deref() == Some("runtime") {
+        if args.next().is_some() || command.1.as_deref() != Some("activate-two-phase-intents") {
+            return Err("usage: openmettle-admin runtime activate-two-phase-intents");
+        }
+        let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+            .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+        let mut c = PgConnection::connect(&url)
+            .await
+            .map_err(|_| "owner connection failed")?;
+        let updated = sqlx::query(
+            "UPDATE openmettle.runtime_feature_gates
+                SET two_phase_effect_intents_enabled = true
+              WHERE id AND NOT two_phase_effect_intents_enabled",
+        )
+        .execute(&mut c)
+        .await
+        .map_err(|_| "runtime feature gate activation failed")?
+        .rows_affected();
+        if updated > 0 {
+            println!("activated two_phase_effect_intents_enabled");
+        } else {
+            println!("two_phase_effect_intents_enabled already active");
+        }
+        return Ok(());
+    }
     if command.0.as_deref() == Some("quota") {
         let artifact_root = args.next();
         if args.next().is_some()

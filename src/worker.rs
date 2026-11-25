@@ -120,6 +120,11 @@ pub enum StepResult {
     Answer(turns::FinalAnswer),
     /// A known scoped tool outcome awaiting bounded observation and optional publication.
     ToolResponse(Result<String, crate::mcp::ToolFault>),
+    /// A known scoped tool success carrying an optional redacted downstream handle.
+    ToolSuccess {
+        text: String,
+        handle: Option<String>,
+    },
     /// Model-visible output of an observed, reviewed tool operation.
     ToolOutput(String),
     /// A fenced authority check already invalidated the run.
@@ -160,6 +165,7 @@ pub trait Executor: Send + Sync + 'static {
     }
     fn reconcile(
         &self,
+        run: &ActiveRun,
         operation: &UnresolvedOperation,
         cx: StepContext,
     ) -> impl Future<Output = Option<OwnedObservation>> + Send;
@@ -495,7 +501,7 @@ async fn reconcile<E: Executor>(
             if let Some(why) = context.stopped() {
                 return Ok(WorkEnd::Stop(why));
             }
-            if let Some(o) = executor.reconcile(op, context.step()).await {
+            if let Some(o) = executor.reconcile(run, op, context.step()).await {
                 let mut c = connection(pool).await?;
                 if context.stopped() == Some(Stop::LeaseLost) {
                     return Ok(WorkEnd::Stop(Stop::LeaseLost));
@@ -573,7 +579,18 @@ async fn execute<E: Executor>(
             return Ok(WorkEnd::Stop(why));
         }
         let pending =
-            approvals::pending_effect(&mut *connection(pool).await?, &run.claim.lease()).await?;
+            match approvals::pending_effect(&mut *connection(pool).await?, &run.claim.lease())
+                .await?
+            {
+                Some((id, proposal)) => Some((Some(id), proposal)),
+                None if adapters.approved.is_some() => approvals::pending_automatic_write(
+                    &mut *connection(pool).await?,
+                    &run.claim.lease(),
+                )
+                .await?
+                .map(|proposal| (None, proposal)),
+                None => None,
+            };
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
@@ -585,7 +602,7 @@ async fn execute<E: Executor>(
                 &mut *connection(pool).await?,
                 &run.claim.lease(),
                 &proposal,
-                Some(&id),
+                id.as_deref(),
                 &adapters.approved,
                 settings,
             )
@@ -619,7 +636,9 @@ async fn execute<E: Executor>(
             StepResult::Handoff => return Ok(WorkEnd::Handoff),
             StepResult::LeaseLost => return Ok(WorkEnd::Stop(Stop::LeaseLost)),
             StepResult::Answer(answer) => return Ok(WorkEnd::Answer(answer)),
-            StepResult::ToolOutput(_) | StepResult::ToolResponse(_) => {
+            StepResult::ToolOutput(_)
+            | StepResult::ToolResponse(_)
+            | StepResult::ToolSuccess { .. } => {
                 return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
             }
             StepResult::Continue => continue,
@@ -804,11 +823,18 @@ impl EffectDispatch<'_> {
         let Ok(mut c) = pool.acquire().await else {
             return StepResult::LeaseLost;
         };
-        let class:Result<String,_>=sqlx::query_scalar("SELECT capability FROM openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid")
-        .bind(lease.scope_id).bind(lease.run_id).bind(&op).fetch_one(&mut *c).await;
-        let permit = match class.as_deref() {
+        let op_row: Result<(String, Option<i32>), _> = sqlx::query_as(
+            "SELECT capability, dispatched_attempts FROM openmettle.operations
+              WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid",
+        )
+        .bind(lease.scope_id)
+        .bind(lease.run_id)
+        .bind(&op)
+        .fetch_one(&mut *c)
+        .await;
+        let permit = match op_row {
             Err(_) => return StepResult::LeaseLost,
-            Ok("repeatable_read") => {
+            Ok((cap, _)) if cap == "repeatable_read" => {
                 if let Some(why) = *step.stop.borrow() {
                     return stopped_step(why);
                 }
@@ -816,6 +842,16 @@ impl EffectDispatch<'_> {
                     return StepResult::Handoff;
                 }
                 approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
+                    .await
+            }
+            Ok((_, Some(0))) if fresh.is_some() => {
+                if let Some(why) = *step.stop.borrow() {
+                    return stopped_step(why);
+                }
+                if Instant::now() >= step.deadline {
+                    return StepResult::Handoff;
+                }
+                approvals::start_write_attempt(&mut c, &lease, &op, proposal, settings, &policy)
                     .await
             }
             Ok(_) => match fresh {
@@ -853,6 +889,46 @@ impl EffectDispatch<'_> {
             Err(_) => return StepResult::Handoff,
         };
         let output = match result {
+            StepResult::ToolSuccess { text, handle } if proposal.tool != crate::mcp::READ_RANGE => {
+                let cx = artifact_fs::SpillContext {
+                    pool,
+                    lease,
+                    proposal,
+                    operation: &op,
+                    step: &step,
+                };
+                return artifact_fs::publish_bytes_with_handle(
+                    &cx,
+                    artifacts,
+                    &text,
+                    handle.as_deref(),
+                    settings,
+                    &policy,
+                )
+                .await;
+            }
+            StepResult::ToolSuccess { text, handle } => {
+                if *step.stop.borrow() == Some(Stop::LeaseLost) {
+                    return StepResult::LeaseLost;
+                }
+                let Ok(mut c) = pool.acquire().await else {
+                    return StepResult::LeaseLost;
+                };
+                if let Err(e) = crate::mcp::observe_known_with_handle(
+                    &mut c,
+                    &lease,
+                    &step,
+                    &op,
+                    true,
+                    handle.as_deref(),
+                    &text,
+                )
+                .await
+                {
+                    return turns::lease_step(e);
+                }
+                text
+            }
             StepResult::ToolResponse(Ok(text)) if proposal.tool != crate::mcp::READ_RANGE => {
                 let cx = artifact_fs::SpillContext {
                     pool,
@@ -959,6 +1035,7 @@ pub(crate) async fn start_permit(
             }
             Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
             Ok(ReplayEffect::Handoff) => return Err(StepResult::Handoff),
+            Ok(ReplayEffect::Exhausted) => return Err(StepResult::Stopped),
             Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
             Err(e) => return Err(turns::lease_step(e)),
         }

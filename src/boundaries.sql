@@ -45,6 +45,9 @@
 -- Version 38 replaces `quota_lock_override` with the same signature, security and privileges, and
 -- replaces the unexposed 4-arg `retention_set_grace` with the approval-bound 5-arg overload
 -- (`openmettle_api` only) (ADR 0027, issue #160).
+-- Version 39 adds `runtime_feature_gates` (`SELECT` only for `openmettle_api` and
+-- `openmettle_worker`; zero write grants for runtime roles) and the owner-owned SECURITY DEFINER
+-- trigger `resolve_terminal_write_intents()` (no role may call) (ADR 0039, V1-14 PR3).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -269,6 +272,7 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT 'openmettle.gateway_dispatch_scoped(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 36
     UNION ALL SELECT 'openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 37
     UNION ALL SELECT 'openmettle.retention_set_grace(uuid,uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 38
+    UNION ALL SELECT 'openmettle.resolve_terminal_write_intents()',true,ARRAY[]::text[] WHERE $1 >= 39
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES
@@ -394,6 +398,9 @@ contract (relation, role, privilege) AS (
     UNION ALL SELECT * FROM capacity_tables
     UNION ALL SELECT * FROM retention_tables
     UNION ALL SELECT * FROM family_tables
+    UNION ALL
+    SELECT 'runtime_feature_gates', role, 'SELECT'
+    FROM unnest(ARRAY['openmettle_api','openmettle_worker']) role WHERE $1 >= 39
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -815,7 +822,8 @@ violations (violation) AS (
                     OR ($1>=27 AND g.object_name LIKE 'capacity\_%')
                     OR ($1>=28 AND (g.object_name LIKE 'deletion\_journal%' OR g.object_name LIKE 'retention\_%'
                                     OR g.object_name='artifact_retention_holds'))
-                    OR ($1>=35 AND g.object_name LIKE 'family\_polic%'))
+                    OR ($1>=35 AND g.object_name LIKE 'family\_polic%')
+                    OR ($1>=39 AND g.object_name='runtime_feature_gates'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
@@ -858,7 +866,7 @@ violations (violation) AS (
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
     WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables
                           UNION ALL SELECT relation FROM retention_tables UNION ALL SELECT relation FROM family_tables)
-           OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
+           OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions','runtime_feature_gates')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL

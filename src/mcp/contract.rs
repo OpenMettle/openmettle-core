@@ -1,0 +1,685 @@
+//! Server-owned reviewed external MCP tool contracts and closed-object argument validation (ADR 0039).
+
+use super::ToolFault;
+use crate::{
+    authz::{
+        CapabilityGate,
+        approvals::{self, Destination, EffectClass, EffectPolicy, EndpointKey, Proposal, Review},
+        projects,
+        store::StoreError,
+    },
+    provider_http::{
+        inference::Tool,
+        mcp::{RemoteToolDeclaration, is_allowed_idempotency_header_name},
+    },
+    provider_keys::documents::unique,
+    runs,
+};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, time::Duration};
+
+const MAX_SCHEMA_BYTES: usize = 65_536;
+const MAX_ARG_BYTES: usize = 65_536;
+const MAX_DEPTH: usize = 16;
+const MAX_OBJECT_PROPERTIES: usize = 64;
+const MAX_ARRAY_ITEMS: usize = 256;
+const MAX_STRING_BYTES: usize = 16_384;
+
+/// Recursively detect any MCP `2026-07-28` `x-mcp-header` annotation in a schema or value.
+pub fn contains_x_mcp_header(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("x-mcp-header") || contains_x_mcp_header(v)),
+        Value::Array(items) => items.iter().any(contains_x_mcp_header),
+        _ => false,
+    }
+}
+
+/// Canonical SHA-256 digest of a JSON schema object after key sorting.
+pub fn canonical_schema_digest(schema: &Value) -> [u8; 32] {
+    let mut sorted = schema.clone();
+    sorted.sort_all_objects();
+    Sha256::digest(sorted.to_string().as_bytes()).into()
+}
+
+/// Where a contract-pinned idempotency key travels on the MCP wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdempotencyCarrier {
+    None,
+    /// HTTP header name (e.g. `Idempotency-Key`); never `Mcp-Session-Id` or `Mcp-Param-*`.
+    Header(String),
+    /// `params._meta` key (never `io.modelcontextprotocol/*`).
+    Meta(String),
+}
+
+/// Reviewed idempotency key window for `EndpointKey::Supported` contracts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdempotencyWindow {
+    pub namespace: String,
+    pub carrier: IdempotencyCarrier,
+    pub valid_from_us: i64,
+    pub expires_us: i64,
+}
+
+/// Contract-defined read-only status lookup used by `Executor::reconcile`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconcileSpec {
+    /// Remote MCP tool name for the read-only lookup (on the same pinned transport).
+    pub lookup_tool: String,
+    /// Argument name populated with `operations.downstream_handle` when present.
+    pub handle_argument: Option<String>,
+    /// Argument name populated with the deterministic key (`endpoint_key` or `logical_key`)
+    /// when `downstream_handle` is absent (e.g. `idempotent` or deterministic `lookup`).
+    pub deterministic_key_argument: Option<String>,
+    /// JSON field name in `structuredContent` (or parsed JSON text) reporting `"succeeded"`,
+    /// `"failed"` / `"not_found"`, or `"pending"`.
+    pub status_field: String,
+}
+
+/// One server-reviewed external MCP tool contract. Upstream `tools/list` can only verify it.
+#[derive(Clone)]
+pub struct ExternalToolContract {
+    pub tool_id: String,
+    pub remote_name: String,
+    pub version: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub schema_digest: [u8; 32],
+    pub connection_id: String,
+    pub account_id: String,
+    pub action: String,
+    /// Optional argument property name that selects `Destination.resource`; otherwise `fixed_resource`.
+    pub resource_field: Option<String>,
+    pub fixed_resource: String,
+    pub class: EffectClass,
+    pub capability: String,
+    pub gate: CapabilityGate,
+    pub tool_policy: String,
+    pub destination_policy: String,
+    pub endpoint_id: String,
+    pub endpoint_version: String,
+    pub idempotency: Option<IdempotencyWindow>,
+    pub authoritative_lookup: bool,
+    pub semantic_errors_are_side_effect_free: bool,
+    /// Optional `structuredContent` string field captured as redacted `downstream_handle`.
+    pub handle_field: Option<String>,
+    pub reconcile: Option<ReconcileSpec>,
+    pub call_timeout: Duration,
+}
+
+impl ExternalToolContract {
+    /// Validate the contract schema at registration time, rejecting `x-mcp-header`, open objects,
+    /// unsupported idempotency headers, or oversized schemas fail-closed.
+    pub fn validate(&mut self) -> Result<(), ToolFault> {
+        if self.tool_id.is_empty()
+            || self.tool_id.len() > 128
+            || self.remote_name.is_empty()
+            || self.remote_name.len() > 256
+            || self.version.is_empty()
+            || self.version.len() > 128
+            || self.connection_id.is_empty()
+            || self.account_id.is_empty()
+            || self.action.is_empty()
+            || self.fixed_resource.is_empty()
+            || self.call_timeout.is_zero()
+        {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        validate_schema(&self.input_schema, 0)?;
+        let mut sorted = self.input_schema.clone();
+        sorted.sort_all_objects();
+        if sorted.to_string().len() > MAX_SCHEMA_BYTES {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        if let Some(idem) = &self.idempotency {
+            if idem.namespace.is_empty() || idem.expires_us <= idem.valid_from_us {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            match &idem.carrier {
+                IdempotencyCarrier::None => return Err(ToolFault::TerminalRefusal),
+                IdempotencyCarrier::Header(name) if !is_allowed_idempotency_header_name(name) => {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+                IdempotencyCarrier::Meta(field)
+                    if field.is_empty() || field.starts_with("io.modelcontextprotocol/") =>
+                {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+                _ => {}
+            }
+        }
+        self.input_schema = sorted;
+        self.schema_digest = canonical_schema_digest(&self.input_schema);
+        Ok(())
+    }
+
+    /// Build the model-facing `Tool` declaration for this reviewed contract.
+    pub fn declaration(&self) -> Tool {
+        Tool {
+            name: self.tool_id.clone(),
+            description: self.description.clone(),
+            parameters: self.input_schema.clone(),
+        }
+    }
+
+    /// Validate raw JSON arguments against this closed-object contract and expand defaults.
+    pub fn validate_arguments(&self, raw: &[u8]) -> Result<Value, ToolFault> {
+        if raw.len() > MAX_ARG_BYTES {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        let parsed = approvals::canonical_arguments(raw).map_err(|_| ToolFault::TerminalRefusal)?;
+        if contains_x_mcp_header(&parsed) {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        let mut normalized = validate_value_against_schema(&parsed, &self.input_schema, 0)?;
+        normalized.sort_all_objects();
+        if normalized.to_string().len() > MAX_ARG_BYTES {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        Ok(normalized)
+    }
+
+    /// Build a server-bound `Proposal` from validated arguments and pinned destination fields.
+    pub fn proposal(&self, key: &str, raw_args: &[u8]) -> Result<Proposal, ToolFault> {
+        if key.is_empty()
+            || key.len() > 128
+            || key.contains('*')
+            || key.chars().any(char::is_control)
+        {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        let normalized = self.validate_arguments(raw_args)?;
+        let resource = match &self.resource_field {
+            Some(field) => normalized
+                .as_object()
+                .and_then(|m| m.get(field))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && !s.contains('*') && !s.chars().any(char::is_control))
+                .ok_or(ToolFault::TerminalRefusal)?,
+            None => self.fixed_resource.as_str(),
+        };
+        Proposal::new(
+            key,
+            &self.tool_id,
+            &self.version,
+            normalized.to_string().as_bytes(),
+            Destination {
+                connection: &self.connection_id,
+                account: &self.account_id,
+                action: &self.action,
+                resource,
+            },
+        )
+        .map_err(|_| ToolFault::TerminalRefusal)
+    }
+
+    /// Derive the deterministic endpoint idempotency key for `(scope, run, proposal)`.
+    pub fn endpoint_key(&self, scope: &str, run: &str, proposal: &Proposal) -> EndpointKey {
+        let Some(idem) = &self.idempotency else {
+            return EndpointKey::Unsupported;
+        };
+        let field = match &idem.carrier {
+            IdempotencyCarrier::Header(name) => name.clone(),
+            IdempotencyCarrier::Meta(field) => field.clone(),
+            IdempotencyCarrier::None => return EndpointKey::Unsupported,
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"openmettle/mcp-idempotency/1\0");
+        for part in [
+            scope.as_bytes(),
+            run.as_bytes(),
+            proposal.logical_key.as_bytes(),
+            proposal.tool.as_bytes(),
+            proposal.version.as_bytes(),
+            proposal.destination().as_bytes(),
+        ] {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part);
+        }
+        let key = projects::hex(&hasher.finalize());
+        EndpointKey::Supported {
+            namespace: idem.namespace.clone(),
+            field,
+            valid_from_us: idem.valid_from_us,
+            key,
+            expires_us: idem.expires_us,
+        }
+    }
+}
+
+/// Registry of reviewed external MCP tool contracts implementing `approvals::EffectPolicy`.
+#[derive(Clone, Default)]
+pub struct ExternalRegistry {
+    contracts: BTreeMap<(String, String), ExternalToolContract>,
+}
+
+impl ExternalRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one reviewed contract after strict schema validation.
+    pub fn register(&mut self, mut contract: ExternalToolContract) -> Result<(), ToolFault> {
+        contract.validate()?;
+        let key = (contract.tool_id.clone(), contract.version.clone());
+        if self.contracts.contains_key(&key) {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        self.contracts.insert(key, contract);
+        Ok(())
+    }
+
+    pub fn get(&self, tool_id: &str, version: &str) -> Option<&ExternalToolContract> {
+        self.contracts
+            .get(&(tool_id.to_owned(), version.to_owned()))
+    }
+
+    pub fn proposal(
+        &self,
+        key: &str,
+        tool_id: &str,
+        version: &str,
+        raw_args: &[u8],
+    ) -> Result<Proposal, ToolFault> {
+        self.get(tool_id, version)
+            .ok_or(ToolFault::TerminalRefusal)?
+            .proposal(key, raw_args)
+    }
+
+    /// Verify upstream `tools/list` declarations for `connection_id`.
+    ///
+    /// Ignores undeclared remote tools, rejects duplicate remote tool names, rejects any
+    /// `x-mcp-header` annotation, and requires every contract pinned to `connection_id` to
+    /// exist remotely with an exact canonical schema digest match.
+    pub fn verify_tools_list(
+        &self,
+        connection_id: &str,
+        remote: &[RemoteToolDeclaration],
+    ) -> Result<(), ToolFault> {
+        let mut by_name: BTreeMap<&str, &Value> = BTreeMap::new();
+        for tool in remote {
+            if by_name
+                .insert(tool.name.as_str(), &tool.input_schema)
+                .is_some()
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+        }
+        let mut matched_any = false;
+        for contract in self.contracts.values() {
+            if contract.connection_id != connection_id {
+                continue;
+            }
+            matched_any = true;
+            let Some(remote_schema) = by_name.get(contract.remote_name.as_str()) else {
+                return Err(ToolFault::TerminalRefusal);
+            };
+            if contains_x_mcp_header(remote_schema) {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            // Reject duplicate keys in remote schema serialization as well as schema drift.
+            let raw = remote_schema.to_string();
+            if raw.len() > MAX_SCHEMA_BYTES || unique(raw.as_bytes()).is_err() {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if canonical_schema_digest(remote_schema) != contract.schema_digest {
+                return Err(ToolFault::TerminalRefusal);
+            }
+        }
+        if !matched_any {
+            return Err(ToolFault::TerminalRefusal);
+        }
+        Ok(())
+    }
+}
+
+impl EffectPolicy for ExternalRegistry {
+    fn review(&self, scope: &str, run: &str, p: &Proposal) -> Result<Option<Review>, StoreError> {
+        let Some(contract) = self.get(&p.tool, &p.version) else {
+            return Ok(None);
+        };
+        let Ok(expected) = contract.proposal(&p.logical_key, p.arguments().to_string().as_bytes())
+        else {
+            return Ok(None);
+        };
+        if expected.arguments() != p.arguments() || expected.destination() != p.destination() {
+            return Ok(None);
+        }
+        Ok(Some(Review {
+            class: contract.class,
+            capability: contract.capability.clone(),
+            gate: contract.gate,
+            tool_policy: contract.tool_policy.clone(),
+            destination_policy: contract.destination_policy.clone(),
+            endpoint_id: contract.endpoint_id.clone(),
+            endpoint_version: contract.endpoint_version.clone(),
+            endpoint_key: contract.endpoint_key(scope, run, p),
+            authoritative_lookup: contract.authoritative_lookup,
+            artifact: None,
+            reservation: None,
+        }))
+    }
+}
+
+fn validate_schema(schema: &Value, depth: usize) -> Result<(), ToolFault> {
+    if depth > MAX_DEPTH || contains_x_mcp_header(schema) {
+        return Err(ToolFault::TerminalRefusal);
+    }
+    let obj = schema.as_object().ok_or(ToolFault::TerminalRefusal)?;
+    let kind = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(ToolFault::TerminalRefusal)?;
+    match kind {
+        "object" => {
+            if obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            let props = obj
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or(ToolFault::TerminalRefusal)?;
+            if props.len() > MAX_OBJECT_PROPERTIES {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            for prop in props.values() {
+                validate_schema(prop, depth + 1)?;
+            }
+            if let Some(required) = obj.get("required") {
+                let reqs = required.as_array().ok_or(ToolFault::TerminalRefusal)?;
+                for req in reqs {
+                    let name = req.as_str().ok_or(ToolFault::TerminalRefusal)?;
+                    if !props.contains_key(name) {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                }
+            }
+            Ok(())
+        }
+        "string" => {
+            if let Some(fmt) = obj.get("format")
+                && fmt.as_str() != Some("uuid")
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            Ok(())
+        }
+        "integer" | "boolean" => Ok(()),
+        "array" => {
+            let items = obj.get("items").ok_or(ToolFault::TerminalRefusal)?;
+            validate_schema(items, depth + 1)
+        }
+        _ => Err(ToolFault::TerminalRefusal),
+    }
+}
+
+fn validate_value_against_schema(
+    value: &Value,
+    schema: &Value,
+    depth: usize,
+) -> Result<Value, ToolFault> {
+    if depth > MAX_DEPTH {
+        return Err(ToolFault::TerminalRefusal);
+    }
+    let obj = schema.as_object().ok_or(ToolFault::TerminalRefusal)?;
+    let kind = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(ToolFault::TerminalRefusal)?;
+    match kind {
+        "object" => {
+            let input = value.as_object().ok_or(ToolFault::TerminalRefusal)?;
+            if input.len() > MAX_OBJECT_PROPERTIES {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            let props = obj
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or(ToolFault::TerminalRefusal)?;
+            for k in input.keys() {
+                if !props.contains_key(k) {
+                    return Err(ToolFault::TerminalRefusal);
+                }
+            }
+            let mut out = Map::new();
+            for (k, prop_schema) in props {
+                if let Some(v) = input.get(k) {
+                    out.insert(
+                        k.clone(),
+                        validate_value_against_schema(v, prop_schema, depth + 1)?,
+                    );
+                } else if let Some(default) = prop_schema.get("default") {
+                    out.insert(
+                        k.clone(),
+                        validate_value_against_schema(default, prop_schema, depth + 1)?,
+                    );
+                }
+            }
+            if let Some(required) = obj.get("required").and_then(Value::as_array) {
+                for req in required {
+                    let name = req.as_str().ok_or(ToolFault::TerminalRefusal)?;
+                    if !out.contains_key(name) {
+                        return Err(ToolFault::TerminalRefusal);
+                    }
+                }
+            }
+            Ok(Value::Object(out))
+        }
+        "string" => {
+            let s = value.as_str().ok_or(ToolFault::TerminalRefusal)?;
+            if s.len() > MAX_STRING_BYTES {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(min) = obj.get("minLength").and_then(Value::as_u64)
+                && (s.len() as u64) < min
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(max) = obj.get("maxLength").and_then(Value::as_u64)
+                && (s.len() as u64) > max
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if obj.get("format").and_then(Value::as_str) == Some("uuid")
+                && !runs::is_canonical_uuid(s)
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(allowed) = obj.get("enum").and_then(Value::as_array)
+                && !allowed.iter().any(|v| v == value)
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            Ok(Value::String(s.to_owned()))
+        }
+        "integer" => {
+            let n = value.as_i64().ok_or(ToolFault::TerminalRefusal)?;
+            if let Some(min) = obj.get("minimum").and_then(Value::as_i64)
+                && n < min
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(max) = obj.get("maximum").and_then(Value::as_i64)
+                && n > max
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            Ok(Value::Number(n.into()))
+        }
+        "boolean" => {
+            let b = value.as_bool().ok_or(ToolFault::TerminalRefusal)?;
+            Ok(Value::Bool(b))
+        }
+        "array" => {
+            let items = value.as_array().ok_or(ToolFault::TerminalRefusal)?;
+            if items.len() > MAX_ARRAY_ITEMS {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            if let Some(max) = obj.get("maxItems").and_then(Value::as_u64)
+                && (items.len() as u64) > max
+            {
+                return Err(ToolFault::TerminalRefusal);
+            }
+            let item_schema = obj.get("items").ok_or(ToolFault::TerminalRefusal)?;
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(validate_value_against_schema(item, item_schema, depth + 1)?);
+            }
+            Ok(Value::Array(out))
+        }
+        _ => Err(ToolFault::TerminalRefusal),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_contract() -> ExternalToolContract {
+        ExternalToolContract {
+            tool_id: "docs.append".into(),
+            remote_name: "docs.append".into(),
+            version: "1".into(),
+            description: "Append one bounded note".into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["doc_id", "body"],
+                "properties": {
+                    "doc_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "body": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "retries": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1}
+                }
+            }),
+            schema_digest: [0; 32],
+            connection_id: "docs-mcp".into(),
+            account_id: "acct-1".into(),
+            action: "append".into(),
+            resource_field: Some("doc_id".into()),
+            fixed_resource: "default".into(),
+            class: EffectClass::EligibleWrite,
+            capability: "tools.docs.write".into(),
+            gate: CapabilityGate::OptIn,
+            tool_policy: "docs.append.v1".into(),
+            destination_policy: "docs.v1".into(),
+            endpoint_id: "docs-mcp".into(),
+            endpoint_version: "1".into(),
+            idempotency: Some(IdempotencyWindow {
+                namespace: "docs".into(),
+                carrier: IdempotencyCarrier::Header("Idempotency-Key".into()),
+                valid_from_us: 1_000,
+                expires_us: 9_000_000_000_000_000,
+            }),
+            authoritative_lookup: false,
+            semantic_errors_are_side_effect_free: true,
+            handle_field: Some("handle".into()),
+            reconcile: None,
+            call_timeout: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn x_mcp_header_and_open_objects_and_tools_list_drift_fail_closed() {
+        let mut with_header = sample_contract();
+        with_header.input_schema["properties"]["doc_id"]["x-mcp-header"] = json!("X-Doc");
+        assert_eq!(with_header.validate(), Err(ToolFault::TerminalRefusal));
+
+        let mut open = sample_contract();
+        open.input_schema["additionalProperties"] = json!(true);
+        assert_eq!(open.validate(), Err(ToolFault::TerminalRefusal));
+
+        let mut bad_idem = sample_contract();
+        bad_idem.idempotency.as_mut().unwrap().carrier =
+            IdempotencyCarrier::Header("Mcp-Param-Id".into());
+        assert_eq!(bad_idem.validate(), Err(ToolFault::TerminalRefusal));
+
+        let mut registry = ExternalRegistry::new();
+        registry.register(sample_contract()).unwrap();
+
+        // Undeclared remote tools are ignored while pinned tool must match exactly.
+        let matching_schema = registry
+            .get("docs.append", "1")
+            .unwrap()
+            .input_schema
+            .clone();
+        assert!(
+            registry
+                .verify_tools_list(
+                    "docs-mcp",
+                    &[
+                        RemoteToolDeclaration {
+                            name: "undeclared.tool".into(),
+                            input_schema: json!({"type": "object"}),
+                        },
+                        RemoteToolDeclaration {
+                            name: "docs.append".into(),
+                            input_schema: matching_schema.clone(),
+                        },
+                    ],
+                )
+                .is_ok()
+        );
+
+        // Missing pinned tool -> refused.
+        assert_eq!(
+            registry.verify_tools_list("docs-mcp", &[]),
+            Err(ToolFault::TerminalRefusal)
+        );
+
+        // Schema drift or remote `x-mcp-header` -> refused.
+        let mut drifted = matching_schema.clone();
+        drifted["properties"]["body"]["maxLength"] = json!(8192);
+        assert_eq!(
+            registry.verify_tools_list(
+                "docs-mcp",
+                &[RemoteToolDeclaration {
+                    name: "docs.append".into(),
+                    input_schema: drifted,
+                }],
+            ),
+            Err(ToolFault::TerminalRefusal)
+        );
+
+        let mut remote_header = matching_schema;
+        remote_header["properties"]["doc_id"]["x-mcp-header"] = json!("X-Custom");
+        assert_eq!(
+            registry.verify_tools_list(
+                "docs-mcp",
+                &[RemoteToolDeclaration {
+                    name: "docs.append".into(),
+                    input_schema: remote_header,
+                }],
+            ),
+            Err(ToolFault::TerminalRefusal)
+        );
+    }
+
+    #[test]
+    fn argument_validation_expands_defaults_and_rejects_extra_or_out_of_bounds_values() {
+        let mut registry = ExternalRegistry::new();
+        registry.register(sample_contract()).unwrap();
+        let proposal = registry
+            .proposal("k1", "docs.append", "1", br#"{"doc_id":"d1","body":"hi"}"#)
+            .unwrap();
+        assert_eq!(proposal.arguments()["retries"], 1);
+        assert_eq!(
+            proposal.destination(),
+            r#"["v1","docs-mcp","acct-1","append","d1"]"#
+        );
+        for bad in [
+            br#"{"doc_id":"d1","body":"hi","extra":1}"#.as_slice(),
+            br#"{"doc_id":"d1","body":"hi","retries":4}"#,
+            br#"{"doc_id":"d1","body":"hi","retries":1.0}"#,
+            br#"{"doc_id":"*","body":"hi"}"#,
+            br#"{"doc_id":"d1","body":"hi","body":"dup"}"#,
+        ] {
+            assert_eq!(
+                registry.proposal("k1", "docs.append", "1", bad).err(),
+                Some(ToolFault::TerminalRefusal)
+            );
+        }
+    }
+}

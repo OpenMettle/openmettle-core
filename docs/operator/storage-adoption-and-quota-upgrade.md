@@ -194,6 +194,28 @@ Migration `0038` ([ADR 0027](../adr/0027-authorization-and-private-projects.md),
 - Replaces `openmettle.quota_lock_override(uuid, uuid, text)` with the same signature, invoker security, `search_path` and privileges, keeping a fast pre-target administrator check under `account_admin_lock` so non-admins never wait on contended scope locks, locking personal-scope owner and actor in ascending `users.id` order, re-checking administrator status under the actor's `users` lock, and placing `run_dispatch_lock` after the actor lock so SQL and Rust follow one canonical lock order (`account_admin_lock -> projects -> login_providers -> local_identity_approvals -> users (ascending id) -> storage_volume_control -> run_dispatch_lock -> storage_accounts | quota_budgets`). Previous-release API binaries calling `quota_upsert_scope_override` and `quota_revoke_scope_override` continue working unchanged.
 - Replaces the unexposed 4-argument `openmettle.retention_set_grace(uuid, integer, text, text)` (no route or runtime caller existed in any prior release) with the 5-argument approval-bound `openmettle.retention_set_grace(p_actor uuid, p_approval uuid, p_grace_seconds integer, p_reason text, p_request_key text)` (`SECURITY DEFINER`, `openmettle_api` only), serializing under `account_admin_lock -> login_providers -> local_identity_approvals -> users -> retention_policy` and verifying full live authority at `clock_timestamp()` both before target locking and after the final `authorization_audit` insert.
 
+## Upgrade from 0038 to 0039 (MCP runtime feature gate and terminal write-intent resolution)
+
+Migration `0039` ([ADR 0039](../adr/0039-scoped-mcp-adapter-and-bounded-tool-results.md), V1-14 PR3) adds the 1-row rollout gate table `openmettle.runtime_feature_gates` (`two_phase_effect_intents_enabled`, `SELECT` only for `openmettle_api` and `openmettle_worker`) and the owner-owned `SECURITY DEFINER` trigger `openmettle.resolve_terminal_write_intents()` on `openmettle.runs`:
+
+- **Populated upgrade default (`false`):** On an upgrade from schema `0038` or earlier, `two_phase_effect_intents_enabled` starts `false`. While `false`, pre-existing ADR 0035 external approval writes keep `dispatched_attempts = NULL` (`N-1`-compatible single-phase behavior) and scoped MCP tool execution stays fail-closed so no previous-release (`N-1`) worker or `settle_expired` sweeper ever observes a `dispatched_attempts = 0` write row. Fresh databases migrated from version `0` start with `two_phase_effect_intents_enabled = true`.
+- **Rollout order:**
+  1. Apply migration `0039` with `openmettle-migrate` using its existing owner connection.
+  2. Roll every `openmettle-worker` (and `openmettle-api`) deployment to the `0039` release binaries and confirm that every previous-release (`0038` or earlier) worker replica and maintenance sweeper has exited.
+  3. Enable two-phase write intents as `openmettle_owner` using the idempotent admin command:
+
+```sh
+openmettle-admin runtime activate-two-phase-intents
+```
+
+  4. Verify `two_phase_effect_intents_enabled = true`:
+
+```sql
+SELECT two_phase_effect_intents_enabled FROM openmettle.runtime_feature_gates WHERE id;
+```
+
+- **Terminal write-intent invariant:** `openmettle.resolve_terminal_write_intents()` rejects any transition to `runs.state = 'succeeded'` while any write operation (`idempotent`, `lookup`, `non_repeatable`) remains in `outcome IN ('intent', 'outcome_unknown')` (including `dispatched_attempts = 0`), and on `failed`, `cancelled`, or `interrupted` transitions any remaining revision-zero write `intent` to `outcome = 'outcome_unknown', revision = 1` with its ADR 0004 observation event strictly before `run-terminal`.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

@@ -216,6 +216,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "admin write serialization",
         sql: include_str!("../migrations/0038_admin_write_serialization.sql"),
     },
+    Source {
+        version: 39,
+        description: "mcp runtime gates and write intents",
+        sql: include_str!("../migrations/0039_mcp_runtime_gates_and_write_intents.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
