@@ -832,3 +832,64 @@ async fn a_cost_metered_turn_settles_through_the_gateway_with_recorded_prices() 
     let (status, stderr) = terminate(packaged.process).await;
     assert!(status.success(), "{stderr}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TEST_DATABASE_URL for isolated PostgreSQL 18"]
+async fn family_policy_denial_at_handoff_settles_run_as_revoked() {
+    let chat = Chat::new().await;
+    let _installation = chat.ensure_metered_gateway().await;
+    let (run, _input) = chat.submit("family-handoff-revoked", "a", 1).await;
+
+    // Hold account_admin_lock FOR UPDATE and stage a disabled-model family policy (uncommitted).
+    // TurnExecutor passes recheck_claim and TurnExecutor::authority before blocking on
+    // account_admin_lock inside reserve_turn_round / handoff_turn, then hits the committed policy
+    // at handoff_turn and must recheck + settle as `cancelled` (`revoked`), not `failed` (`step_failed`).
+    let mut owner = connect(&chat.f.db.0, OWNER).await;
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let mut tx = owner.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.account_admin_lock FOR UPDATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let pid: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.family_policies (grantee_kind, grantee_user_id, active, zone)
+         VALUES ('user', $1::uuid, true, 'UTC') RETURNING id::text",
+    )
+    .bind(&chat.f.actor.user)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.family_policy_models (policy_id, rule_kind, model, active)
+         VALUES ($1::uuid, 'disabled', 'a', true)",
+    )
+    .bind(&pid)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let provider = Provider::new().await;
+    let _worker = chat.start(&provider).await;
+    wait_for_blocked_peer(&chat.f.db, holder_pid).await;
+    tx.commit().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (state, cancel_reason): (String, Option<String>) = loop {
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT state, cancel_reason FROM openmettle.runs WHERE id = $1::uuid")
+                .bind(&run)
+                .fetch_one(&mut owner)
+                .await
+                .unwrap();
+        if matches!(row.0.as_str(), "cancelled" | "failed" | "succeeded") {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "run did not settle: {row:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(state, "cancelled");
+    assert_eq!(cancel_reason.as_deref(), Some("revoked"));
+}

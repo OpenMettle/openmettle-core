@@ -248,7 +248,7 @@ pub(super) struct Change {
     pub(super) details: Value,
 }
 
-pub(super) const UNCHANGED: StoreError =
+pub(crate) const UNCHANGED: StoreError =
     StoreError::Conflict("target is already in the requested state");
 
 /// The [`StoreError::Conflict`] of a request key that already recorded another change. The API
@@ -382,10 +382,11 @@ pub(super) async fn record(
 }
 
 /// The administration write protocol, in one transaction:
-/// 1. account administration and user lifecycle lock `account_admin_lock` before anything else;
-/// 2. the actor's user row is locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable
-///    targets the actor), then the actor is re-hydrated from the primary and must be an active
-///    `account_admin`;
+/// 1. account administration, user lifecycle, local-group and family-policy writes lock
+///    `account_admin_lock FOR UPDATE` before anything else;
+/// 2. the actor's provider and approval rows are locked `FOR SHARE`, then the actor's user row is
+///    locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable targets the actor), then the
+///    actor is re-hydrated from the primary and must be an active `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
 /// 4. `apply` checks the target and changes current state, or the whole transaction rolls back.
 async fn write(
@@ -397,13 +398,49 @@ async fn write(
 ) -> Result<WriteOutcome, StoreError> {
     let self_lifecycle =
         action == Action::ManageAccounts && change.target_id.as_deref() == Some(ctx.actor_user_id);
+    write_with(
+        c,
+        ctx,
+        action,
+        self_lifecycle,
+        async |_, _| Ok(change),
+        apply,
+    )
+    .await
+}
+
+async fn write_with(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    action: Action,
+    self_lifecycle: bool,
+    build_change: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<Change, StoreError>,
+    apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
-        if matches!(action, Action::ManageAccountAdmin | Action::ManageAccounts) {
+        if matches!(
+            action,
+            Action::ManageAccountAdmin
+                | Action::ManageAccounts
+                | Action::ManageLocalGroups
+                | Action::ManageFamilyPolicies
+        ) {
             sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
                 .fetch_one(&mut *c)
                 .await?;
         }
+        // Hold the actor's provider and approval FOR SHARE before locking users so concurrent
+        // approval withdrawals (docs/operator/identity-approval-change.psql) serialize cleanly.
+        sqlx::query(
+            "SELECT FROM openmettle.login_providers p
+               JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
+              WHERE a.id = $1::uuid
+                FOR SHARE OF p, a",
+        )
+        .bind(ctx.actor_approval_id)
+        .execute(&mut *c)
+        .await?;
         // sessions::disable_user locks only the user row: hold the actor's row so a disable in
         // flight is waited for and seen, and a later one waits for this commit. User disable and
         // enable lock their target FOR UPDATE: on their own actor they take it here, never
@@ -417,7 +454,19 @@ async fn write(
             .bind(ctx.actor_user_id)
             .execute(&mut *c)
             .await?;
-        let actor = acting(c, ctx).await?;
+        // Advance `now_ms` monotonically to at least the primary's post-lock `clock_timestamp()`
+        // so approvals that expire while waiting on locks are rejected on hydration, while keeping
+        // synthetic future test clocks monotonic.
+        let post_lock_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *c)
+        .await?;
+        let post_lock_ctx = AuditContext {
+            now_ms: ctx.now_ms.max(post_lock_ms),
+            ..*ctx
+        };
+        let actor = acting(c, &post_lock_ctx).await?;
         check(super::authorize_admin(
             &actor,
             AdminChange {
@@ -426,7 +475,8 @@ async fn write(
                 enabled_account_admins: 0,
             },
         ))?;
-        let outcome = record(c, ctx, &change).await?;
+        let change = build_change(c, &actor).await?;
+        let outcome = record(c, &post_lock_ctx, &change).await?;
         if let WriteOutcome::Applied { target_id } = &outcome {
             apply(c, &actor, target_id).await?;
         }
@@ -479,7 +529,7 @@ async fn keep_last_admin(
 }
 
 /// Whether the user exists and is enabled, holding the row lock for the rest of the transaction.
-pub(super) async fn lock_user(
+pub(crate) async fn lock_user(
     c: &mut PgConnection,
     user_id: &str,
     exclusive: bool,
@@ -666,7 +716,7 @@ fn group_name(name: &str) -> Result<(), StoreError> {
 const DUPLICATE_GROUP: &str = "a local group already has this name";
 
 /// (name, enabled) of a group, locked for the rest of the transaction.
-pub(super) async fn lock_group(
+pub(crate) async fn lock_group(
     c: &mut PgConnection,
     group_id: &str,
     exclusive: bool,
@@ -1037,6 +1087,119 @@ pub async fn set_user_capability_grant(
         "capability.user_revoke"
     };
     set_flag(c, ctx, USER_GRANTS, action, name, Some(user_id), granted).await
+}
+
+// --- family policy administration (ADR 0044, increment 4) --------------------------------------
+
+async fn write_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    action: &'static str,
+    details: Value,
+    apply: impl AsyncFnOnce(&mut PgConnection, &str) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
+    grantee.validate()?;
+    write_with(
+        c,
+        ctx,
+        Action::ManageFamilyPolicies,
+        false,
+        async |c, _| {
+            let existing = super::gateway::family::existing_policy_id(c, grantee).await?;
+            Ok(Change {
+                action,
+                target_kind: "family_policy",
+                target_id: existing,
+                details,
+            })
+        },
+        async |c, _, target_id| apply(c, target_id).await,
+    )
+    .await
+}
+
+/// Create or update a family schedule/override policy for a user, local group or OIDC group.
+/// Serialized under `account_admin_lock` and audited as `actor_kind = 'user'`.
+pub async fn set_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    input: &super::gateway::family::FamilyPolicyInput,
+) -> Result<WriteOutcome, StoreError> {
+    input.validate(grantee)?;
+    let details = super::gateway::family::set_policy_details(grantee, input);
+    write_family_policy(
+        c,
+        ctx,
+        grantee,
+        "family_policy.set",
+        details,
+        async |c, id| {
+            super::gateway::family::apply_set_policy(c, id, grantee, input, Some(ctx.actor_user_id))
+                .await
+        },
+    )
+    .await
+}
+
+/// Deactivate (`active = false`) an active family policy row without deleting history.
+pub async fn clear_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+) -> Result<WriteOutcome, StoreError> {
+    let details = super::gateway::family::clear_policy_details(grantee);
+    write_family_policy(
+        c,
+        ctx,
+        grantee,
+        "family_policy.clear",
+        details,
+        async |c, id| {
+            super::gateway::family::apply_clear_policy(c, id, grantee, Some(ctx.actor_user_id))
+                .await
+        },
+    )
+    .await
+}
+
+/// Activate (`true`) or deactivate (`false`) a `study_allow` or `disabled` model rule on an
+/// existing family policy row.
+pub async fn set_family_policy_model(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    kind: super::gateway::family::FamilyPolicyRuleKind,
+    model: &str,
+    active: bool,
+) -> Result<WriteOutcome, StoreError> {
+    if !super::gateway::family::valid_model(model) {
+        return Err(StoreError::InvalidInput("model"));
+    }
+    let action = kind.audit_action(active);
+    let details = super::gateway::family::set_model_details(grantee, kind, model, active);
+    write_family_policy(c, ctx, grantee, action, details, async |c, id| {
+        super::gateway::family::apply_set_model(
+            c,
+            id,
+            grantee,
+            kind,
+            model,
+            active,
+            Some(ctx.actor_user_id),
+        )
+        .await
+    })
+    .await
+}
+
+/// Read the current-state family policy record and active model rules for `grantee`.
+pub async fn load_family_policy(
+    c: &mut PgConnection,
+    grantee: &super::gateway::family::FamilyGrantee,
+) -> Result<Option<super::gateway::family::FamilyPolicyRecord>, StoreError> {
+    super::gateway::family::load_family_policy(c, grantee).await
 }
 
 #[cfg(test)]

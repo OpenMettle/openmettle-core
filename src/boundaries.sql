@@ -26,6 +26,13 @@
 -- reconciliation helper, and the unbound caller-cost trigger (no role may call), and replaces
 -- handoff/authority/fold/drift/settlement functions with unchanged signatures, security and
 -- privileges (ADR 0044, issue #166).
+-- Version 35 adds `family_policies` and `family_policy_models` (`openmettle_api` SELECT and
+-- column-scoped INSERT/UPDATE only; no DELETE for any runtime role; no table privileges for
+-- worker, gateway or issuance), widens `authorization_audit` CHECK constraints, adds two
+-- trigger guards (no role may call), `family_policy_filter_models` (API only) and
+-- `family_policy_permits` (API and worker only), and replaces `gateway_round_authority`,
+-- `gateway_handoff_round` (6-arg) and `gateway_dispatch` with unchanged signatures, security
+-- and privileges (ADR 0044, increment 4).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -93,6 +100,23 @@ retention_tables (relation,role,privilege) AS (
 ),
 retention_columns (relation,attribute,role,privilege) AS (
     SELECT 'artifact_revisions','retention_policy_revision','openmettle_api','UPDATE' WHERE $1 >= 28
+),
+-- Version 35 (ADR 0044, increment 4): family policies managed by the API only; no DELETE.
+family_tables (relation,role,privilege) AS (
+    SELECT relation,'openmettle_api','SELECT'
+    FROM unnest(ARRAY['family_policies','family_policy_models']) relation WHERE $1 >= 35
+),
+family_columns (relation,attribute,role,privilege) AS (
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+        ('family_policies','INSERT',ARRAY['id','grantee_kind','grantee_user_id','grantee_local_group_id',
+            'grantee_oidc_group_id','active','zone','quiet_start_minute','quiet_end_minute',
+            'study_start_minute','study_end_minute','override_group_schedules','updated_by_user_id']),
+        ('family_policies','UPDATE',ARRAY['active','zone','quiet_start_minute','quiet_end_minute',
+            'study_start_minute','study_end_minute','override_group_schedules','revision',
+            'updated_at','updated_by_user_id']),
+        ('family_policy_models','INSERT',ARRAY['policy_id','rule_kind','model','active','updated_by_user_id']),
+        ('family_policy_models','UPDATE',ARRAY['active','revision','updated_at','updated_by_user_id'])
+    ) AS t(relation,privilege,columns), unnest(columns) attribute WHERE $1 >= 35
 ),
 gateway_columns (relation,attribute,role,privilege) AS (
     SELECT relation, attribute, role, privilege FROM (VALUES
@@ -219,6 +243,11 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.gateway_snapshot_cost_bound(text)',false,ARRAY[]::text[]),
         ('openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint)',false,ARRAY[]::text[]),
         ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 34
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.enforce_family_policy_timezone()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_family_policy_model_writer()',false,ARRAY[]::text[]),
+        ('openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.family_policy_permits(uuid,uuid,text,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[])) AS f WHERE $1 >= 35
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -337,6 +366,7 @@ contract (relation, role, privilege) AS (
     UNION ALL SELECT * FROM quota_tables
     UNION ALL SELECT * FROM capacity_tables
     UNION ALL SELECT * FROM retention_tables
+    UNION ALL SELECT * FROM family_tables
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -405,6 +435,8 @@ column_contract (relation, attribute, role, privilege) AS (
     SELECT * FROM quota_columns
     UNION ALL
     SELECT * FROM retention_columns
+    UNION ALL
+    SELECT * FROM family_columns
     UNION ALL
     SELECT * FROM gateway_columns
     UNION ALL
@@ -755,7 +787,8 @@ violations (violation) AS (
                     (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control'))
                     OR ($1>=27 AND g.object_name LIKE 'capacity\_%')
                     OR ($1>=28 AND (g.object_name LIKE 'deletion\_journal%' OR g.object_name LIKE 'retention\_%'
-                                    OR g.object_name='artifact_retention_holds')))
+                                    OR g.object_name='artifact_retention_holds'))
+                    OR ($1>=35 AND g.object_name LIKE 'family\_polic%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
@@ -791,14 +824,14 @@ violations (violation) AS (
     UNION ALL
     SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
     FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns UNION ALL SELECT * FROM quota_columns
-          UNION ALL SELECT * FROM retention_columns) c WHERE NOT EXISTS (
+          UNION ALL SELECT * FROM retention_columns UNION ALL SELECT * FROM family_columns) c WHERE NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND g.column_name=c.attribute
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
     WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables
-                          UNION ALL SELECT relation FROM retention_tables)
+                          UNION ALL SELECT relation FROM retention_tables UNION ALL SELECT relation FROM family_tables)
            OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)

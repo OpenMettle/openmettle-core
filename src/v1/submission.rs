@@ -205,6 +205,7 @@ impl Request {
 
 async fn resolve(
     c: &mut PgConnection,
+    ctx: &sessions::Context,
     actor: &Principal,
     view: &ResourceView,
     catalog: &Catalog,
@@ -219,9 +220,39 @@ async fn resolve(
         (Selection::default(), None)
     };
     let policy = store::load_platform_capabilities(c).await?;
-    let effective = catalog.resolve(&project, selection, rev, |model, preset| {
+    let resolved = catalog.resolve(&project, selection, rev, |model, preset| {
         catalog::allowed(catalog, actor, &policy, model, preset)
     })?;
+    let permitted = authz::gateway::family::permits_at(
+        c,
+        &actor.user_id,
+        ctx.approval_id(),
+        &resolved.model,
+        ctx.observed_ms(),
+    )
+    .await?;
+    let effective = if permitted {
+        resolved
+    } else if selection.model.is_some() || selection.preset.is_some() {
+        return Err(crate::model_config::Error::Unauthorized.into());
+    } else {
+        let models: Vec<&str> = catalog.models().keys().map(String::as_str).collect();
+        let family_permitted = authz::gateway::family::permits_models(
+            c,
+            &actor.user_id,
+            ctx.approval_id(),
+            &models,
+            ctx.observed_ms(),
+        )
+        .await?;
+        catalog.resolve_with_fallback(
+            &project,
+            selection,
+            rev,
+            |model, preset| catalog::allowed(catalog, actor, &policy, model, preset),
+            |model| family_permitted.contains(model),
+        )?
+    };
     let required_capabilities =
         catalog::capabilities(catalog, &effective.model, effective.preset.as_deref())?;
     let cost_bound = catalog.target(&effective)?.cost_bound;
@@ -359,7 +390,7 @@ pub(super) async fn preview(
         }
     };
     let catalog = catalog.ok_or(PROVISIONING)?;
-    let config = resolve(c, actor, view, catalog, &proposal.selection).await?;
+    let config = resolve(c, call.context, actor, view, catalog, &proposal.selection).await?;
     let e = &config.effective;
     let path = history
         .turns
@@ -573,7 +604,7 @@ async fn admission(
         .await?;
         let c = tx.connection()?;
         let catalog = catalog.ok_or(PROVISIONING)?;
-        let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+        let mut config = resolve(c, ctx, &actor, &view, catalog, intent.selection).await?;
         if r.execution_mode == ExecutionMode::Yolo {
             config
                 .required_capabilities

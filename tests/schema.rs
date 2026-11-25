@@ -973,6 +973,16 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "deletion_journal_head",
         seed_row: Some(DELETION_JOURNAL_HEAD_SEED),
     },
+    AdditiveTable {
+        since: 35,
+        table: "family_policies",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 35,
+        table: "family_policy_models",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1144,6 +1154,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "27c5fd521de087cec5a1d6b2218db88ebddcae87f28a8e186e5706d23569cfdd",
         "02ebc991fda07c990dc47a0e321368379d6ce80d940e8771491f74af24f34c54",
         "cd6543f8de7857b1814c635e691cbe472ac488754bb8ddaaabfb56001c462420",
+        "ed518dd9b187d34053dc16444c8c9d50ba1947a75bb0986e960502acb1fb51d3",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1269,7 +1280,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 46);
+    assert_eq!(after_14.len(), 48);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1330,6 +1341,8 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("artifact_retention_holds", None),
             ("deletion_journal", None),
             ("deletion_journal_head", Some(DELETION_JOURNAL_HEAD_SEED)),
+            ("family_policies", None),
+            ("family_policy_models", None),
         ]
     );
 
@@ -2877,3 +2890,6 @@ mod quotas;
 
 #[path = "schema/capacity.rs"]
 mod capacity;
+
+#[path = "schema/family_policy.rs"]
+mod family_policy;

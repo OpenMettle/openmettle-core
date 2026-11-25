@@ -79,6 +79,7 @@ pub enum Action {
     ManageLocalGroups,
     ManageUserCapabilityDenies,
     ManageQuotas,
+    ManageFamilyPolicies,
     ManageAccountAdmin,
     ManageAccounts,
 }
@@ -149,6 +150,7 @@ pub enum PolicyReason {
     CapabilityDenied,
     CapabilityNotGranted,
     InvalidCapability,
+    FamilyPolicy,
     LastAccountAdmin,
     LastProjectOwner,
     NotShareable,
@@ -651,7 +653,10 @@ pub fn authorize_admin(principal: &Principal, change: AdminChange) -> Decision {
     let admin = lifecycle
         || matches!(
             change.action,
-            Action::ManageLocalGroups | Action::ManageUserCapabilityDenies | Action::ManageQuotas
+            Action::ManageLocalGroups
+                | Action::ManageUserCapabilityDenies
+                | Action::ManageQuotas
+                | Action::ManageFamilyPolicies
         );
     if !admin || (change.removes_enabled_admin && !lifecycle) {
         return policy(PolicyReason::NotApplicable);

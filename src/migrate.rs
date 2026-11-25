@@ -196,6 +196,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway request cost settlement",
         sql: include_str!("../migrations/0034_gateway_request_cost_settlement.sql"),
     },
+    Source {
+        version: 35,
+        description: "family policy tables",
+        sql: include_str!("../migrations/0035_family_policy_tables.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

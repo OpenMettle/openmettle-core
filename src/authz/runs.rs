@@ -56,7 +56,8 @@ macro_rules! non_terminal {
     };
 }
 
-const LOCK_RUN: &str = "SELECT actor_user_id::text, conversation_id::text, state
+const LOCK_RUN: &str =
+    "SELECT actor_user_id::text, conversation_id::text, actor_approval_id::text, state
    FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid FOR NO KEY UPDATE";
 
 // All cancellation paths use the same transition. A reason on an executing run is immutable.
@@ -238,12 +239,19 @@ async fn recheck_locked(
     c: &mut PgConnection,
     r: &RunRecheckRequest<'_>,
 ) -> Result<RunRecheckOutcome, StoreError> {
-    let (owner, conversation, state): (String, String, String) = sqlx::query_as(LOCK_RUN)
-        .bind(r.scope_id)
-        .bind(r.run_id)
-        .fetch_optional(&mut *c)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+    let (owner, conversation, approval, state): (String, String, Option<String>, String) =
+        sqlx::query_as(LOCK_RUN)
+            .bind(r.scope_id)
+            .bind(r.run_id)
+            .fetch_optional(&mut *c)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+    if approval
+        .as_deref()
+        .is_some_and(|stored| stored != r.actor_approval_id)
+    {
+        return Err(StoreError::InvalidInput("actor_approval_id"));
+    }
     if is_terminal(&state) {
         return Ok(RunRecheckOutcome::Terminal { state });
     }
@@ -276,14 +284,198 @@ pub(super) async fn recheck_decision(
         .iter()
         .map(|c| (c.name.to_owned(), c.gate))
         .collect();
-    Ok(evaluate(
+    let decision = evaluate(
         principal.as_ref(),
         &platform,
         scope,
         target,
         extra,
         capabilities,
-    ))
+    );
+    if decision != RunContinuation::Continue {
+        return Ok(decision);
+    }
+    let Some((snapshot_format, snapshot_version, config_snapshot)): Option<(String, i32, Vec<u8>)> =
+        sqlx::query_as(
+            "SELECT snapshot_format, snapshot_version, config_snapshot
+               FROM openmettle.runs
+              WHERE scope_id = $1::uuid AND id = $2::uuid",
+        )
+        .bind(r.scope_id)
+        .bind(r.run_id)
+        .fetch_optional(&mut *c)
+        .await?
+    else {
+        return Ok(RunContinuation::Invalidate(DenialReason::NotFound));
+    };
+    let Some(model) =
+        (match conversation_snapshot_model(&snapshot_format, snapshot_version, &config_snapshot) {
+            Ok(model) => model,
+            Err(()) => {
+                return Ok(RunContinuation::Invalidate(DenialReason::Policy(
+                    super::PolicyReason::FamilyPolicy,
+                )));
+            }
+        })
+    else {
+        return Ok(RunContinuation::Continue);
+    };
+    if !super::gateway::family::permits_at(c, owner, r.actor_approval_id, &model, r.now_ms).await? {
+        return Ok(RunContinuation::Invalidate(DenialReason::Policy(
+            super::PolicyReason::FamilyPolicy,
+        )));
+    }
+    Ok(RunContinuation::Continue)
+}
+
+fn conversation_snapshot_model(
+    snapshot_format: &str,
+    snapshot_version: i32,
+    config_snapshot: &[u8],
+) -> Result<Option<String>, ()> {
+    if snapshot_format != crate::model_config::SNAPSHOT_FORMAT
+        || snapshot_version != crate::model_config::SNAPSHOT_VERSION
+    {
+        return Ok(None);
+    }
+    let doc = crate::provider_keys::documents::unique(config_snapshot).map_err(|_| ())?;
+    // Serde accepts positional arrays for derived structs (`visit_seq`). Require the documented
+    // JSON object shapes at root and nested structs so worker recheck matches SQL handoff, while
+    // retaining optional flattened `execution_mode` written by `/v1/runs` admission.
+    let Some(root) = doc.as_object() else {
+        return Err(());
+    };
+    if !root.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "effective"
+                | "required_capabilities"
+                | "policy_revision"
+                | "cost_bound"
+                | "execution_mode"
+        )
+    }) {
+        return Err(());
+    }
+    if let Some(mode) = root.get("execution_mode")
+        && !matches!(mode.as_str(), Some("standard" | "yolo"))
+    {
+        return Err(());
+    }
+    let Some(eff) = root.get("effective").and_then(serde_json::Value::as_object) else {
+        return Err(());
+    };
+    if eff.len() != 17
+        || !eff.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "catalog_revision"
+                    | "model"
+                    | "model_source"
+                    | "profile"
+                    | "preset"
+                    | "preset_source"
+                    | "preset_revision"
+                    | "project_revision"
+                    | "reasoning_format"
+                    | "instructions"
+                    | "omissions"
+                    | "temperature"
+                    | "top_p"
+                    | "reasoning_effort"
+                    | "context_window"
+                    | "ceiling"
+                    | "output_reserve"
+            )
+        })
+        || !eff
+            .get("model_source")
+            .is_some_and(serde_json::Value::is_string)
+        || !eff
+            .get("preset_source")
+            .is_some_and(|v| v.is_null() || v.is_string())
+        || !eff.get("profile").is_some_and(serde_json::Value::is_object)
+        || ![
+            "temperature",
+            "top_p",
+            "reasoning_effort",
+            "context_window",
+            "ceiling",
+            "output_reserve",
+        ]
+        .into_iter()
+        .all(|k| {
+            eff.get(k)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|f| {
+                    f.len() == 2
+                        && f.keys().all(|fk| matches!(fk.as_str(), "value" | "source"))
+                        && f.get("source").is_some_and(serde_json::Value::is_string)
+                })
+        })
+        || !eff
+            .get("instructions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.as_object().is_some_and(|o| {
+                        o.len() == 2
+                            && o.keys().all(|ik| matches!(ik.as_str(), "source" | "text"))
+                            && o.get("source").is_some_and(serde_json::Value::is_string)
+                    })
+                })
+            })
+        || !eff
+            .get("omissions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.as_object().is_some_and(|o| {
+                        o.len() == 3
+                            && o.keys()
+                                .all(|ok| matches!(ok.as_str(), "source" | "control" | "reason"))
+                            && o.get("source").is_some_and(serde_json::Value::is_string)
+                    })
+                })
+            })
+    {
+        return Err(());
+    }
+    let Some(caps) = root
+        .get("required_capabilities")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(());
+    };
+    if !caps.values().all(serde_json::Value::is_string) {
+        return Err(());
+    }
+    if let Some(cb) = root.get("cost_bound")
+        && !cb.is_null()
+        && !cb
+            .as_object()
+            .is_some_and(|o| o.values().all(serde_json::Value::is_u64))
+    {
+        return Err(());
+    }
+    let snapshot: crate::model_config::ConfigSnapshot =
+        serde_json::from_value(doc).map_err(|_| ())?;
+    if !crate::model_config::name(&snapshot.effective.model)
+        || !snapshot
+            .required_capabilities
+            .keys()
+            .all(|k| super::valid_capability(k))
+    {
+        return Err(());
+    }
+    if let Some(cb) = snapshot.cost_bound
+        && (cb.fixed_micros > i64::MAX as u64
+            || cb.micros_per_token > i64::MAX as u64
+            || (cb.fixed_micros == 0 && cb.micros_per_token == 0))
+    {
+        return Err(());
+    }
+    Ok(Some(snapshot.effective.model))
 }
 
 /// Recheck the claimed run before dispatch. A denial settles stopped work under the same fence.
@@ -338,14 +530,17 @@ async fn recheck_step(
         if approval != actor_approval_id {
             return Err(StoreError::InvalidInput("actor_approval_id"));
         }
-        let r = request.copied().unwrap_or(RunRecheckRequest {
-            scope_id: lease.scope_id,
-            run_id: lease.run_id,
-            actor_approval_id,
-            capabilities: &[],
-            extra_target: None,
-            now_ms,
-        });
+        let r = match request {
+            Some(req) => RunRecheckRequest { now_ms, ..*req },
+            None => RunRecheckRequest {
+                scope_id: lease.scope_id,
+                run_id: lease.run_id,
+                actor_approval_id,
+                capabilities: &[],
+                extra_target: None,
+                now_ms,
+            },
+        };
         match recheck_decision(c, &r, &owner, &conversation).await? {
             RunContinuation::Continue => Ok(None),
             RunContinuation::Invalidate(reason) => {
@@ -1221,12 +1416,13 @@ pub async fn cancel_run(
     uuid(scope_id, "scope_id")?;
     uuid(run_id, "run_id")?;
     transaction(c, async |c| {
-        let row: Option<(String, String, String)> = sqlx::query_as(LOCK_RUN)
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(LOCK_RUN)
             .bind(scope_id)
             .bind(run_id)
             .fetch_optional(&mut *c)
             .await?;
-        let Some((_, _, state)) = row.filter(|(actor, _, _)| *actor == principal.user_id) else {
+        let Some((_, _, _, state)) = row.filter(|(actor, _, _, _)| *actor == principal.user_id)
+        else {
             return Err(StoreError::Denied(DenialReason::NotFound));
         };
         if is_terminal(&state) {

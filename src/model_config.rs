@@ -416,6 +416,58 @@ impl Catalog {
         }
         Ok(e)
     }
+
+    /// Resolve model → preset → project → request for run admission and preview, falling back
+    /// to the first deterministic catalog model permitted by both capabilities and family policy
+    /// ONLY when the request omits both `model` and `preset`, a project default exists and passes
+    /// `capability_allowed`, and `family_allowed` specifically rejects that project default's
+    /// model. Missing project defaults (`Invalid("model selection")`), capability-denied project
+    /// defaults (`Unauthorized`), and explicit request selections never fall back.
+    pub fn resolve_with_fallback(
+        &self,
+        project: &Selection,
+        request: &Selection,
+        project_revision: Option<i64>,
+        mut capability_allowed: impl FnMut(&str, Option<&str>) -> bool,
+        mut family_allowed: impl FnMut(&str) -> bool,
+    ) -> Result<Effective, Error> {
+        let resolved = self.resolve(project, request, project_revision, |m, p| {
+            capability_allowed(m, p)
+        })?;
+        if family_allowed(&resolved.model) {
+            return Ok(resolved);
+        }
+        if request.model.is_some() || request.preset.is_some() {
+            return Err(Error::Unauthorized);
+        }
+        let Some(fallback) = self
+            .0
+            .models
+            .keys()
+            .find(|id| capability_allowed(id, None) && family_allowed(id))
+            .cloned()
+        else {
+            return Err(Error::Unauthorized);
+        };
+        let fallback_project = Selection {
+            model: None,
+            preset: None,
+            layer: project.layer.clone(),
+        };
+        let fallback_request = Selection {
+            model: Some(fallback),
+            preset: None,
+            layer: request.layer.clone(),
+        };
+        let mut effective = self.resolve(
+            &fallback_project,
+            &fallback_request,
+            project_revision,
+            |m, p| capability_allowed(m, p),
+        )?;
+        effective.model_source = Source::Model;
+        Ok(effective)
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

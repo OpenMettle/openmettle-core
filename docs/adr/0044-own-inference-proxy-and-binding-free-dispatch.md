@@ -2,9 +2,11 @@
 
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
 2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
-3b (migration 32), 3c (migration 33) and proxy cost-hold settlement (migration 34, issue #166): see
-[requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage) and
-[cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing).
+3b (migration 32), 3c (migration 33), proxy cost-hold settlement (migration 34, issue #166) and
+increment 4 family policy tables & enforcement (migration 35): see
+[requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage),
+[cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing)
+and [family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement).
 Refs #7, #9, #17, #166.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
@@ -261,7 +263,7 @@ exists.
 | 3c | A response stopped at its output token limit ends the turn with its partial output, usage and `stop_reason = 'limit'` (dropping partial tool calls); aborted/cut streams map to `Error::Incomplete`; migration 33 (delivered 24 November 2026; see ADR 0036 and ADR 0038). |
 | 3e | Proxy cost-hold settlement (issue #166): record immutable `Profile.cost_bound` (`cost_fixed_micros`, `cost_micros_per_token`) on `gateway_requests` at `gateway_handoff_round`, derive `usage_cost_micros` in `quota_gateway_fold` from reported tokens and forbid caller-supplied `cost`/`unit` on unbound requests; migration 34 (delivered 24 November 2026, see the amendment). |
 | 3d | Running usage for cut streams. |
-| 4 | Family policy tables. |
+| 4 | Family policy tables, SQL evaluator, four-point enforcement, audited store API and `openmettle-admin family` CLI; migration 35 (delivered 24 November 2026, see the amendment). |
 | 5 | Cache separation. |
 | 6 | Removal of the superseded code and tables. |
 | 7 | Deployment, TLS and network policy. |
@@ -283,7 +285,6 @@ exists.
 - **Broad database role.** `openmettle_gateway` still has the grants the reconciler needed. A
   network-facing process needs only the dispatch and settlement functions. Increment 6
   narrows the role.
-- **Family policy** is enforced nowhere until increment 4.
 
 ## Amendment, 24 November 2026: requests that end without usage
 
@@ -531,3 +532,100 @@ round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
   refusal and historical replay preservation, `measured >= 1e38` overflow refusal, bound
   ADR 0037 cost acceptance, `OMQ04` pricing mismatch refusal, expired-limit unqualified refusal,
   and column/function grant boundaries.
+
+## Amendment, 24 November 2026: family policy tables and enforcement
+
+Increment 4 (migration 35). Refs #7.
+
+### Problem
+
+With third-party gateway provisioning removed, quiet hours, study hours and per-model switches
+had no durable schema, no authoritative evaluator and no enforcement at admission, worker
+execution, handoff or proxy dispatch.
+
+### Decision
+
+- **Current-state policy tables (no `DELETE` grants).** Migration 35 adds
+  `openmettle.family_policies` (keyed by `(grantee_kind, grantee_user_id, grantee_local_group_id,
+  grantee_oidc_group_id)` with `UNIQUE NULLS NOT DISTINCT`, IANA `zone` validated against
+  `pg_catalog.pg_timezone_names`, optional half-open minute windows for `quiet` and `study` with
+  midnight wraparound, user-only `override_group_schedules`, `active` and strictly increasing
+  `revision`) and `openmettle.family_policy_models` (`(policy_id, rule_kind, model)` for
+  `'study_allow'` and `'disabled'` rules, `active` and monotonic `revision`). `openmettle_api`
+  receives `SELECT` and column-scoped `INSERT`/`UPDATE` only (triggers reject null
+  `updated_by_user_id` for non-owners, unknown timezones and non-increasing revisions);
+  `openmettle_worker`, `openmettle_gateway`, `openmettle_issuance` and `PUBLIC` hold no table
+  grants. `openmettle.authorization_audit` CHECK constraints widen additively under a bounded
+  `NOWAIT` retry loop for `'family_policy.set'`, `'family_policy.clear'`,
+  `'family_policy.model_study_allow'`, `'family_policy.model_study_revoke'`,
+  `'family_policy.model_disable'` and `'family_policy.model_enable'`.
+- **Single authoritative SQL evaluator.** `openmettle.family_policy_filter_models(p_user,
+  p_approval, p_models, p_at)` (`STABLE`, `SECURITY DEFINER`, `SET search_path = pg_catalog`,
+  granted to `openmettle_api`) and its single-model wrapper `openmettle.family_policy_permits(
+  p_user, p_approval, p_model, p_at)` (granted to `openmettle_api` and `openmettle_worker`)
+  evaluate all applicable active policies (`user`, active enabled `local_group` memberships,
+  and fresh `'present'` `oidc_group` observations). An active user row with
+  `override_group_schedules = true` evaluates only that row. Otherwise, any
+  `membership_observations` row on `(p_approval, p_user)` whose enrolled mapping revision
+  (`mo.rule_id, mo.rule_revision`) OR latest mapping revision (`r.id, r.last_revision`) targets
+  an active `oidc_group` family policy fails closed (`false`) whenever the observation is
+  disabled (`NOT mo.enabled`), superseded or disabled at its mapping revision, expired/stale,
+  missing, partial, ambiguous, failed or mismatched in epoch, generation or `grant_changes`
+  (leaving confirmed fresh `'absent'` and genuinely unenrolled users unaffected). Each
+  applicable policy converts `p_at` once via PostgreSQL's in-memory `AT TIME ZONE` cache
+  (zones are validated against `pg_catalog.pg_timezone_names` on write; no per-call filesystem
+  scan) so spring-forward missing minutes never occur and both autumn fall-back occurrences
+  agree, then evaluates `quiet`, `disabled` and `study`/`study_allow` in order.
+- **Four enforcement points (catalog routes unchanged).** `GET /v1/models`, `GET /v1/presets`,
+  `GET /v1/presets/{preset_id}` and `check_project_defaults` remain unchanged:
+  1. *API admission & effective-configuration preview* (`src/v1/submission.rs`,
+     `src/model_config.rs`): resolves model/preset/capabilities first (`400 validation` on
+     missing project default or invalid input; `403 policy` without fallback on capability-denied
+     defaults), checks the resolved model via `family_policy_permits`, and batch-evaluates the
+     catalog via `family_policy_filter_models` only when an omitted selection's
+     capability-allowed project default is rejected by family policy (auto-skipping to the first
+     deterministic model permitted by both capabilities and family policy, or `403 policy` if
+     none is permitted). Exact idempotent replay (`Admission::Replayed`) stays `200 OK` during
+     quiet hours.
+  2. *Worker claim, step recheck & turn handoff* (`src/authz/runs.rs`, `src/worker/turns.rs`):
+     `recheck_run` validates `runs.actor_approval_id` when recorded; `recheck_step` evaluates
+     both `recheck_claim` and `recheck_leased` at post-fence `clock_timestamp()`;
+     `recheck_decision` decodes full `ConfigSnapshot` for `openmettle.conversation` v1 snapshots
+     (failing closed on malformed v1 snapshots; skipping non-conversation synthetic runs) and
+     invalidates with `PolicyReason::FamilyPolicy` (`cancel_reason = 'revoked'`); and
+     `TurnExecutor` rechecks authority after a refused `handoff_turn` so family denial first
+     observed at handoff settles as `revoked` rather than `step_failed`.
+  3. *PostgreSQL handoff & confirm* (`gateway_round_authority`, `gateway_handoff_round`):
+     `gateway_round_authority` adds `family_policy_permits`, while `gateway_handoff_round` keeps
+     the canonical handoff lock prefix (`account_admin_lock FOR SHARE -> projects ->
+     login_providers/approvals -> users -> runs -> gateway_reservations -> gateway_requests`);
+     both `Action::ManageLocalGroups` and `Action::ManageFamilyPolicies` (plus
+     `openmettle-admin family`) acquire `account_admin_lock FOR UPDATE`, serializing local-group
+     membership and policy changes with handoff without lock-order inversions.
+  4. *PostgreSQL proxy dispatch* (`gateway_dispatch`): after proving the bearer, acquires the
+     canonical shared authorization prefix (`account_admin_lock -> login_providers/approvals ->
+     users -> runs -> gateway_requests`) and checks `family_policy_permits` inside its
+     `UPDATE ... WHERE` clause so concurrent policy/group writes, approval withdrawals and user
+     disables serialize before spending the bearer (`401`, nothing sent upstream; wrong bearers
+     still take zero locks; worker sweep closes as `not_dispatched` at `0`).
+- **Audited administration.** `Action::ManageFamilyPolicies` (active `account_admin`,
+  serialized under `account_admin_lock FOR UPDATE -> login_providers/approvals FOR SHARE ->
+  users(actor) FOR SHARE` via shared `store::write`) exposes
+  `store::{set_family_policy, clear_family_policy, set_family_policy_model, load_family_policy}`
+  as `openmettle_api` (`actor_kind = 'user'`). `openmettle-admin family` (`set-policy`,
+  `clear-policy`, `set-model`) connects via `OPENMETTLE_ADMIN_DATABASE_URL` (`openmettle_owner`),
+  acquires `account_admin_lock FOR UPDATE` and records `'operator'` audit rows.
+
+### Evidence
+
+- `tests/schema/family_policy.rs`: DST spring-forward and both autumn fall-back occurrences in
+  `Europe/London` and `America/New_York`, OIDC `Family` group inheritance and fail-closed across
+  all stale/missing/partial/ambiguous/failed/expired/generation states, `override_group_schedules`
+  exemption, HTTP `/v1/runs` and `effective-configuration` quiet-hours `403 policy` + replay +
+  study-hours fallback + unfiltered `/v1/models` and `/v1/presets`, worker `recheck_run` /
+  `recheck_leased` cancellation, `gateway_handoff_round` / `gateway_handoff_round_confirm` /
+  `gateway_dispatch` refusal + `not_dispatched` sweep, `ManageFamilyPolicies` store authz/audit
+  and disable serialization, `openmettle-admin family` CLI e2e, role/trigger boundaries, and
+  `34 -> 35` upgrade.
+- `tests/model_config.rs` and `src/authz/gateway/family.rs`: `Catalog::resolve_with_fallback`,
+  strict `HH:MM-HH:MM` window parsing and `openmettle-admin family` argument parsing.
