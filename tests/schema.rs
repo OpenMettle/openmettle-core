@@ -6,7 +6,10 @@ mod env_support;
 use env_support::scrub_env;
 #[path = "support/proc.rs"]
 mod proc_support;
-use proc_support::{Process, run_bounded, wait_exit_bounded, wait_output_bounded};
+use proc_support::{
+    PipeDrain, Process, probe_http_status_line, read_string_bounded, run_bounded,
+    wait_exit_bounded, wait_http_status_bounded, wait_output_bounded,
+};
 #[path = "support/pg.rs"]
 mod pg;
 use openmettle_core::migrate::{self, Failure, MIGRATIONS, Settings, Source};
@@ -34,6 +37,8 @@ const REFUSAL_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound for graceful or forced child termination after signaling.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound for post-exit stdout/stderr pipe draining once the process has exited.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn run_refusal(command: &mut Command, context: &str) -> Output {
     run_bounded(command, REFUSAL_TIMEOUT, context)
@@ -90,18 +95,7 @@ fn address() -> String {
 }
 
 fn http_status(address: &str, path: &str) -> Option<String> {
-    let mut stream =
-        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .ok()?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    response.lines().next().map(str::to_owned)
+    probe_http_status_line(address, path, Instant::now() + Duration::from_secs(2))
 }
 
 fn start_service(worker: bool, url: &str) -> (Process, String) {
@@ -123,17 +117,7 @@ fn start_service(worker: bool, url: &str) -> (Process, String) {
 }
 
 fn wait_ready(process: &mut Process, bind: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = process.0.try_wait().unwrap() {
-            panic!("process exited before readiness on {bind}: {status}");
-        }
-        if http_status(bind, "/readyz").is_some_and(|s| s.starts_with("HTTP/1.1 200")) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "readiness deadline on {bind}");
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_http_status_bounded(process, bind, "/readyz", 200, Duration::from_secs(15));
 }
 
 fn signal(child: &Child, signal: &str) {
@@ -1713,10 +1697,18 @@ fn interrupted_migrator_reports_at_error_level() {
         );
         assert!(began.elapsed() < Duration::from_secs(5));
         assert_eq!(status.code(), Some(1));
-        let (mut stdout, mut text) = (String::new(), String::new());
-        let pipes = (child.0.stdout.take(), child.0.stderr.take());
-        pipes.0.unwrap().read_to_string(&mut stdout).unwrap();
-        pipes.1.unwrap().read_to_string(&mut text).unwrap();
+        let stdout = read_string_bounded(
+            child.0.stdout.take().unwrap(),
+            PIPE_DRAIN_TIMEOUT,
+            "stdout",
+            &format!("interrupted migrator stdout ({format}, {signal_name})"),
+        );
+        let text = read_string_bounded(
+            child.0.stderr.take().unwrap(),
+            PIPE_DRAIN_TIMEOUT,
+            "stderr",
+            &format!("interrupted migrator stderr ({format}, {signal_name})"),
+        );
         assert!(stdout.is_empty());
         assert!(!text.contains("synthetic-secret"), "{text}");
         let lines: Vec<&str> = text.lines().collect();

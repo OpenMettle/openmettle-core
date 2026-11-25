@@ -1267,7 +1267,7 @@ struct Harness {
     upstream: StandIn,
     gateway: Process,
     bind: String,
-    stderr: thread::JoinHandle<String>,
+    stderr: PipeDrain,
 }
 
 impl Harness {
@@ -1423,7 +1423,7 @@ impl Harness {
             wait_exit(&mut gateway.0, "gateway proxy shutdown (-TERM)")
         });
         assert!(status.success());
-        let stderr = stderr.join().unwrap();
+        let stderr = tokio::task::block_in_place(|| stderr.finish_string(PIPE_DRAIN_TIMEOUT));
         for secret in [COOKIE, "Count from 1 to 5"] {
             assert!(!stderr.contains(secret), "logged: {secret}");
         }
@@ -1458,14 +1458,14 @@ impl Harness {
 
 /// The gateway binary listening on `bind`, serving `db` as `openmettle_gateway` for `model`
 /// through `upstream`, with extra `OPENMETTLE_GATEWAY_` settings applied last. It is ready when
-/// this returns; the thread returns its complete stderr once it has exited.
+/// this returns; the drain returns its complete stderr once it has exited.
 pub(crate) fn launch_gateway(
     db: &TestDb,
     bind: &str,
     upstream: &StandIn,
     model: &str,
     settings: &[(&str, String)],
-) -> (Process, thread::JoinHandle<String>) {
+) -> (Process, PipeDrain) {
     let mut command = binary("gateway");
     command
         .env("OPENMETTLE_GATEWAY_BIND", bind)
@@ -1480,12 +1480,11 @@ pub(crate) fn launch_gateway(
         command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
     }
     let mut child = command.stdout(Stdio::null()).spawn().unwrap();
-    let mut pipe = child.stderr.take().unwrap();
-    let stderr = thread::spawn(move || {
-        let mut text = String::new();
-        pipe.read_to_string(&mut text).unwrap();
-        text
-    });
+    let stderr = PipeDrain::start(
+        child.stderr.take().unwrap(),
+        "stderr",
+        format!("gateway proxy stderr on {bind}"),
+    );
     let mut gateway = Process(child);
     tokio::task::block_in_place(|| wait_ready(&mut gateway, bind));
     (gateway, stderr)

@@ -125,10 +125,7 @@ fn start_worker_with(
 /// returns every `gateway.usage.*` event as (event, request ID, reason). The wait is bounded
 /// like the worker's [`exited`]: past the deadline the panic drops the guard, which kills and
 /// reaps the gateway, so a stuck gateway fails the case instead of hanging it.
-async fn stop_gateway(
-    mut gateway: Process,
-    stderr: thread::JoinHandle<String>,
-) -> Vec<(String, String, String)> {
+async fn stop_gateway(mut gateway: Process, stderr: PipeDrain) -> Vec<(String, String, String)> {
     signal(&gateway.0, "-TERM");
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
@@ -142,8 +139,7 @@ async fn stop_gateway(
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(status.success());
-    tokio::task::block_in_place(|| stderr.join())
-        .unwrap()
+    tokio::task::block_in_place(|| stderr.finish_string(PIPE_DRAIN_TIMEOUT))
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|e| e["event"].as_str().unwrap().starts_with("gateway.usage."))

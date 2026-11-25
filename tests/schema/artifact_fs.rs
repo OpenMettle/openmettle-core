@@ -1022,14 +1022,12 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
     assert_swept(&f, &ids).await;
 
     assert!(stop_process(&mut process, "-TERM", "artifact_fs worker shutdown").success());
-    let mut logs = String::new();
-    process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut logs)
-        .unwrap();
+    let logs = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "artifact_fs worker stderr",
+    );
     assert!(
         logs.lines()
             .any(|line| line.contains("worker.sweep.failed") && line.contains("purge_due"))

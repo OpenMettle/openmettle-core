@@ -12,7 +12,10 @@ mod env_support;
 use env_support::scrub_env;
 #[path = "support/proc.rs"]
 mod proc_support;
-use proc_support::{Process, run_bounded, wait_exit_bounded, wait_output_bounded};
+use proc_support::{
+    PipeDrain, Process, read_string_bounded, run_bounded, wait_exit_bounded,
+    wait_http_status_bounded, wait_output_bounded,
+};
 #[path = "auth_config_support/mod.rs"]
 mod auth_config_support;
 #[path = "support/pg.rs"]
@@ -26,6 +29,8 @@ mod ca;
 const REFUSAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for graceful signal shutdown in runtime tests (`SHUTDOWN_TIMEOUT_MS=1000`).
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound for post-exit stdout/stderr pipe draining once the process has exited.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn role_name(worker: bool) -> &'static str {
     if worker { "worker" } else { "api" }
@@ -86,20 +91,7 @@ fn send(address: &str, request: &str) -> std::io::Result<String> {
     Ok(response)
 }
 fn wait_status(process: &mut Process, address: &str, path: &str, code: u16) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = process.0.try_wait().unwrap() {
-            panic!("process exited before health check ({path} expected {code}): {status}");
-        }
-        if response(address, path).is_ok_and(|r| r.starts_with(&format!("HTTP/1.1 {code}"))) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "health check deadline: {path} expected {code}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_http_status_bounded(process, address, path, code, Duration::from_secs(15));
 }
 fn stop(process: &mut Process, signal: &str) {
     assert!(
@@ -466,22 +458,18 @@ fn start_logging(worker: bool, address: &str, url: &str, settings: &[(&str, &str
     )
 }
 fn drain(process: &mut Process) -> (String, String) {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    process
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .unwrap();
-    process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stdout = read_string_bounded(
+        process.0.stdout.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stdout",
+        "post-exit process stdout",
+    );
+    let stderr = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "post-exit process stderr",
+    );
     (stdout, stderr)
 }
 
@@ -834,14 +822,12 @@ fn configured_export_ignores_proxies_and_keeps_shutdown_bounded() {
     stop(&mut process, "-TERM");
     let stopping = began.elapsed();
     assert!(stopping < Duration::from_secs(2), "{stopping:?}");
-    let mut stderr = String::new();
-    process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stderr = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "configured export api stderr",
+    );
     assert!(!stderr.contains("CANARY"), "{stderr}");
     let names: Vec<String> = stderr
         .lines()
@@ -2899,7 +2885,8 @@ fn json_with(document: &serde_json::Value, pointer: &str, value: &str) -> serde_
 
 #[test]
 fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
-    use std::io::{BufRead, BufReader};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use std::sync::{Arc, Mutex};
     let dir = auth_config_support::Dir::new();
     let root = dir.path("payloads");
     std::fs::create_dir(&root).unwrap();
@@ -2914,18 +2901,55 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         &url,
         &[("SWEEP_MS", "1000"), ("ARTIFACTS_DIR", &root)],
     );
-    let pipe = process.0.stderr.take().unwrap();
+    let mut pipe = process.0.stderr.take().unwrap();
+    let flags = fcntl_getfl(&pipe).unwrap();
+    fcntl_setfl(&pipe, flags | OFlags::NONBLOCK).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
+    let stop_deadline = Arc::new(Mutex::new(None::<Instant>));
+    let reader_deadline = Arc::clone(&stop_deadline);
     let reader = thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            let line = line.unwrap();
-            assert!(!line.contains("CANARY"));
-            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if event["event"] == "worker.sweep.failed" {
-                assert_eq!(event["level"], "WARN");
-                assert_eq!(event["role"], "worker");
-                tx.send(event["error.type"].as_str().unwrap().to_owned())
-                    .unwrap();
+        let mut pending = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut sleep = Duration::from_millis(2);
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => {
+                    assert!(pending.is_empty(), "trailing partial stderr line");
+                    return;
+                }
+                Ok(n) => {
+                    pending.extend_from_slice(&chunk[..n]);
+                    while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                        let raw: Vec<u8> = pending.drain(..=pos).collect();
+                        let line = String::from_utf8(raw).unwrap();
+                        let line = line.trim_end_matches('\n');
+                        assert!(!line.contains("CANARY"));
+                        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                        if event["event"] == "worker.sweep.failed" {
+                            assert_eq!(event["level"], "WARN");
+                            assert_eq!(event["role"], "worker");
+                            let _ = tx.send(event["error.type"].as_str().unwrap().to_owned());
+                        }
+                    }
+                    sleep = Duration::from_millis(2);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Some(deadline) =
+                        *reader_deadline.lock().unwrap_or_else(|e| e.into_inner())
+                    {
+                        let now = Instant::now();
+                        assert!(
+                            now < deadline,
+                            "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
+                        );
+                        thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+                    } else {
+                        thread::sleep(sleep);
+                    }
+                    sleep = (sleep * 2).min(Duration::from_millis(25));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("failed reading worker sweep stderr: {err}"),
             }
         }
     });
@@ -2941,6 +2965,7 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         }
     }
     stop(&mut process, "-TERM");
+    *stop_deadline.lock().unwrap() = Some(Instant::now() + PIPE_DRAIN_TIMEOUT);
     reader.join().unwrap();
 }
 
@@ -2954,15 +2979,26 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Regression test for the shared bounded process helpers:
-/// 1. A service that starts and serves when it should refuse fails within the deadline, is
-///    killed and reaped, and reports the configuration label.
+/// Regression test for the shared bounded process and readiness helpers:
+/// 1. A real `openmettle-api` binary that starts instead of refusing fails within the deadline,
+///    emits `process.started` into the captured timeout diagnostics, names the configuration label
+///    and stops listening after being killed and reaped.
 /// 2. `wait_exit_bounded` and `wait_output_bounded` time out promptly, kill and reap a
 ///    long-running child, and name the configuration label.
-/// 3. `run_bounded` drains stdout and stderr concurrently past OS pipe buffer sizes without
+/// 3. A child whose background descendant inherits stdout/stderr still times out promptly with its
+///    pre-hang diagnostic marker intact and zero leaked reader threads; bounded post-exit pipe
+///    readers (`read_string_bounded` and `PipeDrain`) likewise fail within their deadline when a
+///    descendant keeps the write end open.
+/// 4. `wait_http_status_bounded` fails promptly at its deadline against a slow-drip HTTP peer.
+/// 5. `run_bounded` drains stdout and stderr concurrently past OS pipe buffer sizes without
 ///    deadlocking.
 #[test]
 fn bounded_process_helpers_time_out_kill_and_name_configuration() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     // 1. Real binary starting instead of refusing.
     let (_database, url) = unavailable_database();
     let bind = address();
@@ -2974,7 +3010,7 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         .env("OPENMETTLE_API_SHUTDOWN_TIMEOUT_MS", "1000");
     let began = Instant::now();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_bounded(&mut cmd, Duration::from_millis(300), label)
+        run_bounded(&mut cmd, Duration::from_secs(1), label)
     }))
     .expect_err("serving binary must time out");
     assert!(
@@ -2983,7 +3019,15 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         began.elapsed()
     );
     let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
     assert!(message.contains(label), "missing label in panic: {message}");
+    assert!(
+        message.contains("process.started"),
+        "expected openmettle-api startup event in timeout diagnostics, got: {message}"
+    );
     assert!(
         TcpStream::connect_timeout(&bind.parse().unwrap(), Duration::from_millis(200)).is_err(),
         "timed-out binary kept listening on {bind}"
@@ -3015,6 +3059,10 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         began.elapsed()
     );
     let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
     assert!(
         message.contains("synthetic-sleep-exit-case"),
         "missing label in panic: {message}"
@@ -3059,6 +3107,10 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     );
     let message = panic_text(err);
     assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(
         message.contains("synthetic-sleep-output-case"),
         "missing label in panic: {message}"
     );
@@ -3071,7 +3123,175 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         .success();
     assert!(!alive, "timed-out piped child pid {pid} is still alive");
 
-    // 4. `run_bounded` drains stdout and stderr past typical 64 KiB pipe buffers without deadlock.
+    // 4. Inherited descendant pipe: timeout fails well before `sleep 5`, retains pre-hang stderr
+    //    diagnostics, and spawns no leaking reader threads.
+    let mut inherited = Command::new("sh");
+    inherited.args(["-c", "echo marker-before-hang >&2; sleep 5 & wait"]);
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(
+            &mut inherited,
+            Duration::from_millis(150),
+            "synthetic-inherited-pipe-case",
+        )
+    }))
+    .expect_err("child with inherited grandchild pipe must time out");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "run_bounded waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(
+        message.contains("synthetic-inherited-pipe-case"),
+        "missing label in panic: {message}"
+    );
+    assert!(
+        message.contains("marker-before-hang"),
+        "lost pre-hang stderr marker in panic: {message}"
+    );
+
+    // 5. Post-exit bounded pipe readers (`read_string_bounded` and `PipeDrain`) fail promptly and
+    //    preserve already-written diagnostics when a descendant keeps stderr open after child exit.
+    let mut lingering = Process(
+        Command::new("sh")
+            .args(["-c", "echo post-exit-marker >&2; sleep 5 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        wait_exit_bounded(
+            &mut lingering.0,
+            Duration::from_secs(2),
+            "post-exit-marker child",
+        )
+        .success()
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            lingering.0.stderr.take().unwrap(),
+            Duration::from_millis(150),
+            "stderr",
+            "synthetic-post-exit-pipe-case",
+        )
+    }))
+    .expect_err("read_string_bounded must time out on inherited pipe");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "read_string_bounded waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-post-exit-pipe-case") && message.contains("post-exit-marker"),
+        "missing label or marker in post-exit pipe panic: {message}"
+    );
+
+    let mut lingering_drain = Process(
+        Command::new("sh")
+            .args(["-c", "echo pipe-drain-marker >&2; sleep 5 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let drain = PipeDrain::start(
+        lingering_drain.0.stderr.take().unwrap(),
+        "stderr",
+        "synthetic-pipe-drain-case",
+    );
+    assert!(
+        wait_exit_bounded(
+            &mut lingering_drain.0,
+            Duration::from_secs(2),
+            "pipe-drain-marker child",
+        )
+        .success()
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain.finish_string(Duration::from_millis(150))
+    }))
+    .expect_err("PipeDrain must time out on inherited pipe");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "PipeDrain waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-pipe-drain-case") && message.contains("pipe-drain-marker"),
+        "missing label or marker in PipeDrain panic: {message}"
+    );
+
+    // 6. Readiness probe (`wait_http_status_bounded`) fails promptly against a slow-drip peer
+    //    sending 1 byte every 200 ms with no newline or EOF.
+    let drip_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let drip_addr = drip_listener.local_addr().unwrap().to_string();
+    drip_listener.set_nonblocking(true).unwrap();
+    let stop_drip = Arc::new(AtomicBool::new(false));
+    let drip_flag = Arc::clone(&stop_drip);
+    let drip_server = thread::spawn(move || {
+        while !drip_flag.load(Ordering::Relaxed) {
+            match drip_listener.accept() {
+                Ok((mut stream, _)) => {
+                    while !drip_flag.load(Ordering::Relaxed) {
+                        if stream.write_all(b"H").is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut dummy = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_http_status_bounded(
+            &mut dummy,
+            &drip_addr,
+            "/readyz",
+            200,
+            Duration::from_millis(500),
+        )
+    }))
+    .expect_err("slow-drip readiness probe must time out");
+    stop_drip.store(true, Ordering::Relaxed);
+    drip_server.join().unwrap();
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "slow-drip readiness probe outlived its deadline: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("deadline") && message.contains("/readyz"),
+        "unexpected slow-drip probe panic: {message}"
+    );
+
+    // 7. `run_bounded` drains stdout and stderr past typical 64 KiB pipe buffers without deadlock.
     let mut flood = Command::new("sh");
     flood.args([
         "-c",
