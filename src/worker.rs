@@ -171,6 +171,18 @@ pub trait Executor: Send + Sync + 'static {
     ) -> impl Future<Output = Option<OwnedObservation>> + Send;
 }
 
+/// Outcome of [`ApprovedAdapter::preflight`] before Transaction 1 commits any operation row.
+#[derive(Debug)]
+pub enum PreflightError {
+    /// Non-retryable policy, schema, credential-unavailable, catalog-drift, or terminal refusal.
+    Refused,
+    /// Temporary upstream, network, or timeout outage; caller should hand off or retry rather
+    /// than terminally failing a run or its proven-unsent write.
+    Transient,
+    /// Database or lease-layer error.
+    Store(StoreError),
+}
+
 /// A reviewed adapter receives only committed bytes. It records observations with a Hold fence.
 pub trait ApprovedAdapter: Send + Sync {
     /// Pre-intent server-side gate run strictly before `record_fenced_intent` commits any
@@ -181,8 +193,26 @@ pub trait ApprovedAdapter: Send + Sync {
         _run: &'a ActiveRun,
         _proposal: &'a Proposal,
         _step: &'a StepContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), PreflightError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Filter model-facing tool declarations before starting a turn round (e.g. verifying
+    /// external MCP `tools/list` catalogs before offering those tools to the model).
+    /// Defaults to returning `tools` unchanged.
+    fn filter_turn_tools<'a>(
+        &'a self,
+        _run: &'a ActiveRun,
+        tools: Vec<crate::provider_http::inference::Tool>,
+        _step: &'a StepContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<Vec<crate::provider_http::inference::Tool>, StepResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(tools) })
     }
 
     fn send<'a>(
@@ -205,6 +235,10 @@ impl EffectPolicy for Option<&ApprovedEffects> {
             Some(effects) => effects.policy.review(scope, run, p),
             None => Ok(None),
         }
+    }
+
+    fn requires_two_phase_writes(&self) -> bool {
+        self.is_some_and(|effects| effects.policy.requires_two_phase_writes())
     }
 }
 
@@ -620,8 +654,13 @@ async fn execute<E: Executor>(
                 if let Some(why) = context.stopped() {
                     return Ok(WorkEnd::Stop(why));
                 }
-                if preflight.is_err() {
-                    return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+                match preflight {
+                    Ok(()) => {}
+                    Err(PreflightError::Transient) => return Ok(WorkEnd::Handoff),
+                    Err(PreflightError::Refused) => {
+                        return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+                    }
+                    Err(PreflightError::Store(err)) => return Err(err.into()),
                 }
             }
             let intent = approvals::record_fenced_intent(

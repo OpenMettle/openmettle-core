@@ -9,33 +9,42 @@ use super::{
 use crate::{
     artifact_fs::Store,
     authz::{
-        DenialReason, PolicyReason, RunContinuation,
+        RunContinuation,
         approvals::{self, EffectClass, EffectPolicy, EndpointKey, Proposal, Review},
         leases::{self, ExecState, Fence, LeaseError, LeaseSettings, UnresolvedOperation},
         runs::{CapabilityUse, RunRecheckRequest, recheck_decision},
         store::StoreError,
     },
-    provider_http::mcp::{
-        FaultKind, IdempotencyHeader, IdempotencyMeta, McpTransport, RetryAfter, ToolCallRequest,
-        ToolCallSuccess, TransportFault,
+    provider_http::{
+        inference::Tool,
+        mcp::{
+            FaultKind, IdempotencyHeader, IdempotencyMeta, McpTransport, RetryAfter,
+            ToolCallRequest, ToolCallSuccess, TransportFault,
+        },
     },
     worker::{
-        ActiveRun, ApprovedAdapter, ApprovedEffects, EffectDispatch, OwnedObservation, StepContext,
-        StepResult, Stop, start_permit, stopped_step, turns::lease_step,
+        ActiveRun, ApprovedAdapter, ApprovedEffects, EffectDispatch, OwnedObservation,
+        PreflightError, StepContext, StepResult, Stop, start_permit, stopped_step,
+        turns::lease_step,
     },
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Row};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout_at};
+
+/// Default freshness TTL for verified upstream `tools/list` catalog entries.
+pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(60);
+
+type CatalogCacheKey = (String, String, String, String, [u8; 32]);
 
 /// Redacted MCP outbound credential. `Debug` never emits secret bytes.
 #[derive(Clone)]
@@ -145,7 +154,8 @@ pub struct ExternalMcpAdapter {
     credentials: Arc<dyn McpCredentialProvider>,
     reconcile_auth: Arc<dyn DestinationAuthorizer>,
     artifacts: Option<Store>,
-    verified_catalogs: Mutex<BTreeSet<(String, String, [u8; 32])>>,
+    verified_catalogs: Mutex<BTreeMap<CatalogCacheKey, Instant>>,
+    catalog_ttl: Duration,
 }
 
 impl ExternalMcpAdapter {
@@ -165,13 +175,19 @@ impl ExternalMcpAdapter {
             credentials,
             reconcile_auth,
             artifacts: None,
-            verified_catalogs: Mutex::new(BTreeSet::new()),
+            verified_catalogs: Mutex::new(BTreeMap::new()),
+            catalog_ttl: DEFAULT_CATALOG_TTL,
         }
     }
 
     pub fn with_artifacts(mut self, store: Store) -> Self {
         store.attach(&self.pool);
         self.artifacts = Some(store);
+        self
+    }
+
+    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+        self.catalog_ttl = ttl;
         self
     }
 
@@ -182,44 +198,132 @@ impl ExternalMcpAdapter {
         }
     }
 
-    async fn admit_pre_intent(
+    async fn verify_connection_catalog(
         &self,
         run: &ActiveRun,
-        proposal: &Proposal,
+        contract: &ExternalToolContract,
+        actor_user_id: &str,
         step: &StepContext,
-    ) -> Result<(), StoreError> {
-        const REFUSED: StoreError =
-            StoreError::Denied(DenialReason::Policy(PolicyReason::CapabilityDenied));
-        let Some(contract) = self.registry.get(&proposal.tool, &proposal.version) else {
-            return Err(REFUSED);
-        };
+    ) -> Result<(), PreflightError> {
         let Some(transport) = self.transports.get(&contract.connection_id) else {
-            return Err(REFUSED);
+            return Err(PreflightError::Refused);
         };
         let Some(fingerprint) = self
             .registry
             .connection_fingerprint(&contract.connection_id)
         else {
-            return Err(REFUSED);
+            return Err(PreflightError::Refused);
+        };
+        let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
+        let credential = resolve_credential_bounded(
+            self.credentials.as_ref(),
+            CredentialRequest {
+                connection_id: &contract.connection_id,
+                account_id: &contract.account_id,
+                scope_id: &run.claim.scope_id,
+                actor_user_id,
+            },
+            call_deadline,
+            &step.stop,
+        )
+        .await?;
+        let cache_key: CatalogCacheKey = (
+            contract.connection_id.clone(),
+            contract.account_id.clone(),
+            run.claim.scope_id.clone(),
+            actor_user_id.to_owned(),
+            fingerprint,
+        );
+        let fresh = {
+            let guard = self
+                .verified_catalogs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(&cache_key)
+                .is_some_and(|at| !self.catalog_ttl.is_zero() && at.elapsed() < self.catalog_ttl)
+        };
+        if !fresh {
+            let mut stop = step.stop.clone();
+            let req_id = format!("tools-list:{}", run.claim.run_id);
+            let remote = match transport
+                .tools_list(&req_id, credential.bearer_token(), call_deadline, &mut stop)
+                .await
+            {
+                Ok(remote) => remote,
+                Err(fault) => {
+                    self.verified_catalogs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&cache_key);
+                    return Err(match fault.kind {
+                        FaultKind::Transient(_) | FaultKind::Stopped(_) => {
+                            PreflightError::Transient
+                        }
+                        FaultKind::TerminalRefusal | FaultKind::Semantic { .. } => {
+                            PreflightError::Refused
+                        }
+                    });
+                }
+            };
+            if self
+                .registry
+                .verify_tools_list(&contract.connection_id, &remote)
+                .is_err()
+            {
+                self.verified_catalogs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&cache_key);
+                return Err(PreflightError::Refused);
+            }
+            let mut guard = self
+                .verified_catalogs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.len() > 1024 {
+                guard
+                    .retain(|_, at| !self.catalog_ttl.is_zero() && at.elapsed() < self.catalog_ttl);
+            }
+            guard.insert(cache_key, Instant::now());
+        }
+        Ok(())
+    }
+
+    async fn admit_pre_intent(
+        &self,
+        run: &ActiveRun,
+        proposal: &Proposal,
+        step: &StepContext,
+    ) -> Result<(), PreflightError> {
+        let Some(contract) = self.registry.get(&proposal.tool, &proposal.version) else {
+            return Err(PreflightError::Refused);
         };
         let Ok(expected) = contract.proposal(
             &proposal.logical_key,
             proposal.arguments().to_string().as_bytes(),
         ) else {
-            return Err(REFUSED);
+            return Err(PreflightError::Refused);
         };
         if expected.arguments() != proposal.arguments()
             || expected.destination() != proposal.destination()
         {
-            return Err(REFUSED);
+            return Err(PreflightError::Refused);
         }
         if step.stop.borrow().is_some() {
-            return Err(REFUSED);
+            return Err(PreflightError::Transient);
         }
         let actor_user_id = {
-            let mut c = self.pool.acquire().await?;
-            if !approvals::two_phase_effect_intents_enabled(&mut c).await? {
-                return Err(REFUSED);
+            let mut c = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|e| PreflightError::Store(e.into()))?;
+            if !approvals::two_phase_effect_intents_enabled(&mut c)
+                .await
+                .map_err(PreflightError::Store)?
+            {
+                return Err(PreflightError::Refused);
             }
             sqlx::query_scalar::<_, String>(
                 "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
@@ -227,47 +331,11 @@ impl ExternalMcpAdapter {
             .bind(&run.claim.scope_id)
             .bind(&run.claim.run_id)
             .fetch_one(&mut *c)
-            .await?
-        };
-        let CredentialOutcome::Ready(credential) = self
-            .credentials
-            .resolve(CredentialRequest {
-                connection_id: &contract.connection_id,
-                account_id: &contract.account_id,
-                scope_id: &run.claim.scope_id,
-                actor_user_id: &actor_user_id,
-            })
             .await
-        else {
-            return Err(REFUSED);
+            .map_err(|e| PreflightError::Store(e.into()))?
         };
-        let cache_key = (
-            contract.connection_id.clone(),
-            contract.account_id.clone(),
-            fingerprint,
-        );
-        let already_verified = self
-            .verified_catalogs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&cache_key);
-        if !already_verified {
-            let mut stop = step.stop.clone();
-            let list_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
-            let req_id = format!("tools-list:{}", run.claim.run_id);
-            let remote = transport
-                .tools_list(&req_id, credential.bearer_token(), list_deadline, &mut stop)
-                .await
-                .map_err(|_| REFUSED)?;
-            self.registry
-                .verify_tools_list(&contract.connection_id, &remote)
-                .map_err(|_| REFUSED)?;
-            self.verified_catalogs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(cache_key);
-        }
-        Ok(())
+        self.verify_connection_catalog(run, contract, &actor_user_id, step)
+            .await
     }
 
     /// Execute a reviewed external MCP call through the two-phase effect ledger.
@@ -305,8 +373,11 @@ impl ExternalMcpAdapter {
         }
         match preflight {
             Ok(()) => {}
-            Err(StoreError::Denied(_) | StoreError::InvalidInput(_)) => return refused(),
-            Err(_) => return StepResult::LeaseLost,
+            Err(PreflightError::Refused) => return refused(),
+            Err(PreflightError::Transient) => {
+                return StepResult::ToolOutput(ToolFault::Transient.envelope());
+            }
+            Err(PreflightError::Store(_)) => return StepResult::LeaseLost,
         }
         let intent = {
             let Ok(mut c) = self.pool.acquire().await else {
@@ -430,9 +501,14 @@ impl ExternalMcpAdapter {
 
         // Non-repeatable writes and lookup/idempotent writes without any reconcilable lookup query
         // resolve deterministically to `outcome_unknown` with zero credential lookups and zero HTTP.
+        // If already recorded at `outcome_unknown`, return `None` so replacement workers do not
+        // collide on `reconcile-unknown:<op.id>` at a higher revision.
         let Some((lookup_tool, lookup_args)) =
             build_reconcile_lookup(contract, op, &proposal, &review)
         else {
+            if op.outcome == "outcome_unknown" {
+                return None;
+            }
             return Some(OwnedObservation {
                 key: format!("reconcile-unknown:{}", op.id),
                 outcome: "outcome_unknown".into(),
@@ -496,20 +572,23 @@ impl ExternalMcpAdapter {
             return None;
         }
         let transport = self.transports.get(&contract.connection_id)?;
-        let CredentialOutcome::Ready(credential) = self
-            .credentials
-            .resolve(CredentialRequest {
+        let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
+        let Ok(credential) = resolve_credential_bounded(
+            self.credentials.as_ref(),
+            CredentialRequest {
                 connection_id: &contract.connection_id,
                 account_id: &contract.account_id,
                 scope_id: &run.claim.scope_id,
                 actor_user_id: &actor_user_id,
-            })
-            .await
+            },
+            call_deadline,
+            &step.stop,
+        )
+        .await
         else {
             return None;
         };
         let req_id = format!("reconcile:{}", op.id);
-        let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
         let response = transport
             .tools_call(
                 &ToolCallRequest {
@@ -527,7 +606,12 @@ impl ExternalMcpAdapter {
             .ok()?;
         let reconcile_spec = contract.reconcile.as_ref()?;
         let status = extract_reconcile_status(&response, &reconcile_spec.status_field)?;
-        let remote_handle = extract_downstream_handle(&response, contract.handle_field.as_deref());
+        let remote_handle =
+            match extract_downstream_handle(&response, contract.handle_field.as_deref()) {
+                ExtractedHandle::Absent => None,
+                ExtractedHandle::Valid(h) => Some(h),
+                ExtractedHandle::Malformed => return None,
+            };
         let handle = match (&op.downstream_handle, remote_handle) {
             // Never overwrite an already-recorded downstream handle with a conflicting one.
             (Some(existing), Some(remote)) if remote != *existing => return None,
@@ -571,24 +655,24 @@ fn parse_committed_destination(destination: &str) -> Option<(String, String, Str
     ))
 }
 
-fn endpoint_key_matches(current: &EndpointKey, committed: &EndpointKey) -> bool {
-    match (current, committed) {
-        (EndpointKey::Unsupported, EndpointKey::Unsupported) => true,
-        (
-            EndpointKey::Supported {
-                namespace: cn,
-                field: cf,
-                key: ck,
-                ..
-            },
-            EndpointKey::Supported {
-                namespace: mn,
-                field: mf,
-                key: mk,
-                ..
-            },
-        ) => cn == mn && cf == mf && ck == mk,
-        _ => false,
+async fn resolve_credential_bounded(
+    provider: &dyn McpCredentialProvider,
+    request: CredentialRequest<'_>,
+    deadline: Instant,
+    stop: &tokio::sync::watch::Receiver<Option<Stop>>,
+) -> Result<McpCredential, PreflightError> {
+    if stop.borrow().is_some() || Instant::now() >= deadline {
+        return Err(PreflightError::Transient);
+    }
+    let mut stop_rx = stop.clone();
+    tokio::select! {
+        biased;
+        _ = stop_rx.wait_for(Option::is_some) => Err(PreflightError::Transient),
+        resolved = timeout_at(deadline, provider.resolve(request)) => match resolved {
+            Ok(CredentialOutcome::Ready(cred)) => Ok(cred),
+            Ok(CredentialOutcome::Unavailable) => Err(PreflightError::Refused),
+            Err(_) => Err(PreflightError::Transient),
+        },
     }
 }
 
@@ -606,9 +690,17 @@ fn contract_matches_committed(
     if contract.connection_id != committed_conn
         || contract.account_id != committed_acct
         || contract.action != committed_action
-        || contract.endpoint_id != committed_review.endpoint_id
-        || contract.endpoint_version != committed_review.endpoint_version
-        || contract.capability != committed_review.capability
+    {
+        return false;
+    }
+    let Ok(expected) = contract.proposal(
+        &proposal.logical_key,
+        proposal.arguments().to_string().as_bytes(),
+    ) else {
+        return false;
+    };
+    if expected.destination() != proposal.destination()
+        || expected.arguments() != proposal.arguments()
     {
         return false;
     }
@@ -617,15 +709,7 @@ fn contract_matches_committed(
     else {
         return false;
     };
-    current_review.endpoint_id == committed_review.endpoint_id
-        && current_review.endpoint_version == committed_review.endpoint_version
-        && current_review.destination_policy == committed_review.destination_policy
-        && current_review.tool_policy == committed_review.tool_policy
-        && current_review.capability == committed_review.capability
-        && current_review.gate == committed_review.gate
-        && current_review.class == committed_review.class
-        && current_review.authoritative_lookup == committed_review.authoritative_lookup
-        && endpoint_key_matches(&current_review.endpoint_key, &committed_review.endpoint_key)
+    current_review == *committed_review
 }
 
 fn build_reconcile_lookup(
@@ -668,45 +752,102 @@ fn extract_reconcile_status(response: &ToolCallSuccess, field: &str) -> Option<S
     parsed.as_object()?.get(field)?.as_str().map(str::to_owned)
 }
 
-fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) -> Option<String> {
-    let field = field?;
-    let candidate = response
+enum ExtractedHandle {
+    Absent,
+    Valid(String),
+    Malformed,
+}
+
+fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) -> ExtractedHandle {
+    let Some(field) = field else {
+        return ExtractedHandle::Absent;
+    };
+    let Some(val) = response
         .structured
         .as_ref()
         .and_then(|v| v.as_object())
         .and_then(|m| m.get(field))
-        .and_then(Value::as_str)?;
+    else {
+        return ExtractedHandle::Absent;
+    };
+    let Some(candidate) = val.as_str() else {
+        return ExtractedHandle::Malformed;
+    };
     if candidate.is_empty()
         || candidate.len() > 256
         || !candidate.bytes().all(|b| b.is_ascii_graphic())
     {
-        return None;
+        return ExtractedHandle::Malformed;
     }
-    Some(candidate.to_owned())
+    ExtractedHandle::Valid(candidate.to_owned())
+}
+
+fn redact_value_strings(value: &mut Value, handle: &str) {
+    match value {
+        Value::String(s) => {
+            if s.contains(handle) {
+                *s = s.replace(handle, "[REDACTED]");
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_value_strings(item, handle);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_value_strings(v, handle);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn sanitize_tool_success(
     success: &ToolCallSuccess,
     handle_field: Option<&str>,
-) -> (String, Option<String>) {
-    let handle = extract_downstream_handle(success, handle_field);
-    let raw_text = if let Some(text) = &success.content_text {
-        text.clone()
+) -> Result<(String, Option<String>), ToolFault> {
+    let handle = match extract_downstream_handle(success, handle_field) {
+        ExtractedHandle::Absent => None,
+        ExtractedHandle::Valid(h) => Some(h),
+        ExtractedHandle::Malformed => return Err(ToolFault::TerminalRefusal),
+    };
+    let text = if let Some(content) = &success.content_text {
+        if handle_field.is_some()
+            && let Ok(mut parsed) = serde_json::from_str::<Value>(content)
+            && (parsed.is_object() || parsed.is_array())
+        {
+            if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
+                map.remove(field);
+            }
+            if let Some(h) = handle.as_deref() {
+                redact_value_strings(&mut parsed, h);
+            }
+            parsed.sort_all_objects();
+            parsed.to_string()
+        } else {
+            match handle.as_deref() {
+                Some(h) => content.replace(h, "[REDACTED]"),
+                None => content.clone(),
+            }
+        }
     } else if let Some(structured) = &success.structured {
         let mut sanitized = structured.clone();
         if let (Some(field), Some(map)) = (handle_field, sanitized.as_object_mut()) {
             map.remove(field);
         }
+        if let Some(h) = handle.as_deref() {
+            redact_value_strings(&mut sanitized, h);
+        }
         sanitized.sort_all_objects();
         sanitized.to_string()
     } else {
-        success.text.clone()
+        match handle.as_deref() {
+            Some(h) => success.text.replace(h, "[REDACTED]"),
+            None => success.text.clone(),
+        }
     };
-    let text = match handle.as_deref() {
-        Some(h) => raw_text.replace(h, "[REDACTED]"),
-        None => raw_text,
-    };
-    (text, handle)
+    Ok((text, handle))
 }
 
 impl ApprovedAdapter for ExternalMcpAdapter {
@@ -715,8 +856,88 @@ impl ApprovedAdapter for ExternalMcpAdapter {
         run: &'a ActiveRun,
         proposal: &'a Proposal,
         step: &'a StepContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PreflightError>> + Send + 'a>> {
         Box::pin(async move { self.admit_pre_intent(run, proposal, step).await })
+    }
+
+    fn filter_turn_tools<'a>(
+        &'a self,
+        run: &'a ActiveRun,
+        tools: Vec<Tool>,
+        step: &'a StepContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>> {
+        Box::pin(async move {
+            if tools.is_empty() {
+                return Ok(tools);
+            }
+            if let Some(why) = *step.stop.borrow() {
+                return Err(stopped_step(why));
+            }
+            let (two_phase_enabled, actor_user_id) = {
+                let Ok(mut c) = self.pool.acquire().await else {
+                    return Err(StepResult::LeaseLost);
+                };
+                let Ok(enabled) = approvals::two_phase_effect_intents_enabled(&mut c).await else {
+                    return Err(StepResult::LeaseLost);
+                };
+                let Ok(actor) = sqlx::query_scalar::<_, String>(
+                    "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
+                )
+                .bind(&run.claim.scope_id)
+                .bind(&run.claim.run_id)
+                .fetch_one(&mut *c)
+                .await
+                else {
+                    return Err(StepResult::LeaseLost);
+                };
+                (enabled, actor)
+            };
+            let mut checked: BTreeMap<(String, String), bool> = BTreeMap::new();
+            let mut kept = Vec::with_capacity(tools.len());
+            for tool in tools {
+                let contracts = self.registry.find_by_tool_id(&tool.name);
+                if contracts.is_empty() {
+                    kept.push(tool);
+                    continue;
+                }
+                if !two_phase_enabled {
+                    continue;
+                }
+                let mut ok = true;
+                for contract in contracts {
+                    let conn_key = (contract.connection_id.clone(), contract.account_id.clone());
+                    if let Some(&allowed) = checked.get(&conn_key) {
+                        if !allowed {
+                            ok = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    let res = self
+                        .verify_connection_catalog(run, contract, &actor_user_id, step)
+                        .await;
+                    if let Some(why) = *step.stop.borrow() {
+                        return Err(stopped_step(why));
+                    }
+                    match res {
+                        Ok(()) => {
+                            checked.insert(conn_key, true);
+                        }
+                        Err(PreflightError::Refused) => {
+                            checked.insert(conn_key, false);
+                            ok = false;
+                            break;
+                        }
+                        Err(PreflightError::Transient) => return Err(StepResult::Handoff),
+                        Err(PreflightError::Store(_)) => return Err(StepResult::LeaseLost),
+                    }
+                }
+                if ok {
+                    kept.push(tool);
+                }
+            }
+            Ok(kept)
+        })
     }
 
     fn send<'a>(
@@ -775,21 +996,45 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         StepResult::ToolResponse(Err(ToolFault::Transient))
                     };
                 }
-                let CredentialOutcome::Ready(credential) = self
-                    .credentials
-                    .resolve(CredentialRequest {
+                let credential = match resolve_credential_bounded(
+                    self.credentials.as_ref(),
+                    CredentialRequest {
                         connection_id: &contract.connection_id,
                         account_id: &contract.account_id,
                         scope_id: lease.scope_id,
                         actor_user_id: &actor_user_id,
-                    })
-                    .await
-                else {
-                    return if !is_read && sent_uncertain {
-                        observe_unknown(&self.pool, &lease, &step, &operation_id).await
-                    } else {
-                        StepResult::ToolResponse(Err(ToolFault::TerminalRefusal))
-                    };
+                    },
+                    call_deadline,
+                    &step.stop,
+                )
+                .await
+                {
+                    Ok(cred) => cred,
+                    Err(PreflightError::Refused) => {
+                        return if !is_read && sent_uncertain {
+                            observe_unknown(&self.pool, &lease, &step, &operation_id).await
+                        } else {
+                            StepResult::ToolResponse(Err(ToolFault::TerminalRefusal))
+                        };
+                    }
+                    Err(PreflightError::Transient | PreflightError::Store(_)) => {
+                        let stopped = *step.stop.borrow();
+                        if let Some(why) = stopped {
+                            if why == Stop::LeaseLost {
+                                return StepResult::LeaseLost;
+                            }
+                            if !is_read && sent_uncertain {
+                                return observe_unknown(&self.pool, &lease, &step, &operation_id)
+                                    .await;
+                            }
+                            return stopped_step(why);
+                        }
+                        return if !is_read && sent_uncertain {
+                            observe_unknown(&self.pool, &lease, &step, &operation_id).await
+                        } else {
+                            StepResult::ToolResponse(Err(ToolFault::Transient))
+                        };
+                    }
                 };
 
                 let (idem_header, idem_meta) =
@@ -812,9 +1057,21 @@ impl ApprovedAdapter for ExternalMcpAdapter {
 
                 match call_result {
                     Ok(success) => {
-                        let (text, handle) =
-                            sanitize_tool_success(&success, contract.handle_field.as_deref());
-                        return StepResult::ToolSuccess { text, handle };
+                        match sanitize_tool_success(&success, contract.handle_field.as_deref()) {
+                            Ok((text, handle)) => return StepResult::ToolSuccess { text, handle },
+                            Err(_) => {
+                                if !is_read {
+                                    return observe_unknown(
+                                        &self.pool,
+                                        &lease,
+                                        &step,
+                                        &operation_id,
+                                    )
+                                    .await;
+                                }
+                                return StepResult::ToolResponse(Err(ToolFault::TerminalRefusal));
+                            }
+                        }
                     }
                     Err(TransportFault {
                         kind: FaultKind::Stopped(why),
@@ -921,42 +1178,91 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         }
 
                         // Acquire a fresh Transaction 2 permit (`dispatched_attempts` increment +
-                        // live `{AUTH}` + `effective_expires_us` check) before every retry send.
-                        let Ok(mut c) = self.pool.acquire().await else {
-                            return StepResult::LeaseLost;
+                        // live `{AUTH}` + `effective_expires_us` check) bounded by `logical_call_deadline`.
+                        enum PermitWait {
+                            Stopped(Stop),
+                            TimedOut,
+                            Done(Result<Vec<u8>, StepResult>),
+                        }
+                        let permit_deadline = logical_call_deadline.min(step.deadline);
+                        let mut stop_rx = step.stop.clone();
+                        let permit_wait = tokio::select! {
+                            biased;
+                            waited = stop_rx.wait_for(Option::is_some) => {
+                                PermitWait::Stopped(
+                                    waited.ok().and_then(|v| *v).unwrap_or(Stop::LeaseLost),
+                                )
+                            }
+                            timed = timeout_at(permit_deadline, async {
+                                let Ok(mut c) = self.pool.acquire().await else {
+                                    return Err(StepResult::LeaseLost);
+                                };
+                                let permit = if is_read {
+                                    approvals::start_replayed_read(
+                                        &mut c,
+                                        &lease,
+                                        &operation_id,
+                                        &proposal,
+                                        &self.settings,
+                                        self.registry.as_ref(),
+                                    )
+                                    .await
+                                } else {
+                                    approvals::start_write_retry(
+                                        &mut c,
+                                        &lease,
+                                        &operation_id,
+                                        &proposal,
+                                        &self.settings,
+                                        self.registry.as_ref(),
+                                    )
+                                    .await
+                                };
+                                start_permit(
+                                    &mut c,
+                                    &lease,
+                                    (&operation_id, &proposal),
+                                    &self.settings,
+                                    self.registry.as_ref(),
+                                    &mut step,
+                                    permit,
+                                )
+                                .await
+                            }) => match timed {
+                                Ok(res) => PermitWait::Done(res),
+                                Err(_) => PermitWait::TimedOut,
+                            },
                         };
-                        let permit = if is_read {
-                            approvals::start_replayed_read(
-                                &mut c,
-                                &lease,
-                                &operation_id,
-                                &proposal,
-                                &self.settings,
-                                self.registry.as_ref(),
-                            )
-                            .await
-                        } else {
-                            approvals::start_write_retry(
-                                &mut c,
-                                &lease,
-                                &operation_id,
-                                &proposal,
-                                &self.settings,
-                                self.registry.as_ref(),
-                            )
-                            .await
+                        let checked = match permit_wait {
+                            PermitWait::Stopped(why) => {
+                                if why == Stop::LeaseLost {
+                                    return StepResult::LeaseLost;
+                                }
+                                if !is_read && sent_uncertain {
+                                    return observe_unknown(
+                                        &self.pool,
+                                        &lease,
+                                        &step,
+                                        &operation_id,
+                                    )
+                                    .await;
+                                }
+                                return stopped_step(why);
+                            }
+                            PermitWait::TimedOut => {
+                                if !is_read && sent_uncertain {
+                                    return observe_unknown(
+                                        &self.pool,
+                                        &lease,
+                                        &step,
+                                        &operation_id,
+                                    )
+                                    .await;
+                                }
+                                return StepResult::ToolResponse(Err(ToolFault::Transient));
+                            }
+                            PermitWait::Done(res) => res,
                         };
-                        let checked = start_permit(
-                            &mut c,
-                            &lease,
-                            (&operation_id, &proposal),
-                            &self.settings,
-                            self.registry.as_ref(),
-                            &mut step,
-                            permit,
-                        )
-                        .await;
-                        drop(c);
                         if let Err(step_result) = checked {
                             // If a write had already sent uncertain bytes and the retry failed
                             // exhaustion or handoff (not LeaseLost/Invalidated), commit outcome_unknown.
@@ -1010,4 +1316,149 @@ fn full_jitter(max_ms: u64) -> Duration {
         return Duration::from_millis(max_ms);
     }
     Duration::from_millis(u64::from(u16::from_be_bytes(bytes)) % (max_ms + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sanitize_tool_success_redacts_json_escaped_and_short_handles_without_corrupting_json() {
+        // 1. JSON-escaped handle inside structured-only response.
+        let escaped_handle = "h\"quote\\1";
+        let structured_escaped = ToolCallSuccess {
+            text: String::new(),
+            content_text: None,
+            structured: Some(json!({
+                "handle": escaped_handle,
+                "note": format!("created {escaped_handle} ok"),
+                "nested": [format!("again:{escaped_handle}")],
+                "count": 1
+            })),
+            meta: None,
+        };
+        let (text, handle) = sanitize_tool_success(&structured_escaped, Some("handle")).unwrap();
+        assert_eq!(handle.as_deref(), Some(escaped_handle));
+        assert!(!text.contains(escaped_handle));
+        assert!(!text.contains("quote"));
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(parsed.get("handle").is_none());
+        assert_eq!(parsed["note"], "created [REDACTED] ok");
+        assert_eq!(parsed["nested"][0], "again:[REDACTED]");
+        assert_eq!(parsed["count"], 1);
+
+        // 2. Short handle "1" must NOT corrupt integer JSON values like `"count": 1`.
+        let structured_short = ToolCallSuccess {
+            text: String::new(),
+            content_text: None,
+            structured: Some(json!({
+                "handle": "1",
+                "count": 1,
+                "label": "item-1",
+                "ok": true
+            })),
+            meta: None,
+        };
+        let (short_text, short_handle) =
+            sanitize_tool_success(&structured_short, Some("handle")).unwrap();
+        assert_eq!(short_handle.as_deref(), Some("1"));
+        let parsed_short: Value = serde_json::from_str(&short_text).expect("valid JSON");
+        assert!(parsed_short.get("handle").is_none());
+        assert_eq!(parsed_short["count"], 1);
+        assert_eq!(parsed_short["label"], "item-[REDACTED]");
+        assert_eq!(parsed_short["ok"], true);
+
+        // 3. JSON-encoded text content echoing both handle field and short handle alongside integer 1.
+        let json_content = ToolCallSuccess {
+            text: String::new(),
+            content_text: Some(
+                json!({
+                    "handle": "1",
+                    "count": 1,
+                    "msg": "ref-1"
+                })
+                .to_string(),
+            ),
+            structured: Some(json!({"handle": "1"})),
+            meta: None,
+        };
+        let (ctext, chandle) = sanitize_tool_success(&json_content, Some("handle")).unwrap();
+        assert_eq!(chandle.as_deref(), Some("1"));
+        let parsed_c: Value = serde_json::from_str(&ctext).expect("valid JSON");
+        assert!(parsed_c.get("handle").is_none());
+        assert_eq!(parsed_c["count"], 1);
+        assert_eq!(parsed_c["msg"], "ref-[REDACTED]");
+
+        // 4. Plain non-JSON text content echoing a handle with quotes/backslashes.
+        let plain_content = ToolCallSuccess {
+            text: String::new(),
+            content_text: Some(format!("done {escaped_handle} end")),
+            structured: Some(json!({"handle": escaped_handle})),
+            meta: None,
+        };
+        let (ptext, phandle) = sanitize_tool_success(&plain_content, Some("handle")).unwrap();
+        assert_eq!(phandle.as_deref(), Some(escaped_handle));
+        assert_eq!(ptext, "done [REDACTED] end");
+    }
+
+    #[test]
+    fn extract_downstream_handle_distinguishes_absent_valid_and_malformed() {
+        let absent = ToolCallSuccess {
+            text: "ok".into(),
+            content_text: Some("ok".into()),
+            structured: Some(json!({"ok": true})),
+            meta: None,
+        };
+        assert!(matches!(
+            extract_downstream_handle(&absent, Some("handle")),
+            ExtractedHandle::Absent
+        ));
+        assert_eq!(
+            sanitize_tool_success(&absent, Some("handle")).unwrap().1,
+            None
+        );
+
+        let valid = ToolCallSuccess {
+            text: "ok".into(),
+            content_text: Some("ok".into()),
+            structured: Some(json!({"handle": "op_123-abc"})),
+            meta: None,
+        };
+        assert!(matches!(
+            extract_downstream_handle(&valid, Some("handle")),
+            ExtractedHandle::Valid(ref s) if s == "op_123-abc"
+        ));
+
+        let too_long = "a".repeat(257);
+        for bad in [
+            json!(""),
+            json!("bad space"),
+            json!("line\nbreak"),
+            json!(too_long),
+            json!(123),
+            json!(null),
+            json!(true),
+            json!(["x"]),
+        ] {
+            let malformed = ToolCallSuccess {
+                text: "ok".into(),
+                content_text: Some("ok".into()),
+                structured: Some(json!({"handle": bad})),
+                meta: None,
+            };
+            assert!(
+                matches!(
+                    extract_downstream_handle(&malformed, Some("handle")),
+                    ExtractedHandle::Malformed
+                ),
+                "expected Malformed for {bad}"
+            );
+            assert_eq!(
+                sanitize_tool_success(&malformed, Some("handle")),
+                Err(ToolFault::TerminalRefusal),
+                "expected TerminalRefusal for {bad}"
+            );
+        }
+    }
 }

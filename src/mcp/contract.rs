@@ -162,12 +162,13 @@ impl ExternalToolContract {
         Ok(())
     }
 
-    /// Build the model-facing `Tool` declaration for this reviewed contract.
+    /// Build the model-facing `Tool` declaration projected to the `provider_http::inference`
+    /// function-schema subset while retaining full contract constraint enforcement in `proposal`.
     pub fn declaration(&self) -> Tool {
         Tool {
             name: self.tool_id.clone(),
             description: self.description.clone(),
-            parameters: self.input_schema.clone(),
+            parameters: project_model_schema(&self.input_schema),
         }
     }
 
@@ -283,6 +284,13 @@ impl ExternalRegistry {
             .get(&(tool_id.to_owned(), version.to_owned()))
     }
 
+    pub fn find_by_tool_id(&self, tool_id: &str) -> Vec<&ExternalToolContract> {
+        self.contracts
+            .values()
+            .filter(|c| c.tool_id == tool_id)
+            .collect()
+    }
+
     pub fn proposal(
         &self,
         key: &str,
@@ -392,6 +400,38 @@ impl EffectPolicy for ExternalRegistry {
             reservation: None,
         }))
     }
+
+    fn requires_two_phase_writes(&self) -> bool {
+        true
+    }
+}
+
+fn project_model_schema(schema: &Value) -> Value {
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            "type" | "description" | "required" | "additionalProperties" => {
+                out.insert(k.clone(), v.clone());
+            }
+            "properties" => {
+                if let Some(props) = v.as_object() {
+                    let projected: Map<String, Value> = props
+                        .iter()
+                        .map(|(pk, pv)| (pk.clone(), project_model_schema(pv)))
+                        .collect();
+                    out.insert(k.clone(), Value::Object(projected));
+                }
+            }
+            "items" => {
+                out.insert(k.clone(), project_model_schema(v));
+            }
+            _ => {}
+        }
+    }
+    Value::Object(out)
 }
 
 fn validate_schema_metadata(obj: &Map<String, Value>) -> Result<(), ToolFault> {
@@ -690,13 +730,14 @@ fn validate_value_against_schema(
             if s.len() > MAX_STRING_BYTES {
                 return Err(ToolFault::TerminalRefusal);
             }
+            let char_len = s.chars().count() as u64;
             if let Some(min) = obj.get("minLength").and_then(Value::as_u64)
-                && (s.len() as u64) < min
+                && char_len < min
             {
                 return Err(ToolFault::TerminalRefusal);
             }
             if let Some(max) = obj.get("maxLength").and_then(Value::as_u64)
-                && (s.len() as u64) > max
+                && char_len > max
             {
                 return Err(ToolFault::TerminalRefusal);
             }
@@ -1029,5 +1070,195 @@ mod tests {
                 "header {forbidden} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn declaration_projects_to_inference_schema_subset_while_proposal_enforces_full_constraints() {
+        let mut rich = sample_contract();
+        rich.tool_id = "docs_append".into();
+        rich.input_schema = json!({
+            "type": "object",
+            "title": "AppendInput",
+            "description": "Append arguments",
+            "additionalProperties": false,
+            "required": ["doc_id", "mode"],
+            "properties": {
+                "doc_id": {
+                    "type": "string",
+                    "title": "Document ID",
+                    "description": "Canonical document UUID",
+                    "format": "uuid",
+                    "minLength": 36,
+                    "maxLength": 36
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["append", "replace"],
+                    "minLength": 1,
+                    "maxLength": 16
+                },
+                "retries": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "default": 2
+                },
+                "tags": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "default": ["v1"],
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 8,
+                        "enum": ["v1", "v2"]
+                    }
+                }
+            }
+        });
+        let mut registry = ExternalRegistry::new();
+        registry.register(rich).unwrap();
+        let contract = registry.get("docs_append", "1").unwrap();
+        let decl = contract.declaration();
+
+        // Every schema node in `declaration().parameters` must only contain inference-allowed keys.
+        fn assert_projected_only(node: &Value) {
+            let obj = node.as_object().expect("schema node must be object");
+            for (k, v) in obj {
+                assert!(
+                    matches!(
+                        k.as_str(),
+                        "type"
+                            | "description"
+                            | "properties"
+                            | "required"
+                            | "additionalProperties"
+                            | "items"
+                    ),
+                    "unexpected non-projected schema key {k} in declaration"
+                );
+                if k == "properties" {
+                    for prop in v.as_object().unwrap().values() {
+                        assert_projected_only(prop);
+                    }
+                } else if k == "items" {
+                    assert_projected_only(v);
+                }
+            }
+        }
+        assert_projected_only(&decl.parameters);
+        assert_eq!(decl.parameters["description"], "Append arguments");
+        assert_eq!(
+            decl.parameters["properties"]["doc_id"]["description"],
+            "Canonical document UUID"
+        );
+        assert!(decl.parameters.get("title").is_none());
+        assert!(
+            decl.parameters["properties"]["doc_id"]
+                .get("format")
+                .is_none()
+        );
+        assert!(decl.parameters["properties"]["mode"].get("enum").is_none());
+        assert!(
+            decl.parameters["properties"]["retries"]
+                .get("default")
+                .is_none()
+        );
+        assert!(
+            decl.parameters["properties"]["tags"]
+                .get("minItems")
+                .is_none()
+        );
+
+        // Full validation and default expansion still run in `proposal()`.
+        let ok = contract
+            .proposal(
+                "k-rich-1",
+                br#"{"doc_id":"00000000-0000-4000-8000-000000000001","mode":"append"}"#,
+            )
+            .unwrap();
+        assert_eq!(ok.arguments()["retries"], 2);
+        assert_eq!(ok.arguments()["tags"], json!(["v1"]));
+
+        for bad in [
+            br#"{"doc_id":"not-a-uuid","mode":"append"}"#.as_slice(),
+            br#"{"doc_id":"00000000-0000-4000-8000-000000000001","mode":"delete"}"#,
+            br#"{"doc_id":"00000000-0000-4000-8000-000000000001","mode":"append","retries":9}"#,
+            br#"{"doc_id":"00000000-0000-4000-8000-000000000001","mode":"append","tags":[]}"#,
+        ] {
+            assert_eq!(
+                contract.proposal("k-rich-bad", bad).err(),
+                Some(ToolFault::TerminalRefusal)
+            );
+        }
+    }
+
+    #[test]
+    fn string_length_constraints_count_unicode_scalars_while_preserving_byte_cap() {
+        let mut unicode = sample_contract();
+        unicode.input_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["doc_id", "body"],
+            "properties": {
+                "doc_id": {"type": "string", "minLength": 1, "maxLength": 16},
+                "body": {"type": "string", "minLength": 2, "maxLength": 2}
+            }
+        });
+        let mut registry = ExternalRegistry::new();
+        registry.register(unicode).unwrap();
+
+        // 2 Unicode scalars ("é" = 2 bytes, "🦀" = 4 bytes -> 6 UTF-8 bytes) satisfy [2, 2].
+        let ok_body = json!({"doc_id": "d1", "body": "é🦀"}).to_string();
+        assert!(
+            registry
+                .proposal("u-ok", "docs.append", "1", ok_body.as_bytes())
+                .is_ok()
+        );
+
+        // 1 Unicode scalar ("é" = 2 UTF-8 bytes) must FAIL minLength: 2!
+        let short_body = json!({"doc_id": "d1", "body": "é"}).to_string();
+        assert_eq!(
+            registry
+                .proposal("u-short", "docs.append", "1", short_body.as_bytes())
+                .err(),
+            Some(ToolFault::TerminalRefusal)
+        );
+
+        // 3 Unicode scalars ("é🦀a") must FAIL maxLength: 2!
+        let long_body = json!({"doc_id": "d1", "body": "é🦀a"}).to_string();
+        assert_eq!(
+            registry
+                .proposal("u-long", "docs.append", "1", long_body.as_bytes())
+                .err(),
+            Some(ToolFault::TerminalRefusal)
+        );
+
+        // Byte cap (MAX_STRING_BYTES) still rejects strings whose scalar count fits maxLength
+        // but whose UTF-8 byte length exceeds MAX_STRING_BYTES.
+        let mut wide = sample_contract();
+        wide.input_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["doc_id", "body"],
+            "properties": {
+                "doc_id": {"type": "string", "minLength": 1, "maxLength": 16},
+                "body": {"type": "string", "maxLength": MAX_STRING_BYTES}
+            }
+        });
+        let mut wide_reg = ExternalRegistry::new();
+        wide_reg.register(wide).unwrap();
+        let over_bytes = json!({
+            "doc_id": "d1",
+            "body": "🦀".repeat(MAX_STRING_BYTES / 4 + 1)
+        })
+        .to_string();
+        assert_eq!(
+            wide_reg
+                .proposal("u-bytes", "docs.append", "1", over_bytes.as_bytes())
+                .err(),
+            Some(ToolFault::TerminalRefusal)
+        );
     }
 }

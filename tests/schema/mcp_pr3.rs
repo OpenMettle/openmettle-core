@@ -2022,10 +2022,23 @@ async fn external_mcp_tls_end_to_end_faults_retries_reconcile_and_spill_read_ran
     else {
         panic!("expected spilled ToolOutput");
     };
-    let _e2e_elapsed = t0.elapsed();
+    let e2e_elapsed_us = t0.elapsed().as_micros();
+    assert!(e2e_elapsed_us > 0);
     assert!(spill_json.len() <= INLINE_BYTES);
     let spill_val: Value = serde_json::from_str(&spill_json).unwrap();
     assert_eq!(spill_val["storage"], "spilled");
+    let plan22_record = json!({
+        "e2e_mcp_spill_read_range_us": e2e_elapsed_us,
+        "spilled_bytes": big_body.len(),
+        "inline_preview_bytes": spill_json.len(),
+    });
+    assert!(
+        plan22_record["e2e_mcp_spill_read_range_us"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    println!("PLAN-22: {plan22_record}");
     let art_id = spill_val["provenance"]["artifact_id"].as_str().unwrap();
     let rev_id = spill_val["provenance"]["revision_id"].as_str().unwrap();
     let op_id = spill_val["provenance"]["operation_id"].as_str().unwrap();
@@ -3202,6 +3215,9 @@ async fn review1_two_phase_race_preflight_turn_reclaim_and_reconcile_regressions
                     let _ = tx.send(Some(Stop::Shutdown));
                 }
                 self.inner.review(scope, run, p)
+            }
+            fn requires_two_phase_writes(&self) -> bool {
+                self.inner.requires_two_phase_writes()
             }
         }
 
@@ -4419,6 +4435,1888 @@ async fn review1_catalog_drift_handle_redaction_wire_faults_timeout_and_mid_body
             .await
             .unwrap();
         leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+            .await
+            .unwrap();
+    }
+}
+
+// ============================================================================================
+// 7. Review #2 Regressions: Tx1 Gate TOCTOU, Catalog TTL + 503 Handoff + Turn Tool Filtering,
+//    Multi-Round & Multi-Call TurnExecutor Reclaim, Reconcile Exact Review Equality,
+//    Structured Handle Redaction & Malformed Handle Matrix, Constrained Schema Default Expansion,
+//    Non-Lookup outcome_unknown Reconcile, and Bounded Credential Resolution
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn review2_toctou_ttl_multicall_multiround_reconcile_handle_and_deadline_regressions() {
+    use openmettle_core::{
+        authz::{
+            branches::{
+                self, Conversation, Operation, Part, UserInput,
+                snapshot::{Intent as TurnIntent, Snapshots},
+            },
+            store::{AuditContext, WriteOutcome},
+        },
+        model_config::{
+            Catalog, ConfigSnapshot, Effective, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection,
+        },
+        provider_http::inference::{
+            self, Call, Gateway, Protocol, Qualification, Request, Timeouts, Tool,
+        },
+        runs::RunInput,
+        worker::turns::{Route, TurnExecutor, TurnRoutes},
+    };
+
+    let f = Fixture::new().await;
+    f.grant(true).await;
+    let worker_pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let mut w = worker(&f.db).await;
+    let mut a = api(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+
+    // Build extended registry with flat/rich/multi-account/short-timeout/missing-conn contracts.
+    let mut reg_builder = test_registry(FUTURE * 1000);
+    let mut read_turn = reg_builder.get("mcp.read", "1").unwrap().clone();
+    read_turn.tool_id = "mcp_read".into();
+    read_turn.remote_name = "mcp_read".into();
+    reg_builder.register(read_turn).unwrap();
+
+    let mut idem_turn = reg_builder.get("mcp.idem", "1").unwrap().clone();
+    idem_turn.tool_id = "mcp_idem".into();
+    idem_turn.remote_name = "mcp_idem".into();
+    reg_builder.register(idem_turn).unwrap();
+
+    let mut acct2_read = reg_builder.get("mcp.read", "1").unwrap().clone();
+    acct2_read.tool_id = "mcp.read_acct2".into();
+    acct2_read.remote_name = "mcp.read_acct2".into();
+    acct2_read.account_id = "acct-2".into();
+    reg_builder.register(acct2_read).unwrap();
+
+    let mut rich = reg_builder.get("mcp.idem", "1").unwrap().clone();
+    rich.tool_id = "mcp_rich".into();
+    rich.remote_name = "mcp_rich".into();
+    rich.resource_field = Some("doc_id".into());
+    rich.input_schema = json!({
+        "type": "object",
+        "title": "RichWrite",
+        "description": "Constrained external write",
+        "additionalProperties": false,
+        "required": ["doc_id", "mode"],
+        "properties": {
+            "doc_id": {
+                "type": "string",
+                "description": "Target document UUID",
+                "format": "uuid",
+                "minLength": 36,
+                "maxLength": 36
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["append", "replace"],
+                "minLength": 1,
+                "maxLength": 16
+            },
+            "retries": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3,
+                "default": 2
+            }
+        }
+    });
+    reg_builder.register(rich).unwrap();
+
+    let mut short_to = reg_builder.get("mcp.idem", "1").unwrap().clone();
+    short_to.tool_id = "mcp.idem_short".into();
+    short_to.remote_name = "mcp.idem_short".into();
+    short_to.call_timeout = Duration::from_secs(1);
+    reg_builder.register(short_to).unwrap();
+
+    let registry = Arc::new(reg_builder);
+
+    // --- (a) P1 #1: Transaction 1 enforces two_phase_effect_intents_enabled atomically for ExternalRegistry ---
+    {
+        sqlx::query(
+            "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = false",
+        )
+        .execute(&mut owner)
+        .await
+        .unwrap();
+
+        // Direct record_fenced_intent (simulating gate flip between preflight and Tx1) refuses
+        // BOTH automatic writes and reads with 0 operations rows.
+        let r_auto = f.claim("r2-tx1-toctou-auto", "yolo").await;
+        for (key, tool) in [
+            ("k-toctou-write", "mcp.idem"),
+            ("k-toctou-read", "mcp.read"),
+        ] {
+            let prop = registry
+                .proposal(key, tool, "1", br#"{"item":"toctou"}"#)
+                .unwrap();
+            let err = record_fenced_intent(
+                &mut w,
+                &r_auto.lease(),
+                &prop,
+                None,
+                registry.as_ref(),
+                &LEASES,
+            )
+            .await
+            .err()
+            .expect("ExternalRegistry Tx1 must reject when gate is off");
+            assert!(
+                matches!(err, leases::LeaseError::Store(StoreError::Denied(_))),
+                "{tool} expected Denied, got {err:?}"
+            );
+        }
+        let ops_auto: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&r_auto.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops_auto, 0);
+        leases::settle(&mut w, &r_auto.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+
+        // Human-approved write whose gate flips off before Tx1 invalidates cleanly with 0 operations rows.
+        let r_hum = f.claim("r2-tx1-toctou-human", "ordinary").await;
+        let p_hum = registry
+            .proposal("k-toctou-hum", "mcp.idem", "1", br#"{"item":"toctou-h"}"#)
+            .unwrap();
+        let pk_hum = park(
+            &mut w,
+            &r_hum.lease(),
+            &StepTasks::default().handle(),
+            &p_hum,
+            registry.as_ref(),
+            &LEASES,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let decider = session(&f.db, &f.actor, 61).await;
+        decide(
+            &mut a,
+            &decider,
+            &f.input(&r_hum, &pk_hum, HumanDecision::Approve, "r2-toctou"),
+            registry.as_ref(),
+        )
+        .await
+        .unwrap();
+        let r_hum = f.next().await.unwrap();
+        let res_hum = record_fenced_intent(
+            &mut w,
+            &r_hum.lease(),
+            &p_hum,
+            Some(&pk_hum.approval_id),
+            registry.as_ref(),
+            &LEASES,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res_hum, IntentResult::Invalidated(_)));
+        let ops_hum: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&r_hum.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops_hum, 0);
+
+        sqlx::query(
+            "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = true",
+        )
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    // Shared synthetic TLS MCP server with dynamic tools/list controls and payload capture.
+    let list_tools_json: Value = Value::Array(
+        [
+            "mcp.read",
+            "mcp.read_acct2",
+            "mcp.idem",
+            "mcp.idem_short",
+            "mcp.lookup_handle",
+            "mcp.lookup_det",
+            "mcp.nonrep",
+            "mcp_read",
+            "mcp_idem",
+            "mcp_rich",
+        ]
+        .into_iter()
+        .map(|name| {
+            let c = registry.get(name, "1").unwrap();
+            json!({"name": c.remote_name, "inputSchema": c.input_schema})
+        })
+        .collect(),
+    );
+    let tools_list_calls = Arc::new(AtomicUsize::new(0));
+    let transient_list_503_once = Arc::new(AtomicBool::new(false));
+    let drift_list_enabled = Arc::new(AtomicBool::new(false));
+    let mcp_read_calls = Arc::new(AtomicUsize::new(0));
+    let mcp_idem_calls = Arc::new(AtomicUsize::new(0));
+    let rich_received_args: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+    let tools_list_calls_srv = tools_list_calls.clone();
+    let transient_503_srv = transient_list_503_once.clone();
+    let drift_list_srv = drift_list_enabled.clone();
+    let mcp_read_calls_srv = mcp_read_calls.clone();
+    let mcp_idem_calls_srv = mcp_idem_calls.clone();
+    let rich_received_srv = rich_received_args.clone();
+
+    let server = SyntheticMcpServer::start(move |req| {
+        let id = req.body["id"].as_str().unwrap_or("0");
+        let method = req.body["method"].as_str().unwrap_or("");
+        if method == "tools/list" {
+            tools_list_calls_srv.fetch_add(1, Ordering::SeqCst);
+            if transient_503_srv.swap(false, Ordering::SeqCst) {
+                return http_response(503, &[("retry-after", "0")], b"catalog-unavailable");
+            }
+            if drift_list_srv.load(Ordering::SeqCst) {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "mcp_idem",
+                            "inputSchema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["item"],
+                                "properties": {
+                                    "item": {"type": "string", "minLength": 1, "maxLength": 9999}
+                                }
+                            }
+                        }]
+                    }
+                })
+                .to_string();
+                return http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                );
+            }
+            let body = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": list_tools_json}})
+                .to_string();
+            return http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            );
+        }
+        let tool = req.body["params"]["name"].as_str().unwrap_or("");
+        let args = &req.body["params"]["arguments"];
+        if tool == "mcp.status" {
+            if args.get("handle").and_then(Value::as_str) == Some("h-bad-remote") {
+                return jsonrpc_ok(
+                    id,
+                    r#"{"status":"succeeded"}"#,
+                    Some(json!({"status": "succeeded", "handle": "bad space"})),
+                );
+            }
+            return jsonrpc_ok(
+                id,
+                r#"{"status":"succeeded"}"#,
+                Some(json!({"status": "succeeded", "handle": "h-ok"})),
+            );
+        }
+        if tool == "mcp_rich" {
+            *rich_received_srv.lock().unwrap() = Some(args.clone());
+            return jsonrpc_ok(id, "rich-ok", Some(json!({"handle": "h-rich"})));
+        }
+        if tool == "mcp_read" {
+            mcp_read_calls_srv.fetch_add(1, Ordering::SeqCst);
+            return jsonrpc_ok(id, "r1-read-ok", None);
+        }
+        if tool == "mcp_idem" {
+            mcp_idem_calls_srv.fetch_add(1, Ordering::SeqCst);
+            return jsonrpc_ok(id, "r2-write-ok", Some(json!({"handle": "h-r2"})));
+        }
+        let item = args["item"].as_str().unwrap_or("");
+        match item {
+            "handle-escaped" => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": "h\"quote\\1",
+                            "note": "ref h\"quote\\1 done",
+                            "count": 1
+                        }
+                    }
+                })
+                .to_string();
+                http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                )
+            }
+            "handle-short-1" => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": "1",
+                            "count": 1,
+                            "label": "id-1"
+                        }
+                    }
+                })
+                .to_string();
+                http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                )
+            }
+            "handle-bad-space" => jsonrpc_ok(id, "ok", Some(json!({"handle": "bad space"}))),
+            "handle-bad-num" => jsonrpc_ok(id, "ok", Some(json!({"handle": 123}))),
+            _ => jsonrpc_ok(id, "ok", Some(json!({"handle": "h-default"}))),
+        }
+    })
+    .await;
+
+    let mut transports = BTreeMap::new();
+    transports.insert("synth-mcp".to_owned(), server.transport());
+
+    let worker_settings = || {
+        openmettle_core::WorkerSettings::parse(Duration::from_secs(1), |k| {
+            Ok(Some(
+                match k {
+                    "RUN_SLOTS" | "EXECUTING_PER_ACTOR" | "EXECUTING_PER_SCOPE" => "1",
+                    "LEASE_MS" => "30000",
+                    "EXECUTION_TIMEOUT_MS" => "180000",
+                    "POLL_MS" => "100",
+                    "SWEEP_MS" => "1000",
+                    _ => return Ok(None),
+                }
+                .into(),
+            ))
+        })
+        .unwrap()
+    };
+
+    // --- (b) P1 #2: Catalog TTL expiry, account/scope key isolation, and 503 handoff on resumed approval ---
+    {
+        let ttl_adapter = Arc::new(
+            ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-ttl".into()),
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .with_catalog_ttl(Duration::from_millis(800)),
+        );
+        let rr = f.claim("r2-ttl", "yolo").await;
+        let (_st, step) = fresh_step(20);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let list0 = tools_list_calls.load(Ordering::SeqCst);
+        for k in ["k-ttl-1", "k-ttl-2"] {
+            assert!(matches!(
+                ttl_adapter
+                    .call(
+                        &active,
+                        step.clone(),
+                        ExternalCall {
+                            key: k,
+                            tool: "mcp.read",
+                            version: "1",
+                            raw_args: br#"{"item":"a"}"#,
+                            approval: None,
+                        },
+                    )
+                    .await,
+                StepResult::ToolOutput(_)
+            ));
+        }
+        assert_eq!(
+            tools_list_calls.load(Ordering::SeqCst),
+            list0 + 1,
+            "second call within TTL must hit cache"
+        );
+        // Distinct account_id on the same connection must NOT reuse acct-1's cache entry.
+        assert!(matches!(
+            ttl_adapter
+                .call(
+                    &active,
+                    step.clone(),
+                    ExternalCall {
+                        key: "k-ttl-acct2",
+                        tool: "mcp.read_acct2",
+                        version: "1",
+                        raw_args: br#"{"item":"a"}"#,
+                        approval: None,
+                    },
+                )
+                .await,
+            StepResult::ToolOutput(_)
+        ));
+        assert_eq!(
+            tools_list_calls.load(Ordering::SeqCst),
+            list0 + 2,
+            "different account_id must re-verify tools/list"
+        );
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(matches!(
+            ttl_adapter
+                .call(
+                    &active,
+                    step,
+                    ExternalCall {
+                        key: "k-ttl-3",
+                        tool: "mcp.read",
+                        version: "1",
+                        raw_args: br#"{"item":"a"}"#,
+                        approval: None,
+                    },
+                )
+                .await,
+            StepResult::ToolOutput(_)
+        ));
+        assert_eq!(
+            tools_list_calls.load(Ordering::SeqCst),
+            list0 + 3,
+            "call after TTL expiry must re-verify tools/list"
+        );
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+
+        // Resumed human approval receiving transient 503 on tools/list MUST hand off (NOT fail)
+        // and succeed once the catalog endpoint recovers!
+        struct FinishExec;
+        impl Executor for FinishExec {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &leases::UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                None
+            }
+        }
+        let r_503 = f.claim("r2-503-handoff", "ordinary").await;
+        let p_503 = registry
+            .proposal("k-503-ap", "mcp.idem", "1", br#"{"item":"503-ok"}"#)
+            .unwrap();
+        let pk_503 = park(
+            &mut w,
+            &r_503.lease(),
+            &StepTasks::default().handle(),
+            &p_503,
+            registry.as_ref(),
+            &LEASES,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let decider = session(&f.db, &f.actor, 62).await;
+        decide(
+            &mut a,
+            &decider,
+            &f.input(&r_503, &pk_503, HumanDecision::Approve, "r2-503"),
+            registry.as_ref(),
+        )
+        .await
+        .unwrap();
+        transient_list_503_once.store(true, Ordering::SeqCst);
+        let list_before_503 = tools_list_calls.load(Ordering::SeqCst);
+        let fresh_adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-503".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let pool = worker_pool.clone();
+            let approved = Arc::new(fresh_adapter.approved_effects());
+            let settings = worker_settings();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    Arc::new(FinishExec),
+                    Some(approved),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&r_503.run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "503 handoff resume timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task.await.unwrap();
+        assert_eq!(
+            final_state, "succeeded",
+            "transient tools/list 503 must hand off and succeed on retry"
+        );
+        assert!(tools_list_calls.load(Ordering::SeqCst) >= list_before_503 + 2);
+    }
+
+    // --- Helper to admit real TurnExecutor YOLO runs ---
+    let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
+    let catalog = Arc::new(Catalog::load(catalog_bytes).unwrap());
+    let selection: Selection = serde_json::from_value(
+        json!({"model": "a", "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let snapshot = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("a").unwrap().cost_bound,
+    };
+    let make_gateway = |srv: &SyntheticMcpServer, parallel: bool| -> Arc<Gateway> {
+        let prefix = if srv.ip.is_ipv4() { 32 } else { 128 };
+        let range = format!("{}/{prefix}", srv.ip);
+        Arc::new(
+            Gateway::new(
+                &format!("https://{}:{}/v1/chat/completions", srv.host, srv.port),
+                Trust::Bundle(&srv.ca_pem),
+                &[&range],
+                Qualification {
+                    model: "a".into(),
+                    pin: catalog.model("a").unwrap().pin.clone(),
+                    protocol: Protocol::Chat,
+                    json: true,
+                    sse: false,
+                    functions: Some(inference::SchemaSubset::Flat),
+                    images: false,
+                    parallel,
+                    usage: true,
+                    tool_separator_whitespace: false,
+                },
+                Timeouts {
+                    setup: Duration::from_secs(5),
+                    idle: Duration::from_secs(15),
+                    overall: Duration::from_secs(30),
+                },
+            )
+            .unwrap(),
+        )
+    };
+
+    struct DynamicTurnRoutes {
+        gateway: Arc<Gateway>,
+        registry: Arc<ExternalRegistry>,
+        tool_ids: Vec<&'static str>,
+    }
+    impl TurnRoutes for DynamicTurnRoutes {
+        async fn route(
+            &self,
+            _: &ClaimedRun,
+            _: &str,
+            _: &Effective,
+        ) -> Result<Route, inference::Error> {
+            Ok(Route::metered(
+                self.gateway.clone(),
+                "00000000-0000-4000-8000-000000000091".into(),
+                false,
+            ))
+        }
+        fn tools(&self, _: &ClaimedRun) -> Vec<Tool> {
+            self.tool_ids
+                .iter()
+                .map(|id| self.registry.get(id, "1").unwrap().declaration())
+                .collect()
+        }
+        fn tool_prompt_bound(&self, _: &Effective, request: &Request) -> Option<u64> {
+            (request.history.len() <= 32).then_some(4096)
+        }
+        fn proposal(&self, _: &ClaimedRun, call: &Call) -> Option<Proposal> {
+            self.registry
+                .proposal(
+                    &call.id,
+                    &call.name,
+                    "1",
+                    &serde_json::to_vec(&call.arguments).ok()?,
+                )
+                .ok()
+        }
+    }
+
+    struct StopOnToolReview {
+        inner: Arc<ExternalRegistry>,
+        target_tool: &'static str,
+        stop: Mutex<Option<tokio::sync::watch::Sender<Option<Stop>>>>,
+    }
+    impl approvals::EffectPolicy for StopOnToolReview {
+        fn review(
+            &self,
+            scope: &str,
+            run: &str,
+            p: &Proposal,
+        ) -> Result<Option<Review>, StoreError> {
+            if p.tool == self.target_tool
+                && let Some(tx) = self.stop.lock().unwrap().take()
+            {
+                let _ = tx.send(Some(Stop::Shutdown));
+            }
+            self.inner.review(scope, run, p)
+        }
+        fn requires_two_phase_writes(&self) -> bool {
+            self.inner.requires_two_phase_writes()
+        }
+    }
+
+    struct CountingPreflightAdapter {
+        inner: Arc<ExternalMcpAdapter>,
+        preflights: Arc<Mutex<BTreeMap<String, usize>>>,
+        refuse_key: Option<&'static str>,
+    }
+    impl ApprovedAdapter for CountingPreflightAdapter {
+        fn preflight<'a>(
+            &'a self,
+            run: &'a ActiveRun,
+            proposal: &'a Proposal,
+            step: &'a StepContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), worker::PreflightError>> + Send + 'a>> {
+            *self
+                .preflights
+                .lock()
+                .unwrap()
+                .entry(proposal.logical_key.clone())
+                .or_insert(0) += 1;
+            if self.refuse_key == Some(proposal.logical_key.as_str()) {
+                return Box::pin(async { Err(worker::PreflightError::Refused) });
+            }
+            self.inner.preflight(run, proposal, step)
+        }
+        fn filter_turn_tools<'a>(
+            &'a self,
+            run: &'a ActiveRun,
+            tools: Vec<Tool>,
+            step: &'a StepContext,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>> {
+            self.inner.filter_turn_tools(run, tools, step)
+        }
+        fn send<'a>(
+            &'a self,
+            run: &'a ActiveRun,
+            operation_id: String,
+            request: Vec<u8>,
+            step: StepContext,
+        ) -> Pin<Box<dyn Future<Output = StepResult> + Send + 'a>> {
+            self.inner.send(run, operation_id, request, step)
+        }
+    }
+
+    let admit_yolo_turn = async |key: &'static str, msg_id: &'static str, rounds: i64| -> String {
+        let mut ac = api(&f.db).await;
+        let audit_ctx = |k: &'static str| AuditContext {
+            actor_user_id: &f.actor.user,
+            actor_approval_id: &f.actor.approval,
+            now_ms: f.user.context().observed_ms(),
+            request_key: k,
+            reason: "review2 turn test",
+        };
+        let conv = match branches::create_conversation(&mut ac, &audit_ctx(key), &f.scope)
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Applied { target_id } | WriteOutcome::Replayed { target_id } => target_id,
+        };
+        let chat = Conversation {
+            scope: &f.scope,
+            id: &conv.conversation_id,
+        };
+        let parts = [Part::Text("run external tool".into())];
+        let turn_op = Operation::Append(UserInput {
+            id: msg_id,
+            parts: &parts,
+        });
+        let turn_intent = TurnIntent {
+            source_branch_id: &conv.branch_id,
+            expected_head_message_id: None,
+            operation: turn_op,
+            selection: &selection,
+            requested_rounds: Some(rounds),
+        };
+        let actor_principal = super::super::authz_store::principal(&f.db, &f.actor).await;
+        let mut tx = WriteTransaction::begin(&mut ac).await.unwrap();
+        let msg_key = Box::leak(format!("{key}-msg").into_boxed_str());
+        branches::prepare_turn(
+            &mut tx,
+            &audit_ctx(msg_key),
+            chat,
+            &conv.branch_id,
+            None,
+            turn_op,
+        )
+        .await
+        .unwrap();
+        let history = branches::history(
+            tx.connection().unwrap(),
+            &actor_principal,
+            chat,
+            &conv.branch_id,
+            f.user.context().observed_ms(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pins = Snapshots::encode(&turn_intent, &history, &catalog, &snapshot).unwrap();
+        let mut snap_val: Value = serde_json::from_slice(&pins.config).unwrap();
+        snap_val["execution_mode"] = json!("yolo");
+        let snapshot_bytes = serde_json::to_vec(&snap_val).unwrap();
+        let admission = queue::admit_run_with_mode(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &f.scope,
+                    actor: &f.actor.user,
+                    conversation: &conv.conversation_id,
+                    branch: &conv.branch_id,
+                    message: msg_id,
+                    key,
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: &pins.input,
+                    config: &snapshot_bytes,
+                },
+                actor_approval_id: &f.actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(rounds),
+                now_ms: f.user.context().observed_ms(),
+                cost_qualified: None,
+            },
+            &LIMITS,
+            &f.user,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let Admission::Admitted { run_id, .. } = admission else {
+            panic!("expected admitted turn run for {key}");
+        };
+        run_id
+    };
+
+    // --- (c) P2 #5: TurnExecutor filters out drifted external tools before advertising to model ---
+    {
+        drift_list_enabled.store(true, Ordering::SeqCst);
+        let saw_tools_field = Arc::new(AtomicBool::new(false));
+        let saw_tools_srv = saw_tools_field.clone();
+        let model_srv = SyntheticMcpServer::start(move |req| {
+            if req.body.get("tools").is_some_and(|v| !v.is_null()) {
+                saw_tools_srv.store(true, Ordering::SeqCst);
+            }
+            let body = json!({
+                "id": "chatcmpl-drift-filter",
+                "object": "chat.completion",
+                "model": "a",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "No tools advertised"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+            })
+            .to_string();
+            http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+
+        let run_id =
+            admit_yolo_turn("r2-filter-drift", "00000000-0000-4000-8000-000000002401", 2).await;
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-filter".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let approved = Arc::new(adapter.approved_effects());
+        let exec = Arc::new(
+            TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                DynamicTurnRoutes {
+                    gateway: make_gateway(&model_srv, false),
+                    registry: registry.clone(),
+                    tool_ids: vec!["mcp_idem"],
+                },
+            )
+            .with_effects(approved.clone()),
+        );
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let pool = worker_pool.clone();
+            let settings = worker_settings();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    exec,
+                    Some(approved),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "filter drift turn timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task.await.unwrap();
+        drift_list_enabled.store(false, Ordering::SeqCst);
+
+        assert_eq!(final_state, "succeeded");
+        assert!(
+            !saw_tools_field.load(Ordering::SeqCst),
+            "drifted external tool must be omitted before offering tools to the model"
+        );
+    }
+
+    // --- (d) P1 #3: Multi-round TurnExecutor reclaim (Round 1 read -> Round 2 write handoff -> Round 3 finish) ---
+    {
+        let mr_rounds = Arc::new(AtomicUsize::new(0));
+        let mr_rounds_srv = mr_rounds.clone();
+        let saw_both = Arc::new(AtomicBool::new(false));
+        let saw_both_srv = saw_both.clone();
+        let model_srv = SyntheticMcpServer::start(move |req| {
+            let r = mr_rounds_srv.fetch_add(1, Ordering::SeqCst);
+            let body = match r {
+                0 => json!({
+                    "id": "chatcmpl-mr-1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_mr_1",
+                                "type": "function",
+                                "function": {"name": "mcp_read", "arguments": "{\"item\":\"r1\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                }),
+                1 => json!({
+                    "id": "chatcmpl-mr-2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_mr_2",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"r2\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 15, "completion_tokens": 5}
+                }),
+                _ => {
+                    let s = req.body.to_string();
+                    if s.contains("r1-read-ok") && s.contains("r2-write-ok") {
+                        saw_both_srv.store(true, Ordering::SeqCst);
+                    }
+                    json!({
+                        "id": "chatcmpl-mr-3",
+                        "object": "chat.completion",
+                        "model": "a",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "Multi-round done!"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 25, "completion_tokens": 5}
+                    })
+                }
+            }
+            .to_string();
+            http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+
+        let read0 = mcp_read_calls.load(Ordering::SeqCst);
+        let idem0 = mcp_idem_calls.load(Ordering::SeqCst);
+        let run_id =
+            admit_yolo_turn("r2-multi-round", "00000000-0000-4000-8000-000000002402", 4).await;
+        let claim1 = f.next().await.expect("claim multi-round run");
+        assert_eq!(claim1.run_id, run_id);
+
+        let adapter1 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-mr".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let (stop_tx1, step1) = fresh_step(30);
+        let effects1 = Arc::new(ApprovedEffects {
+            policy: Arc::new(StopOnToolReview {
+                inner: registry.clone(),
+                target_tool: "mcp_idem",
+                stop: Mutex::new(Some(stop_tx1)),
+            }),
+            adapter: adapter1,
+        });
+        let exec1 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            DynamicTurnRoutes {
+                gateway: make_gateway(&model_srv, false),
+                registry: registry.clone(),
+                tool_ids: vec!["mcp_read", "mcp_idem"],
+            },
+        )
+        .with_effects(effects1);
+        let active1 = ActiveRun {
+            claim: claim1.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec1.step(&active1, step1).await,
+            StepResult::Handoff
+        ));
+        leases::release_lease(&mut w, &claim1.lease())
+            .await
+            .unwrap();
+        assert_eq!(mcp_read_calls.load(Ordering::SeqCst), read0 + 1);
+        assert_eq!(mcp_idem_calls.load(Ordering::SeqCst), idem0);
+        assert_eq!(mr_rounds.load(Ordering::SeqCst), 2);
+
+        // Worker 2 reclaims across rounds 1..=2, skips Round 1 read, completes Round 2 write ONCE,
+        // runs Round 3 with full history, and succeeds!
+        let adapter2 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-mr".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let approved2 = Arc::new(adapter2.approved_effects());
+        let exec2 = Arc::new(
+            TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                DynamicTurnRoutes {
+                    gateway: make_gateway(&model_srv, false),
+                    registry: registry.clone(),
+                    tool_ids: vec!["mcp_read", "mcp_idem"],
+                },
+            )
+            .with_effects(approved2.clone()),
+        );
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task2 = tokio::spawn({
+            let pool = worker_pool.clone();
+            let settings = worker_settings();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    exec2,
+                    Some(approved2),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "multi-round reclaim timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task2.await.unwrap();
+
+        assert_eq!(final_state, "succeeded");
+        assert_eq!(
+            mcp_read_calls.load(Ordering::SeqCst),
+            read0 + 1,
+            "Round 1 read must not be re-executed on Worker 2"
+        );
+        assert_eq!(mcp_idem_calls.load(Ordering::SeqCst), idem0 + 1);
+        assert_eq!(mr_rounds.load(Ordering::SeqCst), 3);
+        assert!(saw_both.load(Ordering::SeqCst));
+    }
+
+    // --- (e) P2 #1: Multi-call reclaim [refused, open-zero write, trailing write] ---
+    {
+        let model_srv = SyntheticMcpServer::start(move |_req| {
+            let body = json!({
+                "id": "chatcmpl-mc-1",
+                "object": "chat.completion",
+                "model": "a",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call_mc_0",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"c0\"}"}
+                            },
+                            {
+                                "id": "call_mc_1",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"c1\"}"}
+                            },
+                            {
+                                "id": "call_mc_2",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"c2\"}"}
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8}
+            })
+            .to_string();
+            http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+
+        let idem0 = mcp_idem_calls.load(Ordering::SeqCst);
+        let run_id =
+            admit_yolo_turn("r2-multi-call", "00000000-0000-4000-8000-000000002403", 3).await;
+        let claim1 = f.next().await.expect("claim multi-call run");
+        assert_eq!(claim1.run_id, run_id);
+
+        let w1_preflights = Arc::new(Mutex::new(BTreeMap::new()));
+        let inner1 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-mc".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let adapter1 = Arc::new(CountingPreflightAdapter {
+            inner: inner1,
+            preflights: w1_preflights,
+            refuse_key: Some("call_mc_0"),
+        });
+        let (stop_tx1, step1) = fresh_step(30);
+        let effects1 = Arc::new(ApprovedEffects {
+            policy: Arc::new(StopOnToolReview {
+                inner: registry.clone(),
+                target_tool: "mcp_idem",
+                stop: Mutex::new(Some(stop_tx1)),
+            }),
+            adapter: adapter1,
+        });
+        let exec1 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            DynamicTurnRoutes {
+                gateway: make_gateway(&model_srv, true),
+                registry: registry.clone(),
+                tool_ids: vec!["mcp_idem"],
+            },
+        )
+        .with_effects(effects1);
+        let active1 = ActiveRun {
+            claim: claim1.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec1.step(&active1, step1).await,
+            StepResult::Handoff
+        ));
+        leases::release_lease(&mut w, &claim1.lease())
+            .await
+            .unwrap();
+
+        // Worker 2 has GatedCredentialProvider so call_mc_1's preflight returns Refused:
+        // call_mc_0 must NOT be re-preflighted (reused from turn-result:1:0),
+        // call_mc_1 fails the run immediately (trigger closes it to outcome = 'failed'),
+        // and call_mc_2 is NEVER preflighted or inserted!
+        let w2_preflights = Arc::new(Mutex::new(BTreeMap::new()));
+        let inner2 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(GatedCredentialProvider),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let approved2 = Arc::new(ApprovedEffects {
+            policy: registry.clone(),
+            adapter: Arc::new(CountingPreflightAdapter {
+                inner: inner2,
+                preflights: w2_preflights.clone(),
+                refuse_key: None,
+            }),
+        });
+        let exec2 = Arc::new(
+            TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                DynamicTurnRoutes {
+                    gateway: make_gateway(&model_srv, true),
+                    registry: registry.clone(),
+                    tool_ids: vec!["mcp_idem"],
+                },
+            )
+            .with_effects(approved2.clone()),
+        );
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task2 = tokio::spawn({
+            let pool = worker_pool.clone();
+            let settings = worker_settings();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    exec2,
+                    Some(approved2),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "multi-call reclaim timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task2.await.unwrap();
+
+        assert_eq!(final_state, "failed");
+        assert_eq!(mcp_idem_calls.load(Ordering::SeqCst), idem0);
+        {
+            let pf = w2_preflights.lock().unwrap();
+            assert_eq!(
+                pf.get("call_mc_0"),
+                None,
+                "call_mc_0 must be reused from turn-result"
+            );
+            assert_eq!(
+                pf.get("call_mc_1"),
+                Some(&1),
+                "call_mc_1 must run preflight"
+            );
+            assert_eq!(pf.get("call_mc_2"), None, "call_mc_2 must never execute");
+        }
+        let ops: Vec<(String, String, Option<i32>)> = sqlx::query_as(
+            "SELECT logical_key, outcome, dispatched_attempts FROM openmettle.operations
+              WHERE run_id = $1::uuid ORDER BY logical_key",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops, vec![("call_mc_1".into(), "failed".into(), Some(0))]);
+    }
+
+    // --- (f) P1 #6: Real TurnExecutor round with constrained MCP contract & default expansion ---
+    {
+        let rich_rounds = Arc::new(AtomicUsize::new(0));
+        let rich_rounds_srv = rich_rounds.clone();
+        let model_srv = SyntheticMcpServer::start(move |_req| {
+            let body = if rich_rounds_srv.fetch_add(1, Ordering::SeqCst) == 0 {
+                json!({
+                    "id": "chatcmpl-rich-1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_rich_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "mcp_rich",
+                                    "arguments": "{\"doc_id\":\"00000000-0000-4000-8000-000000000001\",\"mode\":\"append\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+            } else {
+                json!({
+                    "id": "chatcmpl-rich-2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Rich schema ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 16, "completion_tokens": 4}
+                })
+            }
+            .to_string();
+            http_response(200, &[("content-type", "application/json")], body.as_bytes())
+        })
+        .await;
+
+        let run_id =
+            admit_yolo_turn("r2-rich-schema", "00000000-0000-4000-8000-000000002404", 3).await;
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-rich".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let approved = Arc::new(adapter.approved_effects());
+        let exec = Arc::new(
+            TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                DynamicTurnRoutes {
+                    gateway: make_gateway(&model_srv, false),
+                    registry: registry.clone(),
+                    tool_ids: vec!["mcp_rich"],
+                },
+            )
+            .with_effects(approved.clone()),
+        );
+        let (sh_tx, sh_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let pool = worker_pool.clone();
+            let settings = worker_settings();
+            async move {
+                worker::run_with_approvals(
+                    &pool,
+                    None,
+                    settings,
+                    exec,
+                    Some(approved),
+                    async move {
+                        let _ = sh_rx.await;
+                    },
+                    Duration::from_secs(4),
+                )
+                .await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_state = loop {
+            let s: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if !matches!(s.as_str(), "queued" | "waiting" | "running") {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "rich schema turn timed out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = sh_tx.send(());
+        task.await.unwrap();
+
+        assert_eq!(final_state, "succeeded");
+        let sent = rich_received_args
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mcp_rich must have been invoked");
+        assert_eq!(
+            sent["retries"], 2,
+            "schema default must be expanded on dispatch"
+        );
+        assert_eq!(sent["mode"], "append");
+    }
+
+    // --- (g) P1 #5 & P2 #2: Escaped/short handle redaction + malformed handle on write, read & reconcile ---
+    {
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-h".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let rr = f.claim("r2-handles", "yolo").await;
+        let (_st, step) = fresh_step(25);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+
+        // Escaped handle
+        let StepResult::ToolOutput(esc_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-esc",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-escaped"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected escaped handle ToolOutput");
+        };
+        let esc_env: Value = serde_json::from_str(&esc_out).unwrap();
+        let esc_inner: Value = serde_json::from_str(esc_env["text"].as_str().unwrap()).unwrap();
+        assert!(esc_inner.get("handle").is_none());
+        assert_eq!(esc_inner["note"], "ref [REDACTED] done");
+        assert_eq!(esc_inner["count"], 1);
+        let db_esc: Option<String> = sqlx::query_scalar(
+            "SELECT downstream_handle FROM openmettle.operations WHERE run_id=$1::uuid AND logical_key='k-h-esc'",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(db_esc.as_deref(), Some("h\"quote\\1"));
+
+        // Short handle "1" preserves integer `"count": 1`
+        let StepResult::ToolOutput(short_out) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-short",
+                    tool: "mcp.idem",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-short-1"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected short handle ToolOutput");
+        };
+        let short_env: Value = serde_json::from_str(&short_out).unwrap();
+        let short_inner: Value = serde_json::from_str(short_env["text"].as_str().unwrap()).unwrap();
+        assert!(short_inner.get("handle").is_none());
+        assert_eq!(short_inner["count"], 1);
+        assert_eq!(short_inner["label"], "id-[REDACTED]");
+
+        // Malformed handle on read -> TerminalRefusal
+        let mut reg_read_h = ExternalRegistry::new();
+        let mut read_with_h = registry.get("mcp.read", "1").unwrap().clone();
+        read_with_h.handle_field = Some("handle".into());
+        reg_read_h.register(read_with_h).unwrap();
+        let read_h_adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            Arc::new(reg_read_h),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-rh".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let StepResult::ToolOutput(read_mal) = read_h_adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-h-read-bad",
+                    tool: "mcp.read",
+                    version: "1",
+                    raw_args: br#"{"item":"handle-bad-space"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected TerminalRefusal on malformed read handle");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&read_mal).unwrap()["fault_code"],
+            "terminal_refusal"
+        );
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+
+        // Malformed handle on write ("bad space" and 123) -> outcome_unknown + StepResult::Stopped
+        for (idx, item) in ["handle-bad-space", "handle-bad-num"]
+            .into_iter()
+            .enumerate()
+        {
+            let rw = f.claim(&format!("r2-bad-h-{idx}"), "yolo").await;
+            let (_st, st) = fresh_step(20);
+            let act = ActiveRun {
+                claim: rw.clone(),
+                state: leases::ExecState::Running,
+                execution_deadline: st.deadline,
+            };
+            let args = json!({"item": item}).to_string();
+            assert!(matches!(
+                adapter
+                    .call(
+                        &act,
+                        st,
+                        ExternalCall {
+                            key: &format!("k-bh-{idx}"),
+                            tool: "mcp.idem",
+                            version: "1",
+                            raw_args: args.as_bytes(),
+                            approval: None,
+                        },
+                    )
+                    .await,
+                StepResult::Stopped
+            ));
+            let (out, h): (String, Option<String>) = sqlx::query_as(
+                "SELECT outcome, downstream_handle FROM openmettle.operations WHERE run_id = $1::uuid",
+            )
+            .bind(&rw.run_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            assert_eq!((out.as_str(), h), ("outcome_unknown", None));
+            sqlx::query("UPDATE openmettle.runs SET lease_expires_at = least(lease_expires_at, clock_timestamp() + interval '1 second'), execution_expires_at = clock_timestamp() + interval '1 second' WHERE id = $1::uuid")
+                .bind(&rw.run_id)
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            leases::settle(&mut w, &rw.lease(), &LEASES, Settle::Stopped)
+                .await
+                .unwrap();
+        }
+    }
+
+    // --- (h) P1 #4, P2 #2 (reconcile malformed handle), and P2 #3 (non-lookup outcome_unknown -> None) ---
+    {
+        let make_reconciling =
+            async |label: &str, tool: &str, handle: Option<&str>| -> ClaimedRun {
+                let rr = f.claim(label, "yolo").await;
+                let prop = registry
+                    .proposal(label, tool, "1", br#"{"item":"rec-r2"}"#)
+                    .unwrap();
+                let IntentResult::Applied(tx1) = record_fenced_intent(
+                    &mut worker(&f.db).await,
+                    &rr.lease(),
+                    &prop,
+                    None,
+                    registry.as_ref(),
+                    &LEASES,
+                )
+                .await
+                .unwrap() else {
+                    panic!("expected Tx1 for {label}");
+                };
+                assert!(matches!(
+                    start_write_attempt(
+                        &mut worker(&f.db).await,
+                        &rr.lease(),
+                        &tx1.operation_id,
+                        &prop,
+                        &LEASES,
+                        registry.as_ref(),
+                    )
+                    .await
+                    .unwrap(),
+                    ReplayEffect::Ready(_)
+                ));
+                let mut cw = worker(&f.db).await;
+                leases::with_lease(&mut cw, &rr.lease(), Fence::Hold, async |tx, _| {
+                    durable::record_observation(
+                        tx,
+                        &durable::Observation {
+                            scope: &rr.scope_id,
+                            run: &rr.run_id,
+                            operation: &tx1.operation_id,
+                            key: &format!("r2-unk:{}", tx1.operation_id),
+                            expected_revision: 0,
+                            outcome: "outcome_unknown",
+                            handle,
+                            evidence: Payload {
+                                format: "openmettle.unresolved-write",
+                                version: 1,
+                                bytes: br#"{"reason":"unknown"}"#,
+                            },
+                        },
+                    )
+                    .await
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    leases::settle(&mut cw, &rr.lease(), &LEASES, Settle::Stopped)
+                        .await
+                        .unwrap(),
+                    leases::Settled::Reconciling { unresolved: 1 }
+                );
+                rr
+            };
+
+        // P1 #4: Rebind changing ONLY EndpointKey::Supported.expires_us -> None, 0 authz, 0 creds, 0 HTTP!
+        {
+            let rr = make_reconciling("r2-rebind-window", "mcp.idem", None).await;
+            let mut rebound_reg = ExternalRegistry::new();
+            let mut c = registry.get("mcp.idem", "1").unwrap().clone();
+            c.idempotency.as_mut().unwrap().expires_us += 1_000_000;
+            rebound_reg.register(c).unwrap();
+            let checks = Arc::new(AtomicUsize::new(0));
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let rebound_adapter = ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                Arc::new(rebound_reg),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-reb".into()),
+                    lookups: lookups.clone(),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: checks.clone(),
+                }),
+            );
+            let http0 = server.requests.load(Ordering::SeqCst);
+            let op = leases::unresolved_operations(&mut w, &rr.lease(), 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let (_st, step) = fresh_step(15);
+            let active = ActiveRun {
+                claim: rr.clone(),
+                state: leases::ExecState::Reconciling,
+                execution_deadline: step.deadline,
+            };
+            assert!(
+                rebound_adapter
+                    .reconcile_operation(&active, &op, step)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(checks.load(Ordering::SeqCst), 0);
+            assert_eq!(lookups.load(Ordering::SeqCst), 0);
+            assert_eq!(server.requests.load(Ordering::SeqCst), http0);
+            leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+                .await
+                .unwrap();
+        }
+
+        // P2 #2: Reconcile response with malformed handle ("bad space") -> returns None!
+        {
+            let rr =
+                make_reconciling("r2-rec-bad-h", "mcp.lookup_handle", Some("h-bad-remote")).await;
+            let adapter = ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-rec".into()),
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            );
+            let op = leases::unresolved_operations(&mut w, &rr.lease(), 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let (_st, step) = fresh_step(15);
+            let active = ActiveRun {
+                claim: rr.clone(),
+                state: leases::ExecState::Reconciling,
+                execution_deadline: step.deadline,
+            };
+            assert!(
+                adapter
+                    .reconcile_operation(&active, &op, step)
+                    .await
+                    .is_none()
+            );
+            leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+                .await
+                .unwrap();
+        }
+
+        // P2 #3: Non-lookup already at outcome_unknown (revision = 1) -> returns None (no collision)!
+        {
+            let rr = make_reconciling("r2-nonrep-unk", "mcp.nonrep", None).await;
+            let adapter = ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-nr".into()),
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            );
+            let op = leases::unresolved_operations(&mut w, &rr.lease(), 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(op.outcome, "outcome_unknown");
+            let (_st, step) = fresh_step(15);
+            let active = ActiveRun {
+                claim: rr.clone(),
+                state: leases::ExecState::Reconciling,
+                execution_deadline: step.deadline,
+            };
+            assert!(
+                adapter
+                    .reconcile_operation(&active, &op, step)
+                    .await
+                    .is_none()
+            );
+            leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+                .await
+                .unwrap();
+        }
+    }
+
+    // --- (i) P2 #4: Slow credential provider bounded by call_timeout (1s) under 30s lease ---
+    {
+        struct SlowCredentials(Duration);
+        impl McpCredentialProvider for SlowCredentials {
+            fn resolve<'a>(
+                &'a self,
+                _request: CredentialRequest<'a>,
+            ) -> Pin<Box<dyn Future<Output = CredentialOutcome> + Send + 'a>> {
+                let delay = self.0;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    CredentialOutcome::Ready(McpCredential::bearer("too-late"))
+                })
+            }
+        }
+        let slow_adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports,
+            Arc::new(SlowCredentials(Duration::from_secs(5))),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let rr = f.claim("r2-slow-cred", "yolo").await;
+        let (_st, step) = fresh_step(30);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let reqs0 = server.requests.load(Ordering::SeqCst);
+        let t0 = Instant::now();
+        let StepResult::ToolOutput(out) = slow_adapter
+            .call(
+                &active,
+                step,
+                ExternalCall {
+                    key: "k-slow-cred",
+                    tool: "mcp.idem_short",
+                    version: "1",
+                    raw_args: br#"{"item":"slow"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected Transient ToolOutput on slow credential provider");
+        };
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["fault_code"],
+            "transient"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "credential lookup must abort at 1s call_timeout, took {elapsed:?}"
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), reqs0);
+        let ops: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&rr.run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(ops, 0);
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Succeeded)
             .await
             .unwrap();
     }

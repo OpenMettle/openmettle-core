@@ -232,6 +232,12 @@ pub trait EffectPolicy {
         run: &str,
         proposal: &Proposal,
     ) -> Result<Option<Review>, StoreError>;
+
+    /// Whether write intents reviewed by this policy require the migration `0039` two-phase
+    /// write gate (`two_phase_effect_intents_enabled = true`) inside Transaction 1.
+    fn requires_two_phase_writes(&self) -> bool {
+        false
+    }
 }
 impl Review {
     fn validate(&self) -> Result<(), StoreError> {
@@ -1900,6 +1906,9 @@ pub async fn record_fenced_intent(
         let two_phase = two_phase_effect_intents_enabled(c).await?;
         let attempt = async {
             let review = reviewed(policy, &s, p)?;
+            if policy.requires_two_phase_writes() && !two_phase {
+                return Err(DENIED);
+            }
             let proof = proof(
                 &s,
                 &review,
