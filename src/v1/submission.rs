@@ -556,6 +556,7 @@ async fn admission(
         branch,
         message,
         input_attachments,
+        replay_approval_id,
         format,
         version,
         snapshots,
@@ -593,6 +594,7 @@ async fn admission(
             found.branch_id,
             found.input_message_id,
             Vec::new(),
+            Some(found.actor_approval_id),
             found.snapshot_format,
             found.snapshot_version,
             Snapshots {
@@ -653,6 +655,7 @@ async fn admission(
             target.branch_id,
             target.input_message_id,
             target.attachment_revisions,
+            None,
             SNAPSHOT_FORMAT.to_owned(),
             SNAPSHOT_VERSION,
             snapshots,
@@ -667,7 +670,7 @@ async fn admission(
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    let admission_req = queue::RunAdmission {
+    let mut admission_req = queue::RunAdmission {
         input: RunInput {
             scope,
             actor: ctx.user_id(),
@@ -686,7 +689,10 @@ async fn admission(
         now_ms,
         cost_qualified: Some(per_round_cost_micros.is_some()),
     };
-    let admitted = queue::admit_run_with_mode(tx, &admission_req, limits, ctx).await?;
+    let (admitted, admit_now_ms) =
+        queue::admit_run_with_mode_at(tx, &admission_req, limits, ctx).await?;
+    now_ms = now_ms.max(admit_now_ms);
+    admission_req.now_ms = now_ms;
     let build_token_units = |round_limit: i32| -> Result<i64, Problem> {
         let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
         per_round
@@ -783,19 +789,35 @@ async fn admission(
                 now_ms,
             )
             .await?;
+            let stored_approval_id = match replay_approval_id {
+                Some(stored) => stored,
+                None => sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT actor_approval_id::text
+                       FROM openmettle.runs
+                      WHERE scope_id = $1::uuid AND id = $2::uuid AND actor_user_id = $3::uuid",
+                )
+                .bind(scope)
+                .bind(run_id)
+                .bind(ctx.user_id())
+                .fetch_optional(&mut *c)
+                .await
+                .map_err(Problem::from)?
+                .flatten(),
+            };
             let should_commit = if committed && refusal.is_none() {
-                match selected_model.as_deref() {
-                    Some(model) => {
+                match (selected_model.as_deref(), stored_approval_id.as_deref()) {
+                    (Some(model), Some(approval_id)) => {
                         authz::gateway::family::permits_at(
                             c,
                             ctx.user_id(),
-                            ctx.approval_id(),
+                            approval_id,
                             model,
                             post_backfill_ms,
                         )
                         .await?
                     }
-                    None => true,
+                    (Some(_), None) => false,
+                    (None, _) => true,
                 }
             } else {
                 false

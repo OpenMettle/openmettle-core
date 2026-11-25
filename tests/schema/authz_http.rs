@@ -5042,8 +5042,33 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
     let admin_n = As::Native(&admin_tok);
     let alice_cookie = browser(&db, &alice, 22).await;
     let alice_b = As::Browser(&alice_cookie);
+    let linked_approval: String = sqlx::query_scalar(
+        "WITH i AS (
+             INSERT INTO openmettle.user_identities (user_id, issuer, subject)
+             SELECT $1::uuid, p.issuer, 'alice-linked-subject'
+               FROM openmettle.login_providers p
+              WHERE p.id = $2::uuid
+             RETURNING id
+         )
+         INSERT INTO openmettle.local_identity_approvals
+             (provider_id, identity_id, active, expires_ms, changed_by, change_reason)
+         SELECT $2::uuid, i.id, true, $3, 'fixture-owner', 'linked synthetic approval' FROM i
+         RETURNING id::text",
+    )
+    .bind(&alice.user)
+    .bind(authz_store::PROVIDER)
+    .bind(authz_store::FUTURE)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let alice_linked = Account {
+        user: alice.user.clone(),
+        approval: linked_approval,
+    };
+    let alice_linked_cookie = browser(&db, &alice_linked, 23).await;
+    let alice_linked_b = As::Browser(&alice_linked_cookie);
 
-    // Admit two pre-activation queued runs (zero quota_reservations holds).
+    // Admit three pre-activation queued runs under alice's primary approval (zero holds).
     let conv1 = success(
         api.call(
             alice_b,
@@ -5078,6 +5103,47 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
             "/v1/runs",
             Some("r2-rep-key1"),
             Some(&run1_body),
+        ),
+        201,
+    )["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let conv_linked = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("r3-rep-conv-linked"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run_linked_body = json!({
+        "conversation_id": conv_linked["conversation_id"],
+        "branch_id": conv_linked["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f164",
+                "parts": [{"text": "legacy queued run replayed from linked approval"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+    let run_linked = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("r3-rep-key-linked"),
+            Some(&run_linked_body),
         ),
         201,
     )["run_id"]
@@ -5214,10 +5280,89 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
         .await
         .unwrap();
 
-    // 2. P1 #5: Lower alice's personal usage_tokens override to 0 so backfill hits a quota
-    //    refusal. Hold the instance quota_budgets row lock BEFORE arming alice's short approval
-    //    TTL; once the approval expires during the backfill wait, POST /v1/runs must return 401
-    //    (not 200 OK).
+    // 1b. Review #3 P2 #1: Enroll alice's primary approval in OIDC group 'synthetic-team' and
+    //     disable model 'a' on that OIDC group, while leaving alice_linked un-enrolled (so
+    //     alice_linked permits 'a', whereas run_linked's stored actor_approval_id denies 'a').
+    //     Replaying run_linked from alice_linked must still return 200 OK while rolling back the
+    //     backfilled quota holds that would belong to alice's primary approval.
+    let oidc_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    drop(present_membership_at(&db, &alice, oidc_now_ms).await);
+    let oidc_policy_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.family_policies
+             (grantee_kind, grantee_oidc_group_id, active, zone)
+         VALUES ('oidc_group', 'synthetic-team', true, 'UTC')
+         RETURNING id::text",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.family_policy_models (policy_id, rule_kind, model, active)
+         VALUES ($1::uuid, 'disabled', 'a', true)",
+    )
+    .bind(&oidc_policy_id)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let (primary_permits, linked_permits): (bool, bool) = sqlx::query_as(
+        "SELECT
+             openmettle.family_policy_permits($1::uuid, $2::uuid, 'a', clock_timestamp()),
+             openmettle.family_policy_permits($1::uuid, $3::uuid, 'a', clock_timestamp())",
+    )
+    .bind(&alice.user)
+    .bind(&alice.approval)
+    .bind(&alice_linked.approval)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        (primary_permits, linked_permits),
+        (false, true),
+        "primary approval must deny 'a' via OIDC group policy while linked approval permits 'a'"
+    );
+
+    let replayed_linked = success(
+        api.call(
+            alice_linked_b,
+            "POST",
+            "/v1/runs",
+            Some("r3-rep-key-linked"),
+            Some(&run_linked_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed_linked["run_id"], run_linked);
+    let (linked_qr, linked_gw, held_linked): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+            (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+            (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run_linked)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        (linked_qr, linked_gw, held_linked),
+        (0, 0, 0),
+        "linked-approval replay must evaluate stored actor_approval_id and roll back unusable holds"
+    );
+
+    sqlx::query("DELETE FROM openmettle.family_policies WHERE id = $1::uuid")
+        .bind(&oidc_policy_id)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+
+    // 2. P1 #5 & Review #3 P3 #1: Lower alice's personal usage_tokens override to 0 so backfill
+    //    hits a quota refusal. Hold the instance quota_budgets row lock BEFORE arming a short TTL
+    //    ONLY on alice's originating local_sessions row (keeping local_identity_approvals and
+    //    conversation access valid so response authorization alone would return 200 OK). Once the
+    //    session expires during the backfill wait, POST /v1/runs must return 401.
     success(
         api.call(
             admin_n,
@@ -5246,14 +5391,15 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
             .await
             .unwrap();
     let expires_ms = db_now_ms + 700;
-    sqlx::query(
-        "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
-    )
-    .bind(expires_ms)
-    .bind(&alice.approval)
-    .execute(&mut owner)
-    .await
-    .unwrap();
+    let alice_session_id = alice_cookie.split('.').next().unwrap();
+    let updated_sessions =
+        sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
+            .bind(expires_ms)
+            .bind(alice_session_id)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(updated_sessions.rows_affected(), 1);
 
     let api = std::sync::Arc::new(api);
     let api_c = std::sync::Arc::clone(&api);
@@ -5274,6 +5420,17 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
 
     let (status, body) = http_task.await.unwrap();
     assert_eq!(status, 401, "{body}");
+    let approval_still_valid: bool = sqlx::query_scalar(
+        "SELECT active AND expires_ms = $2
+           FROM openmettle.local_identity_approvals
+          WHERE id = $1::uuid",
+    )
+    .bind(&alice.approval)
+    .bind(authz_store::FUTURE)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(approval_still_valid);
 
     let (run2_qr, held2): (i64, i64) = sqlx::query_as(
         "SELECT

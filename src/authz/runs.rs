@@ -891,6 +891,7 @@ pub struct RunReplay {
     pub run_id: String,
     pub state: String,
     pub round_limit: Option<i32>,
+    pub actor_approval_id: Option<String>,
     pub conversation_id: String,
     pub branch_id: String,
     /// Reuse it on retry: the input message is part of the run identity (ADR 0004).
@@ -944,8 +945,8 @@ async fn lookup(
     idempotency_key: &str,
 ) -> Result<Option<RunReplay>, StoreError> {
     let row = sqlx::query(
-        "SELECT id::text, state, round_limit, conversation_id::text, branch_id::text,
-                input_message_id::text, request_identity, request_digest,
+        "SELECT id::text, state, round_limit, actor_approval_id::text, conversation_id::text,
+                branch_id::text, input_message_id::text, request_identity, request_digest,
                 snapshot_format, snapshot_version, input_snapshot, config_snapshot
            FROM openmettle.runs
           WHERE scope_id = $1::uuid AND actor_user_id = $2::uuid AND idempotency_key = $3",
@@ -960,6 +961,7 @@ async fn lookup(
             run_id: row.try_get("id")?,
             state: row.try_get("state")?,
             round_limit: row.try_get("round_limit")?,
+            actor_approval_id: row.try_get("actor_approval_id")?,
             conversation_id: row.try_get("conversation_id")?,
             branch_id: row.try_get("branch_id")?,
             input_message_id: row.try_get("input_message_id")?,
@@ -1124,7 +1126,9 @@ pub async fn admit_run(
     request: &RunAdmission<'_>,
     limits: &AdmissionLimits,
 ) -> Result<Admission, StoreError> {
-    admit(tx, request, limits, None).await
+    admit(tx, request, limits, None)
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
 /// Capture ADR 0035 evidence under the admission locks. The mode comes from the immutable
@@ -1135,6 +1139,21 @@ pub async fn admit_run_with_mode(
     limits: &AdmissionLimits,
     session: &super::approvals::EffectSession,
 ) -> Result<Admission, StoreError> {
+    admit_run_with_mode_at(tx, request, limits, session)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// Like [`admit_run_with_mode`], also returning the latest verified primary-clock millisecond
+/// timestamp observed during admission (including the post-insert authority recheck) so downstream
+/// reservation, backfill, attachment, family-policy, and response checks preserve a monotonic
+/// decision floor even if the database clock steps backward.
+pub async fn admit_run_with_mode_at(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: &super::approvals::EffectSession,
+) -> Result<(Admission, i64), StoreError> {
     if request.input.actor != session.context().user_id()
         || request.actor_approval_id != session.context().approval_id()
     {
@@ -1148,7 +1167,7 @@ async fn admit(
     request: &RunAdmission<'_>,
     limits: &AdmissionLimits,
     session: Option<&str>,
-) -> Result<Admission, StoreError> {
+) -> Result<(Admission, i64), StoreError> {
     limits.validate()?;
     request.validate()?;
     // Validate requested_rounds before any database work; final capping uses effective round_cap.
@@ -1184,7 +1203,7 @@ async fn admit(
     .await?;
     // Step 4: an exact replay is returned whatever the lifecycle or the current limits.
     if let Some(replay) = lookup(c, r.scope, r.actor, r.key).await? {
-        return replayed(replay, r);
+        return replayed(replay, r).map(|outcome| (outcome, now));
     }
     // Steps 5 and 6.
     if archived {
@@ -1255,7 +1274,7 @@ async fn admit(
         ),
     ] {
         if count >= limit {
-            return Ok(Admission::Refused(refusal));
+            return Ok((Admission::Refused(refusal), now));
         }
     }
     if quota_schema
@@ -1268,7 +1287,7 @@ async fn admit(
         )
         .await?
     {
-        return Ok(Admission::Refused(refusal));
+        return Ok((Admission::Refused(refusal), now));
     }
     let effect = match session {
         Some(session) => Some(
@@ -1290,7 +1309,7 @@ async fn admit(
             Err(error) => return Err(error.into()),
         };
     let c = tx.connection()?;
-    verify_admission_authority(
+    let (_, _, _, post_insert_now) = verify_admission_authority(
         c,
         request,
         personal_owner.as_deref(),
@@ -1302,12 +1321,16 @@ async fn admit(
     if !inserted {
         // Only a writer outside these locks (bare `create_run`) can have recorded the key.
         let replay = lookup(c, r.scope, r.actor, r.key).await?;
-        return replayed(replay.ok_or(StoreError::NotFound)?, r);
+        return replayed(replay.ok_or(StoreError::NotFound)?, r)
+            .map(|outcome| (outcome, post_insert_now));
     }
-    Ok(Admission::Admitted {
-        run_id,
-        round_limit,
-    })
+    Ok((
+        Admission::Admitted {
+            run_id,
+            round_limit,
+        },
+        post_insert_now,
+    ))
 }
 
 fn replayed(replay: RunReplay, input: &RunInput<'_>) -> Result<Admission, StoreError> {
@@ -2337,6 +2360,7 @@ mod tests {
             run_id: ID.into(),
             state: "queued".into(),
             round_limit: Some(5),
+            actor_approval_id: Some(ID.into()),
             conversation_id: ID.into(),
             branch_id: ID.into(),
             input_message_id: ID.into(),
