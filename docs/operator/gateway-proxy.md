@@ -61,8 +61,9 @@ policy is provisioned for it.
   hex `cache_salt` (scoped per `(installation, scope, model)` for personal scopes and effectively
   shared project conversations under ADR 0027, per `(installation, scope, owner, model)` for
   private project conversations, or fresh random per request under `CACHE_MODE=per_request`;
-  never logged, exported or returned in errors) and appends it directly before the JSON object's
-  closing `}`, preserving all prior caller bytes verbatim. The request goes upstream on a new
+  never logged, exported or returned in proxy/non-`200` problem responses) and splices it directly
+  before the JSON object's closing `}`, preserving all caller bytes (including trailing RFC 8259
+  whitespace) verbatim. The request goes upstream on a new
   connection with only `Content-Type`, `Accept`, `Accept-Encoding: identity` and the request ID.
   `Authorization`, cookies, other caller headers and any field the caller names in `Connection`
   are not forwarded.
@@ -70,20 +71,23 @@ policy is provisioned for it.
   before anything else: an HTTP/1.0 caller could not tell a cut stream from a complete one.
 - **Identity bodies only.** A request with a `Content-Encoding` other than `identity`, or a
   `Transfer-Encoding` other than one `chunked`, is refused with `415 unsupported_media_type`
-  before anything is sent upstream. An upstream answer with either is not relayed: the caller
-  gets `502 provider_failure` and the upstream connection is closed without reading the
-  body.
+  before anything is sent upstream. A `200 OK` upstream answer with either is not relayed: the
+  caller gets `502 provider_failure` and the upstream connection is closed without reading the
+  body (non-`200` upstream answers take the status-mapping path below first and likewise close the
+  body without reading it).
 - **Relay.** For `200 OK`, the upstream `Content-Type` (unless the upstream names it in
-  `Connection`) and body are relayed chunk by chunk as they arrive. A server-sent event
+  `Connection`) and body—including any in-band SSE payload—are relayed chunk by chunk as they
+  arrive without rewriting (upstream model servers must not echo request fields inside `200 OK`
+  bodies; SGLang does not). A server-sent event
   reaches the caller before the upstream has finished. The caller's response ends cleanly only
   if the upstream body completed and the caller received every chunk. Otherwise the caller
   receives a prefix of the upstream bytes and an unclean end of the HTTP body (no terminal
   chunk, or fewer bytes than `Content-Length`); how much of that prefix arrives is not
   promised. Any non-`200` upstream status closes the upstream body without relaying it and
-  answers with a value-free `application/problem+json` response (`429 rate_limited` with a
-  validated numeric `Retry-After` if present, `503 unavailable`, `504 timeout`, or
-  `502 provider_failure`) so an upstream validation error cannot echo the injected
-  `cache_salt`.
+  answers with a value-free `application/problem+json` response (`429 rate_limited` with an
+  end-to-end validated numeric `Retry-After` if `Connection` is readable, `503 unavailable`,
+  `504 timeout`, or `502 provider_failure`) so a non-`200` upstream validation error cannot echo
+  the injected `cache_salt`.
 - **Usage.** A copy of each chunk is read for the usage object. When the upstream answered
   200, the body completed (a JSON document, or a stream ending with `data: [DONE]`) and a
   valid usage object arrived, one final report is written. In a stream, only a usage object

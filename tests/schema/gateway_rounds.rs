@@ -7511,3 +7511,259 @@ async fn review_1_p2_dispatch_blocks_on_inflight_collaborator_approval_and_membe
         );
     }
 }
+
+/// Review #2 P2 #1: capability writers (`store::set_user_capability_grant` /
+/// `set_user_capability_deny` / `set_platform_capability_deny`) must acquire
+/// `account_admin_lock FOR UPDATE` so an in-flight capability withdrawal blocks
+/// `gateway_dispatch_scoped` (`account_admin_lock FOR SHARE`) and refuses dispatch on commit.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_2_p2_capability_withdrawal_acquires_admin_lock_and_blocks_dispatch() {
+    use openmettle_core::authz::store;
+
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    authz_store::make_admin(&mut f.owner, &alice).await;
+
+    // Grant opt-in capability `runs.use_yolo` to Alice through the audited store API.
+    applied(
+        store::set_user_capability_grant(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev2-p2-grant-yolo"),
+            &alice.user,
+            "runs.use_yolo",
+            true,
+        )
+        .await,
+    );
+
+    // Admit, claim, reserve, and hand off a round whose snapshot requires opt-in `runs.use_yolo`.
+    let mut snap: serde_json::Value = serde_json::from_slice(&quotas::snapshot(100)).unwrap();
+    snap["required_capabilities"] = serde_json::json!({ "runs.use_yolo": "opt_in" });
+    let snap_bytes = serde_json::to_vec(&snap).unwrap();
+    let r_cap = f.round(&snap_bytes).await;
+    f.authorized(&r_cap, "round requiring opt-in runs.use_yolo")
+        .await;
+
+    // 1. Prove `store::set_user_capability_grant(..., false)` acquires `account_admin_lock FOR UPDATE`
+    //    by holding `account_admin_lock FOR SHARE` in an open gateway transaction and verifying the
+    //    store writer blocks until the shared lock releases.
+    let mut gw_hold = connect(&f.db.0, pg::GATEWAY).await;
+    let gw_pid = backend_pid(&mut gw_hold).await;
+    let mut gw_tx = WriteTransaction::begin(&mut gw_hold).await.unwrap();
+    sqlx::query("SELECT id FROM openmettle.account_admin_lock FOR SHARE")
+        .execute(gw_tx.connection().unwrap())
+        .await
+        .unwrap();
+
+    let mut api_conn = connect(&f.db.0, API).await;
+    let alice_clone = alice.clone();
+    let withdraw_task = tokio::spawn(async move {
+        store::set_user_capability_grant(
+            &mut api_conn,
+            &ctx(&alice_clone, "rev2-p2-withdraw-yolo"),
+            &alice_clone.user,
+            "runs.use_yolo",
+            false,
+        )
+        .await
+    });
+    wait_for_blocked_peer(&f.db, gw_pid).await;
+    gw_tx.rollback().await.unwrap();
+    applied(withdraw_task.await.unwrap());
+
+    // After withdrawal committed, `gateway_dispatch_scoped` refuses `r_cap`.
+    assert_eq!(
+        dispatch_scoped(&f, &r_cap).await,
+        [],
+        "dispatch must refuse after opt-in capability withdrawal"
+    );
+    assert!(!f.stored(&r_cap).await.3);
+
+    // 2. Reverse direction: re-grant, hand off a second round, hold an in-flight capability
+    //    withdrawal (`account_admin_lock FOR UPDATE` + `granted = false`), and confirm
+    //    `gateway_dispatch_scoped` blocks until commit and then refuses dispatch.
+    applied(
+        store::set_user_capability_grant(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev2-p2-regrant-yolo"),
+            &alice.user,
+            "runs.use_yolo",
+            true,
+        )
+        .await,
+    );
+    let r_cap2 = f.round(&snap_bytes).await;
+    f.authorized(&r_cap2, "second round requiring opt-in runs.use_yolo")
+        .await;
+
+    let mut admin_writer = connect(&f.db.0, API).await;
+    let admin_pid = backend_pid(&mut admin_writer).await;
+    let mut admin_tx = WriteTransaction::begin(&mut admin_writer).await.unwrap();
+    sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        .execute(admin_tx.connection().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.user_capability_grants
+            SET granted = false, revision = revision + 1, updated_at = clock_timestamp()
+          WHERE user_id = $1::uuid AND capability = 'runs.use_yolo'",
+    )
+    .bind(&alice.user)
+    .execute(admin_tx.connection().unwrap())
+    .await
+    .unwrap();
+
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    let (req_id, bearer) = (r_cap2.request.clone(), r_cap2.bearer);
+    let waiting = tokio::spawn(async move {
+        sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+            .bind(req_id)
+            .bind(bearer.as_slice())
+            .fetch_all(&mut gw)
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_peer(&f.db, admin_pid).await;
+    admin_tx.commit().await.unwrap();
+    assert_eq!(waiting.await.unwrap(), []);
+    assert!(!f.stored(&r_cap2).await.3);
+}
+
+/// Review #2 P2 #2: if a collaborator gains a new approval (`first-identity-approval.psql`) AFTER
+/// `gateway_dispatch_scoped` scanned `local_identity_approvals FOR SHARE` (while parked on a later
+/// lock) and that new approval is concurrently under `FOR UPDATE` withdrawal, the final `UPDATE`
+/// must restrict `share.effective` to the provider/approval/observation/rule IDs actually locked in
+/// this transaction and isolate `cache_owner` to the conversation owner.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_2_p2_newly_added_unlocked_collaborator_approval_cannot_select_shared_cache() {
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    let bob = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+
+    let (project_id, project_scope) =
+        run_admission::new_project(&f.db, &alice, "rev2-p2-new-approval-proj").await;
+    let expected_owner = |actor: &Account, cache_owner: Option<&str>| {
+        vec![(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(actor.user.clone()),
+            Some("a".to_owned()),
+            cache_owner.map(str::to_owned),
+        )]
+    };
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev2-p2-bob-vw"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+            ProjectRole::Viewer,
+        )
+        .await,
+    );
+    let chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev2-p2-share-bob"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+
+    // Give Bob a second OIDC identity with NO approval yet, and withdraw Bob's initial approval so
+    // Bob has zero active approvals when `gateway_dispatch_scoped` scans `local_identity_approvals`.
+    let bob_ident2: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.user_identities (user_id, issuer, subject)
+         VALUES ($1::uuid, 'https://authz-store.example.test', 'bob-second-subject')
+         RETURNING id::text",
+    )
+    .bind(&bob.user)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    f.owner_exec(
+        "UPDATE openmettle.local_identity_approvals SET active = false WHERE id = $1::uuid",
+        &bob.approval,
+    )
+    .await;
+
+    let r_alice = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+
+    // Hold `runs FOR NO KEY UPDATE` on `r_alice`'s run so `gateway_dispatch_scoped` completes its
+    // `local_identity_approvals FOR SHARE` scan and parks right before `runs FOR SHARE`.
+    let mut run_blocker = connect(&f.db.0, OWNER).await;
+    let run_blocker_pid = backend_pid(&mut run_blocker).await;
+    let mut run_tx = WriteTransaction::begin(&mut run_blocker).await.unwrap();
+    sqlx::query("SELECT FROM openmettle.runs WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&r_alice.run)
+        .execute(run_tx.connection().unwrap())
+        .await
+        .unwrap();
+
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    let (req_id, bearer) = (r_alice.request.clone(), r_alice.bearer);
+    let waiting = tokio::spawn(async move {
+        sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+            .bind(req_id)
+            .bind(bearer.as_slice())
+            .fetch_all(&mut gw)
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_peer(&f.db, run_blocker_pid).await;
+
+    // Now insert and commit a brand-new active approval `bob_ap2` for `bob_ident2` AFTER dispatch's
+    // approval lock scan, then hold an uncommitted withdrawal (`FOR UPDATE`, `active = false`) on
+    // `bob_ap2` while releasing `run_tx`.
+    let bob_ap2: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.local_identity_approvals
+             (provider_id, identity_id, revision, access_generation, active, expires_ms,
+              changed_by, change_reason)
+         VALUES ($1::uuid, $2::uuid, 1, 0, true, 4102444800000, 'fixture-owner', 'late first approval')
+         RETURNING id::text",
+    )
+    .bind(PROVIDER)
+    .bind(&bob_ident2)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+
+    let mut withdraw_conn = connect(&f.db.0, OWNER).await;
+    let mut withdraw_tx = WriteTransaction::begin(&mut withdraw_conn).await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+    )
+    .bind(&bob_ap2)
+    .execute(withdraw_tx.connection().unwrap())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.local_identity_approvals
+            SET active = false, revision = revision + 1, access_generation = access_generation + 1
+          WHERE id = $1::uuid",
+    )
+    .bind(&bob_ap2)
+    .execute(withdraw_tx.connection().unwrap())
+    .await
+    .unwrap();
+
+    // Release `run_tx`: `gateway_dispatch_scoped` runs its final `UPDATE` while `withdraw_tx` is
+    // still open. Because `bob_ap2` was NOT in `v_locked_approvals`, it must NOT select `None`!
+    run_tx.rollback().await.unwrap();
+    let result = waiting.await.unwrap();
+    withdraw_tx.commit().await.unwrap();
+
+    assert_eq!(
+        result,
+        expected_owner(&alice, Some(&alice.user)),
+        "unlocked late collaborator approval under concurrent withdrawal must not select shared cache"
+    );
+}

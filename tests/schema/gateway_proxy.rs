@@ -803,6 +803,34 @@ fn script(body: &[u8]) -> Option<Script> {
                     false,
                 )
             }
+            "status-429-hop" => {
+                let body = b"rate limited hop-by-hop".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nconnection: close, Retry-After\r\n\
+                     retry-after: 7\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-429-bad-conn" => {
+                let body = b"rate limited unreadable connection".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nconnection: \tRetry-After\r\n\
+                     retry-after: 7\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
             "status-503" => {
                 let body = b"upstream overloaded".to_vec();
                 let head = format!(
@@ -4548,6 +4576,8 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     let cases = [
         ("echo-422", 502, "provider_failure", None),
         ("status-429", 429, "rate_limited", Some("7")),
+        ("status-429-hop", 429, "rate_limited", None),
+        ("status-429-bad-conn", 429, "rate_limited", None),
         ("status-503", 503, "unavailable", None),
         ("status-504", 504, "timeout", None),
     ];

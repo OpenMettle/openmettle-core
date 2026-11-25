@@ -424,6 +424,7 @@ async fn write_with(
             Action::ManageAccountAdmin
                 | Action::ManageAccounts
                 | Action::ManageLocalGroups
+                | Action::ManageUserCapabilityDenies
                 | Action::ManageFamilyPolicies
         ) {
             sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")

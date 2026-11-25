@@ -23,6 +23,10 @@ DECLARE
     v_actor uuid;
     v_conversation uuid;
     v_collabs uuid[];
+    v_locked_providers uuid[];
+    v_locked_approvals uuid[];
+    v_locked_observations uuid[];
+    v_locked_rules uuid[];
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'gateway dispatch requires READ COMMITTED' USING ERRCODE = '25000';
@@ -40,11 +44,9 @@ BEGIN
     -- (`account_admin_lock -> projects -> login_providers -> local_identity_approvals -> users ->
     -- membership_observations -> grant_mapping_rules -> runs -> gateway_requests`), covering both
     -- the acting principal and any direct-user share recipients on the conversation (whose share
-    -- rows cannot change once `projects FOR SHARE` is held). Concurrent conversation shares or
-    -- unshares, project membership/lifecycle updates, user/group admin writes, operator approval
-    -- or mapped-membership withdrawals (`identity-approval-change.psql`,
-    -- `configure-project-membership.psql`, `withdraw-project-membership.psql`), mapping-rule
-    -- updates and run cancellations all serialize without lock-order inversions.
+    -- rows cannot change once `projects FOR SHARE` is held), and record the exact provider,
+    -- approval, observation and rule IDs locked so rows inserted after the lock scan cannot be
+    -- counted unlocked in the final `READ COMMITTED` `UPDATE`.
     PERFORM FROM openmettle.account_admin_lock FOR SHARE;
     PERFORM FROM openmettle.projects p WHERE p.scope_id = v_scope FOR SHARE;
 
@@ -70,57 +72,64 @@ BEGIN
        AND sc.kind = 'project'
        AND sc.project_id IS NOT NULL;
 
-    PERFORM p.id
-      FROM openmettle.login_providers p
-     WHERE EXISTS (
-         SELECT 1
-           FROM openmettle.local_identity_approvals a
-           JOIN openmettle.user_identities i ON i.id = a.identity_id
-          WHERE a.provider_id = p.id
-            AND (a.id = v_approval OR i.user_id = ANY(v_collabs))
-     )
-     ORDER BY p.id
-       FOR SHARE;
-    PERFORM a.id
-      FROM openmettle.local_identity_approvals a
-     WHERE a.id = v_approval
-        OR EXISTS (
-            SELECT 1
-              FROM openmettle.user_identities i
-             WHERE i.id = a.identity_id
-               AND i.user_id = ANY(v_collabs)
-        )
-     ORDER BY a.id
-       FOR SHARE;
+    SELECT coalesce(array_agg(locked.id), ARRAY[]::uuid[])
+      INTO v_locked_providers
+      FROM (
+          SELECT p.id
+            FROM openmettle.login_providers p
+           WHERE EXISTS (
+               SELECT 1
+                 FROM openmettle.local_identity_approvals a
+                 JOIN openmettle.user_identities i ON i.id = a.identity_id
+                WHERE a.provider_id = p.id
+                  AND (a.id = v_approval OR i.user_id = ANY(v_collabs))
+           )
+           ORDER BY p.id
+             FOR SHARE
+      ) locked;
+    SELECT coalesce(array_agg(locked.id), ARRAY[]::uuid[])
+      INTO v_locked_approvals
+      FROM (
+          SELECT a.id
+            FROM openmettle.local_identity_approvals a
+           WHERE a.id = v_approval
+              OR EXISTS (
+                  SELECT 1
+                    FROM openmettle.user_identities i
+                   WHERE i.id = a.identity_id
+                     AND i.user_id = ANY(v_collabs)
+              )
+           ORDER BY a.id
+             FOR SHARE
+      ) locked;
     PERFORM u.id
       FROM openmettle.users u
      WHERE u.id = v_actor OR u.id = ANY(v_collabs)
      ORDER BY u.id
        FOR SHARE;
-    PERFORM m.approval_id
-      FROM openmettle.membership_observations m
-     WHERE m.approval_id = v_approval
-        OR EXISTS (
-            SELECT 1
-              FROM openmettle.local_identity_approvals a
-              JOIN openmettle.user_identities i ON i.id = a.identity_id
-             WHERE a.id = m.approval_id
-               AND i.user_id = ANY(v_collabs)
-        )
-     ORDER BY m.approval_id
-       FOR SHARE;
-    PERFORM mr.id
-      FROM openmettle.grant_mapping_rules mr
-     WHERE EXISTS (
-         SELECT 1
-           FROM openmettle.membership_observations m
-           JOIN openmettle.local_identity_approvals a ON a.id = m.approval_id
-           JOIN openmettle.user_identities i ON i.id = a.identity_id
-          WHERE m.rule_id = mr.id
-            AND (a.id = v_approval OR i.user_id = ANY(v_collabs))
-     )
-     ORDER BY mr.id
-       FOR SHARE;
+    SELECT coalesce(array_agg(locked.approval_id), ARRAY[]::uuid[])
+      INTO v_locked_observations
+      FROM (
+          SELECT m.approval_id
+            FROM openmettle.membership_observations m
+           WHERE m.approval_id = ANY(v_locked_approvals)
+           ORDER BY m.approval_id
+             FOR SHARE
+      ) locked;
+    SELECT coalesce(array_agg(locked.id), ARRAY[]::uuid[])
+      INTO v_locked_rules
+      FROM (
+          SELECT mr.id
+            FROM openmettle.grant_mapping_rules mr
+           WHERE EXISTS (
+               SELECT 1
+                 FROM openmettle.membership_observations m
+                WHERE m.approval_id = ANY(v_locked_observations)
+                  AND m.rule_id = mr.id
+           )
+           ORDER BY mr.id
+             FOR SHARE
+      ) locked;
     PERFORM FROM openmettle.runs r WHERE r.id = v_run FOR SHARE;
     PERFORM FROM openmettle.gateway_requests q
       WHERE q.id = p_request
@@ -198,6 +207,7 @@ BEGIN
                         ))
                         OR (ga.grantee_kind = 'user'
                             AND ga.grantee_user_id <> c.owner_user_id
+                            AND ga.grantee_user_id = ANY(v_collabs)
                             AND EXISTS (
                                 SELECT 1
                                   FROM openmettle.users gu
@@ -205,8 +215,11 @@ BEGIN
                                     ON i2.user_id = gu.id
                                   JOIN openmettle.local_identity_approvals a2
                                     ON a2.identity_id = i2.id
+                                   AND a2.id = ANY(v_locked_approvals)
                                   JOIN openmettle.login_providers p2
-                                    ON p2.id = a2.provider_id AND p2.issuer = i2.issuer
+                                    ON p2.id = a2.provider_id
+                                   AND p2.issuer = i2.issuer
+                                   AND p2.id = ANY(v_locked_providers)
                                   JOIN LATERAL (
                                       SELECT pr2.epoch, pr2.revision
                                         FROM openmettle.login_provider_revisions pr2
@@ -263,6 +276,7 @@ BEGIN
                                              FROM openmettle.membership_observations m2
                                              JOIN openmettle.grant_mapping_rules r2
                                                ON r2.id = m2.rule_id
+                                              AND r2.id = ANY(v_locked_rules)
                                               AND r2.last_revision = m2.rule_revision
                                               AND r2.provider_config_id = a2.provider_id
                                               AND r2.issuer = i2.issuer
@@ -283,6 +297,7 @@ BEGIN
                                                ON mh2.assignment_id = mg2.id
                                               AND mh2.revision = mg2.last_revision
                                             WHERE m2.approval_id = a2.id
+                                              AND m2.approval_id = ANY(v_locked_observations)
                                               AND m2.enabled
                                               AND v2.enabled
                                               AND v2.binding_format = 'openmettle.project-member'

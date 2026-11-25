@@ -43,7 +43,7 @@ use crate::{
         projects::hex,
     },
     bounded_positive,
-    provider_http::gateway::{UsageReport, problem::retry_delay},
+    provider_http::gateway::UsageReport,
     runs::{digest, identity as framed_identity, is_canonical_uuid},
     telemetry::{self, RequestId, UsageGap},
     v1::{Problem, problem},
@@ -216,11 +216,23 @@ impl From<Problem> for ProxyError {
     }
 }
 
+fn upstream_retry_after(headers: &HeaderMap) -> Option<u32> {
+    if !connection_readable(headers) {
+        return None;
+    }
+    let mut values = end_to_end(headers, &header::RETRY_AFTER);
+    let s = values.next()?.to_str().ok()?;
+    if values.next().is_some() || s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok().filter(|n| *n <= 86400)
+}
+
 fn upstream_status_error(status: StatusCode, headers: &HeaderMap) -> ProxyError {
     match status {
         StatusCode::TOO_MANY_REQUESTS => ProxyError {
             problem: UPSTREAM_RATE_LIMITED,
-            retry_after: retry_delay(headers),
+            retry_after: upstream_retry_after(headers),
         },
         StatusCode::SERVICE_UNAVAILABLE => UNAVAILABLE.into(),
         StatusCode::GATEWAY_TIMEOUT => UPSTREAM_TIMEOUT.into(),
