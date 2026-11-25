@@ -3,8 +3,9 @@
 use openmettle_core::telemetry::{
     self, Process,
     metrics::{
-        self, CONTRACT_VERSION, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind,
-        Metrics, ProviderOperation, ProviderOutcome, ReadinessOutcome, RouteClass, StatusClass,
+        self, CONTRACT_VERSION, CapacityOperation, CapacityOutcome, CapacityStaleSurface,
+        CapacityWaitOutcome, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind, Metrics,
+        ProviderOperation, ProviderOutcome, ReadinessOutcome, RouteClass, StatusClass,
         StorageOperation, StorageOutcome,
     },
 };
@@ -223,6 +224,38 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         contract["policy"]["max_prometheus_series_per_process"].as_u64(),
         Some(total_prom_series as u64)
     );
+
+    // Reserved signals reconcile the V1-18 / V1-17 ownership split: capacity.grants is now
+    // implemented in `metrics`, and storage.quota.drift belongs to V1-17.
+    let reserved = contract["reserved_signals"].as_array().unwrap();
+    let mut reserved_by_name = BTreeMap::new();
+    for entry in reserved {
+        let name = entry["name"].as_str().unwrap();
+        let owner = entry["owner_ticket"].as_str().unwrap();
+        assert!(
+            !seen_otel.contains(name),
+            "implemented metric {name} must not remain in reserved_signals"
+        );
+        assert!(
+            reserved_by_name.insert(name, owner).is_none(),
+            "duplicate reserved signal {name}"
+        );
+    }
+    assert_eq!(
+        reserved_by_name.get("openmettle.storage.quota.drift"),
+        Some(&"V1-17")
+    );
+    assert!(!reserved_by_name.contains_key("openmettle.capacity.grants"));
+    for implemented in [
+        "openmettle.capacity.grants",
+        "openmettle.capacity.observations.stale",
+        "openmettle.capacity.wait.duration",
+    ] {
+        assert!(
+            seen_otel.contains(implemented),
+            "missing V1-18 metric {implemented}"
+        );
+    }
 }
 
 #[test]
@@ -289,6 +322,17 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
     for &sig in DroppedSignal::ALL {
         store.record_dropped(sig, 1);
+    }
+    for &op in CapacityOperation::ALL {
+        for &outcome in CapacityOutcome::ALL {
+            store.record_capacity_grant(op, outcome);
+        }
+    }
+    for &surface in CapacityStaleSurface::ALL {
+        store.record_capacity_stale_observation(surface);
+    }
+    for &outcome in CapacityWaitOutcome::ALL {
+        store.record_capacity_wait(outcome, Duration::from_millis(25));
     }
 
     let request = store

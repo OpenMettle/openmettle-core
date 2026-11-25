@@ -1,7 +1,7 @@
 //! Authenticated `/v1` quota summary reads and `ManageQuotas` scope overrides (ADR 0040 PR3).
 use super::{
     Api, BODY, INTERNAL, INVALID, Op, PROVISIONING, Problem, Session, UNAVAILABLE, parse_unique,
-    path_id, principal, quota_problem, reply, request_key, store_problem,
+    path_id, principal, quota_problem, read_only_snapshot, reply, request_key, store_problem,
 };
 use crate::{
     authz::{self, projects, store::AuditContext},
@@ -107,37 +107,6 @@ fn path_resource(parts: &Parts) -> Result<QuotaResourceKind, Problem> {
         .nth(6)
         .and_then(QuotaResourceKind::parse)
         .ok_or(INVALID)
-}
-
-use sqlx::{Connection, PgConnection};
-
-async fn read_only_snapshot<T>(
-    c: &mut PgConnection,
-    work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, Problem>,
-) -> Result<T, Problem> {
-    let mut tx = c.begin().await.map_err(|_| UNAVAILABLE)?;
-    if sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await
-        .is_err()
-        || sqlx::query("SELECT set_config('statement_timeout', '3s', true)")
-            .execute(&mut *tx)
-            .await
-            .is_err()
-    {
-        let _ = tx.rollback().await;
-        return Err(UNAVAILABLE);
-    }
-    match work(&mut tx).await {
-        Ok(value) => {
-            tx.commit().await.map_err(|_| UNAVAILABLE)?;
-            Ok(value)
-        }
-        Err(error) => {
-            tx.rollback().await.map_err(|_| UNAVAILABLE)?;
-            Err(error)
-        }
-    }
 }
 
 impl Api {

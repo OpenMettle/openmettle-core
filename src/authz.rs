@@ -80,6 +80,7 @@ pub enum Action {
     ManageUserCapabilityDenies,
     ManageQuotas,
     ManageFamilyPolicies,
+    InspectCapacity,
     ManageAccountAdmin,
     ManageAccounts,
 }
@@ -657,6 +658,7 @@ pub fn authorize_admin(principal: &Principal, change: AdminChange) -> Decision {
                 | Action::ManageUserCapabilityDenies
                 | Action::ManageQuotas
                 | Action::ManageFamilyPolicies
+                | Action::InspectCapacity
         );
     if !admin || (change.removes_enabled_admin && !lifecycle) {
         return policy(PolicyReason::NotApplicable);
@@ -668,6 +670,38 @@ pub fn authorize_admin(principal: &Principal, change: AdminChange) -> Decision {
         return policy(PolicyReason::LastAccountAdmin);
     }
     Decision::Allow
+}
+
+/// Opt-in operator capability granting read-only inspection of detailed capacity group and
+/// device observations without account-admin privileges (ADR 0042). Grants no content access.
+pub const CAPABILITY_INSPECT_CAPACITY: &str = "capacity.inspect";
+
+/// Decide whether `principal` may inspect detailed managed GPU group and device observations
+/// (ADR 0042): active `account_admin` (`Action::InspectCapacity`) or an active principal granted
+/// the opt-in `capacity.inspect` capability (subject to platform and user denies). Grants no
+/// content access.
+pub fn authorize_capacity_inspection(principal: &Principal, platform: &PlatformPolicy) -> Decision {
+    if !principal.is_active() {
+        return Decision::Deny(InactivePrincipal);
+    }
+    if authorize_admin(
+        principal,
+        AdminChange {
+            action: Action::InspectCapacity,
+            removes_enabled_admin: false,
+            enabled_account_admins: 1,
+        },
+    )
+    .is_allowed()
+    {
+        return Decision::Allow;
+    }
+    authorize_capability(
+        principal,
+        platform,
+        CAPABILITY_INSPECT_CAPACITY,
+        CapabilityGate::OptIn,
+    )
 }
 
 /// Platform-wide capability policy for the installation.

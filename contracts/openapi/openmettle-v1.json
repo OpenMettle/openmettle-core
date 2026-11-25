@@ -2908,6 +2908,118 @@
           }
         }
       }
+    },
+    "/v1/capacity": {
+      "get": {
+        "operationId": "getCapacity",
+        "summary": "Read coarse caller-authorized capacity availability",
+        "description": "Projects coarse effective availability (ready, busy, queued_estimate or unavailable) for workload and model profiles authorized for the authenticated caller. Inaccessible or denied profiles are omitted. Never exposes group IDs, device IDs, byte counts, exact queue positions, PCIe IDs or other tenants' work, and never reserves capacity.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Coarse availability for the caller's authorized profiles.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapacitySummary"
+                },
+                "examples": {
+                  "mixed": {
+                    "$ref": "#/components/examples/CapacitySummaryMixed"
+                  },
+                  "empty": {
+                    "$ref": "#/components/examples/CapacitySummaryEmpty"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/capacity/groups": {
+      "get": {
+        "operationId": "listAdminCapacityGroups",
+        "summary": "Inspect versioned managed GPU group and device capacity observations",
+        "description": "Privileged operator/admin inspection of managed GPU groups and their latest per-device capacity observations (ADR 0042). Requires active account_admin (InspectCapacity) or the opt-in capacity.inspect capability. Grants no content access and never exposes controller secrets, PCIe topology or per-tenant grant rows.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Managed GPU groups and their latest versioned per-device observations.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminCapacityGroupList"
+                },
+                "examples": {
+                  "groups": {
+                    "$ref": "#/components/examples/AdminCapacityGroupListTypical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7152,6 +7264,257 @@
             "$ref": "#/components/schemas/Timestamp"
           }
         }
+      },
+      "CapacityAvailability": {
+        "description": "Coarse caller-visible availability of an authorized workload or model profile (ADR 0042): ready, busy, queued_estimate or unavailable. Open vocabulary; consumers must tolerate unrecognized values and never treat them as ready.",
+        "$ref": "#/components/schemas/Code",
+        "examples": [
+          "ready",
+          "busy",
+          "queued_estimate",
+          "unavailable"
+        ]
+      },
+      "ProfileCapacity": {
+        "description": "Coarse availability projection for one caller-authorized profile (ADR 0042). Excludes group IDs, device IDs, byte counts, exact queue positions, PCIe IDs and other tenants' work.",
+        "type": "object",
+        "required": [
+          "profile",
+          "availability",
+          "estimated_wait_seconds"
+        ],
+        "properties": {
+          "profile": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "availability": {
+            "$ref": "#/components/schemas/CapacityAvailability"
+          },
+          "estimated_wait_seconds": {
+            "description": "Coarse wait estimate in seconds when availability is queued_estimate; null otherwise.",
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "availability"
+              ],
+              "properties": {
+                "availability": {
+                  "const": "queued_estimate"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "estimated_wait_seconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 86400
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": [
+                "availability"
+              ],
+              "properties": {
+                "availability": {
+                  "enum": [
+                    "ready",
+                    "busy",
+                    "unavailable"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "estimated_wait_seconds": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "CapacitySummary": {
+        "description": "Caller-authorized coarse capacity projection across configured profiles (ADR 0042). Reading this snapshot never reserves capacity.",
+        "type": "object",
+        "required": [
+          "profiles"
+        ],
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/ProfileCapacity"
+            }
+          }
+        }
+      },
+      "CapacityDeviceObservation": {
+        "description": "Latest published capacity counters for one managed device (ADR 0042). Excludes host topology, PCIe IDs and per-tenant grant identifiers.",
+        "type": "object",
+        "required": [
+          "device_id",
+          "total_bytes",
+          "committed_bytes",
+          "actual_used_bytes",
+          "reclaimable_bytes",
+          "safety_headroom_bytes",
+          "active_chat_floor_bytes",
+          "grantable_bytes",
+          "effective_grantable_bytes"
+        ],
+        "properties": {
+          "device_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "total_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "committed_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "actual_used_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "reclaimable_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "safety_headroom_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "active_chat_floor_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "grantable_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "effective_grantable_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          }
+        }
+      },
+      "CapacityGroupTotals": {
+        "description": "Wide per-group byte totals summed across every device observation at the group's latest revision (ADR 0042). Group sums never substitute for per-device fit.",
+        "type": "object",
+        "required": [
+          "total_bytes",
+          "committed_bytes",
+          "actual_used_bytes",
+          "reclaimable_bytes",
+          "safety_headroom_bytes",
+          "active_chat_floor_bytes",
+          "grantable_bytes",
+          "effective_grantable_bytes"
+        ],
+        "properties": {
+          "total_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "committed_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "actual_used_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "reclaimable_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "safety_headroom_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "active_chat_floor_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "grantable_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "effective_grantable_bytes": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          }
+        }
+      },
+      "AdminCapacityGroup": {
+        "description": "Privileged operator/admin view of one managed GPU group and its latest versioned device observations (ADR 0042).",
+        "type": "object",
+        "required": [
+          "group_id",
+          "controller_epoch",
+          "admits_bursts",
+          "observation_revision",
+          "observed_at",
+          "totals",
+          "devices"
+        ],
+        "properties": {
+          "group_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "controller_epoch": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "admits_bursts": {
+            "type": "boolean"
+          },
+          "observation_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "totals": {
+            "$ref": "#/components/schemas/CapacityGroupTotals"
+          },
+          "devices": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/CapacityDeviceObservation"
+            }
+          }
+        }
+      },
+      "AdminCapacityGroupList": {
+        "description": "Privileged operator/admin list of managed GPU groups and their versioned capacity observations (ADR 0042). Grants no content access.",
+        "type": "object",
+        "required": [
+          "groups"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/AdminCapacityGroup"
+            }
+          }
+        }
       }
     },
     "examples": {
@@ -10252,6 +10615,191 @@
           "schema": "#/components/schemas/QuotaOverride",
           "direction": "response",
           "mutations": []
+        }
+      },
+      "CapacitySummaryMixed": {
+        "summary": "Coarse caller-authorized profile availability covering ready, busy, queued_estimate and unavailable states",
+        "dataValue": {
+          "profiles": [
+            {
+              "profile": "chat.base",
+              "availability": "ready",
+              "estimated_wait_seconds": null
+            },
+            {
+              "profile": "media.image",
+              "availability": "busy",
+              "estimated_wait_seconds": null
+            },
+            {
+              "profile": "media.video",
+              "availability": "queued_estimate",
+              "estimated_wait_seconds": 30
+            },
+            {
+              "profile": "eval.large",
+              "availability": "unavailable",
+              "estimated_wait_seconds": null
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/CapacitySummary",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "unrecognized-availability",
+              "class": "compat",
+              "op": "set",
+              "path": "/profiles/0/availability",
+              "value": "warming"
+            },
+            {
+              "name": "queued-estimate-missing-wait",
+              "class": "invalid",
+              "op": "set",
+              "path": "/profiles/2/estimated_wait_seconds",
+              "value": null,
+              "expect": {
+                "instancePath": "/profiles/2/estimated_wait_seconds",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "ready-with-wait",
+              "class": "invalid",
+              "op": "set",
+              "path": "/profiles/0/estimated_wait_seconds",
+              "value": 15,
+              "expect": {
+                "instancePath": "/profiles/0/estimated_wait_seconds",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "zero-wait",
+              "class": "invalid",
+              "op": "set",
+              "path": "/profiles/2/estimated_wait_seconds",
+              "value": 0,
+              "expect": {
+                "instancePath": "/profiles/2/estimated_wait_seconds",
+                "keyword": "minimum"
+              }
+            }
+          ]
+        }
+      },
+      "CapacitySummaryEmpty": {
+        "summary": "Empty capacity summary when all profiles are omitted by caller authorization",
+        "dataValue": {
+          "profiles": []
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/CapacitySummary",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "AdminCapacityGroupListTypical": {
+        "summary": "Privileged operator inspection of one active multi-device group and one unobserved group",
+        "dataValue": {
+          "groups": [
+            {
+              "group_id": "00000000-0000-4000-8000-00000000c001",
+              "controller_epoch": "3",
+              "admits_bursts": true,
+              "observation_revision": "12",
+              "observed_at": "2026-11-25T12:00:00.123456Z",
+              "totals": {
+                "total_bytes": "51539607552",
+                "committed_bytes": "4294967296",
+                "actual_used_bytes": "38654705664",
+                "reclaimable_bytes": "2147483648",
+                "safety_headroom_bytes": "2147483648",
+                "active_chat_floor_bytes": "34359738368",
+                "grantable_bytes": "10737418240",
+                "effective_grantable_bytes": "8589934592"
+              },
+              "devices": [
+                {
+                  "device_id": "00000000-0000-4000-8000-00000000c0d0",
+                  "total_bytes": "25769803776",
+                  "committed_bytes": "4294967296",
+                  "actual_used_bytes": "21474836480",
+                  "reclaimable_bytes": "2147483648",
+                  "safety_headroom_bytes": "1073741824",
+                  "active_chat_floor_bytes": "17179869184",
+                  "grantable_bytes": "3221225472",
+                  "effective_grantable_bytes": "1073741824"
+                },
+                {
+                  "device_id": "00000000-0000-4000-8000-00000000c0d1",
+                  "total_bytes": "25769803776",
+                  "committed_bytes": "0",
+                  "actual_used_bytes": "17179869184",
+                  "reclaimable_bytes": "0",
+                  "safety_headroom_bytes": "1073741824",
+                  "active_chat_floor_bytes": "17179869184",
+                  "grantable_bytes": "7516192768",
+                  "effective_grantable_bytes": "7516192768"
+                }
+              ]
+            },
+            {
+              "group_id": "00000000-0000-4000-8000-00000000c002",
+              "controller_epoch": "0",
+              "admits_bursts": false,
+              "observation_revision": "0",
+              "observed_at": null,
+              "totals": {
+                "total_bytes": "0",
+                "committed_bytes": "0",
+                "actual_used_bytes": "0",
+                "reclaimable_bytes": "0",
+                "safety_headroom_bytes": "0",
+                "active_chat_floor_bytes": "0",
+                "grantable_bytes": "0",
+                "effective_grantable_bytes": "0"
+              },
+              "devices": []
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/AdminCapacityGroupList",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "wide-group-totals",
+              "class": "valid",
+              "op": "set",
+              "path": "/groups/0/totals/total_bytes",
+              "value": "27670116110564327421"
+            },
+            {
+              "name": "device-bytes-above-signed-64",
+              "class": "invalid",
+              "op": "set",
+              "path": "/groups/0/devices/0/grantable_bytes",
+              "value": "9223372036854775808",
+              "expect": {
+                "instancePath": "/groups/0/devices/0/grantable_bytes",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "bad-observed-at",
+              "class": "invalid",
+              "op": "set",
+              "path": "/groups/0/observed_at",
+              "value": "2026-11-25T12:00:00Z",
+              "expect": {
+                "instancePath": "/groups/0/observed_at",
+                "keyword": "anyOf"
+              }
+            }
+          ]
         }
       }
     }

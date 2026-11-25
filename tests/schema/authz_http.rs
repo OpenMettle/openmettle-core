@@ -44,7 +44,7 @@ pub(super) async fn browser(db: &TestDb, account: &Account, n: u8) -> String {
     seeded_session(db, account, n, None).await
 }
 
-async fn native(db: &TestDb, account: &Account, n: u8) -> String {
+pub(super) async fn native(db: &TestDb, account: &Account, n: u8) -> String {
     seeded_session(db, account, n, Some(&audience())).await
 }
 
@@ -293,7 +293,7 @@ pub(super) fn success(response: (u16, Value), status: u16) -> Value {
 }
 
 #[track_caller]
-fn refused(response: (u16, Value), status: u16, code: &str) {
+pub(super) fn refused(response: (u16, Value), status: u16, code: &str) {
     assert_eq!(
         (response.0, response.1["code"].as_str()),
         (status, Some(code)),
@@ -1606,7 +1606,7 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
     assert_eq!(charged(&db, &personal).await, (4096, 0, 0));
 }
 
-fn validate_openapi_schema(pointer: &str, instance: &Value) -> bool {
+pub(super) fn validate_openapi_schema(pointer: &str, instance: &Value) -> bool {
     let mut doc: Value =
         serde_json::from_str(include_str!("../../contracts/openapi/openmettle-v1.json")).unwrap();
     doc["$ref"] = json!(pointer);

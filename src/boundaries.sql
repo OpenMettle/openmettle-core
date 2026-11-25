@@ -48,6 +48,10 @@
 -- Version 39 adds `runtime_feature_gates` (`SELECT` only for `openmettle_api` and
 -- `openmettle_worker`; zero write grants for runtime roles) and the owner-owned SECURITY DEFINER
 -- trigger `resolve_terminal_write_intents()` (no role may call) (ADR 0039, V1-14 PR3).
+-- Version 40 adds `capacity_profiles` (`SELECT` only for `openmettle_api`) and the read-only
+-- SECURITY DEFINER projection `capacity_group_observations()` (`openmettle_api` only) so `/v1`
+-- capacity endpoints never hold table or column privileges on `capacity_groups` or
+-- `capacity_grants` (ADR 0042, V1-18 PR3).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -106,9 +110,13 @@ quota_tables (relation,role,privilege) AS (
        OR ($1 BETWEEN 24 AND 36 AND role = 'openmettle_gateway' AND relation <> 'storage_volume_control')
 ),
 -- Version 27 (ADR 0042): the worker reads the capacity store; every write is a function call.
+-- Version 40 (ADR 0042, PR3): the API reads capacity_profiles only; group/device observations
+-- are exposed exclusively through the STABLE SECURITY DEFINER capacity_group_observations().
 capacity_tables (relation,role,privilege) AS (
     SELECT relation,'openmettle_worker','SELECT' FROM unnest(ARRAY['capacity_groups','capacity_devices',
         'capacity_observations','capacity_grants','capacity_grant_devices']) relation WHERE $1 >= 27
+    UNION ALL
+    SELECT 'capacity_profiles','openmettle_api','SELECT' WHERE $1 >= 40
 ),
 -- Version 28 (ADR 0041): the API reads the grace it applies and stamps its revision.
 retention_tables (relation,role,privilege) AS (
@@ -273,6 +281,7 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT 'openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 37
     UNION ALL SELECT 'openmettle.retention_set_grace(uuid,uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 38
     UNION ALL SELECT 'openmettle.resolve_terminal_write_intents()',true,ARRAY[]::text[] WHERE $1 >= 39
+    UNION ALL SELECT 'openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 40
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES

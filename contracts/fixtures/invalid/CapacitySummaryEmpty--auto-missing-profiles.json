@@ -1,0 +1,19 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "CapacitySummaryEmpty--auto-missing-profiles",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {},
+  "mutation": {
+    "name": "auto-missing-profiles",
+    "op": "remove",
+    "path": "/profiles"
+  },
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryEmpty"
+}

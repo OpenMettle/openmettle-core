@@ -23,11 +23,16 @@
 //! `Fenced`, `Expired`) has already aborted the transaction, losing its earlier writes; an
 //! `Invalid` the Rust API returns before sending any SQL has not. An `Ok` outcome, including
 //! `Decision::Insufficient` and `Decision::Unavailable`, leaves the transaction intact.
-use crate::runs::is_canonical_uuid;
+use crate::{
+    runs::is_canonical_uuid,
+    telemetry::metrics::{self, CapacityOperation, CapacityOutcome, CapacityStaleSurface},
+};
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 use std::{fmt, time::Duration};
+
+pub mod adapter;
 
 /// All failure classes are safe to display or log.
 #[derive(Debug, PartialEq, Eq)]
@@ -213,22 +218,41 @@ pub async fn publish(
     .await?)
 }
 
+fn error_outcome(error: &Error) -> CapacityOutcome {
+    match error {
+        Error::Fenced => CapacityOutcome::Fenced,
+        Error::Expired => CapacityOutcome::Expired,
+        Error::Invalid | Error::LeaseLost | Error::SlotRequired | Error::Conflict => {
+            CapacityOutcome::Refused
+        }
+        Error::Database => CapacityOutcome::Error,
+    }
+}
+
 /// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
 /// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
 /// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
 pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
-    Ok(
+    let result: Result<bool, Error> =
         sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
             .bind(&controller.group_id)
             .bind(controller.secret.as_slice())
             .bind(controller.epoch)
             .fetch_one(c)
-            .await?,
-    )
+            .await
+            .map_err(Error::from);
+    let outcome = match &result {
+        Ok(true) => CapacityOutcome::Resumed,
+        Ok(false) => CapacityOutcome::Unavailable,
+        Err(err) => error_outcome(err),
+    };
+    metrics::global().record_capacity_grant(CapacityOperation::Resume, outcome);
+    result
 }
 
 /// Bytes one grant commits on one device.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceBytes {
     pub device_id: String,
     pub bytes: i64,
@@ -282,6 +306,33 @@ pub enum Decision {
 /// it returns `LeaseLost`, `Fenced` or `Expired`, raised by PostgreSQL: the caller's transaction,
 /// including writes it made earlier, is already aborted. Roll back on any `Err`.
 pub async fn grant(
+    c: &mut PgConnection,
+    controller: &Controller,
+    request: &GrantRequest<'_>,
+) -> Result<Decision, Error> {
+    let result = grant_inner(c, controller, request).await;
+    let outcome = match &result {
+        Ok(Decision::Grant { state, .. }) => match state {
+            GrantState::Granted => CapacityOutcome::Granted,
+            GrantState::Releasing => CapacityOutcome::Releasing,
+            GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
+            GrantState::Released => CapacityOutcome::Released,
+        },
+        Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
+        Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
+        Err(err) => {
+            if *err == Error::Expired {
+                metrics::global()
+                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+            }
+            error_outcome(err)
+        }
+    };
+    metrics::global().record_capacity_grant(CapacityOperation::Grant, outcome);
+    result
+}
+
+async fn grant_inner(
     c: &mut PgConnection,
     controller: &Controller,
     request: &GrantRequest<'_>,
@@ -349,6 +400,27 @@ pub enum Evidence<'a> {
 /// the controller lease expires while any step waits for a lock, every change rolls back and it
 /// returns `Fenced`, with the caller's transaction already aborted.
 pub async fn reconcile(
+    c: &mut PgConnection,
+    controller: &Controller,
+    grant_id: &str,
+    evidence: Evidence<'_>,
+) -> Result<GrantState, Error> {
+    let result = reconcile_inner(c, controller, grant_id, evidence).await;
+    let outcome = match &result {
+        Ok(GrantState::Granted) => CapacityOutcome::Granted,
+        Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
+        Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
+        Ok(GrantState::Released) => match evidence {
+            Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
+            _ => CapacityOutcome::Released,
+        },
+        Err(err) => error_outcome(err),
+    };
+    metrics::global().record_capacity_grant(CapacityOperation::Reconcile, outcome);
+    result
+}
+
+async fn reconcile_inner(
     c: &mut PgConnection,
     controller: &Controller,
     grant_id: &str,

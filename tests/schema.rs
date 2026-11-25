@@ -1088,6 +1088,12 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "runtime_feature_gates",
         seed_row: Some(r#"{"id":true,"two_phase_effect_intents_enabled":false}"#),
     },
+    AdditiveTable {
+        since: 40,
+        dropped_in: None,
+        table: "capacity_profiles",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1264,6 +1270,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
         "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
+        "fe367ef17bd6c228550a4652bb93757f187ec7ee0ac8ef6aa27f8052ae7ce6c1",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1410,7 +1417,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 43);
+    assert_eq!(after_14.len(), 44);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1471,6 +1478,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
                 "runtime_feature_gates",
                 Some(r#"{"id":true,"two_phase_effect_intents_enabled":false}"#),
             ),
+            ("capacity_profiles", None),
         ]
     );
 

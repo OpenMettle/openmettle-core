@@ -385,6 +385,139 @@ impl DroppedSignal {
     }
 }
 
+/// Closed capacity controller operation class (ADR 0042).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityOperation {
+    Grant,
+    Reconcile,
+    Reclaim,
+    Resume,
+}
+
+impl CapacityOperation {
+    pub const ALL: &'static [Self] = &[Self::Grant, Self::Reconcile, Self::Reclaim, Self::Resume];
+    pub const NAMES: &'static [&'static str] = &["grant", "reconcile", "reclaim", "resume"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Closed capacity controller decision/reconciliation outcome (ADR 0042).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityOutcome {
+    Granted,
+    Insufficient,
+    Unavailable,
+    Released,
+    NotAllocated,
+    Releasing,
+    UnknownAllocation,
+    Resumed,
+    Fenced,
+    Expired,
+    Refused,
+    Error,
+}
+
+impl CapacityOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Granted,
+        Self::Insufficient,
+        Self::Unavailable,
+        Self::Released,
+        Self::NotAllocated,
+        Self::Releasing,
+        Self::UnknownAllocation,
+        Self::Resumed,
+        Self::Fenced,
+        Self::Expired,
+        Self::Refused,
+        Self::Error,
+    ];
+    pub const NAMES: &'static [&'static str] = &[
+        "granted",
+        "insufficient",
+        "unavailable",
+        "released",
+        "not_allocated",
+        "releasing",
+        "unknown_allocation",
+        "resumed",
+        "fenced",
+        "expired",
+        "refused",
+        "error",
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Closed surface reporting a stale capacity observation past its TTL (ADR 0042).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityStaleSurface {
+    Controller,
+    V1User,
+    V1Admin,
+}
+
+impl CapacityStaleSurface {
+    pub const ALL: &'static [Self] = &[Self::Controller, Self::V1User, Self::V1Admin];
+    pub const NAMES: &'static [&'static str] = &["controller", "v1_user", "v1_admin"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Closed outcome set for capacity wait duration observations (ADR 0042).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityWaitOutcome {
+    Granted,
+    Busy,
+    Unavailable,
+    Timeout,
+    Cancelled,
+}
+
+impl CapacityWaitOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Granted,
+        Self::Busy,
+        Self::Unavailable,
+        Self::Timeout,
+        Self::Cancelled,
+    ];
+    pub const NAMES: &'static [&'static str] =
+        &["granted", "busy", "unavailable", "timeout", "cancelled"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Instrument kind recorded in telemetry contract v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -627,6 +760,48 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.capacity.grants",
+        prometheus_name: "openmettle_capacity_grants_total",
+        kind: InstrumentKind::Counter,
+        unit: "{decision}",
+        description: "Capacity controller grant, reconciliation, reclaim and resume outcomes.",
+        labels: &[
+            LabelDescriptor {
+                name: "operation",
+                values: CapacityOperation::NAMES,
+            },
+            LabelDescriptor {
+                name: "outcome",
+                values: CapacityOutcome::NAMES,
+            },
+        ],
+        buckets: None,
+    },
+    MetricDescriptor {
+        name: "openmettle.capacity.observations.stale",
+        prometheus_name: "openmettle_capacity_observations_stale_total",
+        kind: InstrumentKind::Counter,
+        unit: "{observation}",
+        description: "Stale capacity observations encountered past their configured freshness TTL.",
+        labels: &[LabelDescriptor {
+            name: "surface",
+            values: CapacityStaleSurface::NAMES,
+        }],
+        buckets: None,
+    },
+    MetricDescriptor {
+        name: "openmettle.capacity.wait.duration",
+        prometheus_name: "openmettle_capacity_wait_duration_seconds",
+        kind: InstrumentKind::Histogram,
+        unit: "s",
+        description: "Capacity wait duration measured separately from workload execution.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: CapacityWaitOutcome::NAMES,
+        }],
+        buckets: Some(&DURATION_BUCKETS),
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -658,6 +833,9 @@ const DB_SLOTS: usize = ReadinessOutcome::NAMES.len();
 const PROVIDER_SLOTS: usize = ProviderOperation::NAMES.len() * ProviderOutcome::NAMES.len();
 const STORAGE_SLOTS: usize = StorageOperation::NAMES.len() * StorageOutcome::NAMES.len();
 const DROPPED_SLOTS: usize = DroppedSignal::NAMES.len();
+const CAPACITY_GRANT_SLOTS: usize = CapacityOperation::NAMES.len() * CapacityOutcome::NAMES.len();
+const CAPACITY_STALE_SLOTS: usize = CapacityStaleSurface::NAMES.len();
+const CAPACITY_WAIT_SLOTS: usize = CapacityWaitOutcome::NAMES.len();
 
 struct HistogramSlot {
     buckets: [AtomicU64; BUCKET_SLOTS],
@@ -713,6 +891,9 @@ pub struct Metrics {
     overdue_handoffs: AtomicU64,
     cancellations: [AtomicU64; CancelReason::NAMES.len()],
     telemetry_dropped: [AtomicU64; DROPPED_SLOTS],
+    capacity_grants: [AtomicU64; CAPACITY_GRANT_SLOTS],
+    capacity_stale_observations: [AtomicU64; CAPACITY_STALE_SLOTS],
+    capacity_wait_duration: [HistogramSlot; CAPACITY_WAIT_SLOTS],
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -751,6 +932,9 @@ impl Metrics {
             overdue_handoffs: AtomicU64::new(0),
             cancellations: std::array::from_fn(|_| AtomicU64::new(0)),
             telemetry_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
+            capacity_grants: std::array::from_fn(|_| AtomicU64::new(0)),
+            capacity_stale_observations: std::array::from_fn(|_| AtomicU64::new(0)),
+            capacity_wait_duration: std::array::from_fn(|_| HistogramSlot::new()),
         }
     }
 
@@ -819,6 +1003,19 @@ impl Metrics {
 
     pub fn dropped_count(&self, signal: DroppedSignal) -> u64 {
         self.telemetry_dropped[signal.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn record_capacity_grant(&self, operation: CapacityOperation, outcome: CapacityOutcome) {
+        let idx = operation.index() * CapacityOutcome::NAMES.len() + outcome.index();
+        self.capacity_grants[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_capacity_stale_observation(&self, surface: CapacityStaleSurface) {
+        self.capacity_stale_observations[surface.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_capacity_wait(&self, outcome: CapacityWaitOutcome, elapsed: Duration) {
+        self.capacity_wait_duration[outcome.index()].observe(elapsed);
     }
 
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
@@ -1020,6 +1217,56 @@ impl Metrics {
             })
             .collect();
         push_counter(&mut metrics, &DESCRIPTORS[11], lag);
+
+        // 12: openmettle.capacity.grants
+        let mut cap_points = Vec::new();
+        for &op in CapacityOperation::ALL {
+            for &outcome in CapacityOutcome::ALL {
+                let idx = op.index() * CapacityOutcome::NAMES.len() + outcome.index();
+                let value = self.capacity_grants[idx].load(Ordering::Relaxed);
+                if value > 0 {
+                    cap_points.push(counter_point(
+                        start,
+                        now,
+                        value,
+                        &[("operation", op.as_str()), ("outcome", outcome.as_str())],
+                    ));
+                }
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[12], cap_points);
+
+        // 13: openmettle.capacity.observations.stale
+        let mut stale_points = Vec::new();
+        for &surface in CapacityStaleSurface::ALL {
+            let value = self.capacity_stale_observations[surface.index()].load(Ordering::Relaxed);
+            if value > 0 {
+                stale_points.push(counter_point(
+                    start,
+                    now,
+                    value,
+                    &[("surface", surface.as_str())],
+                ));
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[13], stale_points);
+
+        // 14: openmettle.capacity.wait.duration
+        let mut wait_hpoints = Vec::new();
+        for &outcome in CapacityWaitOutcome::ALL {
+            let (count, sum, buckets) = self.capacity_wait_duration[outcome.index()].snapshot();
+            if count > 0 {
+                wait_hpoints.push(histogram_point(
+                    start,
+                    now,
+                    count,
+                    sum,
+                    buckets,
+                    &[("outcome", outcome.as_str())],
+                ));
+            }
+        }
+        push_histogram(&mut metrics, &DESCRIPTORS[14], wait_hpoints);
 
         if metrics.is_empty() {
             return None;

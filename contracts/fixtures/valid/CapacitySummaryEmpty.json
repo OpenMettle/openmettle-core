@@ -1,0 +1,15 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapacitySummaryEmpty",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "profiles": []
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryEmpty"
+}
