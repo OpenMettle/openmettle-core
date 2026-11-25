@@ -308,7 +308,12 @@ struct Subject<'a> {
 // capability revisions (including absent rows), and any required reservation. The same
 // expression guards the final INSERT. All reads after the run lock are non-locking.
 const AUTH: &str = concat!(
-    "WITH t AS MATERIALIZED (SELECT clock_timestamp() AS at),
+    "WITH t AS MATERIALIZED (
+       SELECT CASE
+         WHEN $1::bigint IS NULL THEN clock_timestamp()
+         ELSE greatest(clock_timestamp(), timestamptz 'epoch' + ($1::bigint * interval '1 millisecond'))
+       END AS at
+     ),
      live AS MATERIALIZED (
        SELECT s.id, least(s.expires_ms,a.expires_ms) AS until_ms,
               jsonb_build_array(s.id,s.provider_id,s.approval_id,s.identity_id,s.issued_epoch,
@@ -391,12 +396,26 @@ struct Proof<'a> {
     artifact: Option<&'a str>,
     reservation: Option<&'a str>,
     decider: Option<&'a str>,
+    min_now_ms: Option<i64>,
 }
 impl<'a> Proof<'a> {
+    async fn effective_clock(&self, c: &mut PgConnection) -> Result<Option<i64>, StoreError> {
+        match self.min_now_ms {
+            Some(min_now_ms) => Ok(Some(store::post_lock_clock_ms(c, min_now_ms).await?)),
+            None => Ok(None),
+        }
+    }
     fn query<'q>(&'q self, sql: &'q str) -> Query<'q, Postgres, PgArguments> {
+        self.query_at(sql, None)
+    }
+    fn query_at<'q>(
+        &'q self,
+        sql: &'q str,
+        now_ms: Option<i64>,
+    ) -> Query<'q, Postgres, PgArguments> {
         let s = self.subject;
         sqlx::query(AssertSqlSafe(sql))
-            .bind(None::<i64>)
+            .bind(now_ms)
             .bind(s.session)
             .bind(s.actor)
             .bind(s.approval)
@@ -409,23 +428,29 @@ impl<'a> Proof<'a> {
             .bind(s.run)
     }
     async fn session_time(&self, c: &mut PgConnection) -> Result<i64, StoreError> {
+        let now_ms = self.effective_clock(c).await?;
         // Receipt replay depends only on this credential and current read visibility.
         let sql = format!(
             "{AUTH} SELECT floor(extract(epoch FROM t.at)*1000)::bigint AS ms
                             FROM live,t WHERE live.id=$2"
         );
         Ok(self
-            .query(&sql)
+            .query_at(&sql, now_ms)
             .fetch_optional(c)
             .await?
             .ok_or(StoreError::Denied(DenialReason::Unauthenticated))?
             .try_get("ms")?)
     }
     async fn snapshot(&self, c: &mut PgConnection) -> Result<Snapshot, StoreError> {
+        let now_ms = self.effective_clock(c).await?;
         let sql = format!(
             "{AUTH} SELECT * FROM snap WHERE octet_length(base)<=32768 AND octet_length(tool)<=32768"
         );
-        let row = self.query(&sql).fetch_optional(c).await?.ok_or(DENIED)?;
+        let row = self
+            .query_at(&sql, now_ms)
+            .fetch_optional(c)
+            .await?
+            .ok_or(DENIED)?;
         Ok(Snapshot {
             base: row.try_get("base")?,
             tool: row.try_get("tool")?,
@@ -491,6 +516,13 @@ fn session_proof<'a>(subject: &'a Subject<'a>) -> Proof<'a> {
         artifact: None,
         reservation: None,
         decider: None,
+        min_now_ms: None,
+    }
+}
+fn admission_proof<'a>(subject: &'a Subject<'a>, min_now_ms: i64) -> Proof<'a> {
+    Proof {
+        min_now_ms: Some(min_now_ms),
+        ..session_proof(subject)
     }
 }
 
@@ -498,8 +530,9 @@ pub(super) async fn admission_time(
     c: &mut PgConnection,
     r: &RunAdmission<'_>,
     session: &str,
+    min_now_ms: i64,
 ) -> Result<i64, StoreError> {
-    session_proof(&admission_subject(r, session))
+    admission_proof(&admission_subject(r, session), min_now_ms)
         .session_time(c)
         .await
 }
@@ -510,6 +543,7 @@ pub(super) async fn admission<'a>(
     session: &'a str,
     principal: &Principal,
     platform: &PlatformPolicy,
+    min_now_ms: i64,
 ) -> Result<EffectAdmission<'a>, StoreError> {
     let config = unique(r.input.config).map_err(|_| INVALID)?;
     let mode = match config.as_object().ok_or(INVALID)?.get("execution_mode") {
@@ -518,7 +552,7 @@ pub(super) async fn admission<'a>(
         Some(Value::String(s)) if s == "yolo" => "yolo",
         _ => return Err(INVALID),
     };
-    let snap = session_proof(&admission_subject(r, session))
+    let snap = admission_proof(&admission_subject(r, session), min_now_ms)
         .snapshot(c)
         .await?;
     if mode == "yolo" {
@@ -602,6 +636,7 @@ fn proof<'a>(s: &'a Subject<'a>, review: &'a Review, decider: Option<&'a str>) -
         artifact: review.artifact.as_deref(),
         reservation: review.reservation.as_ref().map(|q| q.id.as_str()),
         decider,
+        min_now_ms: None,
     }
 }
 async fn authorized(

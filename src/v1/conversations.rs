@@ -116,7 +116,7 @@ impl Api {
             reason: None,
         };
         if matches!(op, Op::CancelRun | Op::CreateRun) {
-            let (status, run) = match &content {
+            let (status, run, verified_now_ms) = match &content {
                 Content::Run(request) => {
                     let limits = limits.ok_or(PROVISIONING)?;
                     self.with_connection(async |c| {
@@ -130,7 +130,13 @@ impl Api {
                 }
             };
             return self
-                .run_response(&context, keys.ok_or(PROVISIONING)?, &run, status)
+                .run_response(
+                    &context,
+                    keys.ok_or(PROVISIONING)?,
+                    &run,
+                    status,
+                    verified_now_ms,
+                )
                 .await;
         }
 

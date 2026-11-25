@@ -1373,22 +1373,16 @@ async fn retention_set_grace_serializes_with_approval_withdrawal_provider_retire
         "authorization_audit",
     ] {
         let before = revision(&mut owner).await;
-        // Pre-open and warm connections before computing the short DB-clock TTL so connection
-        // setup cannot consume the window before the intended lock wait.
+        // Complete all fixture setup, connection warming, and holder lock acquisition before
+        // arming the short DB-clock TTL so setup latency cannot consume the window.
+        let expiring =
+            authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE)
+                .await;
+        authz_store::make_admin(&mut owner, &expiring).await;
+        let key = format!("ret-exp-{wait_on}");
         let mut holder = connect(&db.0, OWNER).await;
         let holder_pid = backend_pid(&mut holder).await;
         let mut caller = connect(&db.0, API).await;
-        let db_now_ms: i64 = sqlx::query_scalar(
-            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        let expires_ms = db_now_ms + 600;
-        let expiring =
-            authz_store::account(&mut owner, authz_store::PROVIDER, true, expires_ms).await;
-        authz_store::make_admin(&mut owner, &expiring).await;
-        let key = format!("ret-exp-{wait_on}");
 
         holder.execute("BEGIN").await.unwrap();
         match wait_on {
@@ -1418,6 +1412,21 @@ async fn retention_set_grace_serializes_with_approval_withdrawal_provider_retire
                 .unwrap();
             }
         }
+        let db_now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let expires_ms = db_now_ms + 600;
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
+        )
+        .bind(expires_ms)
+        .bind(&expiring.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
         let setter = tokio::spawn({
             let (expiring, key) = (expiring.clone(), key.clone());
             async move {

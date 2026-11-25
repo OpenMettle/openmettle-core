@@ -219,17 +219,19 @@ Four invariants make this order deadlock-free and race-free:
 4. **Post-lock and post-write full authority re-verification.**
    Every administrative, project, share, conversation, branch, quota-override and run-admission
    write advances its decision clock monotonically to the primary's post-lock `clock_timestamp()`
-   (`caller_now_ms.max(post_lock_ms)` in Rust; `clock_timestamp()` directly in SQL
-   `retention_set_grace` and session-bound run admission) before judging authority, and
-   re-verifies the **complete live authorization predicate** (active user, active unexpired
-   approval, non-retired provider, live local groups, live OIDC `membership_observations`, project
-   role, resource share, required capabilities, originating session, and family policy for new run
-   admissions) after the **very last blocking SQL write** in the transaction (`apply`, `set_direct`,
-   `insert_branch`, `publish`, `authorization_audit` insert, `quota_upsert_scope_override` /
-   `quota_revoke_scope_override`, `reserve_admitted_run_budget` / `backfill_replayed_run_budget`)
-   immediately before commit. Self-revoking admin/member mutations preserve only the transaction's
-   own just-revoked direct admin/owner grant while still verifying post-write approval, provider,
-   OIDC/local group and user liveness.
+   (`caller_now_ms.max(post_lock_ms)` in Rust and session-bound run admission; `clock_timestamp()`
+   directly in SQL `retention_set_grace`) before judging authority, and re-verifies the **complete
+   live authorization predicate** (active user, active unexpired approval, non-retired provider,
+   live local groups, live OIDC `membership_observations`, project role, resource share and
+   recipient eligibility, input attachment readability, required capabilities, originating session,
+   and family policy for new run admissions and newly backfilled queued replay holds) after the
+   **very last blocking SQL write** in the transaction (`apply`, `set_direct`, `insert_branch`,
+   `publish`, `authorization_audit` insert, `quota_upsert_scope_override` /
+   `quota_revoke_scope_override`, `reserve_admitted_run_budget` / `backfill_replayed_run_budget`,
+   including when a queued replay backfill hits a quota refusal) immediately before commit.
+   Role and share mutations restore only the changed grantee's pre-write direct assignment when
+   re-checking post-write authority so newly written roles or shares cannot self-authorize while
+   valid self-demotions, group self-demotions and share revocations remain permitted.
 
 ## Capabilities and explicit denies
 

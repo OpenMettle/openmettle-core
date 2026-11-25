@@ -8561,24 +8561,19 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
     // 3. Approval expiring while waiting on either account_admin_lock or storage_accounts is
     //    rejected with InactivePrincipal and writes nothing.
     for wait_on in ["account_admin_lock", "storage_accounts"] {
-        // Pre-open and warm connections before computing the short DB-clock TTL.
-        let mut holder = connect(&db.0, OWNER).await;
-        let holder_pid = backend_pid(&mut holder).await;
-        let mut writer_conn = connect(&db.0, API).await;
-        let db_now_ms: i64 = sqlx::query_scalar(
-            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        let expires_ms = db_now_ms + 500;
+        // Complete all fixture setup, connection warming, and holder lock acquisition before
+        // arming the short DB-clock TTL so setup latency cannot consume the window.
         let expiring =
-            authz_store::account(&mut owner, authz_store::PROVIDER, true, expires_ms).await;
+            authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE)
+                .await;
         authz_store::make_admin(&mut owner, &expiring).await;
         let audited: i64 = sqlx::query_scalar(audit_rows)
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        let mut writer_conn = connect(&db.0, API).await;
 
         holder.execute("BEGIN").await.unwrap();
         if wait_on == "account_admin_lock" {
@@ -8595,6 +8590,22 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
             .await
             .unwrap();
         }
+
+        let db_now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let expires_ms = db_now_ms + 600;
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
+        )
+        .bind(expires_ms)
+        .bind(&expiring.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
 
         let writer = tokio::spawn({
             let (expiring, scope) = (expiring.clone(), scope.clone());

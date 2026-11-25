@@ -602,6 +602,22 @@ pub(crate) async fn create_project_checked(
     .await
 }
 
+/// Restore only the direct grants for `grantee` from `pre_apply` into `fresh`, keeping all
+/// post-write mapped grants and every other grantee's live state untouched.
+fn restore_direct_grantee<P>(
+    mut fresh: Vec<Grant<P>>,
+    pre_apply: Vec<Grant<P>>,
+    grantee: &Grantee,
+) -> Vec<Grant<P>> {
+    fresh.retain(|g| !(g.origin == Origin::Direct && &g.grantee == grantee));
+    fresh.extend(
+        pre_apply
+            .into_iter()
+            .filter(|g| g.origin == Origin::Direct && &g.grantee == grantee),
+    );
+    fresh
+}
+
 /// The project write protocol: lock the project (taking `account_admin_lock FOR SHARE` first on
 /// distinct two-user writes for rolling-upgrade safety), lock and re-hydrate the actor at
 /// post-lock time, hydrate the project, decide with `authorize`, record the audit row, `apply`
@@ -616,7 +632,7 @@ async fn project_write(
     project_id: &str,
     (change, frozen): (Change, bool),
     target_user: Option<(&str, UserLock)>,
-    self_member_change: bool,
+    changed_grantee: Option<&Grantee>,
     authorize: impl Fn(&Principal, Project) -> Decision,
     apply: impl AsyncFnOnce(&mut WriteTransaction<'_>, &str, &Principal) -> Result<(), StoreError>,
     post_check: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
@@ -637,7 +653,7 @@ async fn project_write(
         lock_actor_authority_with(c, ctx, UserLock::Share, target_user).await?;
         let (actor, post_lock_ctx) = post_lock_acting(c, ctx).await?;
         let project = project_in(c, project_id, &locked.scope, post_lock_ctx.now_ms).await?;
-        let pre_apply_project = self_member_change.then(|| project.clone());
+        let pre_apply_project = changed_grantee.is_some().then(|| project.clone());
         let decision = authorize(&actor, project);
         if locked.deleted {
             return deleted_replay(c, &post_lock_ctx, &change, decision).await;
@@ -653,29 +669,23 @@ async fn project_write(
         let c = tx.connection()?;
         let (fresh_actor, fresh_ctx) = post_lock_acting(c, &post_lock_ctx).await?;
         let fresh_project = project_in(c, project_id, &locked.scope, fresh_ctx.now_ms).await?;
-        let check_project = if let (Some(pre_apply), true) = (
+        let check_project = if let (Some(grantee), Some(pre_apply), true) = (
+            changed_grantee,
             pre_apply_project,
             matches!(outcome, WriteOutcome::Applied { .. }),
         ) {
-            // Preserve only the actor's own pre-apply direct grant on this locked project row
-            // when the transaction itself just self-demoted or self-revoked it, while still
-            // re-evaluating fresh approval/user/provider, local groups, OIDC observations and
-            // mapped grants at post-write clock_timestamp().
-            let me = Grantee::User(ctx.actor_user_id.to_owned());
-            let mut grants: Vec<_> = fresh_project
-                .grants
-                .into_iter()
-                .filter(|g| !(g.origin == Origin::Direct && g.grantee == me))
-                .collect();
-            grants.extend(
-                pre_apply
-                    .grants
-                    .into_iter()
-                    .filter(|g| g.origin == Origin::Direct && g.grantee == me),
-            );
+            // Restore only the direct role grant of the grantee this transaction just mutated
+            // under the locked project row:
+            // - A newly written direct role (for the actor or a group the actor belongs to) cannot
+            //   self-authorize the write if the actor's pre-write role expired during apply.
+            // - A still-authorized actor may self-demote or demote/revoke a group that granted
+            //   their own role when another direct owner remains.
+            // - Fresh approval/user/provider, local-group memberships, OIDC observations, mapped
+            //   grants, and every other grantee's live grants are still re-evaluated at post-write
+            //   clock_timestamp().
             Project {
                 id: fresh_project.id,
-                grants,
+                grants: restore_direct_grantee(fresh_project.grants, pre_apply.grants, grantee),
             }
         } else {
             fresh_project
@@ -819,7 +829,7 @@ pub(crate) async fn update_project_settings_checked(
         project_id,
         (change, true),
         None,
-        false,
+        None,
         authorize,
         apply,
         recheck_defaults,
@@ -872,7 +882,7 @@ async fn lifecycle(
         project_id,
         (change, false),
         None,
-        false,
+        None,
         authorize,
         apply,
         async |_, _| Ok(()),
@@ -980,14 +990,13 @@ async fn member_change(
         (true, Grantee::User(id)) => Some((id.as_str(), UserLock::Share)),
         _ => None,
     };
-    let self_member_change = matches!(grantee, Grantee::User(id) if id == ctx.actor_user_id);
     project_write(
         c,
         ctx,
         project_id,
         (change, frozen),
         target_user,
-        self_member_change,
+        Some(grantee),
         authorize,
         apply,
         async |_, _| Ok(()),
@@ -1041,6 +1050,34 @@ pub async fn unshare_resource(
     grantee: &Grantee,
 ) -> Result<WriteOutcome, StoreError> {
     share_change(c, ctx, kind, resource_id, grantee, None).await
+}
+
+async fn check_share_recipient(
+    c: &mut PgConnection,
+    actor: &Principal,
+    resource: &Resource,
+    grantee: &Grantee,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    let project = match &resource.scope {
+        Scope::Project(project) => Some(project),
+        Scope::Personal { .. } => None,
+    };
+    let decision = match grantee {
+        Grantee::User(id) => {
+            let recipient = recipient_principal(c, id, project, now_ms).await?;
+            super::authorize_share(actor, resource, ShareRecipient::User(&recipient))
+        }
+        Grantee::LocalGroup(id) => {
+            recipient_enabled(c, grantee).await?;
+            super::authorize_share(actor, resource, ShareRecipient::LocalGroup(id))
+        }
+        Grantee::OidcGroup(id) => {
+            super::authorize_share(actor, resource, ShareRecipient::OidcGroup(id))
+        }
+        Grantee::Project => super::authorize_share(actor, resource, ShareRecipient::Project),
+    };
+    check(decision)
 }
 
 async fn share_change(
@@ -1114,34 +1151,13 @@ async fn share_change(
         let scope = located.scope_id.clone();
         let located_for_recheck = located.clone();
         let resource = hydrate_located(c, kind, resource_id, located, post_lock_ctx.now_ms).await?;
-        let pre_apply_shares = access.is_none().then(|| resource.shares.clone());
+        let pre_apply_shares = resource.shares.clone();
         check(super::authorize_revoke(&actor, &resource))?;
         if access.is_some() {
             if archived {
                 return Err(ARCHIVED);
             }
-            let project = match &resource.scope {
-                Scope::Project(project) => Some(project),
-                Scope::Personal { .. } => None,
-            };
-            let decision = match grantee {
-                Grantee::User(id) => {
-                    let recipient =
-                        recipient_principal(c, id, project, post_lock_ctx.now_ms).await?;
-                    super::authorize_share(&actor, &resource, ShareRecipient::User(&recipient))
-                }
-                Grantee::LocalGroup(id) => {
-                    recipient_enabled(c, grantee).await?;
-                    super::authorize_share(&actor, &resource, ShareRecipient::LocalGroup(id))
-                }
-                Grantee::OidcGroup(id) => {
-                    super::authorize_share(&actor, &resource, ShareRecipient::OidcGroup(id))
-                }
-                Grantee::Project => {
-                    super::authorize_share(&actor, &resource, ShareRecipient::Project)
-                }
-            };
-            check(decision)?;
+            check_share_recipient(c, &actor, &resource, grantee, post_lock_ctx.now_ms).await?;
         }
         let outcome = record(c, &post_lock_ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
@@ -1163,17 +1179,22 @@ async fn share_change(
         let (fresh_actor, fresh_ctx) = post_lock_acting(c, &post_lock_ctx).await?;
         let mut fresh_resource =
             hydrate_located(c, kind, resource_id, located_for_recheck, fresh_ctx.now_ms).await?;
-        if let (Some(shares), true) = (
-            pre_apply_shares,
-            matches!(outcome, WriteOutcome::Applied { .. }),
-        ) {
-            // An owner revoking a project-wide share can remove their own visibility of another
-            // member's item as the intended effect of unshare; the scope lock prevented any other
-            // writer from changing resource shares, while fresh_actor and fresh_resource.scope
-            // still re-verify approval/provider/user, local groups and OIDC observations.
-            fresh_resource.shares = shares;
+        if matches!(outcome, WriteOutcome::Applied { .. }) {
+            // Restore only the specific direct share assignment this transaction changed:
+            // - On `share`, a newly written share (e.g. `Grantee::Project` or a local group the
+            //   actor belongs to) cannot supply the actor's own visibility if their pre-write
+            //   visibility (such as an OIDC-group share) expired during the write.
+            // - On `unshare`, a still-authorized project owner may retire a share that supplied
+            //   their own visibility while fresh_actor, fresh_resource.scope, and every other
+            //   live share are still re-verified at post-write clock_timestamp().
+            fresh_resource.shares =
+                restore_direct_grantee(fresh_resource.shares, pre_apply_shares, grantee);
         }
         check(super::authorize_revoke(&fresh_actor, &fresh_resource))?;
+        if access.is_some() {
+            check_share_recipient(c, &fresh_actor, &fresh_resource, grantee, fresh_ctx.now_ms)
+                .await?;
+        }
         Ok(outcome)
     })
     .await

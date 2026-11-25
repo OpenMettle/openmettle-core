@@ -4729,5 +4729,563 @@ async fn post_runs_rejects_authority_expired_during_quota_budget_lock_wait() {
     assert_eq!((messages, runs, holds, reserved_held), (0, 0, 0, 0));
 }
 
+/// Issue #160 (Review #2 P1 #4): when an input attachment's OIDC-group share expires while
+/// `POST /v1/runs` waits on a `quota_budgets` lock inside `reserve_admitted_run_budget`, the
+/// post-reservation `readable_revision` recheck rejects with 404 and rolls back the turn, the
+/// run, and all quota holds atomically even though the caller retains direct project/conversation
+/// access.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn post_runs_rejects_attachment_share_expired_during_quota_budget_lock_wait() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::authz::{Grantee, ProjectRole, ResourceAccess, ResourceKind, projects};
+
+    let db = TestDb::migrated().await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid = backend_pid(&mut owner_lock).await;
+    authz_store::providers(&mut owner).await;
+    let alice = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let db_now_init = db_now(&db).await;
+    drop(present_membership_at(&db, &bob, db_now_init).await);
+
+    for scope_kind in ["instance", "personal", "project"] {
+        sqlx::query(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ($1, 'usage_tokens', 100000)",
+        )
+        .bind(scope_kind)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let alice_cookie = browser(&db, &alice, 11).await;
+    let alice_b = As::Browser(&alice_cookie);
+    let bob_cookie = browser(&db, &bob, 12).await;
+    let bob_b = As::Browser(&bob_cookie);
+
+    let proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("r2-p1-4-proj"),
+            Some(&json!({"name": "AttachmentExpiry"})),
+        ),
+        201,
+    );
+    let proj_id = proj["project_id"].as_str().unwrap();
+    let proj_scope = proj["scope_id"].as_str().unwrap();
+
+    // Grant bob a permanent direct Editor role, and grant OIDC team Viewer so the artifact can be
+    // shared ONLY with OIDC team.
+    let mut api_conn = connect(&db.0, API).await;
+    projects::set_project_member_role(
+        &mut api_conn,
+        &ctx(&alice, "r2-p1-4-bob-ed"),
+        proj_id,
+        &Grantee::User(bob.user.clone()),
+        ProjectRole::Editor,
+    )
+    .await
+    .unwrap();
+    projects::set_project_member_role(
+        &mut api_conn,
+        &ctx(&alice, "r2-p1-4-oidc-view"),
+        proj_id,
+        &Grantee::OidcGroup("synthetic-team".into()),
+        ProjectRole::Viewer,
+    )
+    .await
+    .unwrap();
+
+    // Alice uploads an artifact in the project and shares it ONLY with the OIDC group.
+    let upload_body = form(
+        "r2att",
+        &[
+            metadata_part("{}"),
+            file_part(Some("secret.txt"), "text/plain", "oidc-gated attachment"),
+        ],
+        true,
+    );
+    let uploaded = success(
+        api.upload(
+            alice_b,
+            &format!("/v1/artifacts?scope_id={proj_scope}&max_bytes=1024"),
+            "r2-p1-4-upload",
+            &upload_body,
+        ),
+        201,
+    );
+    let artifact_id = uploaded["artifact_id"].as_str().unwrap();
+    let revision_id = uploaded["revision_id"].as_str().unwrap();
+    projects::share_resource(
+        &mut api_conn,
+        &ctx(&alice, "r2-p1-4-share-art"),
+        ResourceKind::Artifact,
+        artifact_id,
+        &Grantee::OidcGroup("synthetic-team".into()),
+        ResourceAccess::Read,
+    )
+    .await
+    .unwrap();
+
+    // Bob creates a conversation in the project (retains permanent direct access to it).
+    let conv = success(
+        api.call(
+            bob_b,
+            "POST",
+            "/v1/conversations",
+            Some("r2-p1-4-conv"),
+            Some(&json!({"scope_id": proj_scope})),
+        ),
+        201,
+    );
+
+    // Materialize instance and project quota_budgets rows for usage_tokens.
+    let seed: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'r2-p1-4-budget-seed',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(proj_scope)
+    .bind(&bob.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap()
+    );
+
+    let run_body = json!({
+        "conversation_id": conv["conversation_id"],
+        "branch_id": conv["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f161",
+                "parts": [
+                    {"text": "read attached file"},
+                    {"attachment": revision_id}
+                ]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+
+    // Lock instance quota_budgets row BEFORE shortening bob's OIDC observation TTL.
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 700;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&bob.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let api = std::sync::Arc::new(api);
+    let api_c = std::sync::Arc::clone(&api);
+    let cookie_c = bob_cookie.clone();
+    let http_task = tokio::task::spawn_blocking(move || {
+        api_c.call(
+            As::Browser(&cookie_c),
+            "POST",
+            "/v1/runs",
+            Some("r2-p1-4-attach-expiry"),
+            Some(&run_body),
+        )
+    });
+
+    wait_for_blocked_peer(&db, lock_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    inst_tx.rollback().await.unwrap();
+
+    let (status, body) = http_task.await.unwrap();
+    assert_eq!(status, 404, "{body}");
+
+    // Turn message, run row, and quota holds must all have rolled back atomically.
+    let (messages, runs, holds, reserved_held): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM openmettle.messages),
+            (SELECT count(*) FROM openmettle.runs),
+            (SELECT count(*) FROM openmettle.quota_reservations WHERE state = 'reserved'),
+            (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((messages, runs, holds, reserved_held), (0, 0, 0, 0));
+}
+
+/// Issue #160 (Review #2 P1 #5 & P2 #2):
+/// 1. (P2 #2) Exact replay of a legacy/unheld queued run during family quiet hours returns 200 OK
+///    with the original `run_id` while rolling back newly backfilled quota holds.
+/// 2. (P1 #5) When caller authority expires while `backfill_replayed_run_budget` waits on a
+///    `quota_budgets` lock and hits a quota refusal, `POST /v1/runs` rejects with 401 rather than
+///    returning 200 OK with stale pre-wait credentials.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_backfill_on_family_policy()
+ {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::migrate;
+
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &migrate::MIGRATIONS[..23])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid = backend_pid(&mut owner_lock).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = personal_of(&db, &alice).await;
+    migrate::apply(&settings, migrate::MIGRATIONS)
+        .await
+        .unwrap();
+
+    for scope_kind in ["instance", "personal"] {
+        sqlx::query(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ($1, 'usage_tokens', 100000)",
+        )
+        .bind(scope_kind)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let admin_tok = native(&db, &admin, 21).await;
+    let admin_n = As::Native(&admin_tok);
+    let alice_cookie = browser(&db, &alice, 22).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    // Admit two pre-activation queued runs (zero quota_reservations holds).
+    let conv1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("r2-rep-conv1"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run1_body = json!({
+        "conversation_id": conv1["conversation_id"],
+        "branch_id": conv1["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f162",
+                "parts": [{"text": "legacy queued run 1"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+    let run1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("r2-rep-key1"),
+            Some(&run1_body),
+        ),
+        201,
+    )["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let conv2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("r2-rep-conv2"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run2_body = json!({
+        "conversation_id": conv2["conversation_id"],
+        "branch_id": conv2["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f163",
+                "parts": [{"text": "legacy queued run 2"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+    let run2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("r2-rep-key2"),
+            Some(&run2_body),
+        ),
+        201,
+    )["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Activate metering + overrides and materialize instance/personal quota_budgets rows.
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true,
+                    metering_enforced_at = clock_timestamp(),
+                    overrides_enforced = true,
+                    overrides_enforced_at = clock_timestamp()
+              WHERE id",
+        )
+        .await
+        .unwrap();
+    let mut api_conn = connect(&db.0, API).await;
+    let seed: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'r2-rep-budget-seed',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap()
+    );
+
+    // 1. P2 #2: Activate 24h-minus-1m UTC quiet hours for alice. Replaying run1 must still return
+    //    200 OK with run1's ID, while rolling back newly backfilled quota holds.
+    let (cur_min,): (i32,) = sqlx::query_as(
+        "SELECT (extract(hour FROM clock_timestamp() AT TIME ZONE 'UTC')::int * 60
+               + extract(minute FROM clock_timestamp() AT TIME ZONE 'UTC')::int)",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let q_start = (cur_min + 1439) % 1440;
+    let q_end = (cur_min + 1438) % 1440;
+    let policy_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.family_policies
+             (grantee_kind, grantee_user_id, active, zone, quiet_start_minute, quiet_end_minute)
+         VALUES ('user', $1::uuid, true, 'UTC', $2, $3)
+         RETURNING id::text",
+    )
+    .bind(&alice.user)
+    .bind(q_start as i16)
+    .bind(q_end as i16)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+
+    let replayed1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("r2-rep-key1"),
+            Some(&run1_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed1["run_id"], run1);
+    let (run1_qr, held1): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+            (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run1)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        (run1_qr, held1),
+        (0, 0),
+        "quiet-hours replay must not commit newly backfilled quota holds"
+    );
+
+    sqlx::query("DELETE FROM openmettle.family_policies WHERE id = $1::uuid")
+        .bind(&policy_id)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+
+    // 2. P1 #5: Lower alice's personal usage_tokens override to 0 so backfill hits a quota
+    //    refusal. Hold the instance quota_budgets row lock BEFORE arming alice's short approval
+    //    TTL; once the approval expires during the backfill wait, POST /v1/runs must return 401
+    //    (not 200 OK).
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{scope}/quotas/usage_tokens"),
+            Some("r2-rep-zero-tokens"),
+            Some(&json!({"hard_limit": "0", "reason": "force backfill quota refusal"})),
+        ),
+        200,
+    );
+
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let expires_ms = db_now_ms + 700;
+    sqlx::query(
+        "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
+    )
+    .bind(expires_ms)
+    .bind(&alice.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let api = std::sync::Arc::new(api);
+    let api_c = std::sync::Arc::clone(&api);
+    let cookie_c = alice_cookie.clone();
+    let http_task = tokio::task::spawn_blocking(move || {
+        api_c.call(
+            As::Browser(&cookie_c),
+            "POST",
+            "/v1/runs",
+            Some("r2-rep-key2"),
+            Some(&run2_body),
+        )
+    });
+
+    wait_for_blocked_peer(&db, lock_pid).await;
+    wait_past_db_ms(&mut owner, expires_ms).await;
+    inst_tx.rollback().await.unwrap();
+
+    let (status, body) = http_task.await.unwrap();
+    assert_eq!(status, 401, "{body}");
+
+    let (run2_qr, held2): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+            (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run2)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((run2_qr, held2), (0, 0));
+}
+
 #[path = "run_events_http.rs"]
 mod run_events_http;

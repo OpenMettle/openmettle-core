@@ -304,6 +304,7 @@ pub enum Operation<'a> {
 pub struct RunTarget {
     pub branch_id: String,
     pub input_message_id: String,
+    pub attachment_revisions: Vec<String>,
 }
 
 /// Only visible active or retained revisions reach the caller. Only active ones supply bytes.
@@ -520,14 +521,21 @@ pub async fn prepare_turn(
             return Ok(RunTarget {
                 branch_id,
                 input_message_id: id,
+                attachment_revisions: revisions,
             });
         }
     };
     validate_parts(input.parts, true)?;
-    for p in input.parts {
-        if let Part::Attachment(id) = p {
-            readable_revision(c, &actor, chat.scope, id, post_lock_ctx.now_ms).await?;
-        }
+    let attachment_revisions: Vec<String> = input
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            Part::Attachment(id) => Some(id.clone()),
+            Part::Text(_) => None,
+        })
+        .collect();
+    for revision in &attachment_revisions {
+        readable_revision(c, &actor, chat.scope, revision, post_lock_ctx.now_ms).await?;
     }
     insert_message(c, chat, input.id, parent.as_deref()).await?;
     sqlx::query(
@@ -557,14 +565,13 @@ pub async fn prepare_turn(
         Action::RunExecute,
     )
     .await?;
-    for p in input.parts {
-        if let Part::Attachment(id) = p {
-            readable_revision(c, &fresh_actor, chat.scope, id, fresh_ctx.now_ms).await?;
-        }
+    for revision in &attachment_revisions {
+        readable_revision(c, &fresh_actor, chat.scope, revision, fresh_ctx.now_ms).await?;
     }
     Ok(RunTarget {
         branch_id: destination,
         input_message_id: input.id.to_owned(),
+        attachment_revisions,
     })
 }
 

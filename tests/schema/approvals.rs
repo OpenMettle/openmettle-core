@@ -2170,5 +2170,160 @@ async fn restore_preserves_receipts_and_unknown_intents_without_authorizing_a_se
     );
 }
 
+/// Issue #160 (Review #2 P2 #1): session-bound `admit_run_with_mode` honors the caller's monotonic
+/// `request.now_ms` floor against both `local_sessions`/`local_identity_approvals` expiry and
+/// OIDC `membership_observations` freshness, even when `request.now_ms` is ahead of the DB wall
+/// clock.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
+    use super::authz_store::{ctx, present_membership_at};
+    use openmettle_core::authz::{DenialReason, Grantee, ProjectRole, projects, store::StoreError};
+
+    let f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+
+    // 1. Session expires 60s in the future on the DB clock, but request.now_ms is 120s ahead
+    //    (simulating a monotonic floor after a backward clock step) -> must fail Unauthenticated.
+    sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
+        .bind(db_now_ms + 60_000)
+        .bind(f.user.locator())
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    {
+        let mut c = api(&f.db).await;
+        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+        let config = json!({"execution_mode": "ordinary"}).to_string();
+        let request = RunAdmission {
+            input: RunInput {
+                scope: &f.scope,
+                actor: &f.actor.user,
+                conversation: &f.conv,
+                branch: &f.branch,
+                message: &f.message,
+                key: "min-now-session-expired",
+                format: "synthetic.run",
+                version: 1,
+                input: b"message",
+                config: config.as_bytes(),
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: db_now_ms + 120_000,
+            cost_qualified: None,
+        };
+        let err = queue::admit_run_with_mode(&mut tx, &request, &LIMITS, &f.user)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(
+            matches!(err, StoreError::Denied(DenialReason::Unauthenticated)),
+            "expected Unauthenticated, got {err:?}"
+        );
+    }
+
+    // 2. Restore long-lived session; seed an OIDC-group-only project membership expiring at
+    //    db_now_ms + 60_000. Passing request.now_ms = db_now_ms + 120_000 must reject the stale
+    //    OIDC observation even though DB clock_timestamp() is still before expires_ms.
+    sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
+        .bind(FUTURE)
+        .bind(f.user.locator())
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let empty = json!({});
+    let proj_id = match projects::create_project(
+        &mut api(&f.db).await,
+        &ctx(&alice, "min-now-proj"),
+        &projects::ProjectSettingsInput {
+            name: "MinNow",
+            instructions: "",
+            defaults: &empty,
+        },
+    )
+    .await
+    .unwrap()
+    {
+        openmettle_core::authz::store::WriteOutcome::Applied { target_id } => target_id,
+        other => panic!("expected Applied, got {other:?}"),
+    };
+    let proj_scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&proj_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    projects::set_project_member_role(
+        &mut api(&f.db).await,
+        &ctx(&alice, "min-now-oidc-role"),
+        &proj_id,
+        &Grantee::OidcGroup("synthetic-team".into()),
+        ProjectRole::Editor,
+    )
+    .await
+    .unwrap();
+    drop(present_membership_at(&f.db, &f.actor, db_now_ms).await);
+    let proj_conv = chat(&f.db, &proj_scope, "project", &f.actor).await;
+    let proj_branch: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&proj_scope)
+    .bind(&proj_conv)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let proj_msg = message(&mut owner, &proj_scope, &proj_conv, None)
+        .await
+        .unwrap();
+
+    {
+        let mut c = api(&f.db).await;
+        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+        let config = json!({"execution_mode": "ordinary"}).to_string();
+        let request = RunAdmission {
+            input: RunInput {
+                scope: &proj_scope,
+                actor: &f.actor.user,
+                conversation: &proj_conv,
+                branch: &proj_branch,
+                message: &proj_msg,
+                key: "min-now-oidc-expired",
+                format: "synthetic.run",
+                version: 1,
+                input: b"message",
+                config: config.as_bytes(),
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: db_now_ms + 120_000,
+            cost_qualified: None,
+        };
+        let err = queue::admit_run_with_mode(&mut tx, &request, &LIMITS, &f.user)
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert!(
+            matches!(err, StoreError::Denied(DenialReason::NotFound)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    let run_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.runs")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
 #[path = "mcp.rs"]
 mod mcp_core;

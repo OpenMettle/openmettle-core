@@ -1064,7 +1064,7 @@ pub(crate) async fn verify_admission_authority(
 ) -> Result<(Principal, PlatformPolicy, bool, i64), StoreError> {
     let r = &request.input;
     let now = match session {
-        Some(locator) => super::approvals::admission_time(c, request, locator).await?,
+        Some(locator) => super::approvals::admission_time(c, request, locator, min_now_ms).await?,
         None => store::post_lock_clock_ms(c, min_now_ms).await?,
     };
     let principal =
@@ -1271,9 +1271,9 @@ async fn admit(
         return Ok(Admission::Refused(refusal));
     }
     let effect = match session {
-        Some(session) => {
-            Some(super::approvals::admission(c, request, session, &principal, &platform).await?)
-        }
+        Some(session) => Some(
+            super::approvals::admission(c, request, session, &principal, &platform, now).await?,
+        ),
         None => None,
     };
     // Step 7: the new row is the reservation of the run slot.

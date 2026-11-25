@@ -1751,21 +1751,14 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
     );
 
     for wait_on in ["account_admin_lock", "local_groups"] {
-        // Open and warm connections before computing the short DB-clock TTL so connection setup
-        // never consumes the approval window before the intended lock wait.
+        // Complete all fixture setup, connection warming, and holder lock acquisition before
+        // arming the short DB-clock TTL so setup latency cannot consume the window.
+        let expiring = account(&mut owner, PROVIDER, true, FUTURE).await;
+        make_admin(&mut owner, &expiring).await;
+        let audited = audit(&db).await.len();
         let mut holder = connect(&db.0, OWNER).await;
         let holder_pid = backend_pid(&mut holder).await;
         let mut writer_conn = connect(&db.0, API).await;
-        let db_now_ms: i64 = sqlx::query_scalar(
-            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        let expires_ms = db_now_ms + 500;
-        let expiring = account(&mut owner, PROVIDER, true, expires_ms).await;
-        make_admin(&mut owner, &expiring).await;
-        let audited = audit(&db).await.len();
 
         holder.execute("BEGIN").await.unwrap();
         if wait_on == "account_admin_lock" {
@@ -1780,6 +1773,22 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
                 .await
                 .unwrap();
         }
+
+        let db_now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let expires_ms = db_now_ms + 600;
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
+        )
+        .bind(expires_ms)
+        .bind(&expiring.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
 
         let writer = tokio::spawn({
             let (expiring, group) = (expiring.clone(), group.clone());
