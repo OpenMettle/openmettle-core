@@ -907,8 +907,54 @@ fn has_json_escape_sequence(s: &str) -> bool {
     false
 }
 
+fn is_json_number_literal(trimmed: &str) -> bool {
+    let b = trimmed.as_bytes();
+    let mut i = 0;
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            i += 1;
+            while matches!(b.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        if !matches!(b.get(i), Some(b'0'..=b'9')) {
+            return false;
+        }
+        while matches!(b.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !matches!(b.get(i), Some(b'0'..=b'9')) {
+            return false;
+        }
+        while matches!(b.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+    }
+    i == b.len()
+}
+
 fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&str>) -> String {
     if handle_field.is_none() && handle.is_none() {
+        return block.to_owned();
+    }
+    // Preserve standalone RFC 8259 JSON number literals verbatim so integers exceeding `u64::MAX`
+    // (e.g. `18446744073709551617`) or wide decimals never lose precision through `serde_json` `f64`
+    // conversion while short handles (e.g. `"1"`) still do not corrupt numeric tokens.
+    if is_json_number_literal(block.trim_ascii()) {
         return block.to_owned();
     }
     if let Ok(mut parsed) = serde_json::from_str::<Value>(block) {
@@ -1737,6 +1783,7 @@ mod tests {
             content_blocks: vec![
                 deep_json,
                 "10".into(),
+                "18446744073709551617".into(),
                 "true".into(),
                 "false".into(),
                 "null".into(),
@@ -1749,7 +1796,17 @@ mod tests {
         assert!(!dp_out.contains("quote"));
         assert!(!dp_out.contains("slash"));
         let dp_lines: Vec<&str> = dp_out.lines().collect();
-        assert_eq!(dp_lines, vec!["[REDACTED]", "10", "true", "false", "null"]);
+        assert_eq!(
+            dp_lines,
+            vec![
+                "[REDACTED]",
+                "10",
+                "18446744073709551617",
+                "true",
+                "false",
+                "null"
+            ]
+        );
 
         let bool_handle = ToolCallSuccess {
             text: String::new(),
@@ -1760,15 +1817,52 @@ mod tests {
         let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle")).unwrap();
         assert_eq!(bh_out, "true\nfalse\nnull");
 
-        // 10. Linear per-base cursor disambiguates hundreds of colliding keys without quadratic probing.
+        // 10. Linear per-base cursor disambiguates 500 distinct keys that ALL redact to the exact
+        //     same `base`, advancing `cursors[&base].0` across insertions without quadratic re-probing.
+        let shared_base = ["[REDACTED]"; 9].join("_");
         let mut many_keys = Map::new();
         many_keys.insert("handle".into(), json!("hk"));
-        for i in 0..500usize {
-            many_keys.insert(
-                format!("same_{}", "hk".repeat(i + 1)),
-                json!(format!("v_{i}_hk")),
+        for mask in 1..=500usize {
+            let key = (0..9)
+                .map(|bit| {
+                    if (mask >> bit) & 1 == 1 {
+                        "hk"
+                    } else {
+                        "[REDACTED]"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("_");
+            assert_eq!(redact_plain_str(&key, "hk"), shared_base);
+            assert!(
+                many_keys
+                    .insert(key, json!(format!("v_{mask}_hk")))
+                    .is_none()
             );
         }
+        assert_eq!(many_keys.len(), 501);
+
+        let orig_set: BTreeSet<String> = many_keys.keys().cloned().collect();
+        let mut probe_out = Map::new();
+        let mut cursors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for step in 1..=500usize {
+            let chosen = disambiguate_redacted_key(
+                shared_base.clone(),
+                "hk",
+                &probe_out,
+                &orig_set,
+                &mut cursors,
+            );
+            if step == 1 {
+                assert_eq!(chosen, shared_base);
+                assert!(!cursors.contains_key(&shared_base));
+            } else {
+                assert_eq!(chosen, format!("{shared_base}#{step}"));
+                assert_eq!(cursors[&shared_base].0, step + 1);
+            }
+            probe_out.insert(chosen, Value::Null);
+        }
+
         let many = ToolCallSuccess {
             text: String::new(),
             content_blocks: Vec::new(),
@@ -1779,7 +1873,12 @@ mod tests {
         assert_eq!(m_h.as_deref(), Some("hk"));
         assert!(!m_out.contains("hk"));
         let m_parsed: Value = serde_json::from_str(&m_out).expect("valid JSON");
-        assert_eq!(m_parsed.as_object().unwrap().len(), 500);
+        let m_obj = m_parsed.as_object().unwrap();
+        assert_eq!(m_obj.len(), 500);
+        assert!(m_obj.contains_key(&shared_base));
+        for n in 2..=500usize {
+            assert!(m_obj.contains_key(&format!("{shared_base}#{n}")));
+        }
     }
 
     #[test]
