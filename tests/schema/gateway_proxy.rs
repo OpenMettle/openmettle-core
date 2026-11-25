@@ -4645,3 +4645,173 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     assert_eq!(events, expected_events);
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }
+
+/// Review #1 P1: gateway-first `0036 -> 0037` live cutover.
+///
+/// 1. Start the `0037`-capable `openmettle-gateway` binary against a schema-36 database and
+///    complete request 1 (`02-chat-plain`), proving settlement succeeds via the pre-37 fallback.
+/// 2. Dispatch request 2 (`03-chat-stream-usage`) on schema 36 and hold its SSE stream open at
+///    the upstream while `openmettle-migrate` applies migration 37 on the same database.
+/// 3. Verify `openmettle_gateway` now receives `42501` on direct table/helper access, release
+///    the upstream stream, and verify the live gateway pool automatically switches to
+///    `openmettle.gateway_settle_report(...)` and settles both token and cost holds with zero
+///    drift and zero error events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
+ {
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..36])
+        .await
+        .unwrap();
+    db.admin()
+        .await
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    db.admin()
+        .await
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_tokens',1000000),
+                    ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+    let mut c = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut c).await;
+    let actor =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &actor).await;
+    let fixture = Fixture {
+        owner: pool(&db, OWNER),
+        worker: pool(&db, WORKER),
+        route: TurnHandoffFixture::chat(INSTALL, MODEL, UNITS, None, false),
+        other_route: TurnHandoffFixture::chat(INSTALL, OTHER_MODEL, UNITS, None, false),
+        runs: AtomicUsize::new(0),
+        issued: Mutex::default(),
+        db,
+        actor,
+        scope,
+    };
+    let h = Harness::launch(fixture, StandIn::start().await, &[]).await;
+
+    let pricing = openmettle_core::model_config::CostBound {
+        fixed_micros: 50,
+        micros_per_token: 10,
+    };
+
+    // 1. Request 1 settles cleanly on schema 36 via `store_pre37`.
+    let req1 = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let reply1 = h.send_case("02-chat-plain", &req1).await;
+    assert_eq!(reply1.status, 200);
+    assert!(reply1.complete);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while h.fixture.settlement(&req1).await.is_none() {
+        assert!(
+            Instant::now() < settle_deadline,
+            "req1 did not settle on schema 36"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        h.fixture.settlement(&req1).await,
+        Some((1, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(
+        h.fixture.hold_of(&req1, "usage_tokens").await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        h.fixture.hold_of(&req1, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "240".to_owned())
+    );
+
+    // 2. Request 2 dispatches on schema 36, holds its SSE stream open while migration 37 runs,
+    //    then finishes streaming and settles on schema 37 via `gateway_settle_report`.
+    let req2 = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let send2 = h.send_recorded("03-chat-stream-usage", &req2, Then::Read);
+    let cutover = async {
+        eventually(Duration::from_secs(10), "req2 reached stand-in", || {
+            h.upstream.count() >= 2
+        })
+        .await;
+        assert!(
+            h.fixture.dispatched(&req2).await,
+            "req2 must already be dispatched on schema 36 before migration 37"
+        );
+        assert!(
+            h.fixture.settlement(&req2).await.is_none(),
+            "req2 must still be unsettled while stream is held open"
+        );
+
+        migrate::apply(&h.fixture.db.settings(Duration::from_secs(10)), MIGRATIONS)
+            .await
+            .expect("live migration 37 during in-flight stream must succeed");
+        assert_eq!(
+            h.upstream.gate.timeouts.load(Ordering::SeqCst),
+            0,
+            "migration 37 must finish before the held stream times out"
+        );
+
+        let mut gw = connect(&h.fixture.db.0, pg::GATEWAY).await;
+        for sql in [
+            "SELECT id FROM openmettle.gateway_requests",
+            "SELECT openmettle.quota_lock_gateway_request_for_settlement(gen_random_uuid())",
+        ] {
+            assert_eq!(
+                sqlstate(gw.execute(sql).await),
+                "42501",
+                "post-37 gateway role must have zero direct table/helper access: {sql}"
+            );
+        }
+
+        h.upstream.gate.released.notify_one();
+    };
+    let (reply2, ()) = tokio::join!(send2, cutover);
+    assert_eq!(reply2.status, 200);
+    assert!(reply2.complete);
+    assert!(
+        reply2.body == recorded::body("03-chat-stream-usage"),
+        "caller must receive the complete relayed stream across the 36 -> 37 cutover"
+    );
+
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(events, []);
+    assert_eq!(
+        fixture.reports(&req2).await,
+        [(
+            req2.clone(),
+            INSTALL.to_owned(),
+            1,
+            true,
+            Some(23),
+            Some(6),
+            Some(0),
+            Some(true),
+        )]
+    );
+    assert_eq!(
+        fixture.settlement(&req2).await,
+        Some((1, true, Some("29".to_owned()), 0))
+    );
+    assert_eq!(
+        fixture.hold_of(&req2, "usage_tokens").await,
+        ("settled".to_owned(), 0, "29".to_owned())
+    );
+    assert_eq!(
+        fixture.hold_of(&req2, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "340".to_owned())
+    );
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}

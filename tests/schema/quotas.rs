@@ -3626,7 +3626,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
             actor: &alice.user,
             approval: &alice.approval,
         },
-        Some(&r_held),
+        &r_held,
         400,
         Some(600),
     )
@@ -4446,7 +4446,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             actor: &bob.user,
             approval: &bob.approval,
         },
-        Some(&r_up),
+        &r_up,
         100,
     )
     .await

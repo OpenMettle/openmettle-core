@@ -174,9 +174,7 @@ async fn run_round_reservation_release_orphan_sweep_and_settlement_finality() {
     let mut api_c = api.acquire().await.unwrap();
     let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
     for _ in 0..2 {
-        gateway::hold(&mut tx, &reserve(), Some(&run), 30)
-            .await
-            .unwrap();
+        gateway::hold(&mut tx, &reserve(), &run, 30).await.unwrap();
     }
     tx.commit().await.unwrap();
     let round = |n, token| Call {
@@ -328,7 +326,7 @@ async fn run_round_reservation_release_orphan_sweep_and_settlement_finality() {
             actor: &actor.user,
             approval: &actor.approval,
         },
-        Some(&run_direct),
+        &run_direct,
         10,
     )
     .await
@@ -393,7 +391,7 @@ async fn run_round_reservation_release_orphan_sweep_and_settlement_finality() {
             actor: &actor.user,
             approval: &actor.approval,
         },
-        Some(&run_m),
+        &run_m,
         10,
     )
     .await
@@ -437,7 +435,7 @@ async fn run_round_reservation_release_orphan_sweep_and_settlement_finality() {
             actor: &actor.user,
             approval: &actor.approval,
         },
-        Some(&run_o),
+        &run_o,
         10,
     )
     .await
@@ -548,7 +546,7 @@ async fn run_round_reservation_release_orphan_sweep_and_settlement_finality() {
                     actor: &actor.user,
                     approval: &actor.approval,
                 },
-                Some(&run_id),
+                &run_id,
                 10,
                 Some(40),
             )

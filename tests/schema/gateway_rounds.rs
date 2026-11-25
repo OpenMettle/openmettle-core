@@ -7538,6 +7538,23 @@ async fn migration_37_removes_superseded_objects_and_enforces_function_only_gate
     ] {
         assert_eq!(sqlstate(api.execute(sql).await), "42501", "api: {sql}");
     }
+    // `gateway_reservations.run_id` is NOT NULL on schema 37, so `openmettle_api` cannot insert
+    // caller-session holds with `run_id = NULL` (`23502`).
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_reservations
+                     (id,scope_id,actor_user_id,approval_id,run_id,units)
+                 VALUES (gen_random_uuid(),$1::uuid,$2::uuid,$3::uuid,NULL,10)",
+            )
+            .bind(&f.scope)
+            .bind(&f.actor.user)
+            .bind(&f.actor.approval)
+            .execute(&mut api)
+            .await,
+        ),
+        "23502"
+    );
     let chat = authz_runs::chat(&f.db, &f.scope, "personal", &f.actor).await;
     let (branch, message) = quotas::branch_and_message(&mut api, &f.scope, &chat).await;
     let std_cb = CostBound {
@@ -7584,7 +7601,7 @@ async fn migration_37_removes_superseded_objects_and_enforces_function_only_gate
             actor: &f.actor.user,
             approval: &f.actor.approval,
         },
-        Some(&api_run),
+        &api_run,
         100,
         Some(250),
     )
@@ -8395,4 +8412,151 @@ async fn migration_37_upgrade_fails_closed_on_legacy_rows_and_preserves_populate
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+}
+
+/// Review #1 P2: migration 37 drops `gateway_bindings` and `gateway_policy`, which acquires
+/// `ACCESS EXCLUSIVE` on FK parent tables (`local_identity_approvals`, `users`, `scopes`,
+/// `grant_changes`). Locking those four parents inside the bounded `NOWAIT` retry loop ensures:
+/// (a) a conflicting lock on `scopes` fails cleanly with `55P03` on `lock_timeout` (never `40P01`),
+/// and (b) a concurrent `openmettle_api` admission holding `scopes FOR KEY SHARE` can still call
+/// `gateway::hold` (`gateway_reservations`) and commit without deadlocking, after which migration
+/// 37 retries and succeeds cleanly.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p2_migration_37_nowait_locks_fk_parents_and_avoids_deadlock_with_concurrent_scopes_holder()
+ {
+    use openmettle_core::authz::gateway::{self, Reservation};
+
+    let mut f = Rounds::at(36).await;
+    f.owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000000)
+             ON CONFLICT (scope_kind, resource_kind) DO NOTHING",
+        )
+        .await
+        .unwrap();
+
+    // (a) A conflicting `ACCESS SHARE` lock on `scopes` held by an open `openmettle_api`
+    //     transaction past `lock_timeout` fails cleanly with SQLSTATE `55P03` and leaves
+    //     migration history at 36.
+    {
+        let mut api = connect(&f.db.0, API).await;
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        sqlx::query("SELECT id FROM openmettle.scopes WHERE id = $1::uuid")
+            .bind(&f.scope)
+            .fetch_one(tx.connection().unwrap())
+            .await
+            .unwrap();
+        let short = f.db.settings(Duration::from_millis(300));
+        let err = migrate::apply(&short, MIGRATIONS)
+            .await
+            .expect_err("held lock on FK parent scopes must fail migration 37 with 55P03");
+        assert!(err.to_string().contains("55P03"), "{err:?}");
+        assert!(!err.to_string().contains("40P01"), "{err:?}");
+        assert_eq!(f.db.history().await, versions_through(36));
+        tx.rollback().await.unwrap();
+    }
+
+    // (b) Concurrent `openmettle_api` run admission holds `scopes FOR KEY SHARE` while migration
+    //     37 enters its `NOWAIT` retry loop, then calls `gateway::hold` (acquiring `ROW EXCLUSIVE`
+    //     on `gateway_reservations`) and commits. Without `scopes` in the `NOWAIT` loop, the
+    //     migrator would hold `ACCESS EXCLUSIVE` on `gateway_reservations` while waiting on
+    //     `scopes` inside `DROP TABLE gateway_policy`, deadlocking (`40P01`) with `gateway::hold`.
+    let chat = authz_runs::chat(&f.db, &f.scope, "personal", &f.actor).await;
+    let mut api = connect(&f.db.0, API).await;
+    let (branch, message) = quotas::branch_and_message(&mut api, &f.scope, &chat).await;
+    let snap = quotas::snapshot(100);
+    let mut api_tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id, .. } = queue::admit_run(
+        &mut api_tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &f.scope,
+                actor: &f.actor.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &message,
+                key: "m37-nowait-scopes-race",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: &snap,
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: NOW,
+            cost_qualified: None,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+
+    let db_name = f.db.0.clone();
+    let scope = f.scope.clone();
+    let actor = f.actor.clone();
+    let settings = f.db.settings(Duration::from_secs(10));
+    let admitter = async {
+        let mut observer = connect(&db_name, OWNER).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = $1
+                        AND application_name = $2
+                        AND state = 'active'
+                        AND query LIKE '%ADR 0044, increment 6%'
+                 )",
+            )
+            .bind(&db_name)
+            .bind(migrate::APPLICATION_NAME)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if active {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "migrator never entered migration 37 NOWAIT retry loop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        gateway::hold(
+            &mut api_tx,
+            &Reservation {
+                id: &run_id,
+                scope_id: &scope,
+                actor: &actor.user,
+                approval: &actor.approval,
+            },
+            &run_id,
+            100,
+        )
+        .await
+        .expect("concurrent gateway::hold after admit_run must not deadlock with migration 37");
+        api_tx
+            .commit()
+            .await
+            .expect("concurrent admission commit must succeed");
+    };
+    let ((), mig_res) = tokio::join!(admitter, migrate::apply(&settings, MIGRATIONS));
+    mig_res.expect("migration 37 must retry and succeed after concurrent scopes holder commits");
+    assert_eq!(f.db.history().await, all_versions());
+
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(preserved, 1);
 }

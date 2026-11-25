@@ -24,7 +24,7 @@ impl fmt::Display for Error {
             Self::Refused => "gateway request refused",
             Self::Retryable => "gateway reservation retryable",
             Self::Protection => "gateway credential unavailable",
-            Self::Conflict => "gateway intent conflict",
+            Self::Conflict => "gateway usage report conflict",
         })
     }
 }
@@ -65,7 +65,7 @@ pub struct Reservation<'a> {
 pub async fn hold(
     tx: &mut WriteTransaction<'_>,
     r: &Reservation<'_>,
-    run: Option<&str>,
+    run: &str,
     units: i64,
 ) -> Result<(), Error> {
     hold_with_cost(tx, r, run, units, None).await
@@ -74,7 +74,7 @@ pub async fn hold(
 pub async fn hold_with_cost(
     tx: &mut WriteTransaction<'_>,
     r: &Reservation<'_>,
-    run: Option<&str>,
+    run: &str,
     units: i64,
     cost_ceiling: Option<i64>,
 ) -> Result<(), Error> {
@@ -88,19 +88,17 @@ pub async fn hold_with_cost(
         .bind(units)
         .execute(tx.connection()?)
         .await?;
-    if let Some(run) = run {
-        let spec = match cost_ceiling {
-            Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
-            None => crate::quotas::CostBoundSpec::Legacy,
-        };
-        let cost = crate::quotas::cost_ceiling(tx, r, None, None, spec).await?;
-        for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
-            if let Some(amount) = amount {
-                sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
-                    (SELECT coalesce(queue_expires_at,clock_timestamp())+interval '60 seconds' FROM openmettle.runs WHERE id=$6::uuid))")
-                    .bind(r.scope_id).bind(r.actor).bind(resource).bind(amount).bind(format!("run:{run}")).bind(run)
-                    .execute(tx.connection()?).await?;
-            }
+    let spec = match cost_ceiling {
+        Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
+        None => crate::quotas::CostBoundSpec::Legacy,
+    };
+    let cost = crate::quotas::cost_ceiling(tx, r, None, None, spec).await?;
+    for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
+        if let Some(amount) = amount {
+            sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
+                (SELECT coalesce(queue_expires_at,clock_timestamp())+interval '60 seconds' FROM openmettle.runs WHERE id=$6::uuid))")
+                .bind(r.scope_id).bind(r.actor).bind(resource).bind(amount).bind(format!("run:{run}")).bind(run)
+                .execute(tx.connection()?).await?;
         }
     }
     Ok(())
@@ -892,3 +890,23 @@ pub(crate) async fn consume(
 
 pub mod family;
 pub mod settlement;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn error_display_messages_are_value_free_and_match_current_surface() {
+        assert_eq!(Error::Database.to_string(), "gateway store unavailable");
+        assert_eq!(Error::Refused.to_string(), "gateway request refused");
+        assert_eq!(
+            Error::Retryable.to_string(),
+            "gateway reservation retryable"
+        );
+        assert_eq!(
+            Error::Protection.to_string(),
+            "gateway credential unavailable"
+        );
+        assert_eq!(Error::Conflict.to_string(), "gateway usage report conflict");
+    }
+}

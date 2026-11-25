@@ -27,6 +27,10 @@ BEGIN
 
     LOOP
         BEGIN
+            LOCK TABLE openmettle.local_identity_approvals IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE openmettle.users IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE openmettle.scopes IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE openmettle.grant_changes IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE openmettle.gateway_reservations IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE openmettle.gateway_requests IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE openmettle.gateway_usage_reports IN ACCESS EXCLUSIVE MODE NOWAIT;
@@ -127,6 +131,9 @@ BEGIN
             v_name
         );
     END LOOP;
+
+    ALTER TABLE openmettle.gateway_reservations
+        ALTER COLUMN run_id SET NOT NULL;
 
     ALTER TABLE openmettle.gateway_requests
         DROP CONSTRAINT gateway_requests_handoff_check,

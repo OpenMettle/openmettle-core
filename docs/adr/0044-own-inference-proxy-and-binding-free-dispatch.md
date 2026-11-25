@@ -743,29 +743,44 @@ Increment 6 (migration 37). Refs #7.
    `quota_settle_gateway_usage(uuid, uuid, uuid, bigint)` from `openmettle_gateway`, leaving
    only database `CONNECT`, schema `USAGE` and `EXECUTE` on `gateway_dispatch(uuid, bytea)`,
    `gateway_dispatch_scoped(uuid, bytea)` and `gateway_settle_report(...)`. During rolling
-   upgrades against pre-37 schemas, `settlement::store` probes `to_regprocedure` and falls back
-   to the unbound pre-37 SQL path.
+   upgrades against pre-37 schemas, `settlement::store` probes `to_regprocedure` per transaction
+   and falls back to the unbound pre-37 SQL path. Because pre-`0037` `openmettle-gateway`
+   replicas call `quota_lock_gateway_request_for_settlement` (which returns `42501` after
+   migration `37`) and the proxy has no persistent report spool, `0036` → `0037` deployments
+   must roll out gateway-first: (1) deploy the `0037`-capable `openmettle-gateway` binary
+   against schema `36`, (2) drain all pre-`0037` gateway replicas until in-flight streams and
+   final usage reports complete, and (3) apply migration `0037`, after which live `0037`-capable
+   gateway replicas transition automatically on the next settlement transaction to
+   `gateway_settle_report(...)`.
 2. **Superseded tables, columns, code and caller-session removal.** Under an autocommit-safe
-   bounded `NOWAIT` lock-retry `DO` block, migration 37 fails closed (`23514`) if any legacy
-   bound `gateway_requests`, caller-session `gateway_requests`/`gateway_reservations` or
-   caller-priced `gateway_usage_reports` rows remain; drops `gateway_handoff`,
-   `quota_commit_handoff(uuid, bytea)`, the six ADR 0037 provisioning tables (`gateway_audit`,
-   `gateway_intents`, `gateway_policy`, `gateway_generations`, `gateway_nonces`,
-   `gateway_bindings`) and `gateway_requests.{binding_id, generation, policy_revision, session_id}`
-   (setting `run_id` and `round` `NOT NULL`); revokes `openmettle_api`'s round-level privileges
-   on `gateway_requests`, `gateway_release(uuid, bytea)` and `quota_recover_lost_handoff` while
-   keeping run-admission `gateway_reservations` holds; and removes the corresponding Rust
-   reconciler, admin client, key ring/sealer, `auth_config.gateway_keys`, legacy `FamilyPolicy`,
-   `with_family_policy_v1` and caller-session dispatch types. Versioned telemetry definitions in
-   `contracts/telemetry/v1.json` and `src/telemetry/metrics.rs` stay unchanged for v1 contract
-   compatibility.
+   bounded `NOWAIT` lock-retry `DO` block (locking FK parent tables
+   `local_identity_approvals`, `users`, `scopes` and `grant_changes` before the gateway tables
+   so concurrent admission/policy transactions cannot deadlock with `DROP TABLE`), migration 37
+   fails closed (`23514`) if any legacy bound `gateway_requests`, caller-session
+   `gateway_requests`/`gateway_reservations` or caller-priced `gateway_usage_reports` rows
+   remain; drops `gateway_handoff`, `quota_commit_handoff(uuid, bytea)`, the six ADR 0037
+   provisioning tables (`gateway_audit`, `gateway_intents`, `gateway_policy`,
+   `gateway_generations`, `gateway_nonces`, `gateway_bindings`) and
+   `gateway_requests.{binding_id, generation, policy_revision, session_id}` (setting
+   `gateway_reservations.run_id`, `gateway_requests.run_id` and `gateway_requests.round`
+   `NOT NULL`); revokes `openmettle_api`'s round-level privileges on `gateway_requests`,
+   `gateway_release(uuid, bytea)` and `quota_recover_lost_handoff` while keeping run-admission
+   `gateway_reservations` holds (`gateway::hold` / `hold_with_cost` taking non-optional
+   `run: &str`); and removes the corresponding Rust reconciler, admin client, key ring/sealer,
+   `auth_config.gateway_keys`, legacy `FamilyPolicy`, `with_family_policy_v1` and caller-session
+   dispatch types. Versioned telemetry definitions in `contracts/telemetry/v1.json` and
+   `src/telemetry/metrics.rs` stay unchanged for v1 contract compatibility.
 
 ### Evidence
 
 - `migrations/0037_gateway_remove_superseded.sql`, `src/boundaries.sql` (version-gated
-  pre-37 vs `>= 37` contract), `src/authz/gateway/settlement.rs`, `src/auth_config/tests.rs`.
+  pre-37 vs `>= 37` contract), `src/authz/gateway.rs`, `src/authz/gateway/settlement.rs`,
+  `src/auth_config/tests.rs`.
 - `tests/schema/gateway_rounds.rs`, `tests/schema/gateway.rs`, `tests/schema/gateway_proxy.rs`,
   `tests/schema/grants.rs`: dropped-object assertions, `openmettle_gateway` zero-table/column
-  `42501` checks, end-to-end `gateway_settle_report` matrix, `openmettle_api` `42501` vs
-  run-admission `hold_with_cost`, boundary-tamper refusals and `36 -> 37` fail-closed preflight
-  plus populated upgrade replay with zero accounting drift.
+  `42501` checks, end-to-end `gateway_settle_report` matrix, `openmettle_api` `42501` and
+  `23502` (`gateway_reservations.run_id NOT NULL`) vs run-admission `hold_with_cost`,
+  `NOWAIT` FK-parent (`scopes`) `55P03` timeout and zero-deadlock concurrent-admission retry,
+  live gateway-first `36 -> 37` in-flight stream cutover settling through `gateway_settle_report`,
+  boundary-tamper refusals and `36 -> 37` fail-closed preflight plus populated upgrade replay
+  with zero accounting drift.

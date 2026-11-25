@@ -193,9 +193,26 @@ increment 6), `openmettle_gateway` holds zero table or column privileges: its en
 surface is database `CONNECT`, schema `USAGE` on `openmettle`, and `EXECUTE` on
 `openmettle.gateway_dispatch(uuid, bytea)`, `openmettle.gateway_dispatch_scoped(uuid, bytea)` and
 `openmettle.gateway_settle_report(...)` (during rolling upgrades against pre-37 schemas,
-settlement probes `to_regprocedure` and falls back to the unbound pre-37 SQL path). The proxy
-never reads `ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
+settlement probes `to_regprocedure` per transaction and falls back to the unbound pre-37 SQL
+path). The proxy never reads `ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
 `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present.
+
+**`0036` → `0037` rollout order (mandatory gateway-first cutover):** Migration `0037` revokes
+`openmettle_gateway`'s table privileges and `EXECUTE` on
+`quota_lock_gateway_request_for_settlement`. A pre-`0037` (`0036`) `openmettle-gateway` binary
+starts every settlement with `quota_lock_gateway_request_for_settlement`, so if it is still
+serving an in-flight stream when migration `0037` commits, its final report write fails with
+`42501` and (because the proxy has no persistent report spool) the stream's measured usage is
+lost and later closed as `unreported`. Roll out in three steps:
+
+1. Deploy the `0037`-capable `openmettle-gateway` binary against schema `36` (it probes
+   `to_regprocedure('openmettle.gateway_settle_report(...)')` per transaction and uses the
+   unbound pre-`37` settlement path).
+2. Drain all pre-`0037` (`0036`) `openmettle-gateway` replicas until their in-flight streams and
+   final usage report writes complete.
+3. Apply migration `0037` via `openmettle-migrate`: live `0037`-capable gateway replicas
+   transition automatically on their next settlement transaction to
+   `openmettle.gateway_settle_report(...)` without losing in-flight stream usage.
 
 | Setting (`OPENMETTLE_GATEWAY_` prefix) | Range | Default |
 | --- | --- | --- |
