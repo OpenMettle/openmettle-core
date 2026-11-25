@@ -76,11 +76,9 @@ pub fn valid_zone(zone: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'-' | b'_' | b'.'))
 }
 
-/// Model identifier syntax rule, matching `openmettle.family_policy_models.model`'s `CHECK`.
+/// Model identifier syntax rule, matching `model_config::name` and `family_policy_models.model`.
 pub fn valid_model(model: &str) -> bool {
-    (1..=256).contains(&model.len())
-        && model.trim() == model
-        && !model.chars().any(char::is_control)
+    crate::model_config::name(model)
 }
 
 /// OIDC group claim rule, matching `openmettle.family_policies.grantee_oidc_group_id`'s `CHECK`.
@@ -339,8 +337,16 @@ pub async fn permits_at(
     Ok(allowed)
 }
 
-/// Evaluate `openmettle.family_policy_permits` across a slice of catalog models in one round trip.
-/// Returns the subset of `models` permitted at `now_ms`. On pre-35 schemas all models pass.
+async fn has_filter_function(c: &mut PgConnection) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)') IS NOT NULL",
+    )
+    .fetch_one(&mut *c)
+    .await?)
+}
+
+/// Evaluate `openmettle.family_policy_filter_models` across a slice of catalog models in one
+/// round trip (converting each active policy's timezone once). On pre-35 schemas all models pass.
 pub async fn permits_models(
     c: &mut PgConnection,
     user_id: &str,
@@ -353,18 +359,16 @@ pub async fn permits_models(
     if models.is_empty() {
         return Ok(BTreeSet::new());
     }
-    if !has_permits_function(c).await? {
+    if !has_filter_function(c).await? {
         return Ok(models.iter().map(|m| (*m).to_owned()).collect());
     }
     let permitted: Vec<String> = sqlx::query_scalar(
-        "SELECT m
-           FROM unnest($3::text[]) AS m
-          WHERE openmettle.family_policy_permits(
-                    $1::uuid,
-                    $2::uuid,
-                    m,
-                    timestamptz 'epoch' + ($4::bigint * interval '1 millisecond')
-                )",
+        "SELECT openmettle.family_policy_filter_models(
+             $1::uuid,
+             $2::uuid,
+             $3::text[],
+             timestamptz 'epoch' + ($4::bigint * interval '1 millisecond')
+         )",
     )
     .bind(user_id)
     .bind(approval_id)
@@ -1247,7 +1251,7 @@ mod tests {
             "--kind",
             "disabled",
             "--model",
-            "heavy-model",
+            " heavy-model ",
             "--enable",
             "--operator-id",
             OP_UUID,
@@ -1262,7 +1266,7 @@ mod tests {
             AdminFamilyCommand::SetModel {
                 grantee: FamilyGrantee::LocalGroup(UUID1.into()),
                 kind: FamilyPolicyRuleKind::Disabled,
-                model: "heavy-model".into(),
+                model: " heavy-model ".into(),
                 active: true,
                 operator: AdminOperatorArgs {
                     operator_id: OP_UUID.into(),
@@ -1271,6 +1275,8 @@ mod tests {
                 },
             }
         );
+        assert!(valid_model(" padded-model "));
+        assert!(!valid_model("bad\nmodel"));
 
         for bad in [
             // Missing subcommand / unknown subcommand

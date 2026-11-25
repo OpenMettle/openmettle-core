@@ -554,6 +554,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             }
                             Err(_) => {
                                 let _ = pending.release(&self.pool).await;
+                                self.authority(&run.claim, &config).await?;
                                 return Err(FAILED);
                             }
                         }

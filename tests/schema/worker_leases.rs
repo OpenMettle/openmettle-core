@@ -5545,7 +5545,8 @@ mod live_turns {
         // The worker rechecks the run's capabilities itself before it reserves a round, so a
         // capability denied beforehand would stop it there. Deny it as the round's request is
         // inserted instead: reserve_turn_round allocates the Round 1 child hold cleanly, then
-        // pending.handoff returns Refused and must release the unsent round hold immediately.
+        // pending.handoff returns Refused, releases the unsent round hold immediately, and
+        // rechecks authority so the committed capability denial settles as `cancelled` (`revoked`).
         refused_round(
             r#"CREATE FUNCTION openmettle.test_deny_on_reserve()
                RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -5559,6 +5560,8 @@ mod live_turns {
                CREATE TRIGGER test_deny_on_reserve_trg
                    AFTER INSERT ON openmettle.gateway_requests
                    FOR EACH ROW EXECUTE FUNCTION openmettle.test_deny_on_reserve();"#,
+            "cancelled",
+            Some("revoked"),
         )
         .await;
     }
@@ -5582,14 +5585,20 @@ mod live_turns {
                    AFTER UPDATE OF state ON openmettle.gateway_requests
                    FOR EACH ROW WHEN (NEW.state = 'handed_off')
                    EXECUTE FUNCTION openmettle.test_expire_on_handoff();"#,
+            "failed",
+            Some("step_failed"),
         )
         .await;
     }
 
     /// A metered round of a model that requires one capability, with the test trigger
     /// `trigger` installed. The round is reserved, its handoff is refused, and the worker
-    /// releases the unsent round at once and fails the run without reaching the gateway.
-    async fn refused_round(trigger: &'static str) {
+    /// releases the unsent round at once and settles the run without reaching the gateway.
+    async fn refused_round(
+        trigger: &'static str,
+        expected_state: &str,
+        expected_reason: Option<&str>,
+    ) {
         use openmettle_core::quotas::{self, RunBudgetReservation};
 
         let mut chat = Chat::new().await;
@@ -5630,7 +5639,7 @@ mod live_turns {
         }
 
         let _worker = chat.start(&server).await;
-        chat.done(&id, "failed", Some("step_failed")).await;
+        chat.done(&id, expected_state, expected_reason).await;
         assert!(server.requests.try_recv().is_err());
 
         let mut owner = connect(&chat.f.db.0, OWNER).await;

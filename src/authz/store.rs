@@ -382,10 +382,11 @@ pub(super) async fn record(
 }
 
 /// The administration write protocol, in one transaction:
-/// 1. account administration and user lifecycle lock `account_admin_lock` before anything else;
-/// 2. the actor's user row is locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable
-///    targets the actor), then the actor is re-hydrated from the primary and must be an active
-///    `account_admin`;
+/// 1. account administration, user lifecycle, local-group and family-policy writes lock
+///    `account_admin_lock FOR UPDATE` before anything else;
+/// 2. the actor's provider and approval rows are locked `FOR SHARE`, then the actor's user row is
+///    locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable targets the actor), then the
+///    actor is re-hydrated from the primary and must be an active `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
 /// 4. `apply` checks the target and changes current state, or the whole transaction rolls back.
 async fn write(
@@ -397,16 +398,49 @@ async fn write(
 ) -> Result<WriteOutcome, StoreError> {
     let self_lifecycle =
         action == Action::ManageAccounts && change.target_id.as_deref() == Some(ctx.actor_user_id);
+    write_with(
+        c,
+        ctx,
+        action,
+        self_lifecycle,
+        async |_, _| Ok(change),
+        apply,
+    )
+    .await
+}
+
+async fn write_with(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    action: Action,
+    self_lifecycle: bool,
+    build_change: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<Change, StoreError>,
+    apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
         if matches!(
             action,
-            Action::ManageAccountAdmin | Action::ManageAccounts | Action::ManageFamilyPolicies
+            Action::ManageAccountAdmin
+                | Action::ManageAccounts
+                | Action::ManageLocalGroups
+                | Action::ManageFamilyPolicies
         ) {
             sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
                 .fetch_one(&mut *c)
                 .await?;
         }
+        // Hold the actor's provider and approval FOR SHARE before locking users so concurrent
+        // approval withdrawals (docs/operator/identity-approval-change.psql) serialize cleanly.
+        sqlx::query(
+            "SELECT FROM openmettle.login_providers p
+               JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
+              WHERE a.id = $1::uuid
+                FOR SHARE OF p, a",
+        )
+        .bind(ctx.actor_approval_id)
+        .execute(&mut *c)
+        .await?;
         // sessions::disable_user locks only the user row: hold the actor's row so a disable in
         // flight is waited for and seen, and a later one waits for this commit. User disable and
         // enable lock their target FOR UPDATE: on their own actor they take it here, never
@@ -429,6 +463,7 @@ async fn write(
                 enabled_account_admins: 0,
             },
         ))?;
+        let change = build_change(c, &actor).await?;
         let outcome = record(c, ctx, &change).await?;
         if let WriteOutcome::Applied { target_id } = &outcome {
             apply(c, &actor, target_id).await?;
@@ -1053,38 +1088,22 @@ async fn write_family_policy(
     apply: impl AsyncFnOnce(&mut PgConnection, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     grantee.validate()?;
-    transact(c, ctx, async move |tx| {
-        let c = tx.connection()?;
-        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
-            .fetch_one(&mut *c)
-            .await?;
-        // Serialize with sessions::disable_user so a concurrently disabled admin cannot commit.
-        sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
-            .bind(ctx.actor_user_id)
-            .execute(&mut *c)
-            .await?;
-        let actor = acting(c, ctx).await?;
-        check(super::authorize_admin(
-            &actor,
-            AdminChange {
-                action: Action::ManageFamilyPolicies,
-                removes_enabled_admin: false,
-                enabled_account_admins: 0,
-            },
-        ))?;
-        let existing = super::gateway::family::existing_policy_id(c, grantee).await?;
-        let change = Change {
-            action,
-            target_kind: "family_policy",
-            target_id: existing,
-            details,
-        };
-        let outcome = record(c, ctx, &change).await?;
-        if let WriteOutcome::Applied { target_id } = &outcome {
-            apply(c, target_id).await?;
-        }
-        Ok(outcome)
-    })
+    write_with(
+        c,
+        ctx,
+        Action::ManageFamilyPolicies,
+        false,
+        async |c, _| {
+            let existing = super::gateway::family::existing_policy_id(c, grantee).await?;
+            Ok(Change {
+                action,
+                target_kind: "family_policy",
+                target_id: existing,
+                details,
+            })
+        },
+        async |c, _, target_id| apply(c, target_id).await,
+    )
     .await
 }
 

@@ -559,45 +559,62 @@ execution, handoff or proxy dispatch.
   `NOWAIT` retry loop for `'family_policy.set'`, `'family_policy.clear'`,
   `'family_policy.model_study_allow'`, `'family_policy.model_study_revoke'`,
   `'family_policy.model_disable'` and `'family_policy.model_enable'`.
-- **Single authoritative SQL evaluator.** `openmettle.family_policy_permits(p_user, p_approval,
-  p_model, p_at)` (`STABLE`, `SECURITY DEFINER`, `SET search_path = pg_catalog`, granted to
-  `openmettle_api` and `openmettle_worker`) evaluates all applicable active policies (`user`,
-  active enabled `local_group` memberships, and fresh `'present'` `oidc_group` observations).
-  An active user row with `override_group_schedules = true` evaluates only that row. Otherwise,
-  any enabled OIDC-group observation on `p_approval` whose latest enabled group mapping rule
-  targets an active `oidc_group` family policy fails closed (`false`) whenever the observation
-  is neither a fresh current `'present'` nor a fresh current `'absent'` (protecting against
-  stale, missing, partial, ambiguous, failed or superseded group evidence while leaving
-  confirmed `'absent'` and unenrolled users unaffected). Each applicable policy converts `p_at`
-  via `pg_catalog.pg_timezone_names` so spring-forward missing minutes never occur and both
-  autumn fall-back occurrences agree, then checks `disabled`, `quiet` and `study`/`study_allow`
-  in order.
+- **Single authoritative SQL evaluator.** `openmettle.family_policy_filter_models(p_user,
+  p_approval, p_models, p_at)` (`STABLE`, `SECURITY DEFINER`, `SET search_path = pg_catalog`,
+  granted to `openmettle_api`) and its single-model wrapper `openmettle.family_policy_permits(
+  p_user, p_approval, p_model, p_at)` (granted to `openmettle_api` and `openmettle_worker`)
+  evaluate all applicable active policies (`user`, active enabled `local_group` memberships,
+  and fresh `'present'` `oidc_group` observations). An active user row with
+  `override_group_schedules = true` evaluates only that row. Otherwise, any
+  `membership_observations` row on `(p_approval, p_user)` whose enrolled mapping revision
+  (`mo.rule_id, mo.rule_revision`) OR latest mapping revision (`r.id, r.last_revision`) targets
+  an active `oidc_group` family policy fails closed (`false`) whenever the observation is
+  disabled (`NOT mo.enabled`), superseded or disabled at its mapping revision, expired/stale,
+  missing, partial, ambiguous, failed or mismatched in epoch, generation or `grant_changes`
+  (leaving confirmed fresh `'absent'` and genuinely unenrolled users unaffected). Each
+  applicable policy converts `p_at` once via PostgreSQL's in-memory `AT TIME ZONE` cache
+  (zones are validated against `pg_catalog.pg_timezone_names` on write; no per-call filesystem
+  scan) so spring-forward missing minutes never occur and both autumn fall-back occurrences
+  agree, then evaluates `quiet`, `disabled` and `study`/`study_allow` in order.
 - **Four enforcement points (catalog routes unchanged).** `GET /v1/models`, `GET /v1/presets`,
   `GET /v1/presets/{preset_id}` and `check_project_defaults` remain unchanged:
   1. *API admission & effective-configuration preview* (`src/v1/submission.rs`,
-     `src/model_config.rs`): evaluates all catalog models in one batch query at
-     `(actor.user_id, approval_id, observed_ms)`. Explicit disallowed model/preset and active
-     quiet hours return `403 policy`; omitted selection with a restricted project default
-     auto-skips to the first deterministic allowed catalog model; exact idempotent replay
-     (`Admission::Replayed`) stays `200 OK` during quiet hours.
-  2. *Worker claim & step recheck* (`src/authz/runs.rs`): `recheck_decision` checks
-     `family_policy_permits` for `openmettle.conversation` v1 snapshots (failing closed on
-     malformed v1 snapshots; skipping non-conversation synthetic runs) and invalidates with
-     `PolicyReason::FamilyPolicy` (`cancel_reason = 'revoked'`).
+     `src/model_config.rs`): resolves model/preset/capabilities first (`400 validation` on
+     missing project default or invalid input; `403 policy` without fallback on capability-denied
+     defaults), checks the resolved model via `family_policy_permits`, and batch-evaluates the
+     catalog via `family_policy_filter_models` only when an omitted selection's
+     capability-allowed project default is rejected by family policy (auto-skipping to the first
+     deterministic model permitted by both capabilities and family policy, or `403 policy` if
+     none is permitted). Exact idempotent replay (`Admission::Replayed`) stays `200 OK` during
+     quiet hours.
+  2. *Worker claim, step recheck & turn handoff* (`src/authz/runs.rs`, `src/worker/turns.rs`):
+     `recheck_run` validates `runs.actor_approval_id` when recorded; `recheck_step` evaluates
+     both `recheck_claim` and `recheck_leased` at post-fence `clock_timestamp()`;
+     `recheck_decision` decodes full `ConfigSnapshot` for `openmettle.conversation` v1 snapshots
+     (failing closed on malformed v1 snapshots; skipping non-conversation synthetic runs) and
+     invalidates with `PolicyReason::FamilyPolicy` (`cancel_reason = 'revoked'`); and
+     `TurnExecutor` rechecks authority after a refused `handoff_turn` so family denial first
+     observed at handoff settles as `revoked` rather than `step_failed`.
   3. *PostgreSQL handoff & confirm* (`gateway_round_authority`, `gateway_handoff_round`):
-     `gateway_round_authority` adds `family_policy_permits`, and `gateway_handoff_round` locks
-     applicable `local_groups` `FOR SHARE` in ascending `id` order after `users` (matching
-     `store.rs`'s `users -> local_groups` order while `account_admin_lock` serializes family
-     policy writes).
-  4. *PostgreSQL proxy dispatch* (`gateway_dispatch`): adds `family_policy_permits` in its
-     `UPDATE ... WHERE` clause so a window or switch taking effect after handoff refuses
-     dispatch (`401`, nothing sent upstream; worker sweep closes as `not_dispatched` at `0`).
+     `gateway_round_authority` adds `family_policy_permits`, while `gateway_handoff_round` keeps
+     the canonical handoff lock prefix (`account_admin_lock FOR SHARE -> projects ->
+     login_providers/approvals -> users -> runs -> gateway_reservations -> gateway_requests`);
+     both `Action::ManageLocalGroups` and `Action::ManageFamilyPolicies` (plus
+     `openmettle-admin family`) acquire `account_admin_lock FOR UPDATE`, serializing local-group
+     membership and policy changes with handoff without lock-order inversions.
+  4. *PostgreSQL proxy dispatch* (`gateway_dispatch`): after proving the bearer, acquires the
+     canonical shared authorization prefix (`account_admin_lock -> login_providers/approvals ->
+     users -> runs -> gateway_requests`) and checks `family_policy_permits` inside its
+     `UPDATE ... WHERE` clause so concurrent policy/group writes, approval withdrawals and user
+     disables serialize before spending the bearer (`401`, nothing sent upstream; wrong bearers
+     still take zero locks; worker sweep closes as `not_dispatched` at `0`).
 - **Audited administration.** `Action::ManageFamilyPolicies` (active `account_admin`,
-  serialized under `account_admin_lock FOR UPDATE` and `users(actor) FOR SHARE`) exposes
+  serialized under `account_admin_lock FOR UPDATE -> login_providers/approvals FOR SHARE ->
+  users(actor) FOR SHARE` via shared `store::write`) exposes
   `store::{set_family_policy, clear_family_policy, set_family_policy_model, load_family_policy}`
   as `openmettle_api` (`actor_kind = 'user'`). `openmettle-admin family` (`set-policy`,
-  `clear-policy`, `set-model`) connects via `OPENMETTLE_ADMIN_DATABASE_URL` (`openmettle_owner`)
-  and records `'operator'` audit rows.
+  `clear-policy`, `set-model`) connects via `OPENMETTLE_ADMIN_DATABASE_URL` (`openmettle_owner`),
+  acquires `account_admin_lock FOR UPDATE` and records `'operator'` audit rows.
 
 ### Evidence
 

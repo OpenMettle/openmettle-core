@@ -418,33 +418,33 @@ impl Catalog {
     }
 
     /// Resolve model → preset → project → request for run admission and preview, falling back
-    /// to the first deterministic permitted catalog model when the request omits both `model` and
-    /// `preset` and no project default is set or the project default is unauthorized (for example
-    /// during active study hours). An explicit request `model` or `preset` never falls back.
+    /// to the first deterministic catalog model permitted by both capabilities and family policy
+    /// ONLY when the request omits both `model` and `preset`, a project default exists and passes
+    /// `capability_allowed`, and `family_allowed` specifically rejects that project default's
+    /// model. Missing project defaults (`Invalid("model selection")`), capability-denied project
+    /// defaults (`Unauthorized`), and explicit request selections never fall back.
     pub fn resolve_with_fallback(
         &self,
         project: &Selection,
         request: &Selection,
         project_revision: Option<i64>,
-        mut authorized: impl FnMut(&str, Option<&str>) -> bool,
+        mut capability_allowed: impl FnMut(&str, Option<&str>) -> bool,
+        mut family_allowed: impl FnMut(&str) -> bool,
     ) -> Result<Effective, Error> {
-        if request.model.is_some() || request.preset.is_some() {
-            return self.resolve(project, request, project_revision, |m, p| authorized(m, p));
+        let resolved = self.resolve(project, request, project_revision, |m, p| {
+            capability_allowed(m, p)
+        })?;
+        if family_allowed(&resolved.model) {
+            return Ok(resolved);
         }
-        if project.model.is_some() || project.preset.is_some() {
-            match self.resolve(project, request, project_revision, |m, p| authorized(m, p)) {
-                Ok(effective) => return Ok(effective),
-                Err(Error::Unauthorized) => {}
-                Err(error) => return Err(error),
-            }
-        } else if self.0.models.is_empty() {
-            return Err(Error::Invalid("model selection"));
+        if request.model.is_some() || request.preset.is_some() {
+            return Err(Error::Unauthorized);
         }
         let Some(fallback) = self
             .0
             .models
             .keys()
-            .find(|id| authorized(id, None))
+            .find(|id| capability_allowed(id, None) && family_allowed(id))
             .cloned()
         else {
             return Err(Error::Unauthorized);
@@ -463,7 +463,7 @@ impl Catalog {
             &fallback_project,
             &fallback_request,
             project_revision,
-            |m, p| authorized(m, p),
+            |m, p| capability_allowed(m, p),
         )?;
         effective.model_source = Source::Model;
         Ok(effective)

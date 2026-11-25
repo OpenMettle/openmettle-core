@@ -29,9 +29,10 @@
 -- Version 35 adds `family_policies` and `family_policy_models` (`openmettle_api` SELECT and
 -- column-scoped INSERT/UPDATE only; no DELETE for any runtime role; no table privileges for
 -- worker, gateway or issuance), widens `authorization_audit` CHECK constraints, adds two
--- trigger guards (no role may call) and `family_policy_permits` (API and worker only), and
--- replaces `gateway_round_authority`, `gateway_handoff_round` (6-arg) and `gateway_dispatch`
--- with unchanged signatures, security and privileges (ADR 0044, increment 4).
+-- trigger guards (no role may call), `family_policy_filter_models` (API only) and
+-- `family_policy_permits` (API and worker only), and replaces `gateway_round_authority`,
+-- `gateway_handoff_round` (6-arg) and `gateway_dispatch` with unchanged signatures, security
+-- and privileges (ADR 0044, increment 4).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -245,6 +246,7 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.enforce_family_policy_timezone()',false,ARRAY[]::text[]),
         ('openmettle.enforce_family_policy_model_writer()',false,ARRAY[]::text[]),
+        ('openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.family_policy_permits(uuid,uuid,text,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[])) AS f WHERE $1 >= 35
 ),
 gateway_functions (signature,definer,inference) AS (

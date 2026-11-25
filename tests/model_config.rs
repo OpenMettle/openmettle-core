@@ -679,21 +679,42 @@ fn resolve_with_fallback_skips_restricted_defaults_without_relaxing_explicit_sel
 
     // Explicit disallowed model or preset never falls back.
     assert_eq!(
-        c.resolve_with_fallback(&empty, &selection(json!({"model": "a"})), None, |m, _| m
-            == "b")
-            .err(),
+        c.resolve_with_fallback(
+            &empty,
+            &selection(json!({"model": "a"})),
+            None,
+            |_, _| true,
+            |m| m == "b",
+        )
+        .err(),
         Some(Error::Unauthorized)
     );
     assert_eq!(
-        c.resolve_with_fallback(&empty, &study(), None, |m, _| m == "b")
+        c.resolve_with_fallback(&empty, &study(), None, |_, _| true, |m| m == "b")
             .err(),
         Some(Error::Unauthorized)
     );
 
-    // Omitted request selection with disallowed project default falls back deterministically to "b",
-    // dropping project controls unsupported by "b" into omissions and preserving instructions.
+    // Omitted request selection with NO project default still returns Invalid("model selection")
+    // (never falls back to catalog[0]).
+    assert_eq!(
+        c.resolve_with_fallback(&empty, &empty, None, |_, _| true, |_| true)
+            .err(),
+        Some(Error::Invalid("model selection"))
+    );
+
+    // Capability-denied project default returns Unauthorized WITHOUT falling back to "b".
+    assert_eq!(
+        c.resolve_with_fallback(&project_a, &empty, Some(4), |m, _| m == "b", |_| true)
+            .err(),
+        Some(Error::Unauthorized)
+    );
+
+    // Omitted request selection with capability-allowed project default rejected by family policy
+    // falls back deterministically to "b", dropping project controls unsupported by "b" into
+    // omissions and preserving instructions.
     let e = c
-        .resolve_with_fallback(&project_a, &empty, Some(4), |m, _| m == "b")
+        .resolve_with_fallback(&project_a, &empty, Some(4), |_, _| true, |m| m == "b")
         .unwrap();
     assert_eq!(e.model, "b");
     assert_eq!(e.model_source, Source::Model);
@@ -709,14 +730,9 @@ fn resolve_with_fallback_skips_restricted_defaults_without_relaxing_explicit_sel
             .any(|i| i.source == Source::Project && i.text == "Project guide.")
     );
 
-    // Active quiet hours (zero models permitted): unauthorized with or without a project default.
+    // Active quiet hours (zero models permitted by family policy): unauthorized.
     assert_eq!(
-        c.resolve_with_fallback(&project_a, &empty, None, |_, _| false)
-            .err(),
-        Some(Error::Unauthorized)
-    );
-    assert_eq!(
-        c.resolve_with_fallback(&empty, &empty, None, |_, _| false)
+        c.resolve_with_fallback(&project_a, &empty, None, |_, _| true, |_| false)
             .err(),
         Some(Error::Unauthorized)
     );
@@ -725,7 +741,7 @@ fn resolve_with_fallback_skips_restricted_defaults_without_relaxing_explicit_sel
     let bare =
         Catalog::load(br#"{"version":1,"revision":"empty","models":{},"presets":{}}"#).unwrap();
     assert_eq!(
-        bare.resolve_with_fallback(&empty, &empty, None, |_, _| true)
+        bare.resolve_with_fallback(&empty, &empty, None, |_, _| true, |_| true)
             .err(),
         Some(Error::Invalid("model selection"))
     );
@@ -733,7 +749,7 @@ fn resolve_with_fallback_skips_restricted_defaults_without_relaxing_explicit_sel
     // Retired/unknown project preset is not masked by fallback.
     let broken_project = selection(json!({"preset": "retired"}));
     assert_eq!(
-        c.resolve_with_fallback(&broken_project, &empty, None, |_, _| true)
+        c.resolve_with_fallback(&broken_project, &empty, None, |_, _| true, |_| true)
             .err(),
         Some(Error::Invalid("preset"))
     );

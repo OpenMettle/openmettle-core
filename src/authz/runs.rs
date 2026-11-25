@@ -56,7 +56,8 @@ macro_rules! non_terminal {
     };
 }
 
-const LOCK_RUN: &str = "SELECT actor_user_id::text, conversation_id::text, state
+const LOCK_RUN: &str =
+    "SELECT actor_user_id::text, conversation_id::text, actor_approval_id::text, state
    FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid FOR NO KEY UPDATE";
 
 // All cancellation paths use the same transition. A reason on an executing run is immutable.
@@ -238,12 +239,19 @@ async fn recheck_locked(
     c: &mut PgConnection,
     r: &RunRecheckRequest<'_>,
 ) -> Result<RunRecheckOutcome, StoreError> {
-    let (owner, conversation, state): (String, String, String) = sqlx::query_as(LOCK_RUN)
-        .bind(r.scope_id)
-        .bind(r.run_id)
-        .fetch_optional(&mut *c)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+    let (owner, conversation, approval, state): (String, String, Option<String>, String) =
+        sqlx::query_as(LOCK_RUN)
+            .bind(r.scope_id)
+            .bind(r.run_id)
+            .fetch_optional(&mut *c)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+    if approval
+        .as_deref()
+        .is_some_and(|stored| stored != r.actor_approval_id)
+    {
+        return Err(StoreError::InvalidInput("actor_approval_id"));
+    }
     if is_terminal(&state) {
         return Ok(RunRecheckOutcome::Terminal { state });
     }
@@ -331,15 +339,12 @@ fn conversation_snapshot_model(
         return Ok(None);
     }
     let doc = crate::provider_keys::documents::unique(config_snapshot).map_err(|_| ())?;
-    let model = doc
-        .as_object()
-        .and_then(|o| o.get("effective"))
-        .and_then(|e| e.as_object())
-        .and_then(|e| e.get("model"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or(())?;
-    Ok(Some(model.to_owned()))
+    let snapshot: crate::model_config::ConfigSnapshot =
+        serde_json::from_value(doc).map_err(|_| ())?;
+    if !crate::model_config::name(&snapshot.effective.model) {
+        return Err(());
+    }
+    Ok(Some(snapshot.effective.model))
 }
 
 /// Recheck the claimed run before dispatch. A denial settles stopped work under the same fence.
@@ -394,14 +399,17 @@ async fn recheck_step(
         if approval != actor_approval_id {
             return Err(StoreError::InvalidInput("actor_approval_id"));
         }
-        let r = request.copied().unwrap_or(RunRecheckRequest {
-            scope_id: lease.scope_id,
-            run_id: lease.run_id,
-            actor_approval_id,
-            capabilities: &[],
-            extra_target: None,
-            now_ms,
-        });
+        let r = match request {
+            Some(req) => RunRecheckRequest { now_ms, ..*req },
+            None => RunRecheckRequest {
+                scope_id: lease.scope_id,
+                run_id: lease.run_id,
+                actor_approval_id,
+                capabilities: &[],
+                extra_target: None,
+                now_ms,
+            },
+        };
         match recheck_decision(c, &r, &owner, &conversation).await? {
             RunContinuation::Continue => Ok(None),
             RunContinuation::Invalidate(reason) => {
@@ -1277,12 +1285,13 @@ pub async fn cancel_run(
     uuid(scope_id, "scope_id")?;
     uuid(run_id, "run_id")?;
     transaction(c, async |c| {
-        let row: Option<(String, String, String)> = sqlx::query_as(LOCK_RUN)
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(LOCK_RUN)
             .bind(scope_id)
             .bind(run_id)
             .fetch_optional(&mut *c)
             .await?;
-        let Some((_, _, state)) = row.filter(|(actor, _, _)| *actor == principal.user_id) else {
+        let Some((_, _, _, state)) = row.filter(|(actor, _, _, _)| *actor == principal.user_id)
+        else {
             return Err(StoreError::Denied(DenialReason::NotFound));
         };
         if is_terminal(&state) {

@@ -41,13 +41,17 @@ CREATE TABLE openmettle.family_policies (
     ),
     CONSTRAINT family_policies_quiet_window_check CHECK (
         (quiet_start_minute IS NULL AND quiet_end_minute IS NULL)
-        OR (quiet_start_minute BETWEEN 0 AND 1439
+        OR (quiet_start_minute IS NOT NULL
+            AND quiet_end_minute IS NOT NULL
+            AND quiet_start_minute BETWEEN 0 AND 1439
             AND quiet_end_minute BETWEEN 0 AND 1439
             AND quiet_start_minute <> quiet_end_minute)
     ),
     CONSTRAINT family_policies_study_window_check CHECK (
         (study_start_minute IS NULL AND study_end_minute IS NULL)
-        OR (study_start_minute BETWEEN 0 AND 1439
+        OR (study_start_minute IS NOT NULL
+            AND study_end_minute IS NOT NULL
+            AND study_start_minute BETWEEN 0 AND 1439
             AND study_end_minute BETWEEN 0 AND 1439
             AND study_start_minute <> study_end_minute)
     ),
@@ -96,7 +100,6 @@ CREATE TABLE openmettle.family_policy_models (
     rule_kind text NOT NULL CHECK (rule_kind IN ('study_allow', 'disabled')),
     model text NOT NULL CHECK (
         octet_length(model) BETWEEN 1 AND 256
-        AND btrim(model) = model
         AND model COLLATE "C" !~ '[[:cntrl:]]'
     ),
     active boolean NOT NULL,
@@ -202,14 +205,16 @@ BEGIN
 END
 $$;
 
--- Single authoritative evaluator shared by API admission/preview, worker claim/recheck,
--- `gateway_round_authority` and `gateway_dispatch`. Takes no row locks.
-CREATE FUNCTION openmettle.family_policy_permits(
+-- Single authoritative batch evaluator shared by API admission/preview (directly) and
+-- `family_policy_permits` (single-model wrapper). Evaluates OIDC/local-group membership and
+-- wall-clock timezone conversion ONCE per applicable policy row using PostgreSQL's in-memory
+-- timezone cache (never scanning `pg_timezone_names` per call). Takes no row locks.
+CREATE FUNCTION openmettle.family_policy_filter_models(
     p_user uuid,
     p_approval uuid,
-    p_model text,
+    p_models text[],
     p_at timestamptz)
-RETURNS boolean
+RETURNS SETOF text
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
@@ -221,9 +226,11 @@ DECLARE
     fp openmettle.family_policies%ROWTYPE;
     local_time timestamp;
     m integer;
+    v_policy_ids uuid[] := '{}'::uuid[];
+    v_study_policy_ids uuid[] := '{}'::uuid[];
 BEGIN
-    IF p_user IS NULL OR p_approval IS NULL OR p_model IS NULL OR p_at IS NULL THEN
-        RETURN false;
+    IF p_user IS NULL OR p_approval IS NULL OR p_models IS NULL OR p_at IS NULL THEN
+        RETURN;
     END IF;
     ms := floor(extract(epoch FROM p_at) * 1000)::bigint;
 
@@ -236,9 +243,11 @@ BEGIN
            AND f.override_group_schedules
     ) INTO has_override;
 
-    -- OIDC-group fail-closed rule: any enabled group membership observation on `p_approval`
-    -- targeting an active `oidc_group` family policy must be fresh, current-epoch,
-    -- current-generation `'present'` or `'absent'`, unless an active user policy sets
+    -- OIDC-group fail-closed rule: any membership observation on `(p_approval, p_user)` whose
+    -- enrolled mapping revision OR latest mapping revision targets an active `oidc_group` family
+    -- policy must be enabled, on the current enabled group revision, at the provider's latest
+    -- non-retired epoch, matching current generations, unexpired, and `'present'` or `'absent'`
+    -- (with `'present'` validated against `grant_changes`), unless an active user policy sets
     -- `override_group_schedules = true`.
     IF NOT has_override AND EXISTS (
         SELECT 1
@@ -247,8 +256,10 @@ BEGIN
           JOIN openmettle.user_identities i ON i.id = a.identity_id AND i.user_id = p_user
           JOIN openmettle.users u ON u.id = i.user_id
           JOIN openmettle.grant_mapping_rules r ON r.id = mo.rule_id
-          JOIN openmettle.grant_mapping_revisions v
-            ON v.rule_id = r.id AND v.revision = r.last_revision
+          JOIN openmettle.grant_mapping_revisions v_enrolled
+            ON v_enrolled.rule_id = mo.rule_id AND v_enrolled.revision = mo.rule_revision
+          JOIN openmettle.grant_mapping_revisions v_latest
+            ON v_latest.rule_id = r.id AND v_latest.revision = r.last_revision
           LEFT JOIN openmettle.grant_assignments g
             ON g.scope_id = mo.scope_id
            AND g.project_id = mo.project_id
@@ -267,24 +278,33 @@ BEGIN
                LIMIT 1
           ) e ON true
          WHERE mo.approval_id = p_approval
-           AND mo.enabled
-           AND v.enabled
-           AND v.selector_kind = 'group'
-           AND EXISTS (
-               SELECT 1
-                 FROM openmettle.family_policies ofp
-                WHERE ofp.grantee_kind = 'oidc_group'
-                  AND ofp.grantee_oidc_group_id = v.claim_value
-                  AND ofp.active
+           AND (
+               (v_enrolled.selector_kind = 'group' AND EXISTS (
+                   SELECT 1
+                     FROM openmettle.family_policies ofp
+                    WHERE ofp.grantee_kind = 'oidc_group'
+                      AND ofp.grantee_oidc_group_id = v_enrolled.claim_value
+                      AND ofp.active
+               ))
+               OR (v_latest.selector_kind = 'group' AND EXISTS (
+                   SELECT 1
+                     FROM openmettle.family_policies ofp
+                    WHERE ofp.grantee_kind = 'oidc_group'
+                      AND ofp.grantee_oidc_group_id = v_latest.claim_value
+                      AND ofp.active
+               ))
            )
            AND (
                CASE
-                   WHEN NOT a.active OR a.expires_ms <= ms OR u.disabled_at IS NOT NULL
+                   WHEN NOT mo.enabled
+                        OR NOT a.active OR a.expires_ms <= ms OR u.disabled_at IS NOT NULL
                         OR r.provider_config_id <> a.provider_id OR r.issuer <> i.issuer
                         OR r.last_revision <> mo.rule_revision
-                        OR v.binding_format <> 'openmettle.project-member'
-                        OR v.binding_version <> 1
-                        OR v.binding <> convert_to(mo.project_id::text, 'UTF8')
+                        OR NOT v_enrolled.enabled
+                        OR v_enrolled.selector_kind <> 'group'
+                        OR v_enrolled.binding_format <> 'openmettle.project-member'
+                        OR v_enrolled.binding_version <> 1
+                        OR v_enrolled.binding <> convert_to(mo.project_id::text, 'UTF8')
                         OR e.revision IS NULL
                         OR h.id IS DISTINCT FROM (mo.observation).change_id THEN 'failed'
                    WHEN mo.issued_ms IS NULL THEN 'missing'
@@ -302,7 +322,7 @@ BEGIN
                END
            ) NOT IN ('present', 'absent')
     ) THEN
-        RETURN false;
+        RETURN;
     END IF;
 
     FOR fp IN
@@ -380,51 +400,80 @@ BEGIN
                ))
            )
     LOOP
-        SELECT p_at AT TIME ZONE tz.name
-          INTO local_time
-          FROM pg_catalog.pg_timezone_names tz
-         WHERE tz.name = fp.zone;
-        IF NOT FOUND THEN
-            RETURN false;
-        END IF;
+        BEGIN
+            local_time := p_at AT TIME ZONE fp.zone;
+        EXCEPTION
+            WHEN invalid_parameter_value THEN
+                RETURN;
+        END;
         m := extract(hour FROM local_time)::int * 60 + extract(minute FROM local_time)::int;
-        IF EXISTS (
-            SELECT 1
-              FROM openmettle.family_policy_models r
-             WHERE r.policy_id = fp.id
-               AND r.rule_kind = 'disabled'
-               AND r.active
-               AND r.model = p_model
-        ) THEN
-            RETURN false;
-        END IF;
         IF fp.quiet_start_minute IS NOT NULL AND (
             (fp.quiet_start_minute < fp.quiet_end_minute
                 AND m >= fp.quiet_start_minute AND m < fp.quiet_end_minute)
             OR (fp.quiet_start_minute > fp.quiet_end_minute
                 AND (m >= fp.quiet_start_minute OR m < fp.quiet_end_minute))
         ) THEN
-            RETURN false;
+            RETURN;
         END IF;
+        v_policy_ids := array_append(v_policy_ids, fp.id);
         IF fp.study_start_minute IS NOT NULL AND (
             (fp.study_start_minute < fp.study_end_minute
                 AND m >= fp.study_start_minute AND m < fp.study_end_minute)
             OR (fp.study_start_minute > fp.study_end_minute
                 AND (m >= fp.study_start_minute OR m < fp.study_end_minute))
-        ) AND NOT EXISTS (
-            SELECT 1
-              FROM openmettle.family_policy_models r
-             WHERE r.policy_id = fp.id
-               AND r.rule_kind = 'study_allow'
-               AND r.active
-               AND r.model = p_model
         ) THEN
-            RETURN false;
+            v_study_policy_ids := array_append(v_study_policy_ids, fp.id);
         END IF;
     END LOOP;
 
-    RETURN true;
+    RETURN QUERY
+    SELECT DISTINCT cand.model
+      FROM unnest(p_models) AS cand(model)
+     WHERE cand.model IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+             FROM openmettle.family_policy_models r
+            WHERE r.policy_id = ANY(v_policy_ids)
+              AND r.rule_kind = 'disabled'
+              AND r.active
+              AND r.model = cand.model
+       )
+       AND NOT EXISTS (
+           SELECT 1
+             FROM unnest(v_study_policy_ids) AS sp(policy_id)
+            WHERE NOT EXISTS (
+                SELECT 1
+                  FROM openmettle.family_policy_models r
+                 WHERE r.policy_id = sp.policy_id
+                   AND r.rule_kind = 'study_allow'
+                   AND r.active
+                   AND r.model = cand.model
+            )
+       );
 END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)
+    TO openmettle_api;
+
+-- Single-model wrapper over `family_policy_filter_models` shared by API admission/preview,
+-- worker claim/recheck, `gateway_round_authority` and `gateway_dispatch`. Takes no row locks.
+CREATE FUNCTION openmettle.family_policy_permits(
+    p_user uuid,
+    p_approval uuid,
+    p_model text,
+    p_at timestamptz)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    SELECT p_model IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+             FROM openmettle.family_policy_filter_models(p_user, p_approval, ARRAY[p_model], p_at)
+       );
 $$;
 REVOKE ALL ON FUNCTION openmettle.family_policy_permits(uuid,uuid,text,timestamptz) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.family_policy_permits(uuid,uuid,text,timestamptz)
@@ -535,9 +584,12 @@ BEGIN
 END
 $$;
 
--- Lock active `local_groups` of the actor `FOR SHARE` in ascending `id` order after `users`
--- (matching `store.rs`'s `users -> local_groups` lock order while `account_admin_lock FOR SHARE`
--- serializes with family-policy writers). Signature, security and privileges are unchanged.
+-- Keep the exact canonical handoff lock prefix (`account_admin_lock -> projects ->
+-- login_providers/approvals -> users -> runs -> gateway_reservations -> gateway_requests`).
+-- Local-group and family-policy writers all acquire `account_admin_lock FOR UPDATE`, so
+-- `account_admin_lock FOR SHARE` (here and in `quota_lock_turn_handoff_prefix`) serializes
+-- every local-group membership and family-policy mutation with round handoff cleanly.
+-- Signature, security and privileges are unchanged.
 CREATE OR REPLACE FUNCTION openmettle.gateway_handoff_round(
     p_request uuid,
     p_dispatch bytea,
@@ -576,15 +628,6 @@ BEGIN
     PERFORM FROM openmettle.login_providers p JOIN openmettle.local_identity_approvals a ON a.provider_id=p.id
         WHERE a.id=req.approval_id FOR SHARE OF p,a;
     PERFORM FROM openmettle.users u WHERE u.id=req.actor_user_id FOR SHARE;
-    PERFORM FROM openmettle.local_groups lg
-      WHERE lg.id IN (
-          SELECT lm.group_id
-            FROM openmettle.local_group_memberships lm
-           WHERE lm.user_id = req.actor_user_id
-             AND lm.active
-      )
-      ORDER BY lg.id
-      FOR SHARE;
     PERFORM FROM openmettle.runs r WHERE r.id=req.run_id FOR SHARE;
     PERFORM FROM openmettle.gateway_reservations WHERE id=req.reservation_id FOR SHARE;
     PERFORM FROM openmettle.gateway_requests q WHERE q.id=p_request AND q.state='reserved' FOR UPDATE;
@@ -611,44 +654,57 @@ BEGIN
 END
 $$;
 
--- Enforce live family policy at proxy dispatch so a window or switch activated after handoff
--- refuses dispatch (`401`, nothing sent upstream; worker sweep closes as `not_dispatched` at 0).
--- Lock order, signature, security and privileges are unchanged.
+-- Enforce live family policy at proxy dispatch after acquiring canonical shared authorization
+-- locks (`account_admin_lock -> login_providers/approvals -> users -> runs -> gateway_requests`)
+-- so concurrent policy/group writes, approval withdrawals and user disables serialize before
+-- spending the bearer (`401`, nothing sent upstream; worker sweep closes as `not_dispatched`).
+-- Wrong bearers still take zero locks. Signature, security and privileges are unchanged.
 CREATE OR REPLACE FUNCTION openmettle.gateway_dispatch(p_request uuid,p_bearer_hash bytea)
 RETURNS TABLE (replayed boolean,installation text,scope text,source text,principal text,model text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     v_run uuid;
+    v_approval uuid;
+    v_actor uuid;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'gateway dispatch requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
-    SELECT q.run_id INTO v_run FROM openmettle.gateway_requests q WHERE q.id=p_request
-        AND q.bearer_hash=p_bearer_hash
-        AND pg_has_role(session_user,'openmettle_gateway','USAGE');
+    SELECT q.run_id, q.approval_id, q.actor_user_id
+      INTO v_run, v_approval, v_actor
+      FROM openmettle.gateway_requests q
+     WHERE q.id = p_request
+       AND q.bearer_hash = p_bearer_hash
+       AND pg_has_role(session_user, 'openmettle_gateway', 'USAGE');
     IF NOT FOUND THEN RETURN; END IF;
-    PERFORM FROM openmettle.runs r WHERE r.id=v_run FOR SHARE;
-    PERFORM FROM openmettle.gateway_requests q WHERE q.id=p_request
-        AND q.bearer_hash=p_bearer_hash AND q.state='handed_off'
-        AND pg_has_role(session_user,'openmettle_gateway','USAGE') FOR NO KEY UPDATE;
+    PERFORM FROM openmettle.account_admin_lock FOR SHARE;
+    PERFORM FROM openmettle.login_providers p
+       JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
+      WHERE a.id = v_approval
+        FOR SHARE OF p, a;
+    PERFORM FROM openmettle.users u WHERE u.id = v_actor FOR SHARE;
+    PERFORM FROM openmettle.runs r WHERE r.id = v_run FOR SHARE;
+    PERFORM FROM openmettle.gateway_requests q WHERE q.id = p_request
+        AND q.bearer_hash = p_bearer_hash AND q.state = 'handed_off'
+        AND pg_has_role(session_user, 'openmettle_gateway', 'USAGE') FOR NO KEY UPDATE;
     IF NOT FOUND THEN RETURN; END IF;
     RETURN QUERY
     WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS t)
-    UPDATE openmettle.gateway_requests q SET dispatched_at=clock.t
+    UPDATE openmettle.gateway_requests q SET dispatched_at = clock.t
       FROM clock
-     WHERE q.id=p_request AND q.bearer_hash=p_bearer_hash AND q.state='handed_off'
+     WHERE q.id = p_request AND q.bearer_hash = p_bearer_hash AND q.state = 'handed_off'
        AND q.dispatched_at IS NULL
-       AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id=q.id)
+       AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id)
        AND EXISTS (SELECT FROM openmettle.runs r
-            WHERE r.id=q.run_id AND r.state='running' AND r.cancel_reason IS NULL
-              AND sha256(uuid_send(r.claim_token))=q.claim_hash
-              AND r.lease_expires_at>clock.t AND r.execution_expires_at>clock.t)
+            WHERE r.id = q.run_id AND r.state = 'running' AND r.cancel_reason IS NULL
+              AND sha256(uuid_send(r.claim_token)) = q.claim_hash
+              AND r.lease_expires_at > clock.t AND r.execution_expires_at > clock.t)
        AND openmettle.family_policy_permits(q.actor_user_id, q.approval_id, q.model, clock.t)
-    RETURNING false,q.installation::text,q.scope_id::text,q.report_source::text,
-              q.actor_user_id::text,q.model;
+    RETURNING false, q.installation::text, q.scope_id::text, q.report_source::text,
+              q.actor_user_id::text, q.model;
     IF FOUND THEN RETURN; END IF;
-    RETURN QUERY SELECT true,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text
-      FROM openmettle.gateway_requests q WHERE q.id=p_request AND q.bearer_hash=p_bearer_hash
+    RETURN QUERY SELECT true, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text
+      FROM openmettle.gateway_requests q WHERE q.id = p_request AND q.bearer_hash = p_bearer_hash
        AND q.dispatched_at IS NOT NULL;
 END
 $$;

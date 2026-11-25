@@ -176,9 +176,6 @@ struct ApiServer {
 
 impl ApiServer {
     fn start(db: &TestDb) -> Self {
-        let dir = auth_config_support::Dir::new();
-        let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
-        doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
         let mut catalog: Value = serde_json::from_slice(CATALOG).unwrap();
         catalog["revision"] = json!("catalog/family-1");
         catalog["models"]["a"]["defaults"]["controls"]["output_reserve"] = json!(512);
@@ -201,6 +198,13 @@ impl ApiServer {
             "tokens_per_byte": 1,
             "tokens_per_attachment": 10
         });
+        Self::start_with_catalog(db, catalog)
+    }
+
+    fn start_with_catalog(db: &TestDb, catalog: Value) -> Self {
+        let dir = auth_config_support::Dir::new();
+        let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+        doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
         doc["admission_limits"] = json!({
             "live_per_actor": 16,
             "live_per_scope": 16,
@@ -809,9 +813,18 @@ async fn family_policy_worker_recheck_and_gateway_handoff_dispatch_refusal() {
     // Admit conversation v1 runs and one synthetic non-conversation run.
     let mut api = connect(&db.0, API).await;
     let conv_id = chat(&db, &scope, "personal", &actor).await;
-    let cfg_a = json!({"effective": {"model": "a"}, "required_capabilities": {}})
-        .to_string()
-        .into_bytes();
+    let catalog = openmettle_core::model_config::Catalog::load(CATALOG).unwrap();
+    let sel_a: openmettle_core::model_config::Selection =
+        serde_json::from_value(json!({"model": "a"})).unwrap();
+    let cfg_a = serde_json::to_vec(&openmettle_core::model_config::ConfigSnapshot {
+        effective: catalog
+            .resolve(&Default::default(), &sel_a, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: Default::default(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: None,
+    })
+    .unwrap();
     let admit_one = async |api: &mut PgConnection, key: &str, format: &str, cfg: &[u8]| -> String {
         let (branch, msg) = quotas::branch_and_message(api, &scope, &conv_id).await;
         let mut tx = WriteTransaction::begin(api).await.unwrap();
@@ -1573,6 +1586,24 @@ async fn family_policy_role_boundaries_triggers_and_upgrade_34_to_35() {
         .unwrap();
         assert_eq!(has, expect_exec, "{role} EXECUTE on family_policy_permits");
     }
+    for (role, expect_exec) in [
+        (API, true),
+        (WORKER, false),
+        (pg::GATEWAY, false),
+        (ISSUANCE, false),
+    ] {
+        let has: bool = sqlx::query_scalar(
+            "SELECT has_function_privilege($1, 'openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)', 'EXECUTE')",
+        )
+        .bind(role)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            has, expect_exec,
+            "{role} EXECUTE on family_policy_filter_models"
+        );
+    }
 
     // Trigger guards on openmettle_api:
     // - NULL updated_by_user_id refused (23514)
@@ -1632,4 +1663,873 @@ async fn family_policy_role_boundaries_triggers_and_upgrade_34_to_35() {
         "23514",
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_1_oidc_and_schema_checks() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let child = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let day_iso = "2027-01-15T12:00:00Z";
+    let day_ms: i64 = 1_800_014_400_000;
+    enroll_oidc_group(&db, &child, FAMILY_RULE, "Family", "present", day_ms).await;
+
+    // Activate OIDC 'Family' policy with quiet hours (22:00-07:00 UTC) so daytime is permitted
+    // when evidence is fresh, but any suspended/disabled/superseded enrollment MUST fail closed.
+    let policy_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.family_policies
+             (grantee_kind, grantee_oidc_group_id, active, zone, quiet_start_minute, quiet_end_minute)
+         VALUES ('oidc_group', 'Family', true, 'UTC', 1320, 420)
+         RETURNING id::text",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+
+    let mut api = connect(&db.0, API).await;
+    assert!(permits_iso(&mut api, &child, "a", day_iso).await);
+
+    // P1 #1a: suspended membership_observations (`enabled = false`) must fail closed.
+    sqlx::query("UPDATE openmettle.membership_observations SET enabled = false WHERE approval_id = $1::uuid")
+        .bind(&child.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    assert!(
+        !permits_iso(&mut api, &child, "a", day_iso).await,
+        "suspended membership_observations must fail closed"
+    );
+    sqlx::query(
+        "UPDATE openmettle.membership_observations SET enabled = true WHERE approval_id = $1::uuid",
+    )
+    .bind(&child.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    assert!(permits_iso(&mut api, &child, "a", day_iso).await);
+
+    // P1 #1b: disabling the enrolled mapping revision (`v.enabled = false`) must fail closed.
+    let (proj_id, _scope_id): (String, String) = sqlx::query_as(
+        "SELECT project_id::text, scope_id::text FROM openmettle.membership_observations WHERE approval_id = $1::uuid",
+    )
+    .bind(&child.approval)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    {
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        grants::record_mapping_revision(
+            &mut tx,
+            &MappingInput {
+                rule: FAMILY_RULE,
+                provider: PROVIDER,
+                issuer: ISSUER,
+                actor: &child.user,
+                key: "fam-rule-disable",
+                expected_revision: 1,
+                selector_kind: "group",
+                claim_name: "groups",
+                claim_value: "Family",
+                binding_format: "openmettle.project-member",
+                binding_version: 1,
+                binding: proj_id.as_bytes(),
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert!(
+        !permits_iso(&mut api, &child, "a", day_iso).await,
+        "superseded/disabled mapping revision must fail closed"
+    );
+
+    // P1 #1c: updating mapping rule to a DIFFERENT selector ('Other') while `mo` is still enrolled
+    // on revision 1 ('Family') must STILL fail closed!
+    {
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        grants::record_mapping_revision(
+            &mut tx,
+            &MappingInput {
+                rule: FAMILY_RULE,
+                provider: PROVIDER,
+                issuer: ISSUER,
+                actor: &child.user,
+                key: "fam-rule-other",
+                expected_revision: 2,
+                selector_kind: "group",
+                claim_name: "groups",
+                claim_value: "Other",
+                binding_format: "openmettle.project-member",
+                binding_version: 1,
+                binding: proj_id.as_bytes(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert!(
+        !permits_iso(&mut api, &child, "a", day_iso).await,
+        "superseded mapping rule moved to another selector must still fail closed on enrolled 'Family' claim"
+    );
+
+    // P1 #1d: enrolled on rev 1 ('Other'), later revised to rev 2 ('Family') -> must fail closed!
+    let other_child = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let other_rule = "00000000-0000-4000-8000-00000000f002";
+    enroll_oidc_group(&db, &other_child, other_rule, "Other", "present", day_ms).await;
+    assert!(permits_iso(&mut api, &other_child, "a", day_iso).await);
+    let other_proj: String = sqlx::query_scalar(
+        "SELECT project_id::text FROM openmettle.membership_observations WHERE approval_id = $1::uuid",
+    )
+    .bind(&other_child.approval)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    {
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        grants::record_mapping_revision(
+            &mut tx,
+            &MappingInput {
+                rule: other_rule,
+                provider: PROVIDER,
+                issuer: ISSUER,
+                actor: &other_child.user,
+                key: "fam-rule-promote",
+                expected_revision: 1,
+                selector_kind: "group",
+                claim_name: "groups",
+                claim_value: "Family",
+                binding_format: "openmettle.project-member",
+                binding_version: 1,
+                binding: other_proj.as_bytes(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert!(
+        !permits_iso(&mut api, &other_child, "a", day_iso).await,
+        "mapping rule revised to target active 'Family' claim must fail closed until re-observed"
+    );
+
+    // P2 #11: half-NULL quiet or study windows must be rejected with 23514 on INSERT and UPDATE.
+    for sql in [
+        "INSERT INTO openmettle.family_policies (grantee_kind, grantee_oidc_group_id, active, zone, quiet_start_minute)
+         VALUES ('oidc_group', 'HalfQ1', true, 'UTC', 60)"
+            .to_owned(),
+        "INSERT INTO openmettle.family_policies (grantee_kind, grantee_oidc_group_id, active, zone, quiet_end_minute)
+         VALUES ('oidc_group', 'HalfQ2', true, 'UTC', 60)"
+            .to_owned(),
+        "INSERT INTO openmettle.family_policies (grantee_kind, grantee_oidc_group_id, active, zone, study_start_minute)
+         VALUES ('oidc_group', 'HalfS1', true, 'UTC', 60)"
+            .to_owned(),
+        "INSERT INTO openmettle.family_policies (grantee_kind, grantee_oidc_group_id, active, zone, study_end_minute)
+         VALUES ('oidc_group', 'HalfS2', true, 'UTC', 60)"
+            .to_owned(),
+        format!(
+            "UPDATE openmettle.family_policies SET quiet_end_minute = NULL, revision = revision + 1 WHERE id = '{policy_id}'::uuid"
+        ),
+    ] {
+        expect_state(&mut owner, &sql, "23514").await;
+    }
+
+    // P3 #12: model names with leading/trailing spaces match model_config::name across SQL, store, and CLI.
+    applied(
+        store::set_family_policy_model(
+            &mut api,
+            &ctx(&admin, "padded-model-store"),
+            &FamilyGrantee::OidcGroup("Family".into()),
+            FamilyPolicyRuleKind::Disabled,
+            " padded-model ",
+            true,
+        )
+        .await,
+    );
+    let rec = store::load_family_policy(&mut api, &FamilyGrantee::OidcGroup("Family".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rec.disabled_models.contains(" padded-model "));
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_1_concurrency_locks() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let scope = personal_of(&db, &actor).await;
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let conv_id = chat(&db, &scope, "personal", &actor).await;
+
+    let mut api = connect(&db.0, API).await;
+    let group_id =
+        applied(store::create_local_group(&mut api, &ctx(&admin, "r1-grp"), "LockGroup").await);
+
+    // P1 #2: add_local_group_member must block on account_admin_lock held FOR SHARE by handoff.
+    {
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        let mut tx = holder.begin().await.unwrap();
+        sqlx::query("SELECT FROM openmettle.account_admin_lock FOR SHARE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let mut peer_api = connect(&db.0, API).await;
+        let admin_c = admin.clone();
+        let group_c = group_id.clone();
+        let actor_user = actor.user.clone();
+        let handle = tokio::spawn(async move {
+            store::add_local_group_member(
+                &mut peer_api,
+                &ctx(&admin_c, "r1-add-member"),
+                &group_c,
+                &actor_user,
+            )
+            .await
+        });
+        wait_for_blocked_peer(&db, holder_pid).await;
+        tx.commit().await.unwrap();
+        applied(handle.await.unwrap());
+    }
+
+    // P1 #3: gateway_dispatch must serialize with concurrent account_admin_lock FOR UPDATE policy
+    // activation, while a wrong bearer still returns immediately without taking locks.
+    {
+        let (branch, msg) = quotas::branch_and_message(&mut api, &scope, &conv_id).await;
+        let catalog = openmettle_core::model_config::Catalog::load(CATALOG).unwrap();
+        let sel: openmettle_core::model_config::Selection =
+            serde_json::from_value(json!({"model": "a"})).unwrap();
+        let cfg = serde_json::to_vec(&openmettle_core::model_config::ConfigSnapshot {
+            effective: catalog
+                .resolve(&Default::default(), &sel, None, |_, _| true)
+                .unwrap(),
+            required_capabilities: Default::default(),
+            policy_revision: "openmettle.authz/1".into(),
+            cost_bound: None,
+        })
+        .unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let adm = queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &actor.user,
+                    conversation: &conv_id,
+                    branch: &branch,
+                    message: &msg,
+                    key: "r1-disp-run",
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: b"{}",
+                    config: &cfg,
+                },
+                actor_approval_id: &actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(2),
+                now_ms: NOW,
+                cost_qualified: None,
+            },
+            &LIMITS,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let run_id = match adm {
+            Admission::Admitted { run_id, .. } => run_id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut worker = connect(&db.0, WORKER).await;
+        let claim = queue::claim_next(&mut worker, &CLAIMS, &LEASES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.run_id, run_id);
+
+        let res_id: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_reservations
+                 (id, scope_id, actor_user_id, approval_id, run_id, units)
+             VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, 100)
+             RETURNING id::text",
+        )
+        .bind(&scope)
+        .bind(&actor.user)
+        .bind(&actor.approval)
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let req_id = "00000000-0000-4000-8000-00000000f301";
+        let secret = [0x31u8; 32];
+        let bearer = [0x41u8; 32];
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_requests
+                 (id, reservation_id, scope_id, actor_user_id, approval_id, installation,
+                  model, units, dispatch_hash, run_id, round)
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+                     'a', 50, sha256($7), $8::uuid, 1)",
+        )
+        .bind(req_id)
+        .bind(&res_id)
+        .bind(&scope)
+        .bind(&actor.user)
+        .bind(&actor.approval)
+        .bind(INSTALL)
+        .bind(secret.as_slice())
+        .bind(&run_id)
+        .execute(&mut worker)
+        .await
+        .unwrap();
+        let ok: bool = sqlx::query_scalar(
+            "SELECT openmettle.gateway_handoff_round($1::uuid, $2, $3::uuid, sha256($4))",
+        )
+        .bind(req_id)
+        .bind(secret.as_slice())
+        .bind(&claim.claim_token)
+        .bind(bearer.as_slice())
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+        assert!(ok);
+
+        // Hold account_admin_lock FOR UPDATE and insert a disabled-model policy for 'a' (uncommitted).
+        let mut writer = connect(&db.0, OWNER).await;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut writer)
+            .await
+            .unwrap();
+        let mut wtx = writer.begin().await.unwrap();
+        sqlx::query("SELECT FROM openmettle.account_admin_lock FOR UPDATE")
+            .execute(&mut *wtx)
+            .await
+            .unwrap();
+        let pid: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.family_policies (grantee_kind, grantee_user_id, active, zone)
+             VALUES ('user', $1::uuid, true, 'UTC') RETURNING id::text",
+        )
+        .bind(&actor.user)
+        .fetch_one(&mut *wtx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.family_policy_models (policy_id, rule_kind, model, active)
+             VALUES ($1::uuid, 'disabled', 'a', true)",
+        )
+        .bind(&pid)
+        .execute(&mut *wtx)
+        .await
+        .unwrap();
+
+        // Wrong bearer must NOT block on account_admin_lock.
+        let mut gw_wrong = connect(&db.0, pg::GATEWAY).await;
+        let wrong_res: Option<(bool,)> = sqlx::query_as(
+            "SELECT replayed FROM openmettle.gateway_dispatch($1::uuid, sha256($2))",
+        )
+        .bind(req_id)
+        .bind([0xffu8; 32].as_slice())
+        .fetch_optional(&mut gw_wrong)
+        .await
+        .unwrap();
+        assert!(wrong_res.is_none());
+
+        // Valid bearer MUST block on account_admin_lock, then observe the committed restriction.
+        let mut gw = connect(&db.0, pg::GATEWAY).await;
+        let handle = tokio::spawn(async move {
+            sqlx::query_as::<_, (bool,)>(
+                "SELECT replayed FROM openmettle.gateway_dispatch($1::uuid, sha256($2))",
+            )
+            .bind(req_id)
+            .bind(bearer.as_slice())
+            .fetch_optional(&mut gw)
+            .await
+            .unwrap()
+        });
+        wait_for_blocked_peer(&db, writer_pid).await;
+        wtx.commit().await.unwrap();
+        assert!(
+            handle.await.unwrap().is_none(),
+            "gateway_dispatch must observe the committed family policy and refuse dispatch"
+        );
+    }
+
+    // P1 #4: admin's set_family_policy must block on concurrent approval withdrawal and be denied.
+    {
+        let mut withdrawer = connect(&db.0, OWNER).await;
+        let withdrawer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut withdrawer)
+            .await
+            .unwrap();
+        let mut tx = withdrawer.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals SET active = false WHERE id = $1::uuid",
+        )
+        .bind(&admin.approval)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut peer_api = connect(&db.0, API).await;
+        let admin_c = admin.clone();
+        let handle = tokio::spawn(async move {
+            store::set_family_policy(
+                &mut peer_api,
+                &ctx(&admin_c, "r1-after-approval-withdraw"),
+                &FamilyGrantee::OidcGroup("BlockedAdmin".into()),
+                &FamilyPolicyInput {
+                    zone: "UTC".into(),
+                    quiet: None,
+                    study: None,
+                    override_group_schedules: false,
+                },
+            )
+            .await
+        });
+        wait_for_blocked_peer(&db, withdrawer_pid).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            denied(handle.await.unwrap()),
+            DenialReason::InactivePrincipal
+        );
+        assert!(
+            store::load_family_policy(&mut api, &FamilyGrantee::OidcGroup("BlockedAdmin".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_1_fallback_perf_and_worker_recheck() {
+    let db = TestDb::migrated().await;
+    super::run_admission::seed_token_budget(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let origin = "https://app.example.test";
+    let cookie = format!(
+        "Cookie: __Host-openmettle-session={}\r\nOrigin: {origin}",
+        seeded_session(&db, &actor, 61, None).await
+    );
+
+    // P2 #6: omitted selection with NO project default -> 400 validation; capability-denied
+    // project preset -> 403 policy WITHOUT falling back to model "b".
+    {
+        let mut cap_catalog: Value = serde_json::from_slice(CATALOG).unwrap();
+        cap_catalog["revision"] = json!("catalog/family-cap-1");
+        cap_catalog["models"]["a"]["required_capabilities"] = json!({"model.a": "on_by_default"});
+        cap_catalog["models"]["a"]["defaults"]["controls"]["output_reserve"] = json!(512);
+        cap_catalog["models"]["a"]["prompt_bound"] = json!({
+            "fixed_tokens": 4,
+            "tokens_per_turn": 4,
+            "tokens_per_part": 2,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 10
+        });
+        cap_catalog["models"]["b"]["context_window"] = json!(8192);
+        cap_catalog["models"]["b"]["output_limit"] = json!(2048);
+        cap_catalog["models"]["b"]["defaults"]["controls"]["output_reserve"] = json!(512);
+        cap_catalog["models"]["b"]["estimator_revision"] = json!("fixture-bound/1");
+        cap_catalog["models"]["b"]["prompt_bound"] = json!({
+            "fixed_tokens": 4,
+            "tokens_per_turn": 4,
+            "tokens_per_part": 2,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 10
+        });
+        let server = ApiServer::start_with_catalog(&db, cap_catalog);
+        let (status, proj_empty) = server.call(
+            &cookie,
+            "POST",
+            "/v1/projects",
+            Some("r1-empty-proj"),
+            Some(&json!({"name": "No Default"})),
+        );
+        assert_eq!(status, 201, "{proj_empty}");
+        let (status, conv_empty) = server.call(
+            &cookie,
+            "POST",
+            "/v1/conversations",
+            Some("r1-empty-conv"),
+            Some(&json!({"scope_id": proj_empty["scope_id"]})),
+        );
+        assert_eq!(status, 201, "{conv_empty}");
+        let preview_empty = format!(
+            "/v1/conversations/{}/branches/{}/effective-configuration",
+            conv_empty["conversation_id"].as_str().unwrap(),
+            conv_empty["branch_id"].as_str().unwrap()
+        );
+        let empty_sel = json!({
+            "expected_head_message_id": null,
+            "turn": {"mode": "append", "input_message_id": INPUT_1, "parts": [{"text": "hi"}]},
+            "selection": {}
+        });
+        let (status, err) = server.call(&cookie, "POST", &preview_empty, None, Some(&empty_sel));
+        assert_eq!(
+            status, 400,
+            "omitted selection with no project default must stay 400: {err}"
+        );
+        assert_eq!(err["code"], "validation");
+
+        let (status, proj_cap) = server.call(
+            &cookie,
+            "POST",
+            "/v1/projects",
+            Some("r1-cap-proj"),
+            Some(
+                &json!({"name": "Cap Default", "defaults": {"model_config": {"preset": "study"}}}),
+            ),
+        );
+        assert_eq!(status, 201, "{proj_cap}");
+        let (status, conv_cap) = server.call(
+            &cookie,
+            "POST",
+            "/v1/conversations",
+            Some("r1-cap-conv"),
+            Some(&json!({"scope_id": proj_cap["scope_id"]})),
+        );
+        assert_eq!(status, 201, "{conv_cap}");
+        sqlx::query(
+            "INSERT INTO openmettle.user_capability_denies (user_id, capability, denied, updated_by_user_id)
+             VALUES ($1::uuid, 'model.a', true, $1::uuid)",
+        )
+        .bind(&actor.user)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        let preview_cap = format!(
+            "/v1/conversations/{}/branches/{}/effective-configuration",
+            conv_cap["conversation_id"].as_str().unwrap(),
+            conv_cap["branch_id"].as_str().unwrap()
+        );
+        let (status, err) = server.call(&cookie, "POST", &preview_cap, None, Some(&empty_sel));
+        assert_eq!(
+            status, 403,
+            "capability-denied project default must NOT fall back to model 'b': {err}"
+        );
+        assert_eq!(err["code"], "policy");
+        sqlx::query("DELETE FROM openmettle.user_capability_denies WHERE user_id = $1::uuid")
+            .bind(&actor.user)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+    }
+
+    // P2 #5: 256-model catalog with active Europe/London study policy must complete well under
+    // 500ms for both explicit selection and study-hours fallback (no per-model pg_timezone_names scan).
+    {
+        let mut catalog: Value = serde_json::from_slice(CATALOG).unwrap();
+        catalog["revision"] = json!("catalog/family-256");
+        let mut base_model = catalog["models"]["b"].clone();
+        base_model["context_window"] = json!(8192);
+        base_model["output_limit"] = json!(2048);
+        base_model["defaults"] = json!({"controls": {"output_reserve": 512}});
+        base_model["prompt_bound"] = json!({
+            "fixed_tokens": 4,
+            "tokens_per_turn": 4,
+            "tokens_per_part": 2,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 10
+        });
+        base_model["replay"] = json!([]);
+        let models_map = catalog["models"].as_object_mut().unwrap();
+        for idx in 0..256 {
+            models_map.insert(format!("m{idx:03}"), base_model.clone());
+        }
+        let server = ApiServer::start_with_catalog(&db, catalog);
+        let (cur_min,): (i32,) = sqlx::query_as(
+            "SELECT (extract(hour FROM clock_timestamp() AT TIME ZONE 'Europe/London')::int * 60
+                   + extract(minute FROM clock_timestamp() AT TIME ZONE 'Europe/London')::int)",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let s_start = (cur_min + 1439) % 1440;
+        let s_end = (cur_min + 1438) % 1440;
+        let pid: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.family_policies
+                 (grantee_kind, grantee_user_id, active, zone, study_start_minute, study_end_minute)
+             VALUES ('user', $1::uuid, true, 'Europe/London', $2, $3)
+             RETURNING id::text",
+        )
+        .bind(&actor.user)
+        .bind(s_start as i16)
+        .bind(s_end as i16)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.family_policy_models (policy_id, rule_kind, model, active)
+             VALUES ($1::uuid, 'study_allow', 'm255', true)",
+        )
+        .bind(&pid)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+
+        let (status, proj) = server.call(
+            &cookie,
+            "POST",
+            "/v1/projects",
+            Some("r1-256-proj"),
+            Some(
+                &json!({"name": "Large Catalog", "defaults": {"model_config": {"model": "m000"}}}),
+            ),
+        );
+        assert_eq!(status, 201, "{proj}");
+        let (status, conv) = server.call(
+            &cookie,
+            "POST",
+            "/v1/conversations",
+            Some("r1-256-conv"),
+            Some(&json!({"scope_id": proj["scope_id"]})),
+        );
+        assert_eq!(status, 201, "{conv}");
+        let preview = format!(
+            "/v1/conversations/{}/branches/{}/effective-configuration",
+            conv["conversation_id"].as_str().unwrap(),
+            conv["branch_id"].as_str().unwrap()
+        );
+
+        let t0 = Instant::now();
+        let (status, explicit_ok) = server.call(
+            &cookie,
+            "POST",
+            &preview,
+            None,
+            Some(&json!({
+                "expected_head_message_id": null,
+                "turn": {"mode": "append", "input_message_id": INPUT_1, "parts": [{"text": "fast"}]},
+                "selection": {"model": "m255"}
+            })),
+        );
+        let explicit_elapsed = t0.elapsed();
+        assert_eq!(status, 200, "{explicit_ok}");
+        assert!(
+            explicit_elapsed < Duration::from_millis(500),
+            "explicit 256-model preview took {explicit_elapsed:?}"
+        );
+
+        let t1 = Instant::now();
+        let (status, fallback_ok) = server.call(
+            &cookie,
+            "POST",
+            &preview,
+            None,
+            Some(&json!({
+                "expected_head_message_id": null,
+                "turn": {"mode": "append", "input_message_id": INPUT_1, "parts": [{"text": "fallback"}]},
+                "selection": {}
+            })),
+        );
+        let fallback_elapsed = t1.elapsed();
+        assert_eq!(status, 200, "{fallback_ok}");
+        assert_eq!(fallback_ok["model"], "m255");
+        assert!(
+            fallback_elapsed < Duration::from_millis(500),
+            "fallback 256-model preview took {fallback_elapsed:?}"
+        );
+
+        // Clear the user's policy before worker recheck assertions below.
+        sqlx::query(
+            "UPDATE openmettle.family_policies SET active = false, revision = revision + 1 WHERE id = $1::uuid",
+        )
+        .bind(&pid)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    // P2 #7, P2 #8, P2 #9: worker recheck approval binding, post-fence clock, and strict ConfigSnapshot decoding.
+    {
+        let mut api = connect(&db.0, API).await;
+        let mut worker = connect(&db.0, WORKER).await;
+        let scope = personal_of(&db, &actor).await;
+        let conv_id = chat(&db, &scope, "personal", &actor).await;
+        let catalog = openmettle_core::model_config::Catalog::load(CATALOG).unwrap();
+        let sel: openmettle_core::model_config::Selection =
+            serde_json::from_value(json!({"model": "a"})).unwrap();
+        let valid_cfg = serde_json::to_vec(&openmettle_core::model_config::ConfigSnapshot {
+            effective: catalog
+                .resolve(&Default::default(), &sel, None, |_, _| true)
+                .unwrap(),
+            required_capabilities: Default::default(),
+            policy_revision: "openmettle.authz/1".into(),
+            cost_bound: None,
+        })
+        .unwrap();
+        let partial_cfg = json!({"effective": {"model": "a"}, "required_capabilities": {}})
+            .to_string()
+            .into_bytes();
+
+        let admit = async |api: &mut PgConnection, key: &str, cfg: &[u8]| -> String {
+            let (branch, msg) = quotas::branch_and_message(api, &scope, &conv_id).await;
+            let mut tx = WriteTransaction::begin(api).await.unwrap();
+            let adm = queue::admit_run(
+                &mut tx,
+                &RunAdmission {
+                    input: RunInput {
+                        scope: &scope,
+                        actor: &actor.user,
+                        conversation: &conv_id,
+                        branch: &branch,
+                        message: &msg,
+                        key,
+                        format: SNAPSHOT_FORMAT,
+                        version: SNAPSHOT_VERSION,
+                        input: b"{}",
+                        config: cfg,
+                    },
+                    actor_approval_id: &actor.approval,
+                    capabilities: &[],
+                    requested_rounds: Some(2),
+                    now_ms: NOW,
+                    cost_qualified: None,
+                },
+                &LIMITS,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            match adm {
+                Admission::Admitted { run_id, .. } => run_id,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+
+        // P2 #9: partial v1 snapshot (has effective.model string, misses full ConfigSnapshot fields)
+        // must fail closed even with no active family policy.
+        let partial_run = admit(&mut api, "r1-partial-snap", &partial_cfg).await;
+        assert_eq!(
+            queue::recheck_run(
+                &mut worker,
+                &RunRecheckRequest {
+                    scope_id: &scope,
+                    run_id: &partial_run,
+                    actor_approval_id: &actor.approval,
+                    capabilities: &[],
+                    extra_target: None,
+                    now_ms: NOW,
+                },
+            )
+            .await
+            .unwrap(),
+            RunRecheckOutcome::Invalidated(DenialReason::Policy(PolicyReason::FamilyPolicy))
+        );
+
+        // P2 #7: recheck_run rejects mismatched actor_approval_id even when it belongs to the same user.
+        let second_identity: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.user_identities (user_id, issuer, subject)
+             VALUES ($1::uuid, $2, 'second-subject')
+             RETURNING id::text",
+        )
+        .bind(&actor.user)
+        .bind(ISSUER)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let second_approval: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.local_identity_approvals
+                 (identity_id, provider_id, active, expires_ms, changed_by, change_reason)
+             VALUES ($1::uuid, $2::uuid, true, $3, 'fixture', 'second approval')
+             RETURNING id::text",
+        )
+        .bind(&second_identity)
+        .bind(PROVIDER)
+        .bind(FUTURE)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let valid_run = admit(&mut api, "r1-valid-snap", &valid_cfg).await;
+        assert!(matches!(
+            queue::recheck_run(
+                &mut worker,
+                &RunRecheckRequest {
+                    scope_id: &scope,
+                    run_id: &valid_run,
+                    actor_approval_id: &second_approval,
+                    capabilities: &[],
+                    extra_target: None,
+                    now_ms: NOW,
+                },
+            )
+            .await,
+            Err(StoreError::InvalidInput("actor_approval_id"))
+        ));
+
+        // P2 #8: recheck_leased evaluates schedule boundaries at post-fence clock_timestamp(),
+        // ignoring a stale caller-supplied now_ms from 12 hours earlier.
+        let claim = queue::claim_next(&mut worker, &CLAIMS, &LEASES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.run_id, valid_run);
+        let (cur_min, now_db_ms): (i32, i64) = sqlx::query_as(
+            "SELECT (extract(hour FROM clock_timestamp() AT TIME ZONE 'UTC')::int * 60
+                   + extract(minute FROM clock_timestamp() AT TIME ZONE 'UTC')::int),
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let q_start = (cur_min + 1435) % 1440;
+        let q_end = (cur_min + 5) % 1440;
+        sqlx::query(
+            "UPDATE openmettle.family_policies
+                SET active = true,
+                    zone = 'UTC',
+                    quiet_start_minute = $2,
+                    quiet_end_minute = $3,
+                    study_start_minute = NULL,
+                    study_end_minute = NULL,
+                    revision = revision + 1
+              WHERE grantee_kind = 'user' AND grantee_user_id = $1::uuid",
+        )
+        .bind(&actor.user)
+        .bind(q_start as i16)
+        .bind(q_end as i16)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        let stale_outside_quiet_ms = now_db_ms - 12 * 3_600_000;
+        assert_eq!(
+            queue::recheck_leased(
+                &mut worker,
+                &claim.lease(),
+                &RunRecheckRequest {
+                    scope_id: &claim.scope_id,
+                    run_id: &claim.run_id,
+                    actor_approval_id: &claim.actor_approval_id,
+                    capabilities: &[],
+                    extra_target: None,
+                    now_ms: stale_outside_quiet_ms,
+                },
+                &LEASES,
+            )
+            .await
+            .unwrap(),
+            RunRecheckOutcome::Invalidated(DenialReason::Policy(PolicyReason::FamilyPolicy))
+        );
+    }
 }
