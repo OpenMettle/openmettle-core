@@ -286,6 +286,27 @@ async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
     .unwrap()
 }
 
+/// Wait until PostgreSQL's `clock_timestamp()` advances strictly past `target_ms`.
+async fn wait_past_db_ms(c: &mut PgConnection, target_ms: i64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *c)
+        .await
+        .unwrap();
+        if now_ms > target_ms {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "clock_timestamp() {now_ms} did not advance past {target_ms}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn sqlstate<T: std::fmt::Debug>(result: Result<T, sqlx::Error>) -> String {
     match result {
         Err(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
@@ -1226,7 +1247,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "ed518dd9b187d34053dc16444c8c9d50ba1947a75bb0986e960502acb1fb51d3",
         "911d89606c1f322b82dc5085bedae506c210b59c69c36ee1a46a8647d403bee7",
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
-        "7679c374843882e7e3cfca50c7ca7c5c2513b85c08533c36ffdc910b3ac73900",
+        "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

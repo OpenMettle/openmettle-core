@@ -1451,6 +1451,22 @@ fn map_override_sql_error(error: sqlx::Error) -> QuotaError {
     QuotaError::Store(StoreError::Database(error))
 }
 
+async fn verify_manage_quotas<'a>(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'a>,
+) -> Result<AuditContext<'a>, QuotaError> {
+    let (actor, post_lock_ctx) = store::post_lock_acting(c, ctx).await?;
+    store::check(authz::authorize_admin(
+        &actor,
+        AdminChange {
+            action: Action::ManageQuotas,
+            removes_enabled_admin: false,
+            enabled_account_admins: 0,
+        },
+    ))?;
+    Ok(post_lock_ctx)
+}
+
 async fn authorize_manage_quotas_and_check_upgrade<'a>(
     c: &mut PgConnection,
     ctx: &AuditContext<'a>,
@@ -1463,6 +1479,10 @@ async fn authorize_manage_quotas_and_check_upgrade<'a>(
     sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
         .fetch_one(&mut *c)
         .await?;
+    // Fast fail-closed check under account_admin_lock BEFORE locking any target scope row so an
+    // unprivileged or inactive caller never holds account_admin_lock across a busy project or
+    // personal-owner lock wait.
+    verify_manage_quotas(c, ctx).await?;
     let scope_target: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT personal_user_id::text, project_id::text
            FROM openmettle.scopes
@@ -1487,15 +1507,7 @@ async fn authorize_manage_quotas_and_check_upgrade<'a>(
             .map(|owner| (owner, store::UserLock::NoKeyUpdate)),
     )
     .await?;
-    let (actor, post_lock_ctx) = store::post_lock_acting(c, ctx).await?;
-    store::check(authz::authorize_admin(
-        &actor,
-        AdminChange {
-            action: Action::ManageQuotas,
-            removes_enabled_admin: false,
-            enabled_account_admins: 0,
-        },
-    ))?;
+    let post_lock_ctx = verify_manage_quotas(c, ctx).await?;
     let (metering_enforced, overrides_enforced): (bool, bool) = sqlx::query_as(
         "SELECT metering_enforced, overrides_enforced
            FROM openmettle.quota_enforcement
@@ -1512,7 +1524,7 @@ async fn authorize_manage_quotas_and_check_upgrade<'a>(
         .execute(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
-    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
+    let post_lock_ctx = verify_manage_quotas(c, &post_lock_ctx).await?;
     Ok(post_lock_ctx)
 }
 
@@ -1636,8 +1648,9 @@ pub async fn set_scope_override(
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
-        store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
-        read_override_row(c, scope_id, resource).await
+        let record = read_override_row(c, scope_id, resource).await?;
+        verify_manage_quotas(c, &post_lock_ctx).await?;
+        Ok(record)
     }
     .await;
     match outcome {
@@ -1698,7 +1711,6 @@ pub async fn revoke_scope_override(
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
-        store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
         if revoked.is_none() {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
@@ -1716,7 +1728,9 @@ pub async fn revoke_scope_override(
                 QuotaError::Store(StoreError::NotFound)
             });
         }
-        read_override_row(c, scope_id, resource).await
+        let record = read_override_row(c, scope_id, resource).await?;
+        verify_manage_quotas(c, &post_lock_ctx).await?;
+        Ok(record)
     }
     .await;
     match outcome {

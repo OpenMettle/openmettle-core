@@ -7952,27 +7952,20 @@ async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_
         if serialized {
             migrate::apply(&settings, MIGRATIONS).await.unwrap();
             assert_eq!(db.history().await, all_versions());
-            // Same signature, invoker security, search_path and privileges, its only callers are
-            // the two override writers, and the redundant early unlocked admin check is removed.
-            let (definer, config, executable, src): (bool, Vec<String>, bool, String) =
-                sqlx::query_as(
-                    "SELECT prosecdef, proconfig,
-                            has_function_privilege('openmettle_api', p.oid, 'EXECUTE'),
-                            p.prosrc
-                       FROM pg_proc p
-                      WHERE p.oid = 'openmettle.quota_lock_override(uuid,uuid,text)'::regprocedure",
-                )
-                .fetch_one(&mut owner)
-                .await
-                .unwrap();
+            // Same signature, invoker security, search_path and privileges, and its only callers
+            // are the two override writers.
+            let (definer, config, executable): (bool, Vec<String>, bool) = sqlx::query_as(
+                "SELECT prosecdef, proconfig,
+                        has_function_privilege('openmettle_api', p.oid, 'EXECUTE')
+                   FROM pg_proc p
+                  WHERE p.oid = 'openmettle.quota_lock_override(uuid,uuid,text)'::regprocedure",
+            )
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
             assert_eq!(
                 (definer, config, executable),
                 (false, vec!["search_path=pg_catalog".to_owned()], false)
-            );
-            assert_eq!(
-                src.matches("openmettle.account_admins").count(),
-                1,
-                "redundant early unlocked administrator check must stay removed: {src}"
             );
             let callers: Vec<String> = sqlx::query_scalar(
                 "SELECT p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -7986,7 +7979,9 @@ async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_
                 callers,
                 ["quota_revoke_scope_override", "quota_upsert_scope_override"]
             );
-            // Non-admin on an unknown scope still raises 42501 rather than leaking P0002.
+            // Non-admin on an unknown scope still raises 42501 rather than leaking P0002, and on
+            // a contended personal scope fails immediately with 42501 without blocking on the
+            // target user row while holding account_admin_lock.
             let non_admin_unknown = sqlx::query_scalar::<_, i64>(
                 "SELECT openmettle.quota_upsert_scope_override(
                      $1::uuid, $2::uuid, 'usage_tokens', 100, NULL, 'denied', 'na-unknown', NULL
@@ -7997,6 +7992,32 @@ async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_
             .fetch_one(&mut connect(&db.0, API).await)
             .await;
             assert_eq!(sqlstate(non_admin_unknown), "42501");
+
+            let mut target_holder = connect(&db.0, OWNER).await;
+            target_holder.execute("BEGIN").await.unwrap();
+            sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE")
+                .bind(&alice.user)
+                .execute(&mut target_holder)
+                .await
+                .unwrap();
+            let mut caller = connect(&db.0, API).await;
+            let mut caller_tx = WriteTransaction::begin(&mut caller).await.unwrap();
+            sqlx::query("SET LOCAL lock_timeout = '500ms'")
+                .execute(caller_tx.connection().unwrap())
+                .await
+                .unwrap();
+            let non_admin_busy = sqlx::query_scalar::<_, i64>(
+                "SELECT openmettle.quota_upsert_scope_override(
+                     $1::uuid, $2::uuid, 'usage_tokens', 100, NULL, 'denied', 'na-busy', NULL
+                 )",
+            )
+            .bind(&scope)
+            .bind(&alice.user)
+            .fetch_one(caller_tx.connection().unwrap())
+            .await;
+            caller_tx.rollback().await.unwrap();
+            assert_eq!(sqlstate(non_admin_busy), "42501");
+            target_holder.execute("ROLLBACK").await.unwrap();
         }
 
         // 1. The disable is in flight when the SQL override runs: the statements of
@@ -8031,7 +8052,7 @@ async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_
             let disabler_pid = backend_pid(&mut disabler).await;
             let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
             for sql in [
-                "SELECT session_generation FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
+                "SELECT session_generation FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE",
                 "UPDATE openmettle.users SET disabled_at = GREATEST(created_at, clock_timestamp()),
                      session_generation = session_generation + 1 WHERE id = $1::uuid",
             ] {
@@ -8083,14 +8104,17 @@ async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_
                     res
                 }
             });
-            if serialized {
+            let result = if serialized {
                 wait_for_blocked_peer(&db, disabler_pid).await;
+                tx.commit().await.unwrap();
+                writer.await.unwrap()
             } else {
-                // Schema 29 never locked the actor's user row, so it finishes without waiting.
-                tokio::time::sleep(Duration::from_millis(120)).await;
-            }
-            tx.commit().await.unwrap();
-            let result = writer.await.unwrap();
+                // Schema 29 never locked the actor's user row, so the override finishes cleanly
+                // while the disable transaction is still uncommitted.
+                let r = writer.await.unwrap();
+                tx.commit().await.unwrap();
+                r
+            };
             let after: (i64, bool) = sqlx::query_as(override_row)
                 .bind(&scope)
                 .bind("usage_tokens")
@@ -8537,22 +8561,25 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
     // 3. Approval expiring while waiting on either account_admin_lock or storage_accounts is
     //    rejected with InactivePrincipal and writes nothing.
     for wait_on in ["account_admin_lock", "storage_accounts"] {
+        // Pre-open and warm connections before computing the short DB-clock TTL.
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        let mut writer_conn = connect(&db.0, API).await;
         let db_now_ms: i64 = sqlx::query_scalar(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
         )
         .fetch_one(&mut owner)
         .await
         .unwrap();
+        let expires_ms = db_now_ms + 500;
         let expiring =
-            authz_store::account(&mut owner, authz_store::PROVIDER, true, db_now_ms + 250).await;
+            authz_store::account(&mut owner, authz_store::PROVIDER, true, expires_ms).await;
         authz_store::make_admin(&mut owner, &expiring).await;
         let audited: i64 = sqlx::query_scalar(audit_rows)
             .fetch_one(&mut owner)
             .await
             .unwrap();
 
-        let mut holder = connect(&db.0, OWNER).await;
-        let holder_pid = backend_pid(&mut holder).await;
         holder.execute("BEGIN").await.unwrap();
         if wait_on == "account_admin_lock" {
             holder
@@ -8570,9 +8597,8 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
         }
 
         let writer = tokio::spawn({
-            let (name, expiring, scope) = (db.0.clone(), expiring.clone(), scope.clone());
+            let (expiring, scope) = (expiring.clone(), scope.clone());
             async move {
-                let mut c = connect(&name, API).await;
                 let audit_ctx = AuditContext {
                     actor_user_id: &expiring.user,
                     actor_approval_id: &expiring.approval,
@@ -8580,12 +8606,19 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
                     request_key: wait_on,
                     reason: "approval expires during quota override wait",
                 };
-                quotas::set_scope_override(&mut c, &audit_ctx, &scope, K::StorageBytes, 4096, None)
-                    .await
+                quotas::set_scope_override(
+                    &mut writer_conn,
+                    &audit_ctx,
+                    &scope,
+                    K::StorageBytes,
+                    4096,
+                    None,
+                )
+                .await
             }
         });
         wait_for_blocked_peer(&db, holder_pid).await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_past_db_ms(&mut owner, expires_ms).await;
         holder.execute("ROLLBACK").await.unwrap();
         let res = writer.await.unwrap();
         assert!(
@@ -8642,4 +8675,42 @@ async fn rust_quota_overrides_serialize_with_disable_demotion_withdrawal_retirem
         );
     proj_holder.execute("ROLLBACK").await.unwrap();
     ov.await.unwrap().unwrap();
+
+    // 5. P2 #3: non-admin quota override requests fail immediately with NotAccountAdmin without
+    //    waiting on a contended target projects or personal users row while holding
+    //    account_admin_lock FOR UPDATE.
+    let mut target_holder = connect(&db.0, OWNER).await;
+    target_holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR UPDATE")
+        .bind(&proj_id)
+        .execute(&mut target_holder)
+        .await
+        .unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE")
+        .bind(&alice.user)
+        .execute(&mut target_holder)
+        .await
+        .unwrap();
+    let mut non_admin_conn = connect(&db.0, API).await;
+    for (label, contended_scope) in [("project", &proj_scope), ("personal", &scope)] {
+        let res = quotas::set_scope_override(
+            &mut non_admin_conn,
+            &authz_store::ctx(&alice, &format!("non-admin-busy-{label}")),
+            contended_scope,
+            K::UsageTokens,
+            100,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(QuotaError::Store(StoreError::Denied(DenialReason::Policy(
+                    PolicyReason::NotAccountAdmin
+                ))))
+            ),
+            "{label}: {res:?}"
+        );
+    }
+    target_holder.execute("ROLLBACK").await.unwrap();
 }

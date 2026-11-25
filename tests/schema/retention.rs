@@ -1364,52 +1364,88 @@ async fn retention_set_grace_serializes_with_approval_withdrawal_provider_retire
         }
     }
 
-    // 3. Approval expiring while waiting on either account_admin_lock or retention_policy is
-    //    rejected with 42501 and leaves retention_policy unchanged.
-    for wait_on in ["account_admin_lock", "retention_policy"] {
+    // 3. Approval expiring while waiting on account_admin_lock, retention_policy, or an
+    //    uncommitted duplicate (actor_user_id, request_key) in authorization_audit is rejected
+    //    with 42501 and rolls back both retention_policy and authorization_audit.
+    for wait_on in [
+        "account_admin_lock",
+        "retention_policy",
+        "authorization_audit",
+    ] {
         let before = revision(&mut owner).await;
+        // Pre-open and warm connections before computing the short DB-clock TTL so connection
+        // setup cannot consume the window before the intended lock wait.
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        let mut caller = connect(&db.0, API).await;
         let db_now_ms: i64 = sqlx::query_scalar(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
         )
         .fetch_one(&mut owner)
         .await
         .unwrap();
+        let expires_ms = db_now_ms + 600;
         let expiring =
-            authz_store::account(&mut owner, authz_store::PROVIDER, true, db_now_ms + 250).await;
+            authz_store::account(&mut owner, authz_store::PROVIDER, true, expires_ms).await;
         authz_store::make_admin(&mut owner, &expiring).await;
+        let key = format!("ret-exp-{wait_on}");
 
-        let mut holder = connect(&db.0, OWNER).await;
-        let holder_pid = backend_pid(&mut holder).await;
         holder.execute("BEGIN").await.unwrap();
-        if wait_on == "account_admin_lock" {
-            holder
-                .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        match wait_on {
+            "account_admin_lock" => {
+                holder
+                    .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+                    .await
+                    .unwrap();
+            }
+            "retention_policy" => {
+                holder
+                    .execute("SELECT FROM openmettle.retention_policy WHERE id FOR UPDATE")
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                sqlx::query(
+                    "INSERT INTO openmettle.authorization_audit
+                         (actor_user_id, action, target_kind, target_id, request_key, reason, details)
+                     VALUES ($1::uuid, 'retention.policy_update', 'retention_policy', 'instance',
+                             $2, 'holder', '{}'::jsonb)",
+                )
+                .bind(&expiring.user)
+                .bind(&key)
+                .execute(&mut holder)
                 .await
                 .unwrap();
-        } else {
-            holder
-                .execute("SELECT FROM openmettle.retention_policy WHERE id FOR UPDATE")
-                .await
-                .unwrap();
+            }
         }
         let setter = tokio::spawn({
-            let (db_name, expiring) = (db.0.clone(), expiring.clone());
+            let (expiring, key) = (expiring.clone(), key.clone());
             async move {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 30, 'synthetic', $3)",
                 )
                 .bind(&expiring.user)
                 .bind(&expiring.approval)
-                .bind(format!("ret-exp-{wait_on}"))
-                .fetch_one(&mut connect(&db_name, API).await)
+                .bind(&key)
+                .fetch_one(&mut caller)
                 .await
             }
         });
         wait_for_blocked_peer(&db, holder_pid).await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_past_db_ms(&mut owner, expires_ms).await;
         holder.execute("ROLLBACK").await.unwrap();
         assert_eq!(sqlstate(setter.await.unwrap()), "42501", "{wait_on}");
         assert_eq!(revision(&mut owner).await, before, "{wait_on}");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.authorization_audit
+              WHERE actor_user_id = $1::uuid AND request_key = $2",
+        )
+        .bind(&expiring.user)
+        .bind(&key)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 0, "{wait_on}");
     }
 }
 

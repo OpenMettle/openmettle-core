@@ -991,7 +991,8 @@ const LIVE_COUNTS: &str = concat!(
 );
 
 /// Scope and actor locks shared with graph writers in canonical order:
-/// `[projects] -> login_providers -> local_identity_approvals -> users` (ascending `id`).
+/// `[account_admin_lock FOR SHARE] -> [projects] -> login_providers ->
+/// local_identity_approvals -> users` (ascending `id`).
 /// Acquire these before a run or branch head.
 pub(crate) async fn lock_scope_actor(
     c: &mut PgConnection,
@@ -1007,6 +1008,18 @@ pub(crate) async fn lock_scope_actor(
     .fetch_optional(&mut *c)
     .await?
     .unwrap_or_default();
+    // On the two-user personal path (e.g. a collaborator creating a branch on another user's
+    // personal conversation), acquire account_admin_lock FOR SHARE before touching users so an
+    // N-1 schema-37 API running unordered disable_user(owner, collaborator) during a rolling
+    // upgrade serializes on account_admin_lock instead of deadlocking on users.
+    if personal_owner
+        .as_deref()
+        .is_some_and(|owner| owner != actor)
+    {
+        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR SHARE")
+            .fetch_one(&mut *c)
+            .await?;
+    }
     if let Some(project) = &project_id {
         sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
             .bind(project)
@@ -1035,6 +1048,67 @@ pub(crate) async fn lock_scope_actor(
         }
     }
     Ok((personal_owner, project_id))
+}
+
+/// Evaluate the full live admission authorization predicate (session if present, primary clock,
+/// active principal, OIDC/local groups, project role, conversation share, and platform/user
+/// capabilities) under the already-held scope/actor locks. Used both before and immediately after
+/// every blocking write (run insert, quota reservation, or replay hold backfill).
+pub(crate) async fn verify_admission_authority(
+    c: &mut PgConnection,
+    request: &RunAdmission<'_>,
+    personal_owner: Option<&str>,
+    project_id: Option<&str>,
+    session: Option<&str>,
+    min_now_ms: i64,
+) -> Result<(Principal, PlatformPolicy, bool, i64), StoreError> {
+    let r = &request.input;
+    let now = match session {
+        Some(locator) => super::approvals::admission_time(c, request, locator).await?,
+        None => store::post_lock_clock_ms(c, min_now_ms).await?,
+    };
+    let principal =
+        store::hydrate_api_principal(c, r.actor, request.actor_approval_id, now).await?;
+    let platform = store::load_platform_capabilities(c).await?;
+    let (scope, archived) = match (personal_owner, project_id) {
+        (Some(owner_user_id), _) => (
+            Some(Scope::Personal {
+                scope_id: r.scope.to_owned(),
+                owner_user_id: owner_user_id.to_owned(),
+            }),
+            false,
+        ),
+        (None, Some(project)) => match projects::load_project_settings(c, project).await? {
+            Some(settings) if !settings.deleted => (
+                projects::hydrate_project(c, project, now)
+                    .await?
+                    .map(Scope::Project),
+                settings.archived,
+            ),
+            _ => (None, false),
+        },
+        (None, None) => (None, false),
+    };
+    let target =
+        projects::hydrate_resource(c, ResourceKind::Conversation, r.conversation, now).await?;
+    let capabilities = request
+        .capabilities
+        .iter()
+        .map(|c| (c.name.to_owned(), c.gate))
+        .collect();
+    let decision = evaluate(
+        principal.as_ref(),
+        &platform,
+        scope,
+        target,
+        None,
+        capabilities,
+    );
+    if let RunContinuation::Invalidate(reason) = decision {
+        return Err(StoreError::Denied(reason));
+    }
+    let principal = principal.ok_or(StoreError::NotFound)?;
+    Ok((principal, platform, archived, now))
 }
 
 /// Admit one run in the caller's READ COMMITTED transaction (ADR 0032): lock the scope and the
@@ -1098,51 +1172,16 @@ async fn admit(
     } else {
         "project"
     };
-    let now = match session {
-        Some(locator) => super::approvals::admission_time(c, request, locator).await?,
-        None => request.now_ms,
-    };
-    // Step 3: authorize after the locks with the recheck's decision.
-    let principal =
-        store::hydrate_api_principal(c, r.actor, request.actor_approval_id, now).await?;
-    let platform = store::load_platform_capabilities(c).await?;
-    let (scope, archived) = match (personal_owner, project_id) {
-        (Some(owner_user_id), _) => (
-            Some(Scope::Personal {
-                scope_id: r.scope.to_owned(),
-                owner_user_id,
-            }),
-            false,
-        ),
-        (None, Some(project)) => match projects::load_project_settings(c, &project).await? {
-            Some(settings) if !settings.deleted => (
-                projects::hydrate_project(c, &project, now)
-                    .await?
-                    .map(Scope::Project),
-                settings.archived,
-            ),
-            _ => (None, false),
-        },
-        (None, None) => (None, false),
-    };
-    let target =
-        projects::hydrate_resource(c, ResourceKind::Conversation, r.conversation, now).await?;
-    let capabilities = request
-        .capabilities
-        .iter()
-        .map(|c| (c.name.to_owned(), c.gate))
-        .collect();
-    let decision = evaluate(
-        principal.as_ref(),
-        &platform,
-        scope,
-        target,
-        None,
-        capabilities,
-    );
-    if let RunContinuation::Invalidate(reason) = decision {
-        return Err(StoreError::Denied(reason));
-    }
+    // Step 3: authorize after the locks with the recheck's decision at post-lock time.
+    let (principal, platform, archived, now) = verify_admission_authority(
+        c,
+        request,
+        personal_owner.as_deref(),
+        project_id.as_deref(),
+        session,
+        request.now_ms,
+    )
+    .await?;
     // Step 4: an exact replay is returned whatever the lifecycle or the current limits.
     if let Some(replay) = lookup(c, r.scope, r.actor, r.key).await? {
         return replayed(replay, r);
@@ -1151,11 +1190,7 @@ async fn admit(
     if archived {
         return Err(projects::ARCHIVED);
     }
-    let actor_scope_id = principal
-        .as_ref()
-        .ok_or(StoreError::NotFound)?
-        .personal_scope_id
-        .clone();
+    let actor_scope_id = principal.personal_scope_id.clone();
     let quota_schema = has_quota_schema(c).await?;
     let (eff_live_actor, eff_live_scope, eff_round_cap): (i64, i64, i64) = if quota_schema {
         sqlx::query_as(
@@ -1236,16 +1271,9 @@ async fn admit(
         return Ok(Admission::Refused(refusal));
     }
     let effect = match session {
-        Some(session) => Some(
-            super::approvals::admission(
-                c,
-                request,
-                session,
-                principal.as_ref().ok_or(StoreError::NotFound)?,
-                &platform,
-            )
-            .await?,
-        ),
+        Some(session) => {
+            Some(super::approvals::admission(c, request, session, &principal, &platform).await?)
+        }
         None => None,
     };
     // Step 7: the new row is the reservation of the run slot.
@@ -1261,9 +1289,19 @@ async fn admit(
             Err(durable::Error::Conflict) => return Err(StoreError::Conflict(KEY_REUSED)),
             Err(error) => return Err(error.into()),
         };
+    let c = tx.connection()?;
+    verify_admission_authority(
+        c,
+        request,
+        personal_owner.as_deref(),
+        project_id.as_deref(),
+        session,
+        now,
+    )
+    .await?;
     if !inserted {
         // Only a writer outside these locks (bare `create_run`) can have recorded the key.
-        let replay = lookup(tx.connection()?, r.scope, r.actor, r.key).await?;
+        let replay = lookup(c, r.scope, r.actor, r.key).await?;
         return replayed(replay.ok_or(StoreError::NotFound)?, r);
     }
     Ok(Admission::Admitted {

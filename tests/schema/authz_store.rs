@@ -1056,9 +1056,22 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
     let db = TestDb::migrated().await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
-    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    // Sort three accounts by UUID so `member_low < admin < member_high` is deterministic:
+    // - when `admin < member_high`, `lock_users_ordered` locks `admin` first, then blocks on
+    //   `member_high`, so `sessions::disable_user(admin)` waits on `writer_pid`.
+    // - when `member_low < admin`, `lock_users_ordered` blocks on `member_low` before reaching
+    //   `admin`, so `sessions::disable_user(admin)` commits first and `grant_account_admin` fails
+    //   closed with InactivePrincipal after waking up.
+    let mut ordered = vec![
+        account(&mut owner, PROVIDER, true, FUTURE).await,
+        account(&mut owner, PROVIDER, true, FUTURE).await,
+        account(&mut owner, PROVIDER, true, FUTURE).await,
+    ];
+    ordered.sort_by(|a, b| a.user.cmp(&b.user));
+    let member_high = ordered.pop().unwrap();
+    let admin = ordered.pop().unwrap();
+    let member_low = ordered.pop().unwrap();
     let boss = account(&mut owner, PROVIDER, true, FUTURE).await;
-    let member = account(&mut owner, PROVIDER, true, FUTURE).await;
     make_admin(&mut owner, &admin).await;
     make_admin(&mut owner, &boss).await;
     let group = applied(
@@ -1083,14 +1096,14 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
     .enumerate()
     {
         let generation = session_generation(&mut owner, &admin).await;
-        // The fixture holds the write's target, so the write stops after it has decided.
+        // The fixture holds the write's target, so the write stops after locking `admin`.
         let mut fixture = connect(&db.0, OWNER).await;
         let fixture_pid = backend_pid(&mut fixture).await;
         fixture.execute("BEGIN").await.unwrap();
         let (sql, target) = if write == "account_admin.grant" {
             (
-                "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
-                &member.user,
+                "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE",
+                &member_high.user,
             )
         } else {
             (
@@ -1108,7 +1121,7 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
             let (db_name, admin, member, group, name) = (
                 db.0.clone(),
                 admin.clone(),
-                member.clone(),
+                member_high.clone(),
                 group.clone(),
                 name.clone(),
             );
@@ -1157,7 +1170,7 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
         );
         assert!(!hydrate(&db, API, &admin, NOW).await.unwrap().is_active());
         if write == "account_admin.grant" {
-            assert!(principal(&db, &member).await.account_admin);
+            assert!(principal(&db, &member_high).await.account_admin);
         } else {
             assert_eq!(group_name(&mut owner, &group).await, name);
         }
@@ -1176,6 +1189,42 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
         );
         reenable(&mut owner, &admin).await;
     }
+
+    // Opposite UUID ordering (`member_low < admin`): `lock_users_ordered` blocks on `member_low`
+    // before reaching `admin`, so `sessions::disable_user(admin)` commits immediately and the
+    // waiting `grant_account_admin` fails closed with InactivePrincipal once released.
+    let generation = session_generation(&mut owner, &admin).await;
+    let mut fixture = connect(&db.0, OWNER).await;
+    let fixture_pid = backend_pid(&mut fixture).await;
+    fixture.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&member_low.user)
+        .execute(&mut fixture)
+        .await
+        .unwrap();
+    let writer = tokio::spawn({
+        let (db_name, admin, member_low) = (db.0.clone(), admin.clone(), member_low.clone());
+        async move {
+            let mut c = connect(&db_name, API).await;
+            store::grant_account_admin(&mut c, &ctx(&admin, "write-low-target"), &member_low.user)
+                .await
+        }
+    });
+    wait_for_blocked_peer(&db, fixture_pid).await;
+    openmettle_core::sessions::disable_user(
+        &mut connect(&db.0, API).await,
+        &admin.user,
+        generation,
+        &policy,
+    )
+    .await
+    .unwrap();
+    fixture.execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+    assert!(!principal(&db, &member_low).await.account_admin);
 }
 
 /// Review #1: a self-disable needs its actor's row `FOR UPDATE`. Taking `FOR SHARE` first let
@@ -1702,18 +1751,22 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
     );
 
     for wait_on in ["account_admin_lock", "local_groups"] {
+        // Open and warm connections before computing the short DB-clock TTL so connection setup
+        // never consumes the approval window before the intended lock wait.
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        let mut writer_conn = connect(&db.0, API).await;
         let db_now_ms: i64 = sqlx::query_scalar(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
         )
         .fetch_one(&mut owner)
         .await
         .unwrap();
-        let expiring = account(&mut owner, PROVIDER, true, db_now_ms + 250).await;
+        let expires_ms = db_now_ms + 500;
+        let expiring = account(&mut owner, PROVIDER, true, expires_ms).await;
         make_admin(&mut owner, &expiring).await;
         let audited = audit(&db).await.len();
 
-        let mut holder = connect(&db.0, OWNER).await;
-        let holder_pid = backend_pid(&mut holder).await;
         holder.execute("BEGIN").await.unwrap();
         if wait_on == "account_admin_lock" {
             holder
@@ -1729,9 +1782,8 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
         }
 
         let writer = tokio::spawn({
-            let (name, expiring, group) = (db.0.clone(), expiring.clone(), group.clone());
+            let (expiring, group) = (expiring.clone(), group.clone());
             async move {
-                let mut c = connect(&name, API).await;
                 let audit_ctx = AuditContext {
                     actor_user_id: &expiring.user,
                     actor_approval_id: &expiring.approval,
@@ -1739,12 +1791,12 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
                     request_key: wait_on,
                     reason: "approval expires during lock wait",
                 };
-                store::rename_local_group(&mut c, &audit_ctx, &group, "Expired").await
+                store::rename_local_group(&mut writer_conn, &audit_ctx, &group, "Expired").await
             }
         });
 
         wait_for_blocked_peer(&db, holder_pid).await;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        wait_past_db_ms(&mut owner, expires_ms).await;
         holder.execute("ROLLBACK").await.unwrap();
 
         assert_eq!(
@@ -1755,4 +1807,141 @@ async fn administrative_write_rejects_approval_expired_during_lock_wait() {
         assert_eq!(group_name(&mut owner, &group).await, "Before", "{wait_on}");
         assert_eq!(audit(&db).await.len(), audited, "{wait_on}");
     }
+}
+
+/// Issue #160 (P2 #1): `store::disable_user` locks `openmettle.users` `FOR NO KEY UPDATE` (not
+/// `FOR UPDATE`), so a fenced worker spill holding a `runs` row can insert a
+/// `storage_reservations` row referencing `users(id)` (`FOR KEY SHARE`) while `disable_user`
+/// waits on that same run row, without deadlocking.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn disable_user_does_not_deadlock_with_worker_spill_storage_reservation_fk() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let target = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let scope: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.scopes WHERE personal_user_id = $1::uuid AND kind = 'personal'",
+    )
+    .bind(&target.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let conversation: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversations (scope_id, scope_kind, owner_user_id)
+         VALUES ($1::uuid, 'personal', $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&target.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let branch_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&conversation)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let message_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.messages (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&conversation)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let run_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.runs
+             (scope_id, actor_user_id, actor_approval_id, conversation_id, branch_id,
+              input_message_id, idempotency_key, state, snapshot_format, snapshot_version,
+              input_snapshot, config_snapshot, request_identity, request_digest,
+              round_limit, queue_expires_at)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+                 $6::uuid, 'spill-run', 'queued', 'openmettle.turn', 1,
+                 '{}'::bytea, '{}'::bytea, 'spill-run'::bytea, sha256('spill-run'::bytea),
+                 1, clock_timestamp() + interval '1 hour')
+         RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&target.user)
+    .bind(&target.approval)
+    .bind(&conversation)
+    .bind(&branch_id)
+    .bind(&message_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let artifact_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.artifacts (id, scope_id, scope_kind, owner_user_id)
+         VALUES (gen_random_uuid(), $1::uuid, 'personal', $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&target.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.storage_accounts (scope_id) VALUES ($1::uuid) ON CONFLICT DO NOTHING",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Session B simulates a fenced worker tool spill holding the run row FOR NO KEY UPDATE.
+    let mut worker = connect(&db.0, OWNER).await;
+    let worker_pid = backend_pid(&mut worker).await;
+    worker.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.runs WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&run_id)
+        .execute(&mut worker)
+        .await
+        .unwrap();
+
+    // Session A runs store::disable_user(target): locks users(target) FOR NO KEY UPDATE, updates
+    // users, then waits on runs(run_id) inside cancel_user_runs.
+    let mut api_conn = connect(&db.0, API).await;
+    let disabler = tokio::spawn({
+        let (admin, target) = (admin.clone(), target.clone());
+        async move { store::disable_user(&mut api_conn, &ctx(&admin, "dis-spill"), &target.user).await }
+    });
+    wait_for_blocked_peer(&db, worker_pid).await;
+
+    // While disable_user holds users(target) FOR NO KEY UPDATE and waits on runs(run_id), the
+    // worker inserts storage_reservations referencing users(target) (FOR KEY SHARE): must succeed
+    // immediately with no 40P01 deadlock.
+    sqlx::query(
+        "INSERT INTO openmettle.storage_reservations
+             (scope_id, actor_user_id, idempotency_key, artifact_id, max_bytes, run_id,
+              request_identity, request_digest, lease_expires_at)
+         VALUES ($1::uuid, $2::uuid, 'spill-res', $3::uuid, 64, $4::uuid,
+                 'spill-res'::bytea, sha256('spill-res'::bytea),
+                 clock_timestamp() + interval '5 minutes')",
+    )
+    .bind(&scope)
+    .bind(&target.user)
+    .bind(&artifact_id)
+    .bind(&run_id)
+    .execute(&mut worker)
+    .await
+    .expect(
+        "FOR NO KEY UPDATE on users must admit storage_reservations FOR KEY SHARE without deadlock",
+    );
+    worker.execute("COMMIT").await.unwrap();
+
+    applied(disabler.await.unwrap());
+    let run_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+            .bind(&run_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(run_state, "cancelled");
 }

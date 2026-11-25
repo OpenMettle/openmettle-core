@@ -1218,6 +1218,9 @@ impl Api {
                 let check_defaults = async |c: &mut PgConnection, actor: &Principal| {
                     catalog::check_project_defaults(c, actor, catalog, &selection).await
                 };
+                let recheck_defaults = async |c: &mut PgConnection, actor: &Principal| {
+                    catalog::check_project_defaults(c, actor, catalog, &selection).await
+                };
                 let view = self
                     .database(async |c| {
                         let project = if op == Op::CreateProject {
@@ -1230,6 +1233,7 @@ impl Api {
                                 target,
                                 &settings,
                                 check_defaults,
+                                recheck_defaults,
                             )
                             .await?
                         };
@@ -1348,20 +1352,23 @@ impl<'a> Call<'a> {
 }
 
 /// The session's principal, hydrated on the primary for this request; it must be active.
+async fn principal_at(
+    c: &mut PgConnection,
+    context: &sessions::Context,
+    now_ms: i64,
+) -> Result<Principal, StoreError> {
+    let principal =
+        store::hydrate_api_principal(c, context.user_id(), context.approval_id(), now_ms).await?;
+    authz::require(principal.as_ref())
+        .cloned()
+        .map_err(StoreError::Denied)
+}
+
 async fn principal(
     c: &mut PgConnection,
     context: &sessions::Context,
 ) -> Result<Principal, StoreError> {
-    let principal = store::hydrate_api_principal(
-        c,
-        context.user_id(),
-        context.approval_id(),
-        context.observed_ms(),
-    )
-    .await?;
-    authz::require(principal.as_ref())
-        .cloned()
-        .map_err(StoreError::Denied)
+    principal_at(c, context, context.observed_ms()).await
 }
 
 async fn read_project(

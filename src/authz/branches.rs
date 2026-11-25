@@ -21,15 +21,13 @@ pub struct Conversation<'a> {
     pub id: &'a str,
 }
 
-async fn write_access<'a>(
+async fn verify_write_access<'a>(
     c: &mut PgConnection,
     ctx: &AuditContext<'a>,
     chat: Conversation<'_>,
+    project: Option<&str>,
     action: Action,
 ) -> Result<(Principal, bool, AuditContext<'a>), StoreError> {
-    store::uuid(chat.scope, "scope_id")?;
-    let (_, project) =
-        runs::lock_scope_actor(c, chat.scope, ctx.actor_user_id, ctx.actor_approval_id).await?;
     let (actor, post_lock_ctx) = store::post_lock_acting(c, ctx).await?;
     let resource =
         projects::hydrate_resource(c, ResourceKind::Conversation, chat.id, post_lock_ctx.now_ms)
@@ -37,13 +35,13 @@ async fn write_access<'a>(
             .ok_or(HIDDEN)?;
     let in_scope = match &resource.scope {
         Scope::Personal { scope_id, .. } => scope_id == chat.scope,
-        Scope::Project(p) => project.as_ref() == Some(&p.id),
+        Scope::Project(p) => project == Some(p.id.as_str()),
     };
     if !in_scope {
         return Err(HIDDEN);
     }
     let archived = if let Some(id) = project {
-        let settings = projects::load_project_settings(c, &id)
+        let settings = projects::load_project_settings(c, id)
             .await?
             .ok_or(HIDDEN)?;
         if settings.deleted {
@@ -55,6 +53,20 @@ async fn write_access<'a>(
     };
     store::check(authorize_resource(&actor, &resource, action))?;
     Ok((actor, archived, post_lock_ctx))
+}
+
+async fn write_access<'a>(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'a>,
+    chat: Conversation<'_>,
+    action: Action,
+) -> Result<(Principal, bool, AuditContext<'a>, Option<String>), StoreError> {
+    store::uuid(chat.scope, "scope_id")?;
+    let (_, project) =
+        runs::lock_scope_actor(c, chat.scope, ctx.actor_user_id, ctx.actor_approval_id).await?;
+    let (actor, archived, post_lock_ctx) =
+        verify_write_access(c, ctx, chat, project.as_deref(), action).await?;
+    Ok((actor, archived, post_lock_ctx, project))
 }
 
 async fn insert_branch(
@@ -160,8 +172,11 @@ pub async fn create_conversation(
         } else {
             sqlx::query_scalar("SELECT branch_id::text FROM openmettle.branch_heads
                 WHERE conversation_id=$1::uuid AND parent_branch_id IS NULL")
-                .bind(id).fetch_one(c).await?
+                .bind(id).fetch_one(&mut *c).await?
         };
+        let (fresh_actor, fresh_ctx) = store::post_lock_acting(c, &post_lock_ctx).await?;
+        projects::authorized_create_scope_is_archived(c, &fresh_actor, scope, fresh_ctx.now_ms)
+            .await?;
         Ok(outcome.map(|conversation_id| Root { conversation_id, branch_id }))
     }).await
 }
@@ -237,7 +252,8 @@ pub async fn create_branch(
     );
     store::transact(c, &ctx, async |tx| {
         let c = tx.connection()?;
-        let (_, archived, post_lock_ctx) = write_access(c, &ctx, chat, Action::Write).await?;
+        let (_, archived, post_lock_ctx, project) =
+            write_access(c, &ctx, chat, Action::Write).await?;
         let change = Change {
             action: "branch.create",
             target_kind: "branch",
@@ -249,11 +265,11 @@ pub async fn create_branch(
             if archived { return Err(projects::ARCHIVED); }
             if let Some(source) = source {
                 let head = lock_head(c, chat, source.branch).await?;
-                store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
                 ancestor(c, chat, head.as_deref(), source.ancestor).await?;
             }
             insert_branch(c, chat, Some(result.target_id()), branch, fork).await?;
         }
+        verify_write_access(c, &post_lock_ctx, chat, project.as_deref(), Action::Write).await?;
         Ok(result)
     }).await
 }
@@ -436,12 +452,20 @@ pub async fn prepare_turn(
         store::uuid(id, "expected_head_message_id")?;
     }
     let c = tx.connection()?;
-    let (actor, archived, post_lock_ctx) = write_access(c, ctx, chat, Action::RunExecute).await?;
+    let (_, archived, post_lock_ctx, project) =
+        write_access(c, ctx, chat, Action::RunExecute).await?;
     if archived {
         return Err(projects::ARCHIVED);
     }
     let head = lock_head(c, chat, branch).await?;
-    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
+    let (actor, _, post_lock_ctx) = verify_write_access(
+        c,
+        &post_lock_ctx,
+        chat,
+        project.as_deref(),
+        Action::RunExecute,
+    )
+    .await?;
     if head.as_deref() != expected_head {
         return Err(StoreError::Conflict(HEAD_MISMATCH));
     }
@@ -478,11 +502,23 @@ pub async fn prepare_turn(
             let revisions: Vec<String> = sqlx::query_scalar("SELECT artifact_revision_id::text FROM
                 openmettle.message_parts WHERE message_id=$1::uuid AND kind='attachment' ORDER BY ordinal")
                 .bind(&id).fetch_all(&mut *c).await?;
-            for revision in revisions {
-                readable_revision(c, &actor, chat.scope, &revision, post_lock_ctx.now_ms).await?;
+            for revision in &revisions {
+                readable_revision(c, &actor, chat.scope, revision, post_lock_ctx.now_ms).await?;
+            }
+            let branch_id = insert_branch(c, chat, None, Some(branch), Some(&id)).await?;
+            let (fresh_actor, _, fresh_ctx) = verify_write_access(
+                c,
+                &post_lock_ctx,
+                chat,
+                project.as_deref(),
+                Action::RunExecute,
+            )
+            .await?;
+            for revision in &revisions {
+                readable_revision(c, &fresh_actor, chat.scope, revision, fresh_ctx.now_ms).await?;
             }
             return Ok(RunTarget {
-                branch_id: insert_branch(c, chat, None, Some(branch), Some(&id)).await?,
+                branch_id,
                 input_message_id: id,
             });
         }
@@ -513,7 +549,19 @@ pub async fn prepare_turn(
         input.parts,
     )
     .await?;
-    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
+    let (fresh_actor, _, fresh_ctx) = verify_write_access(
+        c,
+        &post_lock_ctx,
+        chat,
+        project.as_deref(),
+        Action::RunExecute,
+    )
+    .await?;
+    for p in input.parts {
+        if let Part::Attachment(id) = p {
+            readable_revision(c, &fresh_actor, chat.scope, id, fresh_ctx.now_ms).await?;
+        }
+    }
     Ok(RunTarget {
         branch_id: destination,
         input_message_id: input.id.to_owned(),

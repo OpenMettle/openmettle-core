@@ -338,12 +338,14 @@ pub(crate) async fn lock_actor_approval(
 }
 
 /// Row-lock strength on `openmettle.users`, ordered weakest to strongest so locking the same user
-/// twice in one canonical acquisition takes the stronger mode once.
+/// twice in one canonical acquisition takes the stronger mode once. Lifecycle mutations never
+/// change `users.id`, so writers use `FOR NO KEY UPDATE` (never `FOR UPDATE`) to admit concurrent
+/// foreign-key `FOR KEY SHARE` checks (`grant_assignments`, `storage_reservations`) while still
+/// conflicting with `FOR SHARE`, `FOR NO KEY UPDATE` and `FOR UPDATE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum UserLock {
     Share,
     NoKeyUpdate,
-    Update,
 }
 
 async fn lock_one_user(
@@ -356,7 +358,6 @@ async fn lock_one_user(
         UserLock::NoKeyUpdate => {
             "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE"
         }
-        UserLock::Update => "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
     };
     sqlx::query(sql).bind(user_id).execute(c).await?;
     Ok(())
@@ -442,8 +443,10 @@ pub(crate) async fn post_lock_acting<'a>(
     Ok((actor, post_lock_ctx))
 }
 
-/// Re-check approval expiry against post-lock `clock_timestamp()` after a target or ledger lock
-/// wait. All authority rows are already held, so only wall-clock expiry can change while waiting.
+/// Re-check approval and provider liveness against post-write `clock_timestamp()`. Used only for
+/// self-revoking writes (self-disable / self-demotion) where the transaction itself just disabled
+/// the actor or cleared `account_admins.active`; all other writes re-evaluate the full principal
+/// and authorization predicate after the last SQL write.
 pub(crate) async fn ensure_approval_unexpired(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -451,10 +454,20 @@ pub(crate) async fn ensure_approval_unexpired(
     let now_ms = post_lock_clock_ms(c, ctx.now_ms).await?;
     let active: bool = sqlx::query_scalar(
         "SELECT EXISTS (
-             SELECT FROM openmettle.local_identity_approvals
-              WHERE id = $1::uuid AND active AND expires_ms > $2
+             SELECT FROM openmettle.local_identity_approvals a
+               JOIN openmettle.user_identities i ON i.id = a.identity_id AND i.user_id = $1::uuid
+               JOIN openmettle.login_providers p ON p.id = a.provider_id AND p.issuer = i.issuer
+               JOIN LATERAL (
+                   SELECT pr.revision
+                     FROM openmettle.login_provider_revisions pr
+                    WHERE pr.provider_id = p.id
+                    ORDER BY pr.epoch DESC
+                    LIMIT 1
+               ) e ON e.revision IS NOT NULL
+              WHERE a.id = $2::uuid AND a.active AND a.expires_ms > $3
          )",
     )
+    .bind(ctx.actor_user_id)
     .bind(ctx.actor_approval_id)
     .bind(now_ms)
     .fetch_one(c)
@@ -580,9 +593,28 @@ async fn write_with(
         ))?;
         let change = build_change(c, &actor).await?;
         let outcome = record(c, &post_lock_ctx, &change).await?;
+        let self_revoked = matches!(
+            (&outcome, action),
+            (
+                WriteOutcome::Applied { target_id },
+                Action::ManageAccountAdmin | Action::ManageAccounts
+            ) if target_id == ctx.actor_user_id
+        );
         if let WriteOutcome::Applied { target_id } = &outcome {
             apply(c, &actor, target_id).await?;
+        }
+        if self_revoked {
             ensure_approval_unexpired(c, &post_lock_ctx).await?;
+        } else {
+            let (fresh_actor, _) = post_lock_acting(c, &post_lock_ctx).await?;
+            check(super::authorize_admin(
+                &fresh_actor,
+                AdminChange {
+                    action,
+                    removes_enabled_admin: false,
+                    enabled_account_admins: 0,
+                },
+            ))?;
         }
         Ok(outcome)
     })
@@ -633,13 +665,16 @@ async fn keep_last_admin(
 }
 
 /// Whether the user exists and is enabled, holding the row lock for the rest of the transaction.
+/// Uses `FOR NO KEY UPDATE` for exclusive lifecycle writes so foreign-key `FOR KEY SHARE` checks
+/// (`grant_assignments`, `storage_reservations`) are never blocked while authority locks stay
+/// strictly serialized.
 pub(crate) async fn lock_user(
     c: &mut PgConnection,
     user_id: &str,
     exclusive: bool,
 ) -> Result<bool, StoreError> {
     let sql = if exclusive {
-        "SELECT disabled_at IS NULL FROM openmettle.users WHERE id = $1::uuid FOR UPDATE"
+        "SELECT disabled_at IS NULL FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE"
     } else {
         "SELECT disabled_at IS NULL FROM openmettle.users WHERE id = $1::uuid FOR SHARE"
     };
@@ -745,7 +780,7 @@ pub async fn disable_user(
         c,
         ctx,
         Action::ManageAccounts,
-        Some((user_id, UserLock::Update)),
+        Some((user_id, UserLock::NoKeyUpdate)),
         change,
         async |c, actor, user| {
             if !lock_user(c, user, true).await? {
@@ -781,7 +816,7 @@ pub async fn enable_user(
         c,
         ctx,
         Action::ManageAccounts,
-        Some((user_id, UserLock::Update)),
+        Some((user_id, UserLock::NoKeyUpdate)),
         change,
         async |c, _, user| {
             if lock_user(c, user, true).await? {

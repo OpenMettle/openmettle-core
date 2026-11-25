@@ -210,6 +210,7 @@ async fn resolve(
     view: &ResourceView,
     catalog: &Catalog,
     selection: &Selection,
+    now_ms: i64,
 ) -> Result<ConfigSnapshot, Problem> {
     let (project, rev) = if let Some(id) = &view.project_id {
         let settings = projects::load_project_settings(c, id)
@@ -228,7 +229,7 @@ async fn resolve(
         &actor.user_id,
         ctx.approval_id(),
         &resolved.model,
-        ctx.observed_ms(),
+        now_ms,
     )
     .await?;
     let effective = if permitted {
@@ -242,7 +243,7 @@ async fn resolve(
             &actor.user_id,
             ctx.approval_id(),
             &models,
-            ctx.observed_ms(),
+            now_ms,
         )
         .await?;
         catalog.resolve_with_fallback(
@@ -390,7 +391,16 @@ pub(super) async fn preview(
         }
     };
     let catalog = catalog.ok_or(PROVISIONING)?;
-    let config = resolve(c, call.context, actor, view, catalog, &proposal.selection).await?;
+    let config = resolve(
+        c,
+        call.context,
+        actor,
+        view,
+        catalog,
+        &proposal.selection,
+        now,
+    )
+    .await?;
     let e = &config.effective;
     let path = history
         .turns
@@ -508,14 +518,16 @@ async fn admission(
 ) -> Result<(Admission, bool), Problem> {
     let c = tx.connection()?;
     let ctx = call.context;
-    queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;
-    let actor = principal(c, ctx).await?;
+    let (personal_owner, project_id) =
+        queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;
+    let mut now_ms = store::post_lock_clock_ms(c, ctx.observed_ms()).await?;
+    let actor = principal_at(c, ctx, now_ms).await?;
     let view = projects::resource_view(
         c,
         &actor,
         ResourceKind::Conversation,
         &r.conversation_id,
-        ctx.observed_ms(),
+        now_ms,
         authz::Action::RunExecute,
     )
     .await?;
@@ -549,6 +561,7 @@ async fn admission(
         per_round_ceiling,
         per_round_cost_micros,
         requires_device_slot,
+        selected_model,
     ) = if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
         let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
         let mode: StoredMode =
@@ -587,9 +600,11 @@ async fn admission(
             config.effective.ceiling.value,
             round_cost,
             device_slot,
+            None,
         )
     } else {
         let audit = AuditContext {
+            now_ms,
             request_key: &key,
             ..call.audit()
         };
@@ -603,14 +618,16 @@ async fn admission(
         )
         .await?;
         let c = tx.connection()?;
+        now_ms = store::post_lock_clock_ms(c, now_ms).await?;
+        let actor = principal_at(c, ctx, now_ms).await?;
         let catalog = catalog.ok_or(PROVISIONING)?;
-        let mut config = resolve(c, ctx, &actor, &view, catalog, intent.selection).await?;
+        let mut config = resolve(c, ctx, &actor, &view, catalog, intent.selection, now_ms).await?;
         if r.execution_mode == ExecutionMode::Yolo {
             config
                 .required_capabilities
                 .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
         }
-        let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
+        let history = branches::history(c, &actor, chat, &target.branch_id, now_ms)
             .await?
             .ok_or(NOT_FOUND)?;
         let path = history
@@ -622,6 +639,7 @@ async fn admission(
         let profile = catalog.target(&config.effective)?;
         let round_cost = catalog.round_cost_ceiling(&config.effective)?;
         let device_slot = profile.requires_device_slot;
+        let selected_model = config.effective.model.clone();
         let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
         snapshots.config = serde_json::to_vec(&AdmissionConfig {
             config: &config,
@@ -638,37 +656,33 @@ async fn admission(
             config.effective.ceiling.value,
             round_cost,
             device_slot,
+            Some(selected_model),
         )
     };
     let caps = gates
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    let admitted = queue::admit_run_with_mode(
-        tx,
-        &queue::RunAdmission {
-            input: RunInput {
-                scope,
-                actor: ctx.user_id(),
-                conversation: chat.id,
-                branch: &branch,
-                message: &message,
-                key: &key,
-                format: &format,
-                version,
-                input: &snapshots.input,
-                config: &snapshots.config,
-            },
-            actor_approval_id: ctx.approval_id(),
-            capabilities: &caps,
-            requested_rounds: intent.requested_rounds,
-            now_ms: ctx.observed_ms(),
-            cost_qualified: Some(per_round_cost_micros.is_some()),
+    let admission_req = queue::RunAdmission {
+        input: RunInput {
+            scope,
+            actor: ctx.user_id(),
+            conversation: chat.id,
+            branch: &branch,
+            message: &message,
+            key: &key,
+            format: &format,
+            version,
+            input: &snapshots.input,
+            config: &snapshots.config,
         },
-        limits,
-        ctx,
-    )
-    .await?;
+        actor_approval_id: ctx.approval_id(),
+        capabilities: &caps,
+        requested_rounds: intent.requested_rounds,
+        now_ms,
+        cost_qualified: Some(per_round_cost_micros.is_some()),
+    };
+    let admitted = queue::admit_run_with_mode(tx, &admission_req, limits, ctx).await?;
     let build_token_units = |round_limit: i32| -> Result<i64, Problem> {
         let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
         per_round
@@ -701,6 +715,28 @@ async fn admission(
             {
                 return Ok((Admission::Refused(limit), false));
             }
+            let c = tx.connection()?;
+            let (_, _, _, post_reserve_ms) = queue::verify_admission_authority(
+                c,
+                &admission_req,
+                personal_owner.as_deref(),
+                project_id.as_deref(),
+                Some(ctx.locator()),
+                now_ms,
+            )
+            .await?;
+            if let Some(model) = selected_model.as_deref()
+                && !authz::gateway::family::permits_at(
+                    c,
+                    ctx.user_id(),
+                    ctx.approval_id(),
+                    model,
+                    post_reserve_ms,
+                )
+                .await?
+            {
+                return Err(crate::model_config::Error::Unauthorized.into());
+            }
             Ok((admitted, true))
         }
         Admission::Replayed {
@@ -730,6 +766,15 @@ async fn admission(
             if refusal.is_some() {
                 return Ok((admitted, false));
             }
+            queue::verify_admission_authority(
+                tx.connection()?,
+                &admission_req,
+                personal_owner.as_deref(),
+                project_id.as_deref(),
+                Some(ctx.locator()),
+                now_ms,
+            )
+            .await?;
             Ok((admitted, committed))
         }
         _ => Ok((admitted, false)),

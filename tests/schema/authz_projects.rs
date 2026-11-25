@@ -1935,12 +1935,17 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
     }
 
     // 2. Approval expiring while waiting on the project row lock is rejected with InactivePrincipal.
+    //    Pre-open and warm connections before computing the short DB-clock TTL.
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
     let db_now_ms: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let expiring = account(&mut owner, PROVIDER, true, db_now_ms + 250).await;
+    let expires_ms = db_now_ms + 500;
+    let expiring = account(&mut owner, PROVIDER, true, expires_ms).await;
     applied(
         set_role(
             &db,
@@ -1953,8 +1958,6 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
         .await,
     );
     let audited = audit(&db).await.len();
-    let mut holder = connect(&db.0, OWNER).await;
-    let holder_pid = backend_pid(&mut holder).await;
     holder.execute("BEGIN").await.unwrap();
     sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
         .bind(&p)
@@ -1962,9 +1965,8 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
         .await
         .unwrap();
     let writer = tokio::spawn({
-        let (db_name, expiring, bob, p) = (db.0.clone(), expiring.clone(), bob.clone(), p.clone());
+        let (expiring, bob, p) = (expiring.clone(), bob.clone(), p.clone());
         async move {
-            let mut c = connect(&db_name, API).await;
             let audit_ctx = store::AuditContext {
                 actor_user_id: &expiring.user,
                 actor_approval_id: &expiring.approval,
@@ -1973,7 +1975,7 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
                 reason: "approval expires waiting on project lock",
             };
             projects::set_project_member_role(
-                &mut c,
+                &mut writer_conn,
                 &audit_ctx,
                 &p,
                 &user(&bob),
@@ -1983,7 +1985,7 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
         }
     });
     wait_for_blocked_peer(&db, holder_pid).await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    wait_past_db_ms(&mut owner, expires_ms).await;
     holder.execute("ROLLBACK").await.unwrap();
     assert_eq!(
         denied(writer.await.unwrap()),
@@ -2048,4 +2050,287 @@ async fn project_share_and_conversation_writes_serialize_with_revocation_and_exp
         DenialReason::InactivePrincipal
     );
     assert_eq!(audit(&db).await.len(), audited);
+}
+
+/// Issue #160 (P1 #1): `project_write` re-evaluates the full live authorization predicate at
+/// post-write `clock_timestamp()`, rejecting and rolling back when an OIDC group
+/// `membership_observations` row supplying `Owner` expires while `apply` waits on a target lock
+/// even though `local_identity_approvals` remains valid far in the future.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn project_write_rejects_oidc_membership_expired_during_target_lock_wait() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    // Long-lived approval (year 2100); only the OIDC membership observation has a short TTL.
+    let oidc_actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let mut owner = present_membership(&db, &oidc_actor).await;
+    let p = create(&db, &alice, "proj-oidc-owner").await;
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-oidc-owner",
+            &p,
+            &Grantee::OidcGroup(OIDC_TEAM.into()),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+
+    // Pre-open and warm connections before shortening the OIDC observation expiry.
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    let mut writer_conn = connect(&db.0, API).await;
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let obs_expires_ms = db_now_ms + 600;
+    sqlx::query(
+        "UPDATE openmettle.membership_observations
+            SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
+          WHERE approval_id = $3::uuid",
+    )
+    .bind(db_now_ms - 1000)
+    .bind(obs_expires_ms)
+    .bind(&oidc_actor.approval)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let audited = audit(&db).await.len();
+
+    // Hold ONLY project_settings (not projects), so project_write passes its initial authorize()
+    // check while the OIDC Owner observation is still live and blocks inside apply().
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.project_settings WHERE project_id = $1::uuid FOR UPDATE")
+        .bind(&p)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let writer = tokio::spawn({
+        let (oidc_actor, p) = (oidc_actor.clone(), p.clone());
+        async move {
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &oidc_actor.user,
+                actor_approval_id: &oidc_actor.approval,
+                now_ms: db_now_ms,
+                request_key: "oidc-expiring-settings",
+                reason: "oidc owner expires during settings lock wait",
+            };
+            let empty = json!({});
+            let updated = ProjectSettingsInput {
+                name: "Should Roll Back",
+                instructions: "expired oidc owner",
+                defaults: &empty,
+            };
+            projects::update_project_settings(&mut writer_conn, &audit_ctx, &p, &updated).await
+        }
+    });
+
+    wait_for_blocked_peer(&db, holder_pid).await;
+    wait_past_db_ms(&mut owner, obs_expires_ms).await;
+    holder.execute("ROLLBACK").await.unwrap();
+
+    assert_eq!(denied(writer.await.unwrap()), DenialReason::NotFound);
+    assert_eq!(
+        projects::load_project_settings(&mut api(&db).await, &p)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        "P"
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+}
+
+/// Issue #160 (P2 #1 & P2 #2):
+/// 1. `store::disable_user` takes `FOR NO KEY UPDATE` (not `FOR UPDATE`) on `openmettle.users`,
+///    so a personal `share_change` holding `owner` `FOR NO KEY UPDATE` can insert a
+///    `grant_assignments` row referencing `recipient` (`FOR KEY SHARE`) even when
+///    `recipient.user < owner.user` and `disable_user(owner, recipient)` holds `recipient`.
+/// 2. Two-user personal `branches::create_branch` (`collaborator != owner`) takes
+///    `account_admin_lock FOR SHARE` before `users`, so neither an `N-1` (schema-37) unordered
+///    `disable_user(owner, collaborator)` nor a schema-38 `store::disable_user` deadlocks when
+///    `collaborator.user < owner.user`.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn personal_share_and_two_user_branch_do_not_deadlock_with_disable_user() {
+    use openmettle_core::authz::branches;
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let backup_admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &backup_admin).await;
+    let u1 = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let u2 = account(&mut owner, PROVIDER, true, FUTURE).await;
+    // Order so `low.user < high.user` (the exact direction that triggers AB/BA cycles).
+    let (low, high) = if u1.user < u2.user {
+        (u1, u2)
+    } else {
+        (u2, u1)
+    };
+    make_admin(&mut owner, &high).await;
+
+    let high_personal: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.scopes
+          WHERE personal_user_id = $1::uuid AND kind = 'personal'",
+    )
+    .bind(&high.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let chat = conversation(&mut owner, &high_personal, "personal", &high.user)
+        .await
+        .unwrap();
+
+    // 1. P2 #1: personal share_change holds users(high) FOR NO KEY UPDATE while
+    //    store::disable_user(admin=high, target=low) locks users(low) FOR NO KEY UPDATE first
+    //    (low < high) and waits on users(high) FOR SHARE. Inserting grant_assignments with
+    //    grantee_user_id = low (FOR KEY SHARE on users(low)) must succeed without deadlock.
+    let mut sharer = connect(&db.0, OWNER).await;
+    let sharer_pid = backend_pid(&mut sharer).await;
+    sharer.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&high.user)
+        .execute(&mut sharer)
+        .await
+        .unwrap();
+
+    let mut dis_conn = connect(&db.0, API).await;
+    let disabler = tokio::spawn({
+        let (high, low) = (high.clone(), low.clone());
+        async move { store::disable_user(&mut dis_conn, &ctx(&high, "dis-low-1"), &low.user).await }
+    });
+    wait_for_blocked_peer(&db, sharer_pid).await;
+
+    sqlx::query(
+        "INSERT INTO openmettle.grant_assignments
+             (scope_id, target_kind, conversation_id, grantee_kind, grantee_user_id,
+              assignment_format, assignment_version, assignment_key, source_kind, created_by_user_id)
+         VALUES ($1::uuid, 'conversation', $2::uuid, 'user', $3::uuid,
+                 'openmettle.resource-access', 1, 'read', 'direct', $4::uuid)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&high_personal)
+    .bind(&chat)
+    .bind(&low.user)
+    .bind(&high.user)
+    .execute(&mut sharer)
+    .await
+    .expect("FOR NO KEY UPDATE on users(low) must admit grant_assignments FOR KEY SHARE");
+    sharer.execute("COMMIT").await.unwrap();
+    applied(disabler.await.unwrap());
+
+    // Re-enable `low` and grant Write share on `high`'s personal conversation.
+    applied(store::enable_user(&mut api(&db).await, &ctx(&high, "en-low"), &low.user).await);
+    applied(
+        projects::share_resource(
+            &mut api(&db).await,
+            &ctx(&high, "share-write-low"),
+            CONVERSATION,
+            &chat,
+            &user(&low),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+
+    // 2a. P2 #2: N-1 (schema-37) unordered disable_user(admin=high, target=low) holds
+    //     account_admin_lock FOR UPDATE -> users(high) FOR SHARE before locking users(low).
+    //     Collaborator create_branch (low < high) must block on account_admin_lock FOR SHARE
+    //     before touching users(low), so N-1's users(low) FOR UPDATE NOWAIT succeeds cleanly.
+    let mut n1_disabler = connect(&db.0, OWNER).await;
+    let n1_pid = backend_pid(&mut n1_disabler).await;
+    n1_disabler.execute("BEGIN").await.unwrap();
+    n1_disabler
+        .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        .await
+        .unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+        .bind(&high.user)
+        .execute(&mut n1_disabler)
+        .await
+        .unwrap();
+
+    let mut branch_conn = connect(&db.0, API).await;
+    let branch_writer = tokio::spawn({
+        let (low, high_personal, chat) = (low.clone(), high_personal.clone(), chat.clone());
+        async move {
+            branches::create_branch(
+                &mut branch_conn,
+                &ctx(&low, "collab-branch-n1"),
+                branches::Conversation {
+                    scope: &high_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, n1_pid).await;
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE NOWAIT")
+        .bind(&low.user)
+        .execute(&mut n1_disabler)
+        .await
+        .expect("two-user personal create_branch must block on account_admin_lock before locking users(low)");
+    sqlx::query(
+        "UPDATE openmettle.users
+            SET disabled_at = clock_timestamp(), session_generation = session_generation + 1
+          WHERE id = $1::uuid",
+    )
+    .bind(&low.user)
+    .execute(&mut n1_disabler)
+    .await
+    .unwrap();
+    n1_disabler.execute("COMMIT").await.unwrap();
+    assert_eq!(
+        denied(branch_writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+
+    // 2b. Schema-38 (N) store::disable_user(admin=high, target=low) also serializes cleanly with
+    //     collaborator create_branch when low < high.
+    applied(store::enable_user(&mut api(&db).await, &ctx(&high, "en-low-2"), &low.user).await);
+    let mut gate = connect(&db.0, OWNER).await;
+    let gate_pid = backend_pid(&mut gate).await;
+    gate.execute("BEGIN").await.unwrap();
+    gate.execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+        .await
+        .unwrap();
+    let mut dis_conn_2 = connect(&db.0, API).await;
+    let dis_n = tokio::spawn({
+        let (high, low) = (high.clone(), low.clone());
+        async move { store::disable_user(&mut dis_conn_2, &ctx(&high, "dis-low-2"), &low.user).await }
+    });
+    let mut branch_conn_2 = connect(&db.0, API).await;
+    let br_n = tokio::spawn({
+        let (low, high_personal, chat) = (low.clone(), high_personal.clone(), chat.clone());
+        async move {
+            branches::create_branch(
+                &mut branch_conn_2,
+                &ctx(&low, "collab-branch-n"),
+                branches::Conversation {
+                    scope: &high_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, gate_pid).await;
+    gate.execute("ROLLBACK").await.unwrap();
+    applied(dis_n.await.unwrap());
+    // Whichever won account_admin_lock first, neither may deadlock (40P01).
+    match br_n.await.unwrap() {
+        Ok(WriteOutcome::Applied { .. })
+        | Err(StoreError::Denied(DenialReason::InactivePrincipal)) => {}
+        other => panic!("unexpected outcome: {other:?}"),
+    }
 }
