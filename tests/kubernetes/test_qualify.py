@@ -49,20 +49,36 @@ class ContractTests(unittest.TestCase):
 
     def test_repository_contract_is_valid(self):
         self.assertEqual(self.contract["api"]["serviceAccountName"], "openmettle-api")
+        self.assertEqual(self.contract["worker"]["serviceAccountName"], "openmettle-worker")
+        self.assertEqual(self.contract["gateway"]["serviceAccountName"], "openmettle-gateway")
+        self.assertEqual(self.contract["gateway"]["port"], 8082)
 
-    def test_rejects_shared_service_account(self):
-        bad = copy.deepcopy(self.contract)
-        bad["worker"]["serviceAccountName"] = bad["api"]["serviceAccountName"]
-        with self.assertRaisesRegex(qualify.ContractError, "serviceAccountName"):
-            qualify.validate_contract(bad)
+    def test_rejects_shared_service_account_or_port(self):
+        for role_a, role_b in (("api", "worker"), ("api", "gateway"), ("worker", "gateway")):
+            bad = copy.deepcopy(self.contract)
+            bad[role_b]["serviceAccountName"] = bad[role_a]["serviceAccountName"]
+            with self.assertRaisesRegex(qualify.ContractError, "serviceAccountName"):
+                qualify.validate_contract(bad)
+            bad = copy.deepcopy(self.contract)
+            bad[role_b]["port"] = bad[role_a]["port"]
+            with self.assertRaisesRegex(qualify.ContractError, "port"):
+                qualify.validate_contract(bad)
 
     def test_rejects_token_automount(self):
         bad = copy.deepcopy(self.contract)
         bad["api"]["automountServiceAccountToken"] = True
         with self.assertRaisesRegex(qualify.ContractError, "automount"):
             qualify.validate_contract(bad)
+        bad = copy.deepcopy(self.contract)
+        bad["gateway"]["automountServiceAccountToken"] = True
+        with self.assertRaisesRegex(qualify.ContractError, "automount"):
+            qualify.validate_contract(bad)
 
-    def test_rejects_missing_requests_and_wrong_prefix(self):
+    def test_rejects_missing_role_missing_requests_and_wrong_prefix(self):
+        bad = copy.deepcopy(self.contract)
+        del bad["gateway"]
+        with self.assertRaisesRegex(qualify.ContractError, "gateway: missing"):
+            qualify.validate_contract(bad)
         bad = copy.deepcopy(self.contract)
         del bad["worker"]["requests"]["memory"]
         with self.assertRaisesRegex(qualify.ContractError, "requests"):
@@ -76,8 +92,12 @@ class ContractTests(unittest.TestCase):
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.contract = qualify.load_contract()
-        self.passwords = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32}
-        images = {"api": "openmettle-api:k8s-qual-x", "worker": "openmettle-worker:k8s-qual-x"}
+        self.passwords = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "gateway": "d" * 32}
+        images = {
+            "api": "openmettle-api:k8s-qual-x",
+            "worker": "openmettle-worker:k8s-qual-x",
+            "gateway": "openmettle-gateway:k8s-qual-x",
+        }
         rendered = qualify.render_manifests(self.contract, images, self.passwords, "0123abcd")
         self.items = rendered["items"]
 
@@ -101,6 +121,16 @@ class ManifestTests(unittest.TestCase):
             self.assertNotIn("envFrom", container)
             account = self.find("ServiceAccount", spec["serviceAccountName"])
             self.assertIs(account["automountServiceAccountToken"], False)
+        gw_env = {
+            e["name"]: e.get("value")
+            for e in self.find("Deployment", "openmettle-gateway")["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(gw_env["OPENMETTLE_GATEWAY_UPSTREAM_URL"], "http://127.0.0.1:30000")
+        self.assertEqual(gw_env["OPENMETTLE_GATEWAY_MODEL"], "synthetic-model")
+        for role in ("api", "gateway"):
+            svc = self.find("Service", f"openmettle-{role}")
+            self.assertEqual(svc["spec"]["selector"], {"app.kubernetes.io/name": f"openmettle-{role}"})
+            self.assertEqual(svc["spec"]["ports"][0]["port"], self.contract[role]["port"])
 
     def test_only_worker_uses_fast_maintenance_sweeps(self):
         for role in qualify.ROLES:
@@ -114,7 +144,8 @@ class ManifestTests(unittest.TestCase):
             url = self.find("Secret", f"openmettle-{role}-database")["stringData"]["url"]
             self.assertIn(f"openmettle_{role}:{self.passwords[role]}@", url)
         rendered = json.dumps(self.items)
-        self.assertEqual(rendered.count(self.passwords["api"]), 2)  # URL and role SQL only
+        for role in qualify.ROLES:
+            self.assertEqual(rendered.count(self.passwords[role]), 2)  # URL and role SQL only
 
     def test_app_namespace_enforces_restricted_and_marks_dev(self):
         labels = self.find("Namespace", qualify.APP_NAMESPACE)["metadata"]["labels"]
@@ -142,8 +173,17 @@ class WorkerRecoveryTests(unittest.TestCase):
         q.deploy()
         self.assertEqual(events[:4], [
             ("apply", ["postgres"]), ("ready", "deployment/postgres"), ("schema",),
-            ("apply", ["openmettle-api", "openmettle-worker"]),
+            ("apply", ["openmettle-api", "openmettle-worker", "openmettle-gateway"]),
         ])
+
+    def test_prepare_sweeps_does_not_recreate_provisioned_gateway_role(self):
+        q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
+        q.fixture_sql = Mock()
+        q.prepare_sweeps()
+        sql = q.fixture_sql.call_args.args[0]
+        self.assertIn("CREATE ROLE openmettle_owner;", sql)
+        self.assertIn("CREATE ROLE openmettle_issuance;", sql)
+        self.assertNotIn("CREATE ROLE openmettle_gateway", sql)
 
     def test_sigkill_targets_only_observed_worker_and_waits_for_a_new_ready_container(self):
         q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
@@ -297,7 +337,7 @@ class CleanupTests(unittest.TestCase):
         def run(args, **kwargs):
             calls.append(args)
             if args[:3] == ["docker", "image", "inspect"]:
-                role = "worker" if "worker" in args[-1] else "api"
+                role = next(r for r in qualify.ROLES if f"openmettle-{r}:" in args[-1])
                 return done(json.dumps({"ExposedPorts": {f"{q.contract[role]['port']}/tcp": {}},
                                         "User": qualify.IMAGE_USER,
                                         "Entrypoint": [f"/usr/local/bin/openmettle-{role}"]}))
@@ -305,7 +345,7 @@ class CleanupTests(unittest.TestCase):
         q.run = run
         q.build_images()
         builds = [c for c in calls if c[:2] == ["docker", "build"]]
-        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(builds), 3)
         self.assertTrue(all(c[2:4] == ["--builder", "default"] for c in builds))
 
     def test_cleanup_attempts_remaining_resources_after_failure(self):
@@ -320,8 +360,8 @@ class CleanupTests(unittest.TestCase):
             return done(returncode=1)
         q.run = run
         failures = q.cleanup()
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(len(failures), 3)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(failures), 4)
         self.assertIn("TimeoutExpired", failures[0])
 
     def test_cleanup_failure_overrides_successful_scenario(self):

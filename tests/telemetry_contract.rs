@@ -413,7 +413,12 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         // Standard Prometheus resource label derived from `service.name`.
         labels.insert(
             "job".to_owned(),
-            ["openmettle-api".to_owned(), "openmettle-worker".to_owned()].into(),
+            [
+                "openmettle-api".to_owned(),
+                "openmettle-worker".to_owned(),
+                "openmettle-gateway".to_owned(),
+            ]
+            .into(),
         );
         allowed_metrics.insert(prom_name, labels);
     }

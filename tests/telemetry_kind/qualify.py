@@ -3,7 +3,7 @@
 
 Test fixture only: this is not an installer, Helm chart or deployment manifest. The harness
 creates a uniquely named kind cluster classified `dev`, uses a temporary kubeconfig, builds
-local `openmettle-api` and `openmettle-worker` images without publishing them, deploys pinned
+local `openmettle-api`, `openmettle-worker` and `openmettle-gateway` images without publishing them, deploys pinned
 PostgreSQL, Grafana Alloy and Prometheus fixtures with an ephemeral synthetic TLS CA, and
 deletes only the cluster and image tags it created.
 
@@ -109,6 +109,7 @@ CANARY_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 CANARY_TRACEPARENT = f"00-{CANARY_TRACE_ID}-00f067aa0ba902b7-01"
 CANARY_QUERY_SECRET = "openmettle-synthetic-query-secret-never-log"
 CANARY_BEARER_TOKEN = "openmettle-synthetic-bearer-token-never-log"
+GATEWAY_PROBE_REQUEST_ID = "00000000-0000-4000-8000-000000000001"
 EXPECTED_ALERTS = (
     "OpenMettleApiHighServerErrorRatio",
     "OpenMettleDatabaseReadinessFailing",
@@ -282,7 +283,7 @@ def render_manifests(
     alerts_yaml: str,
     run_id: str,
 ) -> dict:
-    """Return a kubectl List with DB, Prometheus, Alloy, and OTLP-enabled API/worker."""
+    """Return a kubectl List with DB, Prometheus, Alloy, and OTLP-enabled API/worker/gateway."""
     labels = {"openmettle.dev/environment": "dev", "openmettle.dev/qualification-run": run_id}
     items = [
         {
@@ -559,7 +560,7 @@ def render_manifests(
         },
     ]
 
-    # OTLP-enabled API and worker deployments under restricted PSS
+    # OTLP-enabled API, worker and gateway deployments under restricted PSS
     traces_url = f"https://{ALLOY_HOST}:{ALLOY_OTLP_PORT}/v1/traces"
     metrics_url = f"https://{ALLOY_HOST}:{ALLOY_OTLP_PORT}/v1/metrics"
     for role in ROLES:
@@ -574,6 +575,7 @@ def render_manifests(
                 "valueFrom": {"secretKeyRef": {"name": f"{name}-database", "key": "url"}},
             },
             *[{"name": prefix + k, "value": v} for k, v in FIXTURE_SETTINGS[role].items()],
+            *([{"name": f"{prefix}LOG_LEVEL", "value": "debug"}] if role == "gateway" else []),
             {"name": f"{prefix}OTLP_TRACES_ENDPOINT", "value": traces_url},
             {"name": f"{prefix}OTLP_METRICS_ENDPOINT", "value": metrics_url},
             {"name": f"{prefix}OTLP_CA_FILE", "value": OTLP_CA_FILE},
@@ -680,12 +682,12 @@ def validate_prometheus_series(series_list: list[dict], telemetry_contract: dict
     - Every metric name is declared by contracts/telemetry/v1.json (with Prometheus translation).
     - Zero label names contain any disallowed substring from the contract.
     - Every label name is either `__name__`, `job`, `instance`, or a declared label for that metric.
-    - `job` is `openmettle-api` or `openmettle-worker` and `instance` is a valid UUIDv4.
+    - `job` is `openmettle-api`, `openmettle-worker`, or `openmettle-gateway` and `instance` is a valid UUIDv4.
     - Every metric-specific label value belongs to the contract's closed enum set.
     """
     disallowed = [s.lower() for s in telemetry_contract["policy"]["disallowed_metric_label_substrings"]]
     catalog = _allowed_series_catalog(telemetry_contract)
-    allowed_jobs = {"openmettle-api", "openmettle-worker"}
+    allowed_jobs = {f"openmettle-{role}" for role in ROLES}
     instances_by_job: dict[str, set[str]] = {}
     observed_names: set[str] = set()
 
@@ -766,6 +768,35 @@ def parse_alloy_accepted_spans(metrics_text: str) -> float:
     return total
 
 
+def parse_gateway_request_logs(logs: str) -> list[dict]:
+    """Extract DEBUG `http.request.completed` JSON entries for unauthenticated gateway probes."""
+    matches = []
+    for line in logs.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        request_id = entry.get("request_id")
+        duration_us = entry.get("duration_us")
+        if (
+            entry.get("level") == "DEBUG"
+            and entry.get("event") == "http.request.completed"
+            and entry.get("http.route") == "/v1/chat/completions"
+            and entry.get("http.request.method") == "POST"
+            and entry.get("http.response.status_code") == 401
+            and isinstance(request_id, str)
+            and UUIDV4_RE.fullmatch(request_id)
+            and request_id != GATEWAY_PROBE_REQUEST_ID
+            and isinstance(duration_us, int)
+            and not isinstance(duration_us, bool)
+        ):
+            matches.append(entry)
+    return matches
+
+
 # --- Safety guards & HTTP/port-forward helpers -------------------------------------------
 
 def check_cluster_absent(run, name: str) -> None:
@@ -785,8 +816,21 @@ def check_openssl(run) -> None:
         raise Refusal("required runner tool unusable: openssl")
 
 
-def http_request(port: int, path: str, headers: dict[str, str] | None = None, timeout: float = 5.0):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+def http_request(
+    port: int,
+    path: str,
+    headers: dict[str, str] | None = None,
+    timeout: float = 5.0,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        headers=headers or {},
+        method=method,
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -981,7 +1025,7 @@ class TelemetryQualification:
             self.process_contract, self.images, passwords, tls, self.alerts_yaml, self.run_id,
         )
         # Apply namespaces, Postgres, Prometheus, and Alloy first so the collector is ready
-        # before openmettle-api/worker start and emit their initial zero-baseline drop series.
+        # before openmettle-api/worker/gateway start and emit their initial zero-baseline drop series.
         infra_items = []
         app_items = []
         for item in manifests["items"]:
@@ -1099,9 +1143,13 @@ class TelemetryQualification:
 
     def scenario(self):
         api_spec = self.process_contract["api"]
+        gateway_spec = self.process_contract["gateway"]
         api_pods = self.pods(APP_NAMESPACE, "app.kubernetes.io/name=openmettle-api")
         self.expect(len(api_pods) == 1, f"expected 1 api pod, found {len(api_pods)}")
         api_pod = api_pods[0]["metadata"]["name"]
+        gateway_pods = self.pods(APP_NAMESPACE, "app.kubernetes.io/name=openmettle-gateway")
+        self.expect(len(gateway_pods) == 1, f"expected 1 gateway pod, found {len(gateway_pods)}")
+        gateway_pod = gateway_pods[0]["metadata"]["name"]
 
         with contextlib.ExitStack() as stack:
             prom_pf = stack.enter_context(PortForward(
@@ -1115,6 +1163,10 @@ class TelemetryQualification:
             api_pf = stack.enter_context(PortForward(
                 self.kubectl, self.env, APP_NAMESPACE,
                 f"pod/{api_pod}", api_spec["port"],
+            ))
+            gateway_pf = stack.enter_context(PortForward(
+                self.kubectl, self.env, APP_NAMESPACE,
+                f"pod/{gateway_pod}", gateway_spec["port"],
             ))
 
             # 1. Verify all 4 v1 Prometheus alert rules are loaded and healthy.
@@ -1137,11 +1189,16 @@ class TelemetryQualification:
             self.passed("Prometheus loaded all v1 alert rules",
                         rules=sorted(loaded_rules.keys()))
 
-            # 2. Generate live HTTP traffic: probes + unmatched route with synthetic canary headers.
+            # 2. Generate live HTTP traffic on API and gateway: probes + traced routes with
+            # synthetic canary headers/query strings.
             self.expect(http_request(api_pf.port, "/healthz") == (200, "ok\n"),
                         "API /healthz failed")
             self.expect(http_request(api_pf.port, "/readyz") == (200, "ready\n"),
                         "API /readyz failed")
+            self.expect(http_request(gateway_pf.port, "/healthz") == (200, "ok\n"),
+                        "gateway /healthz failed")
+            self.expect(http_request(gateway_pf.port, "/readyz") == (200, "ready\n"),
+                        "gateway /readyz failed")
             for _ in range(3):
                 status, _ = http_request(
                     api_pf.port,
@@ -1152,32 +1209,62 @@ class TelemetryQualification:
                     },
                 )
                 self.expect(status == 404, f"expected 404 for unmatched probe, got {status}")
+            # Send an unauthenticated POST /v1/chat/completions to openmettle-gateway with a
+            # non-32-byte bearer containing CANARY_BEARER_TOKEN so credential() fails closed
+            # with 401 before touching PostgreSQL while exercising matched /v1 telemetry.
+            for _ in range(3):
+                status, _ = http_request(
+                    gateway_pf.port,
+                    f"/v1/chat/completions?secret={CANARY_QUERY_SECRET}",
+                    headers={
+                        "x-request-id": GATEWAY_PROBE_REQUEST_ID,
+                        "traceparent": CANARY_TRACEPARENT,
+                        "Authorization": f"Bearer {CANARY_BEARER_TOKEN}-invalid",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                    data=b"{}",
+                )
+                self.expect(status == 401, f"expected 401 for unauthenticated gateway probe, got {status}")
 
-            # 3. Verify Alloy accepted OTLP trace spans over HTTPS and respected redaction / traceparent.
+            # 3. Verify Alloy accepted OTLP trace spans over HTTPS from both API and gateway
+            # and respected redaction / traceparent ignoring.
             def alloy_accepted_spans():
                 status, body = http_request(alloy_pf.port, "/metrics")
                 if status != 200:
                     return None
                 count = parse_alloy_accepted_spans(body)
-                return count if count >= 3.0 else None
+                return count if count >= 6.0 else None
 
             accepted_spans = self.wait_for(
                 "Alloy to accept OTLP trace spans over HTTPS", alloy_accepted_spans, timeout=60
             )
-            alloy_logs = self.kube("--namespace", TELEMETRY_NAMESPACE, "logs",
-                                   "deployment/alloy", "--tail=500").stdout
-            self.expect("http.server.request" in alloy_logs,
-                        "Alloy debug exporter did not log http.server.request span")
-            self.expect("unmatched" in alloy_logs,
-                        "Alloy debug exporter did not log unmatched route attribute")
+
+            def alloy_trace_logs_ready():
+                logs = self.kube("--namespace", TELEMETRY_NAMESPACE, "logs",
+                                 "deployment/alloy", "--tail=1000").stdout
+                if (
+                    "http.server.request" in logs
+                    and "unmatched" in logs
+                    and "/v1/chat/completions" in logs
+                    and "openmettle-gateway" in logs
+                ):
+                    return logs
+                return None
+
+            alloy_logs = self.wait_for(
+                "Alloy debug exporter to log API and gateway http.server.request spans",
+                alloy_trace_logs_ready,
+                timeout=30,
+            )
             for forbidden in (CANARY_TRACE_ID, CANARY_QUERY_SECRET, CANARY_BEARER_TOKEN):
                 self.expect(forbidden not in alloy_logs,
                             f"forbidden canary leaked into Alloy trace logs: {forbidden}")
             self.passed("HTTPS OTLP trace ingestion and inbound traceparent/secret redaction",
                         accepted_spans=accepted_spans)
 
-            # 4. Verify Prometheus ingested API and worker metrics (including zero-initialized
-            # drop counters) with valid contract labels.
+            # 4. Verify Prometheus ingested API, worker and gateway metrics (including
+            # zero-initialized drop counters) with valid contract labels.
             def core_metrics_ingested():
                 unmatched = self.prom_query(
                     prom_pf.port,
@@ -1201,55 +1288,101 @@ class TelemetryQualification:
                     'openmettle_db_readiness_checks_total{job="openmettle-worker",outcome="ok"}',
                     allow_transient=True,
                 )
+                gateway_v1 = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_http_server_requests_total{job="openmettle-gateway",'
+                    'http_request_method="POST",openmettle_route_class="v1",'
+                    'http_response_status_class="4xx"}',
+                    allow_transient=True,
+                )
+                gateway_readyz = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_db_readiness_checks_total{job="openmettle-gateway",outcome="ok"}',
+                    allow_transient=True,
+                )
+                gateway_duration = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_http_server_request_duration_seconds_count{job="openmettle-gateway",'
+                    'openmettle_route_class="v1",http_response_status_class="4xx"}',
+                    allow_transient=True,
+                )
                 drop_baseline = self.prom_query(
                     prom_pf.port,
                     'openmettle_telemetry_dropped_total{job="openmettle-api",'
                     'signal="metric_exports"}',
                     allow_transient=True,
                 )
-                if unmatched and readyz and duration and worker and drop_baseline:
+                gateway_drop_baseline = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_telemetry_dropped_total{job="openmettle-gateway",'
+                    'signal="metric_exports"}',
+                    allow_transient=True,
+                )
+                if (
+                    unmatched and readyz and duration and worker
+                    and gateway_v1 and gateway_readyz and gateway_duration
+                    and drop_baseline and gateway_drop_baseline
+                ):
                     return {
                         "api_unmatched_4xx": float(unmatched[0]["value"][1]),
                         "api_db_ready_ok": float(readyz[0]["value"][1]),
                         "api_duration_count": float(duration[0]["value"][1]),
                         "worker_db_ready_ok": float(worker[0]["value"][1]),
+                        "gateway_v1_4xx": float(gateway_v1[0]["value"][1]),
+                        "gateway_db_ready_ok": float(gateway_readyz[0]["value"][1]),
+                        "gateway_duration_count": float(gateway_duration[0]["value"][1]),
                         "api_drop_baseline": float(drop_baseline[0]["value"][1]),
+                        "gateway_drop_baseline": float(gateway_drop_baseline[0]["value"][1]),
                     }
                 return None
 
             ingested = self.wait_for(
-                "Prometheus OTLP metric ingestion for API and worker",
+                "Prometheus OTLP metric ingestion for API, worker and gateway",
                 core_metrics_ingested,
                 timeout=90,
             )
             self.expect(
                 ingested["api_drop_baseline"] == 0.0,
-                f"expected zero-initialized metric_exports drop baseline before outage, got {ingested['api_drop_baseline']}",
+                f"expected zero-initialized API metric_exports drop baseline before outage, got {ingested['api_drop_baseline']}",
+            )
+            self.expect(
+                ingested["gateway_drop_baseline"] == 0.0,
+                f"expected zero-initialized gateway metric_exports drop baseline before outage, got {ingested['gateway_drop_baseline']}",
             )
             all_series = self.prom_query(prom_pf.port, '{__name__=~"openmettle_.*"}')
             validation = validate_prometheus_series(all_series, self.telemetry_contract)
-            api_instances = validation["instances_by_job"].get("openmettle-api", [])
-            worker_instances = validation["instances_by_job"].get("openmettle-worker", [])
-            self.expect(len(api_instances) == 1 and len(worker_instances) == 1,
-                        f"expected 1 instance per job, got {validation['instances_by_job']}")
-            self.expect(api_instances[0] != worker_instances[0],
-                        "openmettle-api and openmettle-worker shared a service.instance.id")
+            instances = {}
+            for role in ROLES:
+                job = f"openmettle-{role}"
+                job_instances = validation["instances_by_job"].get(job, [])
+                self.expect(
+                    len(job_instances) == 1,
+                    f"expected 1 instance for {job}, got {validation['instances_by_job']}",
+                )
+                instances[job] = job_instances[0]
+            self.expect(
+                len(set(instances.values())) == len(ROLES),
+                f"processes shared a service.instance.id: {instances}",
+            )
             self.passed(
                 "Prometheus OTLP metrics ingestion and contract label conformance",
                 **ingested,
                 **validation,
             )
 
-            # 5. Single collector outage: verify API resilience and that OpenMettleTelemetryDropsDetected
-            # transitions from zero baseline through pending into firing (for: 5m over [15m] window).
+            # 5. Single collector outage: verify API and gateway resilience and that
+            # OpenMettleTelemetryDropsDetected transitions from zero baseline through pending
+            # into firing (for: 5m over [15m] window).
             alloy_pf.close()
             probe_results: list[tuple] = []
             stop_probing = threading.Event()
 
             def probe_loop():
                 while not stop_probing.is_set():
-                    probe_results.append(("healthz", http_request(api_pf.port, "/healthz")))
-                    probe_results.append(("readyz", http_request(api_pf.port, "/readyz")))
+                    probe_results.append(("api.healthz", http_request(api_pf.port, "/healthz")))
+                    probe_results.append(("api.readyz", http_request(api_pf.port, "/readyz")))
+                    probe_results.append(("gateway.healthz", http_request(gateway_pf.port, "/healthz")))
+                    probe_results.append(("gateway.readyz", http_request(gateway_pf.port, "/readyz")))
                     time.sleep(0.25)
 
             def api_metric_drop_events() -> list[dict]:
@@ -1306,22 +1439,23 @@ class TelemetryQualification:
 
             bad_probes = [
                 p for p in probe_results
-                if (p[0] == "healthz" and p[1] != (200, "ok\n"))
-                or (p[0] == "readyz" and p[1] != (200, "ready\n"))
+                if (p[0].endswith(".healthz") and p[1] != (200, "ok\n"))
+                or (p[0].endswith(".readyz") and p[1] != (200, "ready\n"))
             ]
-            api_pf_exit = api_pf.proc.poll()
-            if api_pf_exit is not None:
-                raise QualificationFailure(
-                    f"API port-forward exited unexpectedly with code {api_pf_exit} during collector "
-                    f"outage ({len(bad_probes)}/{len(probe_results)} failed probes; sample={bad_probes[:5]!r})"
-                )
+            for label, pf in (("API", api_pf), ("gateway", gateway_pf)):
+                pf_exit = pf.proc.poll()
+                if pf_exit is not None:
+                    raise QualificationFailure(
+                        f"{label} port-forward exited unexpectedly with code {pf_exit} during collector "
+                        f"outage ({len(bad_probes)}/{len(probe_results)} failed probes; sample={bad_probes[:5]!r})"
+                    )
             self.expect(
                 len(probe_results) >= 20 and not bad_probes,
-                f"API probes degraded during collector outage: {len(bad_probes)} failures of "
+                f"API/gateway probes degraded during collector outage: {len(bad_probes)} failures of "
                 f"{len(probe_results)}; sample={bad_probes[:5]!r}",
             )
 
-            # Verify zero restarts across API and worker.
+            # Verify zero restarts across API, worker and gateway.
             for role in ROLES:
                 restarts = [
                     c.get("restartCount", 0)
@@ -1331,11 +1465,23 @@ class TelemetryQualification:
                 self.expect(restarts and all(r == 0 for r in restarts),
                             f"{role} restarted during collector outage: {restarts}")
 
-            # Verify structured stderr logs contain telemetry.dropped events and zero canary leaks.
+            # Verify structured stderr logs contain gateway DEBUG request completion entries,
+            # telemetry.dropped events and zero canary leaks.
             api_logs = self.kube("--namespace", APP_NAMESPACE, "logs", api_pod).stdout
-            for forbidden in (CANARY_TRACE_ID, CANARY_QUERY_SECRET, CANARY_BEARER_TOKEN):
-                self.expect(forbidden not in api_logs,
-                            f"forbidden canary leaked into openmettle-api stderr logs: {forbidden}")
+            gateway_logs = self.kube("--namespace", APP_NAMESPACE, "logs", gateway_pod).stdout
+            gateway_request_events = parse_gateway_request_logs(gateway_logs)
+            self.expect(
+                len(gateway_request_events) >= 3,
+                "expected at least 3 DEBUG http.request.completed 401 entries in "
+                f"openmettle-gateway stderr logs, found {len(gateway_request_events)}",
+            )
+            for role_name, pod_logs in (
+                ("openmettle-api", api_logs),
+                ("openmettle-gateway", gateway_logs),
+            ):
+                for forbidden in (CANARY_TRACE_ID, CANARY_QUERY_SECRET, CANARY_BEARER_TOKEN):
+                    self.expect(forbidden not in pod_logs,
+                                f"forbidden canary leaked into {role_name} stderr logs: {forbidden}")
             dropped_events = api_metric_drop_events()
             self.expect(len(dropped_events) >= 1,
                         "expected at least one telemetry.dropped stderr event from collector outage")
@@ -1390,14 +1536,21 @@ class TelemetryQualification:
                 drop_counter_baseline=ingested["api_drop_baseline"],
                 drop_counter_after_outage=drops_after_outage,
                 stderr_dropped_events=len(dropped_events),
+                gateway_debug_request_events=len(gateway_request_events),
                 alert_state=firing_alert.get("state"),
                 alert_labels=alert_labels,
             )
 
         # 6. Clean SIGTERM shutdown with active OTLP trace + metrics exporters.
         worker_exits = self.scale_down_observing_exit("worker")
+        gateway_exits = self.scale_down_observing_exit("gateway")
         api_exits = self.scale_down_observing_exit("api")
-        self.passed("clean SIGTERM shutdown with OTLP exporters", worker=worker_exits, api=api_exits)
+        self.passed(
+            "clean SIGTERM shutdown with OTLP exporters",
+            worker=worker_exits,
+            gateway=gateway_exits,
+            api=api_exits,
+        )
         self.report["result"] = "passed"
 
     def diagnostics(self):

@@ -6,7 +6,7 @@
 //! The worker runs maintenance sweeps; with `OPENMETTLE_WORKER_RUN_SLOTS` and an
 //! `OPENMETTLE_WORKER_INFERENCE_CONFIG` document it also executes metered turn rounds
 //! (ADRs 0033 and 0043). The gateway forwards chat completions to one upstream and records
-//! their usage ([`gateway_proxy`]); it is not yet deployable.
+//! their usage ([`gateway_proxy`]).
 pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
