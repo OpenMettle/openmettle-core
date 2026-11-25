@@ -97,28 +97,80 @@ pub struct TurnExecutor<R> {
     effects: Option<Arc<ApprovedEffects>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AdvertisedDeclaration {
+    Unoffered,
+    Internal,
+    External { version: String },
+}
+
+impl AdvertisedDeclaration {
+    fn from_external_version(ext: Option<String>) -> Self {
+        match ext {
+            None => Self::Internal,
+            Some(version) => Self::External { version },
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SavedCallGroup {
     Valid {
         round: i64,
+        continuation_rounds: Vec<i64>,
         parts: Vec<String>,
         reasoning: Option<Box<SavedReasoning>>,
         calls: Vec<SavedCall>,
     },
     Rejected {
         round: i64,
+        continuation_rounds: Vec<i64>,
         errors: Vec<inference::ToolError>,
     },
 }
 
 impl SavedCallGroup {
     fn is_valid_shape(&self, expected_round: i64) -> bool {
+        let rounds_ok = |rounds: &[i64]| {
+            !rounds.is_empty()
+                && rounds.last() == Some(&expected_round)
+                && rounds.iter().all(|&r| r >= 1 && r <= expected_round)
+                && rounds.windows(2).all(|w| w[0] < w[1])
+        };
         match self {
-            Self::Valid { round, calls, .. } => *round == expected_round && !calls.is_empty(),
-            Self::Rejected { round, errors } => *round == expected_round && !errors.is_empty(),
+            Self::Valid {
+                round,
+                continuation_rounds,
+                calls,
+                ..
+            } => *round == expected_round && !calls.is_empty() && rounds_ok(continuation_rounds),
+            Self::Rejected {
+                round,
+                continuation_rounds,
+                errors,
+            } => *round == expected_round && !errors.is_empty() && rounds_ok(continuation_rounds),
         }
     }
+
+    fn continuation_rounds(&self) -> &[i64] {
+        match self {
+            Self::Valid {
+                continuation_rounds,
+                ..
+            }
+            | Self::Rejected {
+                continuation_rounds,
+                ..
+            } => continuation_rounds,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedHandoff {
+    continuation_rounds: Vec<i64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -133,6 +185,7 @@ struct SavedCall {
     id: String,
     name: String,
     arguments: Value,
+    advertised: AdvertisedDeclaration,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -353,7 +406,19 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         .map_err(lease_step)
     }
 
-    async fn persist_turn_handoff(&self, run: &ActiveRun, round: i64) -> Result<(), StepResult> {
+    async fn persist_turn_handoff(
+        &self,
+        run: &ActiveRun,
+        round: i64,
+        continuation_rounds: &[i64],
+    ) -> Result<(), StepResult> {
+        let bytes = serde_json::to_vec(&SavedHandoff {
+            continuation_rounds: continuation_rounds.to_vec(),
+        })
+        .map_err(|_| FAILED)?;
+        if bytes.len() > 65_536 {
+            return Err(FAILED);
+        }
         let mut c = self
             .pool
             .acquire()
@@ -368,7 +433,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 Payload {
                     format: "openmettle.turn-handoff",
                     version: 1,
-                    bytes: b"{}",
+                    bytes: &bytes,
                 },
             )
             .await?;
@@ -420,12 +485,70 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         .map_err(lease_step)
     }
 
+    fn declared_tool_map(
+        raw: &[DeclaredTool],
+    ) -> Result<std::collections::BTreeMap<String, AdvertisedDeclaration>, StepResult> {
+        let mut map = std::collections::BTreeMap::new();
+        for dt in raw {
+            let decl = AdvertisedDeclaration::from_external_version(dt.external_version.clone());
+            if map.insert(dt.tool.name.clone(), decl).is_some() {
+                return Err(FAILED);
+            }
+        }
+        Ok(map)
+    }
+
+    fn proposal_matches_declaration(
+        &self,
+        claim: &ClaimedRun,
+        effects: &ApprovedEffects,
+        call: &Call,
+        proposal: &Proposal,
+        decl: &AdvertisedDeclaration,
+    ) -> bool {
+        if proposal.tool != call.name {
+            return false;
+        }
+        match decl {
+            AdvertisedDeclaration::Unoffered => false,
+            AdvertisedDeclaration::Internal => {
+                if proposal.tool == crate::mcp::READ_RANGE {
+                    let Ok(expected) = crate::mcp::Registry.proposal(
+                        &claim.scope_id,
+                        &proposal.logical_key,
+                        &call.name,
+                        &proposal.version,
+                        call.arguments.to_string().as_bytes(),
+                    ) else {
+                        return false;
+                    };
+                    expected.arguments() == proposal.arguments()
+                        && expected.destination() == proposal.destination()
+                } else {
+                    effects
+                        .adapter
+                        .verify_turn_call_proposal(call, proposal, None)
+                }
+            }
+            AdvertisedDeclaration::External { version } => {
+                proposal.version == *version
+                    && effects.adapter.verify_turn_call_proposal(
+                        call,
+                        proposal,
+                        Some(version.as_str()),
+                    )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn tool(
         &self,
         run: &ActiveRun,
         cx: &StepContext,
         config: &ConfigSnapshot,
         call: &Call,
+        advertised: &AdvertisedDeclaration,
         prior_effects: &mut Vec<(String, Proposal)>,
         is_open_zero: bool,
     ) -> Result<(String, Option<String>), StepResult> {
@@ -441,28 +564,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 Ok((crate::mcp::ToolFault::TerminalRefusal.envelope(), None))
             }
         };
+        if matches!(advertised, AdvertisedDeclaration::Unoffered) {
+            return refused();
+        }
         let Some(proposal) = self.routes.proposal(&run.claim, call) else {
             return refused();
         };
-        if proposal.tool != call.name {
-            return refused();
-        }
-        if proposal.tool == crate::mcp::READ_RANGE {
-            let Ok(expected) = crate::mcp::Registry.proposal(
-                &run.claim.scope_id,
-                &proposal.logical_key,
-                &call.name,
-                &proposal.version,
-                call.arguments.to_string().as_bytes(),
-            ) else {
-                return refused();
-            };
-            if expected.arguments() != proposal.arguments()
-                || expected.destination() != proposal.destination()
-            {
-                return refused();
-            }
-        } else if !effects.adapter.verify_turn_call_proposal(call, &proposal) {
+        if !self.proposal_matches_declaration(&run.claim, effects, call, &proposal, advertised) {
             return refused();
         }
         let step = StepContext {
@@ -605,13 +713,14 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .map_err(|_| FAILED)?
         };
         let mut continuation = Vec::new();
+        let mut continuation_rounds: Vec<i64> = Vec::new();
         let mut prior_effects: Vec<(String, Proposal)> = Vec::new();
         let mut last_completed_round: i64 = 0;
         // Discover either (a) an open, proven-unsent automatic (`approval_id IS NULL`,
         // `dispatched_attempts = 0`) write intent left by a prior claim that handed off before
         // Transaction 2, or (b) an explicit fenced `turn-handoff:{used}` checkpoint written when
         // pre-round tool verification transiently handed off after a completed round.
-        if self.effects.is_some() {
+        if let Some(effects) = self.effects.as_deref() {
             if let Some(why) = *cx.stop.borrow() {
                 return Err(stopped_step(why));
             }
@@ -667,7 +776,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .map_err(lease_step)?
             };
             if has_pending_auto || has_turn_handoff {
-                let (used, saved_rounds, saved_results, ops_by_key) = {
+                let route_declared =
+                    Self::declared_tool_map(&self.routes.declared_tools(&run.claim))?;
+                let (used, expected_rounds, saved_rounds, saved_results, ops_by_key) = {
                     let mut c = self
                         .pool
                         .acquire()
@@ -684,6 +795,28 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         .fetch_one(&mut *conn)
                         .await?;
                         if used <= 0 {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        let handoff_bytes: Option<Vec<u8>> = sqlx::query_scalar(
+                            "SELECT payload FROM openmettle.run_events
+                              WHERE scope_id=$1::uuid AND run_id=$2::uuid
+                                AND append_key=$3
+                                AND format='openmettle.turn-handoff'
+                                AND format_version=1",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .bind(format!("turn-handoff:{used}"))
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                        let saved_handoff = match handoff_bytes {
+                            Some(bytes) => Some(
+                                serde_json::from_slice::<SavedHandoff>(&bytes)
+                                    .map_err(|_| crate::runs::Error::Conflict)?,
+                            ),
+                            None => None,
+                        };
+                        if has_turn_handoff && saved_handoff.is_none() {
                             return Err(crate::runs::Error::Conflict);
                         }
                         let call_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
@@ -704,6 +837,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             let Ok(r) = round_str.parse::<i64>() else {
                                 return Err(crate::runs::Error::Conflict);
                             };
+                            if r < 1 || r > used {
+                                return Err(crate::runs::Error::Conflict);
+                            }
                             let saved: SavedCallGroup = serde_json::from_slice(&bytes)
                                 .map_err(|_| crate::runs::Error::Conflict)?;
                             if !saved.is_valid_shape(r) {
@@ -713,13 +849,27 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 return Err(crate::runs::Error::Conflict);
                             }
                         }
-                        for r in 1..=used {
-                            if !saved_rounds.contains_key(&r) {
+                        let Some(last_group) = saved_rounds.get(&used) else {
+                            return Err(crate::runs::Error::Conflict);
+                        };
+                        let expected_rounds = last_group.continuation_rounds().to_vec();
+                        if let Some(ref ho) = saved_handoff
+                            && ho.continuation_rounds != expected_rounds
+                        {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        if expected_rounds.is_empty()
+                            || expected_rounds.last() != Some(&used)
+                            || !expected_rounds.iter().all(|&r| r >= 1 && r <= used)
+                            || !expected_rounds.windows(2).all(|w| w[0] < w[1])
+                            || !saved_rounds.keys().copied().eq(expected_rounds.iter().copied())
+                        {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        for (idx, &r) in expected_rounds.iter().enumerate() {
+                            if saved_rounds[&r].continuation_rounds() != &expected_rounds[..=idx] {
                                 return Err(crate::runs::Error::Conflict);
                             }
-                        }
-                        if saved_rounds.len() != usize::try_from(used).unwrap_or(usize::MAX) {
-                            return Err(crate::runs::Error::Conflict);
                         }
                         let result_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
                             "SELECT append_key, payload FROM openmettle.run_events
@@ -745,6 +895,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             else {
                                 return Err(crate::runs::Error::Conflict);
                             };
+                            if !saved_rounds.contains_key(&r) {
+                                return Err(crate::runs::Error::Conflict);
+                            }
                             let res: SavedCallResult = serde_json::from_slice(&bytes)
                                 .map_err(|_| crate::runs::Error::Conflict)?;
                             if saved_results.insert((r, idx), res).is_some() {
@@ -771,7 +924,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         for (id, logical_key, is_open_zero) in op_rows {
                             ops_by_key.insert(logical_key, (id, is_open_zero));
                         }
-                        Ok((used, saved_rounds, saved_results, ops_by_key))
+                        Ok((
+                            used,
+                            expected_rounds,
+                            saved_rounds,
+                            saved_results,
+                            ops_by_key,
+                        ))
                     })
                     .await
                     .map_err(lease_step)?
@@ -789,7 +948,15 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 name: sc.name.clone(),
                                 arguments: sc.arguments.clone(),
                             };
-                            if let Some(p) = self.routes.proposal(&run.claim, &call) {
+                            if let Some(p) = self.routes.proposal(&run.claim, &call)
+                                && self.proposal_matches_declaration(
+                                    &run.claim,
+                                    effects,
+                                    &call,
+                                    &p,
+                                    &sc.advertised,
+                                )
+                            {
                                 saved_keys.insert(p.logical_key);
                             }
                         }
@@ -799,7 +966,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     return Err(FAILED);
                 }
                 let mut saved_rounds = saved_rounds;
-                for r in 1..=used {
+                for &r in &expected_rounds {
                     match saved_rounds.remove(&r).ok_or(FAILED)? {
                         SavedCallGroup::Rejected { errors, .. } => {
                             if saved_results.keys().any(|(rr, _)| *rr == r) {
@@ -810,20 +977,25 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         SavedCallGroup::Valid {
                             parts,
                             reasoning,
-                            calls,
+                            calls: saved_calls,
                             ..
                         } => {
-                            let calls: Vec<Call> = calls
+                            let call_decls: Vec<(Call, AdvertisedDeclaration)> = saved_calls
                                 .into_iter()
-                                .map(|c| Call {
-                                    id: c.id,
-                                    name: c.name,
-                                    arguments: c.arguments,
+                                .map(|c| {
+                                    (
+                                        Call {
+                                            id: c.id,
+                                            name: c.name,
+                                            arguments: c.arguments,
+                                        },
+                                        c.advertised,
+                                    )
                                 })
                                 .collect();
                             let must_be_saved = r < used || !has_pending_auto;
-                            let mut results = Vec::with_capacity(calls.len());
-                            for (idx, call) in calls.iter().enumerate() {
+                            let mut results = Vec::with_capacity(call_decls.len());
+                            for (idx, (call, saved_decl)) in call_decls.iter().enumerate() {
                                 let proposal = self.routes.proposal(&run.claim, call);
                                 let op_entry = proposal
                                     .as_ref()
@@ -835,7 +1007,10 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                     }
                                     match (&saved_res.operation_id, op_entry, proposal) {
                                         (Some(op_id), Some((db_id, false)), Some(prop))
-                                            if op_id == db_id && prop.tool == call.name =>
+                                            if op_id == db_id
+                                                && self.proposal_matches_declaration(
+                                                    &run.claim, effects, call, &prop, saved_decl,
+                                                ) =>
                                         {
                                             prior_effects.push((op_id.clone(), prop));
                                         }
@@ -846,12 +1021,19 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 } else if must_be_saved {
                                     return Err(FAILED);
                                 } else {
+                                    let effective_decl =
+                                        if route_declared.get(&call.name) == Some(saved_decl) {
+                                            saved_decl
+                                        } else {
+                                            &AdvertisedDeclaration::Unoffered
+                                        };
                                     let (output, op_id) = self
                                         .tool(
                                             run,
                                             &cx,
                                             &config,
                                             call,
+                                            effective_decl,
                                             &mut prior_effects,
                                             is_open_zero,
                                         )
@@ -868,6 +1050,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                     results.push((call.id.clone(), output));
                                 }
                             }
+                            let calls: Vec<Call> = call_decls.into_iter().map(|(c, _)| c).collect();
                             let reasoning = reasoning.map(|rr| inference::Reasoning {
                                 source: Box::new(rr.source),
                                 blocks: rr.blocks,
@@ -900,14 +1083,16 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 if still_pending {
                     return Err(FAILED);
                 }
+                continuation_rounds = expected_rounds;
                 last_completed_round = used;
             }
         }
         loop {
-            let tools = if let Some(effects) = self.effects.as_deref() {
+            let (tools, offered_declarations) = if let Some(effects) = self.effects.as_deref() {
                 let raw = self.routes.declared_tools(&run.claim);
+                let raw_map = Self::declared_tool_map(&raw)?;
                 if raw.is_empty() {
-                    None
+                    (None, std::collections::BTreeMap::new())
                 } else {
                     let filter_step = StepContext {
                         deadline: run.execution_deadline,
@@ -924,16 +1109,30 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         Ok(kept) => kept,
                         Err(StepResult::Handoff) => {
                             if !continuation.is_empty() && last_completed_round > 0 {
-                                self.persist_turn_handoff(run, last_completed_round).await?;
+                                self.persist_turn_handoff(
+                                    run,
+                                    last_completed_round,
+                                    &continuation_rounds,
+                                )
+                                .await?;
                             }
                             return Err(StepResult::Handoff);
                         }
                         Err(other) => return Err(other),
                     };
-                    (!kept.is_empty()).then_some(kept)
+                    let mut offered = std::collections::BTreeMap::new();
+                    for t in &kept {
+                        let Some(decl) = raw_map.get(&t.name) else {
+                            return Err(FAILED);
+                        };
+                        if offered.insert(t.name.clone(), decl.clone()).is_some() {
+                            return Err(FAILED);
+                        }
+                    }
+                    ((!kept.is_empty()).then_some(kept), offered)
                 }
             } else {
-                None
+                (None, std::collections::BTreeMap::new())
             };
             let (route, request, round, actor) = tokio::select! {
                 biased;
@@ -1145,23 +1344,30 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 }
                 CallGroup::InvalidArguments(errors) => {
                     if self.effects.is_some() {
+                        let mut next_rounds = continuation_rounds.clone();
+                        next_rounds.push(round);
                         self.persist_turn_calls(
                             run,
                             round,
                             &SavedCallGroup::Rejected {
                                 round,
+                                continuation_rounds: next_rounds.clone(),
                                 errors: errors.clone(),
                             },
                         )
                         .await?;
+                        continuation_rounds = next_rounds;
                     }
                     continuation.push(History::RejectedGroup(errors));
                     last_completed_round = round;
                 }
                 CallGroup::Valid(calls) => {
                     if self.effects.is_some() {
+                        let mut next_rounds = continuation_rounds.clone();
+                        next_rounds.push(round);
                         let saved = SavedCallGroup::Valid {
                             round,
+                            continuation_rounds: next_rounds.clone(),
                             parts: answer.parts.clone(),
                             reasoning: answer.reasoning.as_ref().map(|r| {
                                 Box::new(SavedReasoning {
@@ -1176,15 +1382,23 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                     id: c.id.clone(),
                                     name: c.name.clone(),
                                     arguments: c.arguments.clone(),
+                                    advertised: offered_declarations
+                                        .get(&c.name)
+                                        .cloned()
+                                        .unwrap_or(AdvertisedDeclaration::Unoffered),
                                 })
                                 .collect(),
                         };
                         self.persist_turn_calls(run, round, &saved).await?;
+                        continuation_rounds = next_rounds;
                     }
                     let mut results = Vec::with_capacity(calls.len());
                     for (idx, call) in calls.iter().enumerate() {
+                        let adv = offered_declarations
+                            .get(&call.name)
+                            .unwrap_or(&AdvertisedDeclaration::Unoffered);
                         let (output, op_id) = self
-                            .tool(run, &cx, &config, call, &mut prior_effects, false)
+                            .tool(run, &cx, &config, call, adv, &mut prior_effects, false)
                             .await?;
                         if self.effects.is_some() {
                             self.persist_turn_result(

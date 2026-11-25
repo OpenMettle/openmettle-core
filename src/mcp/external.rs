@@ -782,11 +782,80 @@ fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) ->
     ExtractedHandle::Valid(candidate.to_owned())
 }
 
+fn choose_safe_marker(handle: &str) -> String {
+    if !handle.contains('[') && !handle.contains(']') && !"[REDACTED]".contains(handle) {
+        return "[REDACTED]".to_owned();
+    }
+    for b in b"*~^@#%!+=:;?|/".iter().copied().chain(0x21u8..=0x7eu8) {
+        if !handle.as_bytes().contains(&b) {
+            return std::iter::repeat_n(char::from(b), 3).collect();
+        }
+    }
+    // `handle` contains all 94 ASCII graphic bytes (`handle.len() >= 94`), so `"[REDACTED]"`
+    // (len 10) cannot contain `handle` and each replacement shrinks byte length by `>= 84`.
+    "[REDACTED]".to_owned()
+}
+
+fn redact_plain_str(input: &str, handle: &str) -> String {
+    if handle.is_empty() || !input.contains(handle) {
+        return input.to_owned();
+    }
+    let marker = choose_safe_marker(handle);
+    let mut out = input.replace(handle, &marker);
+    while out.contains(handle) {
+        out = out.replace(handle, &marker);
+    }
+    out
+}
+
+fn disambiguate_redacted_key(
+    base: String,
+    handle: &str,
+    out: &Map<String, Value>,
+    original_keys: &BTreeSet<String>,
+) -> String {
+    debug_assert!(!base.contains(handle));
+    if !out.contains_key(&base) && !original_keys.contains(&base) {
+        return base;
+    }
+    let max_probe = out
+        .len()
+        .saturating_add(original_keys.len())
+        .saturating_add(3);
+    let sep = if handle.contains('#') { "_" } else { "#" };
+    for n in 2..=max_probe {
+        let candidate = format!("{base}{sep}{n}");
+        if !candidate.contains(handle)
+            && !out.contains_key(&candidate)
+            && !original_keys.contains(&candidate)
+        {
+            return candidate;
+        }
+    }
+    // Fallback when `base + sep + digits` overlaps `handle` (e.g. `handle = "D]#"`): repeat a
+    // single ASCII graphic byte absent from `handle` (or `'~'` when `handle` spans all 94 distinct
+    // bytes, since a 1-character alphabet can never contain a 94-distinct-byte substring).
+    let safe_pad = (b"~_*^@".iter().copied().chain(0x21u8..=0x7eu8))
+        .find(|b| !handle.as_bytes().contains(b))
+        .map(char::from)
+        .unwrap_or('~');
+    for len in 1..=max_probe {
+        let fallback: String = std::iter::repeat_n(safe_pad, len).collect();
+        if !fallback.contains(handle)
+            && !out.contains_key(&fallback)
+            && !original_keys.contains(&fallback)
+        {
+            return fallback;
+        }
+    }
+    unreachable!("pigeonhole bound guarantees an unused key in 1..=max_probe")
+}
+
 fn redact_value_strings(value: &mut Value, handle: &str) {
     match value {
         Value::String(s) => {
             if s.contains(handle) {
-                *s = s.replace(handle, "[REDACTED]");
+                *s = redact_plain_str(s, handle);
             }
         }
         Value::Array(items) => {
@@ -797,27 +866,12 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
         Value::Object(map) => {
             let entries = std::mem::take(map);
             let original_keys: BTreeSet<String> = entries.keys().cloned().collect();
-            let sep = if handle.contains('#') { "_" } else { "#" };
             let mut out = Map::with_capacity(entries.len());
             for (k, mut v) in entries {
                 redact_value_strings(&mut v, handle);
                 let new_key = if k.contains(handle) {
-                    let base = k.replace(handle, "[REDACTED]");
-                    if !out.contains_key(&base) && !original_keys.contains(&base) {
-                        base
-                    } else {
-                        let mut n = 2usize;
-                        loop {
-                            let candidate = format!("{base}{sep}{n}");
-                            if !out.contains_key(&candidate)
-                                && !original_keys.contains(&candidate)
-                                && (base.contains(handle) || !candidate.contains(handle))
-                            {
-                                break candidate;
-                            }
-                            n += 1;
-                        }
-                    }
+                    let base = redact_plain_str(&k, handle);
+                    disambiguate_redacted_key(base, handle, &out, &original_keys)
                 } else {
                     k
                 };
@@ -826,6 +880,27 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
             *map = out;
         }
         _ => {}
+    }
+}
+
+fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&str>) -> String {
+    if (handle_field.is_some() || handle.is_some())
+        && let Ok(mut parsed) = serde_json::from_str::<Value>(block)
+        && (parsed.is_object() || parsed.is_array() || parsed.is_string())
+    {
+        if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
+            map.remove(field);
+        }
+        if let Some(h) = handle {
+            redact_value_strings(&mut parsed, h);
+        }
+        parsed.sort_all_objects();
+        parsed.to_string()
+    } else {
+        match handle {
+            Some(h) => redact_plain_str(block, h),
+            None => block.to_owned(),
+        }
     }
 }
 
@@ -838,25 +913,15 @@ fn sanitize_tool_success(
         ExtractedHandle::Valid(h) => Some(h),
         ExtractedHandle::Malformed => return Err(ToolFault::TerminalRefusal),
     };
-    let text = if let Some(content) = &success.content_text {
-        if (handle_field.is_some() || handle.is_some())
-            && let Ok(mut parsed) = serde_json::from_str::<Value>(content)
-            && (parsed.is_object() || parsed.is_array() || parsed.is_string())
-        {
-            if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
-                map.remove(field);
-            }
-            if let Some(h) = handle.as_deref() {
-                redact_value_strings(&mut parsed, h);
-            }
-            parsed.sort_all_objects();
-            parsed.to_string()
-        } else {
-            match handle.as_deref() {
-                Some(h) => content.replace(h, "[REDACTED]"),
-                None => content.clone(),
-            }
+    // Valid handles reject control characters (`'\n'`), so joining sanitized blocks with `"\n"`
+    // cannot form a handle across a block boundary, while per-block JSON sanitization preserves
+    // numeric/boolean JSON tokens (e.g. `"count": 1` when `handle == "1"`).
+    let text = if !success.content_blocks.is_empty() {
+        let mut sanitized_blocks = Vec::with_capacity(success.content_blocks.len());
+        for block in &success.content_blocks {
+            sanitized_blocks.push(sanitize_text_block(block, handle_field, handle.as_deref()));
         }
+        sanitized_blocks.join("\n")
     } else if let Some(structured) = &success.structured {
         let mut sanitized = structured.clone();
         if let (Some(field), Some(map)) = (handle_field, sanitized.as_object_mut()) {
@@ -869,7 +934,7 @@ fn sanitize_tool_success(
         sanitized.to_string()
     } else {
         match handle.as_deref() {
-            Some(h) => success.text.replace(h, "[REDACTED]"),
+            Some(h) => redact_plain_str(&success.text, h),
             None => success.text.clone(),
         }
     };
@@ -886,8 +951,19 @@ impl ApprovedAdapter for ExternalMcpAdapter {
         Box::pin(async move { self.admit_pre_intent(run, proposal, step).await })
     }
 
-    fn verify_turn_call_proposal(&self, call: &Call, proposal: &Proposal) -> bool {
-        let Some(contract) = self.registry.get(&proposal.tool, &proposal.version) else {
+    fn verify_turn_call_proposal(
+        &self,
+        call: &Call,
+        proposal: &Proposal,
+        expected_external_version: Option<&str>,
+    ) -> bool {
+        let Some(expected_ver) = expected_external_version else {
+            return false;
+        };
+        if proposal.version != expected_ver {
+            return false;
+        }
+        let Some(contract) = self.registry.get(&proposal.tool, expected_ver) else {
             return false;
         };
         let Ok(raw_bytes) = serde_json::to_vec(&call.arguments) else {
@@ -897,7 +973,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             return false;
         };
         expected.tool == call.name
-            && expected.version == proposal.version
+            && expected.version == expected_ver
             && expected.destination() == proposal.destination()
             && expected.arguments() == proposal.arguments()
     }
@@ -937,7 +1013,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             let mut checked: BTreeMap<(String, String), bool> = BTreeMap::new();
             let mut kept = Vec::with_capacity(tools.len());
             for dt in tools {
-                let contracts: Vec<&ExternalToolContract> = match dt.external_version.as_deref() {
+                let contract = match dt.external_version.as_deref() {
                     Some(ver) => {
                         let Some(contract) = self.registry.get(&dt.tool.name, ver) else {
                             continue;
@@ -945,51 +1021,42 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         if contract.declaration() != dt.tool {
                             continue;
                         }
-                        vec![contract]
+                        contract
                     }
                     None => {
-                        let matched = self.registry.find_by_tool_id(&dt.tool.name);
-                        if matched.is_empty() {
-                            kept.push(dt.tool);
-                            continue;
+                        if !self.registry.find_by_tool_id(&dt.tool.name).is_empty() {
+                            return Err(StepResult::Failed(leases::FailReason::StepFailed));
                         }
-                        matched
-                    }
-                };
-                if !two_phase_enabled {
-                    continue;
-                }
-                let mut ok = true;
-                for contract in contracts {
-                    let conn_key = (contract.connection_id.clone(), contract.account_id.clone());
-                    if let Some(&allowed) = checked.get(&conn_key) {
-                        if !allowed {
-                            ok = false;
-                            break;
-                        }
+                        kept.push(dt.tool);
                         continue;
                     }
-                    let res = self
-                        .verify_connection_catalog(run, contract, &actor_user_id, step)
-                        .await;
-                    if let Some(why) = *step.stop.borrow() {
-                        return Err(stopped_step(why));
-                    }
-                    match res {
-                        Ok(()) => {
-                            checked.insert(conn_key, true);
-                        }
-                        Err(PreflightError::Refused) => {
-                            checked.insert(conn_key, false);
-                            ok = false;
-                            break;
-                        }
-                        Err(PreflightError::Transient) => return Err(StepResult::Handoff),
-                        Err(PreflightError::Store(_)) => return Err(StepResult::LeaseLost),
-                    }
+                };
+                if contract.capability != "repeatable_read" && !two_phase_enabled {
+                    continue;
                 }
-                if ok {
-                    kept.push(dt.tool);
+                let conn_key = (contract.connection_id.clone(), contract.account_id.clone());
+                if let Some(&allowed) = checked.get(&conn_key) {
+                    if allowed {
+                        kept.push(dt.tool);
+                    }
+                    continue;
+                }
+                let res = self
+                    .verify_connection_catalog(run, contract, &actor_user_id, step)
+                    .await;
+                if let Some(why) = *step.stop.borrow() {
+                    return Err(stopped_step(why));
+                }
+                match res {
+                    Ok(()) => {
+                        checked.insert(conn_key, true);
+                        kept.push(dt.tool);
+                    }
+                    Err(PreflightError::Refused) => {
+                        checked.insert(conn_key, false);
+                    }
+                    Err(PreflightError::Transient) => return Err(StepResult::Handoff),
+                    Err(PreflightError::Store(_)) => return Err(StepResult::LeaseLost),
                 }
             }
             Ok(kept)
@@ -1421,7 +1488,7 @@ mod tests {
         let escaped_handle = "h\"quote\\1";
         let structured_escaped = ToolCallSuccess {
             text: String::new(),
-            content_text: None,
+            content_blocks: Vec::new(),
             structured: Some(json!({
                 "handle": escaped_handle,
                 "note": format!("created {escaped_handle} ok"),
@@ -1443,7 +1510,7 @@ mod tests {
         // 2. Short handle "1" must NOT corrupt integer JSON values like `"count": 1`.
         let structured_short = ToolCallSuccess {
             text: String::new(),
-            content_text: None,
+            content_blocks: Vec::new(),
             structured: Some(json!({
                 "handle": "1",
                 "count": 1,
@@ -1464,14 +1531,14 @@ mod tests {
         // 3. JSON-encoded text content echoing both handle field and short handle alongside integer 1.
         let json_content = ToolCallSuccess {
             text: String::new(),
-            content_text: Some(
+            content_blocks: vec![
                 json!({
                     "handle": "1",
                     "count": 1,
                     "msg": "ref-1"
                 })
                 .to_string(),
-            ),
+            ],
             structured: Some(json!({"handle": "1"})),
             meta: None,
         };
@@ -1485,7 +1552,7 @@ mod tests {
         // 4. Plain non-JSON text content echoing a handle with quotes/backslashes.
         let plain_content = ToolCallSuccess {
             text: String::new(),
-            content_text: Some(format!("done {escaped_handle} end")),
+            content_blocks: vec![format!("done {escaped_handle} end")],
             structured: Some(json!({"handle": escaped_handle})),
             meta: None,
         };
@@ -1497,7 +1564,7 @@ mod tests {
         //    and single-char handles like `"2"` or `"#"` whose suffix must not re-introduce handle).
         let key_collision = ToolCallSuccess {
             text: String::new(),
-            content_text: None,
+            content_blocks: Vec::new(),
             structured: Some(json!({
                 "handle": "h-key",
                 "[REDACTED]": "keep",
@@ -1517,7 +1584,7 @@ mod tests {
 
         let digit_two = ToolCallSuccess {
             text: String::new(),
-            content_text: None,
+            content_blocks: Vec::new(),
             structured: Some(json!({
                 "handle": "2",
                 "[REDACTED]": 1,
@@ -1534,7 +1601,7 @@ mod tests {
 
         let hash_handle = ToolCallSuccess {
             text: String::new(),
-            content_text: None,
+            content_blocks: Vec::new(),
             structured: Some(json!({
                 "handle": "#",
                 "[REDACTED]": "a",
@@ -1549,10 +1616,10 @@ mod tests {
         assert_eq!(parsed_h["[REDACTED]"], "a");
         assert_eq!(parsed_h["[REDACTED]_2"], "b");
 
-        // 6. Top-level JSON string scalar in `content_text` containing a JSON-escaped handle.
+        // 6. Top-level JSON string scalar in `content_blocks` containing a JSON-escaped handle.
         let top_level_json_string = ToolCallSuccess {
             text: String::new(),
-            content_text: Some(json!(format!("prefix {escaped_handle} suffix")).to_string()),
+            content_blocks: vec![json!(format!("prefix {escaped_handle} suffix")).to_string()],
             structured: Some(json!({"handle": escaped_handle})),
             meta: None,
         };
@@ -1565,13 +1632,64 @@ mod tests {
             serde_json::from_str::<Value>(&stext).unwrap(),
             json!("prefix [REDACTED] suffix")
         );
+
+        // 7. Multiple JSON-encoded MCP text blocks: each block is decoded and sanitized before join.
+        let multi_block = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![
+                json!(format!("block1 {escaped_handle}")).to_string(),
+                json!({"handle": escaped_handle, "echo": format!("block2 {escaped_handle}")})
+                    .to_string(),
+            ],
+            structured: Some(json!({"handle": escaped_handle})),
+            meta: None,
+        };
+        let (mb_text, mb_handle) = sanitize_tool_success(&multi_block, Some("handle")).unwrap();
+        assert_eq!(mb_handle.as_deref(), Some(escaped_handle));
+        assert!(!mb_text.contains("quote"));
+        assert!(!mb_text.contains(escaped_handle));
+        let lines: Vec<&str> = mb_text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[0]).unwrap(),
+            json!("block1 [REDACTED]")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(lines[1]).unwrap(),
+            json!({"echo": "block2 [REDACTED]"})
+        );
+
+        // 8. Adversarial handles overlapping `[REDACTED]` or separator boundaries (`"EDACT"`, `"]["`, `"D]#"`).
+        for tricky_handle in ["EDACT", "REDACTED", "][", "D]#", "]#"] {
+            let tricky = ToolCallSuccess {
+                text: String::new(),
+                content_blocks: Vec::new(),
+                structured: Some(json!({
+                    "handle": tricky_handle,
+                    "[REDACTED]": "keep",
+                    "***": "keep-stars",
+                    format!("k1-{tricky_handle}"): format!("v1-{tricky_handle}"),
+                    format!("k1-{tricky_handle}{tricky_handle}"): "v2",
+                    tricky_handle: "v3"
+                })),
+                meta: None,
+            };
+            let (t_out, t_h) = sanitize_tool_success(&tricky, Some("handle")).unwrap();
+            assert_eq!(t_h.as_deref(), Some(tricky_handle));
+            assert!(
+                !t_out.contains(tricky_handle),
+                "output leaked handle {tricky_handle:?}: {t_out}"
+            );
+            let parsed_t: Value = serde_json::from_str(&t_out).expect("valid JSON");
+            assert_eq!(parsed_t.as_object().unwrap().len(), 5);
+        }
     }
 
     #[test]
     fn extract_downstream_handle_distinguishes_absent_valid_and_malformed() {
         let absent = ToolCallSuccess {
             text: "ok".into(),
-            content_text: Some("ok".into()),
+            content_blocks: vec!["ok".into()],
             structured: Some(json!({"ok": true})),
             meta: None,
         };
@@ -1586,7 +1704,7 @@ mod tests {
 
         let valid = ToolCallSuccess {
             text: "ok".into(),
-            content_text: Some("ok".into()),
+            content_blocks: vec!["ok".into()],
             structured: Some(json!({"handle": "op_123-abc"})),
             meta: None,
         };
@@ -1608,7 +1726,7 @@ mod tests {
         ] {
             let malformed = ToolCallSuccess {
                 text: "ok".into(),
-                content_text: Some("ok".into()),
+                content_blocks: vec!["ok".into()],
                 structured: Some(json!({"handle": bad})),
                 meta: None,
             };

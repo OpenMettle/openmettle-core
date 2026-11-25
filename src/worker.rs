@@ -223,14 +223,18 @@ pub trait ApprovedAdapter: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Verify that a model tool `call` maps faithfully to `proposal` (allowing deterministic
-    /// schema-default expansion on external MCP contracts while rejecting route-injected fields).
+    /// Verify that a model tool `call` maps faithfully to `proposal` under the advertised
+    /// `expected_external_version` (allowing deterministic schema-default expansion on external
+    /// MCP contracts while rejecting version switches and route-injected fields).
     fn verify_turn_call_proposal(
         &self,
         call: &crate::provider_http::inference::Call,
         proposal: &Proposal,
+        expected_external_version: Option<&str>,
     ) -> bool {
-        proposal.tool == call.name && proposal.arguments() == &call.arguments
+        expected_external_version.is_none()
+            && proposal.tool == call.name
+            && proposal.arguments() == &call.arguments
     }
 
     /// Filter model-facing tool declarations before starting a turn round (e.g. verifying

@@ -201,8 +201,8 @@ pub struct ToolCallRequest<'a> {
 /// Normalized successful MCP `tools/call` payload. `Debug` is redacted.
 pub struct ToolCallSuccess {
     pub text: String,
-    /// Present only when text `content` blocks were returned; `None` for structured-only replies.
-    pub content_text: Option<String>,
+    /// Decoded text `content` blocks in wire order; empty for structured-only replies.
+    pub content_blocks: Vec<String>,
     pub structured: Option<Value>,
     pub meta: Option<Value>,
 }
@@ -1022,11 +1022,12 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
             }
         }
     }
-    let (content_text, text) = if !chunks.is_empty() {
+    let (content_blocks, text) = if !chunks.is_empty() {
         let joined = chunks.join("\n");
-        (Some(joined.clone()), joined)
+        let blocks = chunks.into_iter().map(str::to_owned).collect();
+        (blocks, joined)
     } else if let Some(ref s) = structured {
-        (None, s.to_string())
+        (Vec::new(), s.to_string())
     } else {
         return Err(FaultKind::TerminalRefusal);
     };
@@ -1035,7 +1036,7 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
     }
     Ok(ToolCallSuccess {
         text,
-        content_text,
+        content_blocks,
         structured,
         meta,
     })

@@ -5144,8 +5144,14 @@ async fn review2_toctou_ttl_multicall_multiround_reconcile_handle_and_deadline_r
             }
             self.inner.preflight(run, proposal, step)
         }
-        fn verify_turn_call_proposal(&self, call: &Call, proposal: &Proposal) -> bool {
-            self.inner.verify_turn_call_proposal(call, proposal)
+        fn verify_turn_call_proposal(
+            &self,
+            call: &Call,
+            proposal: &Proposal,
+            expected_external_version: Option<&str>,
+        ) -> bool {
+            self.inner
+                .verify_turn_call_proposal(call, proposal, expected_external_version)
         }
         fn filter_turn_tools<'a>(
             &'a self,
@@ -7303,8 +7309,14 @@ async fn review3_gate_reauth_proposal_guard_key_redaction_handoff_declared_tools
             {
                 self.inner.preflight(run, proposal, step)
             }
-            fn verify_turn_call_proposal(&self, call: &Call, proposal: &Proposal) -> bool {
-                self.inner.verify_turn_call_proposal(call, proposal)
+            fn verify_turn_call_proposal(
+                &self,
+                call: &Call,
+                proposal: &Proposal,
+                expected_external_version: Option<&str>,
+            ) -> bool {
+                self.inner
+                    .verify_turn_call_proposal(call, proposal, expected_external_version)
             }
             fn filter_turn_tools<'a>(
                 &'a self,
@@ -7881,8 +7893,14 @@ async fn review3_gate_reauth_proposal_guard_key_redaction_handoff_declared_tools
                 {
                     self.inner.preflight(run, proposal, step)
                 }
-                fn verify_turn_call_proposal(&self, call: &Call, proposal: &Proposal) -> bool {
-                    self.inner.verify_turn_call_proposal(call, proposal)
+                fn verify_turn_call_proposal(
+                    &self,
+                    call: &Call,
+                    proposal: &Proposal,
+                    expected_external_version: Option<&str>,
+                ) -> bool {
+                    self.inner
+                        .verify_turn_call_proposal(call, proposal, expected_external_version)
                 }
                 fn filter_turn_tools<'a>(
                     &'a self,
@@ -8071,6 +8089,1276 @@ async fn review3_gate_reauth_proposal_guard_key_redaction_handoff_declared_tools
             .await
             .unwrap();
         leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Stopped)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL container"]
+async fn review4_version_pin_key_redaction_multiblock_collision_and_abandoned_round_regressions() {
+    use openmettle_core::{
+        artifact_fs::Store,
+        authz::{
+            branches::{
+                self, Conversation, Operation, Part, UserInput,
+                snapshot::{Intent as TurnIntent, Snapshots},
+            },
+            store::{AuditContext, WriteOutcome},
+        },
+        model_config::{
+            Catalog, ConfigSnapshot, Effective, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection,
+        },
+        provider_http::inference::{
+            self, Call, Gateway, Protocol, Qualification, Request, Timeouts, Tool,
+        },
+        runs::RunInput,
+        worker::turns::{Route, TurnExecutor, TurnRoutes},
+    };
+
+    let f = Fixture::new().await;
+    f.grant(true).await;
+    let worker_pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let api_pool = PgPool::connect(&f.db.url(API)).await.unwrap();
+    let mut w = worker(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+
+    let dir = crate::auth_config_support::Dir::new();
+    let root = std::path::PathBuf::from(dir.path("mcp-r4-spill"));
+    std::fs::create_dir(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&api_pool).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_instance SET personal_limit_bytes=4000000, instance_budget_bytes=4000000",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let mut reg_builder = test_registry(FUTURE * 1000);
+    let mut read_v1 = reg_builder.get("mcp.read", "1").unwrap().clone();
+    read_v1.tool_id = "mcp_read".into();
+    read_v1.remote_name = "mcp_read".into();
+    read_v1.version = "1".into();
+    read_v1.connection_id = "synth-v1".into();
+    read_v1.endpoint_id = "ep-v1".into();
+    reg_builder.register(read_v1.clone()).unwrap();
+
+    let mut read_v2 = read_v1.clone();
+    read_v2.version = "2".into();
+    read_v2.connection_id = "synth-v2".into();
+    read_v2.endpoint_id = "ep-v2".into();
+    reg_builder.register(read_v2).unwrap();
+
+    let mut idem_v1 = reg_builder.get("mcp.idem", "1").unwrap().clone();
+    idem_v1.tool_id = "mcp_idem".into();
+    idem_v1.remote_name = "mcp_idem".into();
+    idem_v1.version = "1".into();
+    idem_v1.connection_id = "synth-v1".into();
+    idem_v1.endpoint_id = "ep-v1".into();
+    reg_builder.register(idem_v1.clone()).unwrap();
+
+    let mut idem_v2 = idem_v1.clone();
+    idem_v2.version = "2".into();
+    idem_v2.connection_id = "synth-v2".into();
+    idem_v2.endpoint_id = "ep-v2".into();
+    reg_builder.register(idem_v2).unwrap();
+
+    let registry = Arc::new(reg_builder);
+
+    let v1_read_calls = Arc::new(AtomicUsize::new(0));
+    let v1_idem_calls = Arc::new(AtomicUsize::new(0));
+    let v2_calls = Arc::new(AtomicUsize::new(0));
+    let pad_big = "R".repeat(INLINE_BYTES + 4096);
+
+    let v1_read_srv = v1_read_calls.clone();
+    let v1_idem_srv = v1_idem_calls.clone();
+    let pad_srv = pad_big.clone();
+    let server_v1 = SyntheticMcpServer::start(move |req| {
+        let id = req.body["id"].as_str().unwrap_or("0");
+        let method = req.body["method"].as_str().unwrap_or("");
+        if method == "tools/list" {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {"name": "mcp_read", "inputSchema": read_v1.input_schema},
+                        {"name": "mcp_idem", "inputSchema": idem_v1.input_schema}
+                    ]
+                }
+            })
+            .to_string();
+            return http_response(200, &[("content-type", "application/json")], body.as_bytes());
+        }
+        let tool = req.body["params"]["name"].as_str().unwrap_or("");
+        let item = req.body["params"]["arguments"]["item"]
+            .as_str()
+            .unwrap_or("");
+        match (tool, item) {
+            ("mcp_read", _) => {
+                v1_read_srv.fetch_add(1, Ordering::SeqCst);
+                jsonrpc_ok(id, "r4-v1-read-ok", None)
+            }
+            ("mcp_idem", "mb-inline") => {
+                let h = "h\"mb\\1";
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": json!({"b1": format!("a {h} z")}).to_string()},
+                            {"type": "text", "text": json!(format!("b2 {h} end")).to_string()}
+                        ],
+                        "structuredContent": {"handle": h}
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            ("mcp_idem", "mb-spilled") => {
+                let h = "h\"mb\\1";
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": json!({"b1": format!("a {h} {pad_srv}")}).to_string()},
+                            {"type": "text", "text": json!(format!("b2 {h} end")).to_string()}
+                        ],
+                        "structuredContent": {"handle": h}
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            ("mcp_idem", "tricky-key-inline") => {
+                let h = "D]#";
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": h,
+                            "[REDACTED]": "keep",
+                            "p-D]#": "v-D]#",
+                            "p-D]#D]#": "v2",
+                            "D]#": "v3"
+                        }
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            ("mcp_idem", "tricky-key-spilled") => {
+                let h = "EDACT";
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "structuredContent": {
+                            "handle": h,
+                            "[REDACTED]": "keep",
+                            "***": "keep-stars",
+                            "p-EDACT": "v-EDACT",
+                            "EDACT": "v3",
+                            "pad": pad_srv
+                        }
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
+            ("mcp_idem", _) => {
+                v1_idem_srv.fetch_add(1, Ordering::SeqCst);
+                jsonrpc_ok(id, "r4-v1-idem-ok", Some(json!({"handle": "h-r4-idem"})))
+            }
+            _ => jsonrpc_ok(id, "ok", None),
+        }
+    })
+    .await;
+
+    let read_schema_v2 = registry.get("mcp_read", "2").unwrap().input_schema.clone();
+    let idem_schema_v2 = registry.get("mcp_idem", "2").unwrap().input_schema.clone();
+    let v2_srv = v2_calls.clone();
+    let server_v2 = SyntheticMcpServer::start(move |req| {
+        let id = req.body["id"].as_str().unwrap_or("0");
+        let method = req.body["method"].as_str().unwrap_or("");
+        if method == "tools/list" {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [
+                        {"name": "mcp_read", "inputSchema": read_schema_v2},
+                        {"name": "mcp_idem", "inputSchema": idem_schema_v2}
+                    ]
+                }
+            })
+            .to_string();
+            return http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            );
+        }
+        v2_srv.fetch_add(1, Ordering::SeqCst);
+        jsonrpc_ok(id, "r4-v2-unexpected", Some(json!({"handle": "h-v2"})))
+    })
+    .await;
+
+    let mut transports = BTreeMap::new();
+    transports.insert("synth-v1".to_owned(), server_v1.transport());
+    transports.insert("synth-v2".to_owned(), server_v2.transport());
+
+    // --- (a) P1 #2 + P1 #3: Multi-block JSON-escaped handle & adversarial key collisions (inline + spilled) ---
+    {
+        let adapter = Arc::new(
+            ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-r4-h".into()),
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .with_artifacts(store.clone()),
+        );
+        let scoped = ScopedAdapter::new(worker_pool.clone(), store.clone(), LEASES);
+        let rr = f.claim("r4-handle-mb-keys", "yolo").await;
+        let (_st, step) = fresh_step(25);
+        let active = ActiveRun {
+            claim: rr.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step.deadline,
+        };
+        let read_all_spilled = async |art_id: &str, rev_id: &str, prefix: &str| -> String {
+            let mut full = String::new();
+            let mut offset = 0u64;
+            let mut page = 0usize;
+            loop {
+                let args = json!({
+                    "artifact_id": art_id,
+                    "revision_id": rev_id,
+                    "offset": offset,
+                    "max_bytes": INLINE_BYTES
+                })
+                .to_string();
+                let StepResult::ToolOutput(chunk_json) = scoped
+                    .call(
+                        &active,
+                        step.clone(),
+                        &format!("{prefix}-{page}"),
+                        mcp::READ_RANGE,
+                        "1",
+                        args.as_bytes(),
+                    )
+                    .await
+                else {
+                    panic!("expected read_range page");
+                };
+                let pv: Value = serde_json::from_str(&chunk_json).unwrap();
+                full.push_str(pv["text"].as_str().unwrap());
+                offset = pv["next_offset"].as_u64().unwrap();
+                if pv["eof"] == true {
+                    break;
+                }
+                page += 1;
+            }
+            full
+        };
+
+        let StepResult::ToolOutput(mb_in) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-r4-mb-in",
+                    tool: "mcp_idem",
+                    version: "1",
+                    raw_args: br#"{"item":"mb-inline"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected mb-inline ToolOutput");
+        };
+        assert!(!mb_in.contains("mb"));
+
+        let StepResult::ToolOutput(mb_sp) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-r4-mb-sp",
+                    tool: "mcp_idem",
+                    version: "1",
+                    raw_args: br#"{"item":"mb-spilled"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected mb-spilled ToolOutput");
+        };
+        assert!(!mb_sp.contains("mb"));
+        let mb_env: Value = serde_json::from_str(&mb_sp).unwrap();
+        assert_eq!(mb_env["storage"], "spilled");
+        let mb_full = read_all_spilled(
+            mb_env["provenance"]["artifact_id"].as_str().unwrap(),
+            mb_env["provenance"]["revision_id"].as_str().unwrap(),
+            "r4-mb",
+        )
+        .await;
+        assert!(!mb_full.contains("mb"));
+
+        let StepResult::ToolOutput(tk_in) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-r4-tk-in",
+                    tool: "mcp_idem",
+                    version: "1",
+                    raw_args: br#"{"item":"tricky-key-inline"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected tricky-key-inline ToolOutput");
+        };
+        assert!(!tk_in.contains("D]#"));
+
+        let StepResult::ToolOutput(tk_sp) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-r4-tk-sp",
+                    tool: "mcp_idem",
+                    version: "1",
+                    raw_args: br#"{"item":"tricky-key-spilled"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected tricky-key-spilled ToolOutput");
+        };
+        let tk_env: Value = serde_json::from_str(&tk_sp).unwrap();
+        assert_eq!(tk_env["storage"], "spilled");
+        let tk_full = read_all_spilled(
+            tk_env["provenance"]["artifact_id"].as_str().unwrap(),
+            tk_env["provenance"]["revision_id"].as_str().unwrap(),
+            "r4-tk",
+        )
+        .await;
+        assert!(!tk_full.contains("EDACT"));
+
+        leases::settle(&mut w, &rr.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+    }
+
+    let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
+    let catalog = Arc::new(Catalog::load(catalog_bytes).unwrap());
+    let selection: Selection = serde_json::from_value(
+        json!({"model": "a", "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let snapshot = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("a").unwrap().cost_bound,
+    };
+    let make_gateway = |srv: &SyntheticMcpServer| -> Arc<Gateway> {
+        let prefix = if srv.ip.is_ipv4() { 32 } else { 128 };
+        let range = format!("{}/{prefix}", srv.ip);
+        Arc::new(
+            Gateway::new(
+                &format!("https://{}:{}/v1/chat/completions", srv.host, srv.port),
+                Trust::Bundle(&srv.ca_pem),
+                &[&range],
+                Qualification {
+                    model: "a".into(),
+                    pin: catalog.model("a").unwrap().pin.clone(),
+                    protocol: Protocol::Chat,
+                    json: true,
+                    sse: false,
+                    functions: Some(inference::SchemaSubset::Flat),
+                    images: false,
+                    parallel: false,
+                    usage: true,
+                    tool_separator_whitespace: false,
+                },
+                Timeouts {
+                    setup: Duration::from_secs(5),
+                    idle: Duration::from_secs(15),
+                    overall: Duration::from_secs(30),
+                },
+            )
+            .unwrap(),
+        )
+    };
+    let admit_yolo_turn = async |key: &'static str, msg_id: &'static str, rounds: i64| -> String {
+        let mut ac = api(&f.db).await;
+        let audit_ctx = |k: &'static str| AuditContext {
+            actor_user_id: &f.actor.user,
+            actor_approval_id: &f.actor.approval,
+            now_ms: f.user.context().observed_ms(),
+            request_key: k,
+            reason: "review4 turn test",
+        };
+        let conv = match branches::create_conversation(&mut ac, &audit_ctx(key), &f.scope)
+            .await
+            .unwrap()
+        {
+            WriteOutcome::Applied { target_id } | WriteOutcome::Replayed { target_id } => target_id,
+        };
+        let chat = Conversation {
+            scope: &f.scope,
+            id: &conv.conversation_id,
+        };
+        let parts = [Part::Text("run review4 turn".into())];
+        let turn_op = Operation::Append(UserInput {
+            id: msg_id,
+            parts: &parts,
+        });
+        let turn_intent = TurnIntent {
+            source_branch_id: &conv.branch_id,
+            expected_head_message_id: None,
+            operation: turn_op,
+            selection: &selection,
+            requested_rounds: Some(rounds),
+        };
+        let actor_principal = super::super::authz_store::principal(&f.db, &f.actor).await;
+        let mut tx = WriteTransaction::begin(&mut ac).await.unwrap();
+        let msg_key = Box::leak(format!("{key}-msg").into_boxed_str());
+        branches::prepare_turn(
+            &mut tx,
+            &audit_ctx(msg_key),
+            chat,
+            &conv.branch_id,
+            None,
+            turn_op,
+        )
+        .await
+        .unwrap();
+        let history = branches::history(
+            tx.connection().unwrap(),
+            &actor_principal,
+            chat,
+            &conv.branch_id,
+            f.user.context().observed_ms(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pins = Snapshots::encode(&turn_intent, &history, &catalog, &snapshot).unwrap();
+        let mut snap_val: Value = serde_json::from_slice(&pins.config).unwrap();
+        snap_val["execution_mode"] = json!("yolo");
+        let snapshot_bytes = serde_json::to_vec(&snap_val).unwrap();
+        let admission = queue::admit_run_with_mode(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &f.scope,
+                    actor: &f.actor.user,
+                    conversation: &conv.conversation_id,
+                    branch: &conv.branch_id,
+                    message: msg_id,
+                    key,
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: &pins.input,
+                    config: &snapshot_bytes,
+                },
+                actor_approval_id: &f.actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(rounds),
+                now_ms: f.user.context().observed_ms(),
+                cost_qualified: None,
+            },
+            &LIMITS,
+            &f.user,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let Admission::Admitted { run_id, .. } = admission else {
+            panic!("expected admitted turn run for {key}");
+        };
+        run_id
+    };
+
+    struct VersionSwitchRoutes {
+        gateway: Arc<Gateway>,
+        registry: Arc<ExternalRegistry>,
+        propose_version: &'static str,
+    }
+    impl TurnRoutes for VersionSwitchRoutes {
+        async fn route(
+            &self,
+            _: &ClaimedRun,
+            _: &str,
+            _: &Effective,
+        ) -> Result<Route, inference::Error> {
+            Ok(Route::metered(
+                self.gateway.clone(),
+                "00000000-0000-4000-8000-000000000091".into(),
+                false,
+            ))
+        }
+        fn declared_tools(&self, _: &ClaimedRun) -> Vec<DeclaredTool> {
+            vec![
+                self.registry.get("mcp_read", "1").unwrap().declared_tool(),
+                self.registry.get("mcp_idem", "1").unwrap().declared_tool(),
+            ]
+        }
+        fn tool_prompt_bound(&self, _: &Effective, request: &Request) -> Option<u64> {
+            (request.history.len() <= 32).then_some(4096)
+        }
+        fn proposal(&self, _: &ClaimedRun, call: &Call) -> Option<Proposal> {
+            self.registry
+                .proposal(
+                    &call.id,
+                    &call.name,
+                    self.propose_version,
+                    &serde_json::to_vec(&call.arguments).ok()?,
+                )
+                .ok()
+        }
+    }
+
+    // --- (b) P1 #1: Live route advertises v1 (`synth-v1`) and proposes registered v2 (`synth-v2`) -> refused with 0 HTTP & 0 ops ---
+    {
+        let saw_refusal = Arc::new(AtomicBool::new(false));
+        let saw_refusal_srv = saw_refusal.clone();
+        let m_rounds = Arc::new(AtomicUsize::new(0));
+        let m_rounds_srv = m_rounds.clone();
+        let model_srv = SyntheticMcpServer::start(move |req| {
+            let r = m_rounds_srv.fetch_add(1, Ordering::SeqCst);
+            let body = if r == 0 {
+                json!({
+                    "id": "chatcmpl-vs-1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_vs_1",
+                                "type": "function",
+                                "function": {"name": "mcp_read", "arguments": "{\"item\":\"vswitch\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+            } else {
+                if req.body.to_string().contains("terminal_refusal") {
+                    saw_refusal_srv.store(true, Ordering::SeqCst);
+                }
+                json!({
+                    "id": "chatcmpl-vs-2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Refused version switch!"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 16, "completion_tokens": 4}
+                })
+            }
+            .to_string();
+            http_response(200, &[("content-type", "application/json")], body.as_bytes())
+        })
+        .await;
+
+        let r1_before = v1_read_calls.load(Ordering::SeqCst);
+        let r2_before = v2_calls.load(Ordering::SeqCst);
+        let run_id =
+            admit_yolo_turn("r4-ver-switch", "00000000-0000-4000-8000-000000004401", 3).await;
+        let claim = f.next().await.expect("claim version-switch run");
+        assert_eq!(claim.run_id, run_id);
+
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-vs".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let exec = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "2",
+            },
+        )
+        .with_effects(Arc::new(adapter.approved_effects()));
+        let (_st, step) = fresh_step(30);
+        let active = ActiveRun {
+            claim: claim.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec.step(&active, step).await,
+            StepResult::Answer(_)
+        ));
+        assert!(saw_refusal.load(Ordering::SeqCst));
+        assert_eq!(v1_read_calls.load(Ordering::SeqCst), r1_before);
+        assert_eq!(v2_calls.load(Ordering::SeqCst), r2_before);
+        let op_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(op_count, 0);
+        leases::settle(&mut w, &claim.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+    }
+
+    // --- (c) P2 #1: DeclaredTool::internal colliding with registered external MCP contract fails closed ---
+    {
+        struct LegacyInternalCollisionRoutes {
+            gateway: Arc<Gateway>,
+            tool: Tool,
+        }
+        impl TurnRoutes for LegacyInternalCollisionRoutes {
+            async fn route(
+                &self,
+                _: &ClaimedRun,
+                _: &str,
+                _: &Effective,
+            ) -> Result<Route, inference::Error> {
+                Ok(Route::metered(
+                    self.gateway.clone(),
+                    "00000000-0000-4000-8000-000000000091".into(),
+                    false,
+                ))
+            }
+            fn tools(&self, _: &ClaimedRun) -> Vec<Tool> {
+                vec![self.tool.clone()]
+            }
+            fn tool_prompt_bound(&self, _: &Effective, _: &Request) -> Option<u64> {
+                Some(4096)
+            }
+        }
+
+        let m_calls = Arc::new(AtomicUsize::new(0));
+        let m_calls_srv = m_calls.clone();
+        let model_srv = SyntheticMcpServer::start(move |_| {
+            m_calls_srv.fetch_add(1, Ordering::SeqCst);
+            http_response(500, &[], b"unreachable")
+        })
+        .await;
+        let run_id =
+            admit_yolo_turn("r4-int-collide", "00000000-0000-4000-8000-000000004402", 3).await;
+        let claim = f.next().await.expect("claim internal-collision run");
+        assert_eq!(claim.run_id, run_id);
+
+        let adapter = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-ic".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let exec = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            LegacyInternalCollisionRoutes {
+                gateway: make_gateway(&model_srv),
+                tool: registry.get("mcp_read", "1").unwrap().declared_tool().tool,
+            },
+        )
+        .with_effects(Arc::new(adapter.approved_effects()));
+        let (_st, step) = fresh_step(30);
+        let active = ActiveRun {
+            claim: claim.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec.step(&active, step).await,
+            StepResult::Failed(leases::FailReason::StepFailed)
+        ));
+        assert_eq!(m_calls.load(Ordering::SeqCst), 0);
+        leases::settle(
+            &mut w,
+            &claim.lease(),
+            &LEASES,
+            Settle::Failed(leases::FailReason::StepFailed),
+        )
+        .await
+        .unwrap();
+    }
+
+    // --- (d) P2 #2: Abandoned pre-effect Round 1 (`model-round:1`, no `turn-calls:1`) + Round 2 tool + `turn-handoff:2` -> Worker 3 succeeds ---
+    {
+        struct HandoffSecondFilter {
+            inner: Arc<ExternalMcpAdapter>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl ApprovedAdapter for HandoffSecondFilter {
+            fn preflight<'a>(
+                &'a self,
+                run: &'a ActiveRun,
+                proposal: &'a Proposal,
+                step: &'a StepContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), worker::PreflightError>> + Send + 'a>>
+            {
+                self.inner.preflight(run, proposal, step)
+            }
+            fn verify_turn_call_proposal(
+                &self,
+                call: &Call,
+                proposal: &Proposal,
+                expected_external_version: Option<&str>,
+            ) -> bool {
+                self.inner
+                    .verify_turn_call_proposal(call, proposal, expected_external_version)
+            }
+            fn filter_turn_tools<'a>(
+                &'a self,
+                run: &'a ActiveRun,
+                tools: Vec<DeclaredTool>,
+                step: &'a StepContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>>
+            {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Box::pin(async { Err(StepResult::Handoff) });
+                }
+                self.inner.filter_turn_tools(run, tools, step)
+            }
+            fn send<'a>(
+                &'a self,
+                run: &'a ActiveRun,
+                operation_id: String,
+                request: Vec<u8>,
+                step: StepContext,
+            ) -> Pin<Box<dyn Future<Output = StepResult> + Send + 'a>> {
+                self.inner.send(run, operation_id, request, step)
+            }
+        }
+
+        let (st1, step1) = fresh_step(30);
+        let st1_slot = Arc::new(Mutex::new(Some(st1)));
+        let st1_srv = st1_slot.clone();
+        let m_attempts = Arc::new(AtomicUsize::new(0));
+        let m_attempts_srv = m_attempts.clone();
+        let saw_r2_output = Arc::new(AtomicBool::new(false));
+        let saw_r2_srv = saw_r2_output.clone();
+        let model_srv = SyntheticMcpServer::start(move |req| {
+            let att = m_attempts_srv.fetch_add(1, Ordering::SeqCst);
+            if att == 0 {
+                if let Some(tx) = st1_srv.lock().unwrap().take() {
+                    let _ = tx.send(Some(Stop::Shutdown));
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                return http_response(503, &[("retry-after", "0")], b"aborted");
+            }
+            let body = if att == 1 {
+                json!({
+                    "id": "chatcmpl-ab-2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_ab_r2",
+                                "type": "function",
+                                "function": {"name": "mcp_read", "arguments": "{\"item\":\"ab\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+            } else {
+                if req.body.to_string().contains("r4-v1-read-ok") {
+                    saw_r2_srv.store(true, Ordering::SeqCst);
+                }
+                json!({
+                    "id": "chatcmpl-ab-3",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Recovered after abandoned round 1!"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 18, "completion_tokens": 4}
+                })
+            }
+            .to_string();
+            http_response(200, &[("content-type", "application/json")], body.as_bytes())
+        })
+        .await;
+
+        let r1_before = v1_read_calls.load(Ordering::SeqCst);
+        let run_id =
+            admit_yolo_turn("r4-abandoned-r1", "00000000-0000-4000-8000-000000004403", 3).await;
+
+        let claim1 = f.next().await.expect("claim1 abandoned r1");
+        assert_eq!(claim1.run_id, run_id);
+        let adapter1 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-ab".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let exec1 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "1",
+            },
+        )
+        .with_effects(Arc::new(adapter1.approved_effects()));
+        let active1 = ActiveRun {
+            claim: claim1.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec1.step(&active1, step1).await,
+            StepResult::Stopped
+        ));
+        leases::release_lease(&mut w, &claim1.lease())
+            .await
+            .unwrap();
+
+        let (mr_after_w1, tc_after_w1): (i64, i64) = sqlx::query_as(
+            "SELECT
+                count(*) FILTER (WHERE format = 'openmettle.model-round'),
+                count(*) FILTER (WHERE format = 'openmettle.turn-calls')
+             FROM openmettle.run_events WHERE run_id = $1::uuid",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((mr_after_w1, tc_after_w1), (1, 0));
+
+        let claim2 = leases::reclaim_next(&mut w, &LEASES)
+            .await
+            .unwrap()
+            .expect("claim2 abandoned r1")
+            .run;
+        assert_eq!(claim2.run_id, run_id);
+        let adapter2_inner = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-ab".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let effects2 = Arc::new(ApprovedEffects {
+            policy: registry.clone(),
+            adapter: Arc::new(HandoffSecondFilter {
+                inner: adapter2_inner,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        });
+        let exec2 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "1",
+            },
+        )
+        .with_effects(effects2);
+        let (_st2, step2) = fresh_step(30);
+        let active2 = ActiveRun {
+            claim: claim2.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec2.step(&active2, step2).await,
+            StepResult::Handoff
+        ));
+        leases::release_lease(&mut w, &claim2.lease())
+            .await
+            .unwrap();
+        assert_eq!(v1_read_calls.load(Ordering::SeqCst), r1_before + 1);
+
+        let claim3 = leases::reclaim_next(&mut w, &LEASES)
+            .await
+            .unwrap()
+            .expect("claim3 abandoned r1")
+            .run;
+        assert_eq!(claim3.run_id, run_id);
+        let adapter3 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-ab".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let exec3 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "1",
+            },
+        )
+        .with_effects(Arc::new(adapter3.approved_effects()));
+        let (_st3, step3) = fresh_step(30);
+        let active3 = ActiveRun {
+            claim: claim3.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec3.step(&active3, step3).await,
+            StepResult::Answer(_)
+        ));
+        assert!(saw_r2_output.load(Ordering::SeqCst));
+        assert_eq!(v1_read_calls.load(Ordering::SeqCst), r1_before + 1);
+        leases::settle(&mut w, &claim3.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+    }
+
+    // --- (e) P1 #1 + P2 #2: Abandoned Round 1 + Round 2 `has_pending_auto` rejects recovery version switch to v2, succeeds on v1 ---
+    {
+        struct AbortPreflightAfterCalls {
+            inner: Arc<ExternalMcpAdapter>,
+        }
+        impl ApprovedAdapter for AbortPreflightAfterCalls {
+            fn preflight<'a>(
+                &'a self,
+                _: &'a ActiveRun,
+                _: &'a Proposal,
+                _: &'a StepContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), worker::PreflightError>> + Send + 'a>>
+            {
+                Box::pin(async {
+                    Err(worker::PreflightError::Store(StoreError::Conflict(
+                        "crash-at-tx1",
+                    )))
+                })
+            }
+            fn verify_turn_call_proposal(
+                &self,
+                call: &Call,
+                proposal: &Proposal,
+                expected_external_version: Option<&str>,
+            ) -> bool {
+                self.inner
+                    .verify_turn_call_proposal(call, proposal, expected_external_version)
+            }
+            fn filter_turn_tools<'a>(
+                &'a self,
+                run: &'a ActiveRun,
+                tools: Vec<DeclaredTool>,
+                step: &'a StepContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>>
+            {
+                self.inner.filter_turn_tools(run, tools, step)
+            }
+            fn send<'a>(
+                &'a self,
+                run: &'a ActiveRun,
+                operation_id: String,
+                request: Vec<u8>,
+                step: StepContext,
+            ) -> Pin<Box<dyn Future<Output = StepResult> + Send + 'a>> {
+                self.inner.send(run, operation_id, request, step)
+            }
+        }
+
+        let (st1, step1) = fresh_step(30);
+        let st1_slot = Arc::new(Mutex::new(Some(st1)));
+        let st1_srv = st1_slot.clone();
+        let m_att = Arc::new(AtomicUsize::new(0));
+        let m_att_srv = m_att.clone();
+        let model_srv = SyntheticMcpServer::start(move |_| {
+            let att = m_att_srv.fetch_add(1, Ordering::SeqCst);
+            if att == 0 {
+                if let Some(tx) = st1_srv.lock().unwrap().take() {
+                    let _ = tx.send(Some(Stop::Shutdown));
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                return http_response(503, &[("retry-after", "0")], b"aborted");
+            }
+            let body = if att == 1 {
+                json!({
+                    "id": "chatcmpl-rec-2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_rec_r2",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"rec\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+            } else {
+                json!({
+                    "id": "chatcmpl-rec-3",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Recovered pending auto!"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 18, "completion_tokens": 4}
+                })
+            }
+            .to_string();
+            http_response(
+                200,
+                &[("content-type", "application/json")],
+                body.as_bytes(),
+            )
+        })
+        .await;
+
+        let idem0 = v1_idem_calls.load(Ordering::SeqCst);
+        let v2_0 = v2_calls.load(Ordering::SeqCst);
+        let run_id = admit_yolo_turn("r4-rec-ver", "00000000-0000-4000-8000-000000004404", 3).await;
+
+        // Worker 1 abandons pre-effect Round 1.
+        let claim1 = f.next().await.expect("claim1 rec-ver");
+        assert_eq!(claim1.run_id, run_id);
+        let adapter1 = Arc::new(ExternalMcpAdapter::new(
+            worker_pool.clone(),
+            LEASES,
+            registry.clone(),
+            transports.clone(),
+            Arc::new(CountingCredentials {
+                token: Some("tok-rv".into()),
+                lookups: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ToggleReconcileAuth {
+                allowed: Arc::new(AtomicBool::new(true)),
+                checks: Arc::new(AtomicUsize::new(0)),
+            }),
+        ));
+        let exec1 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "1",
+            },
+        )
+        .with_effects(Arc::new(adapter1.approved_effects()));
+        let active1 = ActiveRun {
+            claim: claim1.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec1.step(&active1, step1).await,
+            StepResult::Stopped
+        ));
+        leases::release_lease(&mut w, &claim1.lease())
+            .await
+            .unwrap();
+
+        // Worker 2 persists `turn-calls:2` (`advertised = v1`, `continuation_rounds = [2]`) and commits Tx1 (`attempts = 0`), then loses lease before Tx2.
+        let claim2 = leases::reclaim_next(&mut w, &LEASES)
+            .await
+            .unwrap()
+            .expect("claim2 rec-ver")
+            .run;
+        let effects2 = Arc::new(ApprovedEffects {
+            policy: registry.clone(),
+            adapter: Arc::new(AbortPreflightAfterCalls {
+                inner: adapter1.clone(),
+            }),
+        });
+        let exec2 = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "1",
+            },
+        )
+        .with_effects(effects2);
+        let (_st2, step2) = fresh_step(30);
+        let active2 = ActiveRun {
+            claim: claim2.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec2.step(&active2, step2).await,
+            StepResult::LeaseLost
+        ));
+        let prop_v1 = registry
+            .proposal("call_rec_r2", "mcp_idem", "1", br#"{"item":"rec"}"#)
+            .unwrap();
+        assert!(matches!(
+            record_fenced_intent(
+                &mut w,
+                &claim2.lease(),
+                &prop_v1,
+                None,
+                registry.as_ref(),
+                &LEASES
+            )
+            .await
+            .unwrap(),
+            IntentResult::Applied(_)
+        ));
+        leases::release_lease(&mut w, &claim2.lease())
+            .await
+            .unwrap();
+
+        // Worker 3a attempts recovery with `propose_version: "2"` -> MUST fail closed (`StepFailed`), 0 v2 calls!
+        let claim3a = leases::reclaim_next(&mut w, &LEASES)
+            .await
+            .unwrap()
+            .expect("claim3a rec-ver")
+            .run;
+        let exec3a = TurnExecutor::new(
+            worker_pool.clone(),
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry: registry.clone(),
+                propose_version: "2",
+            },
+        )
+        .with_effects(Arc::new(adapter1.approved_effects()));
+        let (_st3a, step3a) = fresh_step(30);
+        let active3a = ActiveRun {
+            claim: claim3a.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec3a.step(&active3a, step3a).await,
+            StepResult::Failed(leases::FailReason::StepFailed)
+        ));
+        assert_eq!(v2_calls.load(Ordering::SeqCst), v2_0);
+        assert_eq!(v1_idem_calls.load(Ordering::SeqCst), idem0);
+        leases::release_lease(&mut w, &claim3a.lease())
+            .await
+            .unwrap();
+
+        // Worker 3b recovers cleanly with `propose_version: "1"`, finishes Tx2 + send (`idem0 + 1`), and completes Round 3!
+        let claim3b = leases::reclaim_next(&mut w, &LEASES)
+            .await
+            .unwrap()
+            .expect("claim3b rec-ver")
+            .run;
+        let exec3b = TurnExecutor::new(
+            worker_pool,
+            catalog.clone(),
+            LEASES,
+            VersionSwitchRoutes {
+                gateway: make_gateway(&model_srv),
+                registry,
+                propose_version: "1",
+            },
+        )
+        .with_effects(Arc::new(adapter1.approved_effects()));
+        let (_st3b, step3b) = fresh_step(30);
+        let active3b = ActiveRun {
+            claim: claim3b.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(matches!(
+            exec3b.step(&active3b, step3b).await,
+            StepResult::Answer(_)
+        ));
+        assert_eq!(v1_idem_calls.load(Ordering::SeqCst), idem0 + 1);
+        assert_eq!(v2_calls.load(Ordering::SeqCst), v2_0);
+        leases::settle(&mut w, &claim3b.lease(), &LEASES, Settle::Succeeded)
             .await
             .unwrap();
     }
