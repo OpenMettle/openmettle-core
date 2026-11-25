@@ -52,10 +52,20 @@ policy is provisioned for it.
   `403 policy`. The body must be one JSON object whose top-level `model` is that model,
   without a repeated `model` key, or it is refused with `400 validation`. SGLang answers any
   model name from its loaded model, so nothing else checks it.
-- **Forwarding.** The request body (at most 2 MiB, read within 10 s) is sent upstream byte
-  for byte on a new connection, with only `Content-Type`, `Accept`, `Accept-Encoding:
-  identity` and the request ID. `Authorization`, cookies, other caller headers and any field
-  the caller names in `Connection` are not forwarded.
+- **Forwarding and prefix-cache isolation.** The request body (at most 2 MiB, read within 10 s)
+  is validated as one unique-key JSON object naming the served model and setting none of SGLang's
+  proxy-owned top-level cache or routing fields (`cache_salt`, `extra_key`, `session_id`, `rid`,
+  `lora_path`; any of those keys—even `null`—is refused with `400 validation` and closes the
+  spent hold as `request_body` without contacting the upstream). Nested occurrences inside
+  `messages` content are allowed. For valid requests the proxy derives a 64-character lowercase
+  hex `cache_salt` (scoped per `(installation, scope, model)` for personal scopes and effectively
+  shared project conversations under ADR 0027, per `(installation, scope, owner, model)` for
+  private project conversations, or fresh random per request under `CACHE_MODE=per_request`;
+  never logged, exported or returned in errors) and appends it directly before the JSON object's
+  closing `}`, preserving all prior caller bytes verbatim. The request goes upstream on a new
+  connection with only `Content-Type`, `Accept`, `Accept-Encoding: identity` and the request ID.
+  `Authorization`, cookies, other caller headers and any field the caller names in `Connection`
+  are not forwarded.
 - **HTTP/1.1 only.** Any other version is refused with `505 http_version_not_supported`
   before anything else: an HTTP/1.0 caller could not tell a cut stream from a complete one.
 - **Identity bodies only.** A request with a `Content-Encoding` other than `identity`, or a
@@ -136,7 +146,7 @@ one alone:
 | --- | --- | --- |
 | `model_not_served` | No | The request was reserved for a model other than `MODEL` (`403 policy`) |
 | `model_mismatch` | No | The body was not a JSON object naming the reserved model exactly once (`400 validation`) |
-| `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`) |
+| `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, the caller left while sending it, or the body set a proxy-owned top-level cache or routing field (`cache_salt`, `extra_key`, `session_id`, `rid`, `lora_path`) (`400 validation`) |
 | `upstream_connect` | No | No connection to the upstream was made, in time or at all (`502 provider_failure` or `504 timeout`), or the caller left before one was |
 | `not_dispatched` | No (worker sweep, revision 0) | The request was handed off without a binding, never dispatched, and its run can no longer dispatch it (failed, cancelled, reclaimed, or past its lease or execution deadline) |
 | `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
@@ -179,6 +189,7 @@ The gateway reads the same process settings as the API and the worker under the
 | --- | --- | --- |
 | `UPSTREAM_URL` | `http://host[:port]` with at most a `/` path | Required |
 | `MODEL` | The catalog model ID the upstream serves, 1–128 bytes | Required |
+| `CACHE_MODE` | `scoped` (scope/owner-isolated deterministic `cache_salt`) or `per_request` (fresh random `cache_salt` per request) | `scoped` |
 | `UPSTREAM_CONNECT_TIMEOUT_MS` | 1–30,000 ms | 5,000 |
 | `UPSTREAM_IDLE_TIMEOUT_MS` | 1–3,600,000 ms | 120,000 |
 
@@ -191,10 +202,15 @@ chunk (it is then treated as gone), and how long the relay reads on once the cal
 `MODEL` must equal the model ID that run admission stores, which is the catalog's. One
 gateway process serves one model.
 
+`CACHE_MODE` defaults to `scoped`, sharing prefix cache within a user's personal scope, within
+each owner's unshared conversations inside a project, and across a project's effectively shared
+conversations (migration 36). Set `per_request` to disable cross-request prefix reuse where live
+upstream `cache_salt` isolation has not yet been qualified.
+
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
 required`, `configuration error: UPSTREAM_URL must use http://`, `configuration error:
-invalid UPSTREAM_URL`, `configuration error: MODEL is required` or `configuration error:
-invalid MODEL`. The line never contains the value.
+invalid UPSTREAM_URL`, `configuration error: MODEL is required`, `configuration error:
+invalid MODEL` or `configuration error: invalid CACHE_MODE`. The line never contains the value.
 
 ## Bounds
 
@@ -229,6 +245,11 @@ on a connection that stopped answering: the pool waits for every connection when
 - **Chat completions only.** The Responses API is not routed.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.
+- **Live upstream `cache_salt` qualification pending.** Proxy-side derivation, sanitation and wire
+  injection are tested against the stand-in SGLang; live verification of `cache_salt` isolation
+  on the deployment's patched SGLang build and elastic KV tail (`0031–0033`) remains an
+  owner-gated live check (`#7` / `#9`). Use `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` where
+  cross-request prefix reuse must stay disabled until live qualification passes.
 
 ## Testing
 

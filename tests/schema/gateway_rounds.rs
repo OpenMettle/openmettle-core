@@ -156,6 +156,18 @@ impl Rounds {
         (format, version, config): (&str, i32, &[u8]),
         rounds: i64,
     ) -> Claimed {
+        self.claimed_on_at(actor, (scope, chat), (format, version, config), rounds, NOW)
+            .await
+    }
+
+    async fn claimed_on_at(
+        &mut self,
+        actor: &Account,
+        (scope, chat): (&str, &str),
+        (format, version, config): (&str, i32, &[u8]),
+        rounds: i64,
+        now_ms: i64,
+    ) -> Claimed {
         let mut api = connect(&self.db.0, API).await;
         let (branch, message) = quotas::branch_and_message(&mut api, scope, chat).await;
         let key = format!("round-{}", self.number());
@@ -178,7 +190,7 @@ impl Rounds {
                 actor_approval_id: &actor.approval,
                 capabilities: &[],
                 requested_rounds: Some(rounds),
-                now_ms: NOW,
+                now_ms,
                 cost_qualified: None,
             },
             &LIMITS,
@@ -6107,4 +6119,1082 @@ async fn review_3_p2_backfill_reconciles_unconsumed_schema_31_accepted_revisions
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+}
+
+/// One row of `openmettle.gateway_dispatch_scoped`: replay flag, routing fields, and `cache_owner`.
+type ScopedDispatched = (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+const DISPATCH_SCOPED: &str =
+    "SELECT replayed,installation,scope,source,principal,model,cache_owner
+    FROM openmettle.gateway_dispatch_scoped($1::uuid,sha256($2))";
+
+const SCOPED_REPLAY: ScopedDispatched = (true, None, None, None, None, None, None);
+
+async fn dispatch_scoped_as(
+    db: &TestDb,
+    role: &str,
+    request: &str,
+    bearer: &[u8],
+) -> Result<Vec<ScopedDispatched>, sqlx::Error> {
+    sqlx::query_as(DISPATCH_SCOPED)
+        .bind(request)
+        .bind(bearer)
+        .fetch_all(&mut connect(&db.0, role).await)
+        .await
+}
+
+async fn dispatch_scoped(f: &Rounds, round: &Round) -> Vec<ScopedDispatched> {
+    dispatch_scoped_as(&f.db, pg::GATEWAY, &round.request, &round.bearer)
+        .await
+        .unwrap()
+}
+
+/// Admits, claims, reserves, hands off, and returns a single-round request on `chat` for `actor`.
+async fn handoff_round_on(f: &mut Rounds, actor: &Account, scope: &str, chat: &str) -> Round {
+    let now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let plain = quotas::snapshot(100);
+    let run = f
+        .claimed_on_at(
+            actor,
+            (scope, chat),
+            ("openmettle.conversation", 1, &plain),
+            1,
+            now_ms,
+        )
+        .await;
+    let round = f.reserve(&run, 1, "a").await;
+    f.authorized(&round, "live run round on conversation").await;
+    round
+}
+
+/// Enrolls `account` in a fresh `'present'` ADR 0021 `membership_observations` row for
+/// `(project_id, scope_id)` using `selector_kind` (`'group'` or `'app_role'`) and `claim_value`.
+#[allow(clippy::too_many_arguments)]
+async fn enroll_mapped_member(
+    db: &TestDb,
+    account: &Account,
+    project_id: &str,
+    scope_id: &str,
+    rule_id: &str,
+    selector_kind: &str,
+    claim_value: &str,
+    key_tag: &str,
+) {
+    use openmettle_core::grants::{
+        self, Assignment, ChangeInput, Decision, Grantee as GrantGrantee, MappingInput, Target,
+    };
+    const ISSUER: &str = "https://authz-store.example.test";
+    let mut owner = connect(&db.0, OWNER).await;
+    let now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let mut api = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    grants::record_mapping_revision(
+        &mut tx,
+        &MappingInput {
+            rule: rule_id,
+            provider: PROVIDER,
+            issuer: ISSUER,
+            actor: &account.user,
+            key: &format!("cache-rule-{key_tag}"),
+            expected_revision: 0,
+            enabled: true,
+            selector_kind,
+            claim_name: if selector_kind == "group" {
+                "groups"
+            } else {
+                "roles"
+            },
+            claim_value,
+            binding_format: "openmettle.project-member",
+            binding_version: 1,
+            binding: project_id.as_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let receipt = grants::change_grant(
+        &mut tx,
+        &ChangeInput {
+            assignment: Assignment {
+                scope: scope_id,
+                target: Target::Project(project_id),
+                grantee: GrantGrantee::User(&account.user),
+                format: "openmettle.project-member",
+                version: 1,
+                key: &account.approval,
+                mapping_rule: Some(rule_id),
+            },
+            actor: &account.user,
+            key: &format!("cache-grant-{key_tag}"),
+            expected_revision: 0,
+            mapping_revision: Some(1),
+            decision: Decision::Grant,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    sqlx::query(
+        "WITH c AS (
+           INSERT INTO openmettle.membership_configuration_changes
+               (request_id, approval_id, previous_revision, rule_id, rule_revision, project_id,
+                scope_id, max_age_seconds, enabled, baseline_change, floor_ms, actor, reason)
+           VALUES (gen_random_uuid(), $1::uuid, 0, $2::uuid, 1, $3::uuid, $4::uuid, 3600, true,
+                   NULL, NULL, gen_random_uuid(), 'synthetic cache-owner mapped enrollment')
+           RETURNING revision)
+         INSERT INTO openmettle.membership_observations
+             (approval_id, config_revision, enabled, floor_ms, rule_id, rule_revision, project_id,
+              scope_id, max_age_seconds, issued_ms, expires_ms, observation, epoch,
+              approval_generation, user_generation)
+         SELECT $1::uuid, c.revision, true, NULL, $2::uuid, 1, $3::uuid, $4::uuid, 3600,
+                $6 - 60000, $6 + 600000, ROW('present', $5::uuid)::openmettle.membership_evidence,
+                (SELECT max(epoch) FROM openmettle.login_provider_revisions
+                  WHERE provider_id = $7::uuid), 0, 0
+           FROM c",
+    )
+    .bind(&account.approval)
+    .bind(rule_id)
+    .bind(project_id)
+    .bind(scope_id)
+    .bind(&receipt.change)
+    .bind(now_ms)
+    .bind(PROVIDER)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+}
+
+/// ADR 0044 increment 5 (migration 36): `openmettle.gateway_dispatch_scoped` enforces role,
+/// isolation, replay, archived/deleted project defense-in-depth, and ADR 0027 `cache_owner`
+/// separation across personal scopes, private project conversations, all effective share forms
+/// (project, user direct/local-group/mapped app_role/mapped group/OIDC group, local_group,
+/// oidc_group), and all Gate 2b stale/ineffective share fail-closed cases.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn gateway_dispatch_scoped_computes_cache_owner_under_adr_0027() {
+    use openmettle_core::authz::store;
+
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    let bob = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let carol = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let dave = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let erin = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let frank = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    authz_store::make_admin(&mut f.owner, &alice).await;
+
+    // 1. Personal scope: `cache_owner` is NULL, role/isolation/replay/wrong-bearer checks hold,
+    //    and 6-column `gateway_dispatch` delegates cleanly.
+    let personal_round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&personal_round, "personal scope round").await;
+    for role in [API, WORKER, ISSUANCE] {
+        let denied =
+            dispatch_scoped_as(&f.db, role, &personal_round.request, &personal_round.bearer).await;
+        assert_eq!(sqlstate(denied), "42501", "{role}");
+    }
+    {
+        let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+        gw.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .unwrap();
+        let err = sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+            .bind(&personal_round.request)
+            .bind(personal_round.bearer.as_slice())
+            .fetch_all(&mut gw)
+            .await;
+        assert_eq!(sqlstate(err), "25000");
+        gw.execute("ROLLBACK").await.unwrap();
+    }
+    assert_eq!(
+        dispatch_scoped_as(&f.db, pg::GATEWAY, &personal_round.request, &[0xee; 32])
+            .await
+            .unwrap(),
+        []
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &personal_round).await,
+        [(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(f.scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(alice.user.clone()),
+            Some("a".to_owned()),
+            None,
+        )]
+    );
+    assert_eq!(dispatch_scoped(&f, &personal_round).await, [SCOPED_REPLAY]);
+    assert_eq!(f.dispatch(&personal_round).await, [REPLAY]);
+
+    let personal_legacy = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&personal_legacy, "6-col wrapper").await;
+    assert_eq!(f.dispatch(&personal_legacy).await, [f.routed()]);
+    assert_eq!(dispatch_scoped(&f, &personal_legacy).await, [SCOPED_REPLAY]);
+
+    // 2. Project scope setup.
+    let (project_id, project_scope) =
+        run_admission::new_project(&f.db, &alice, "cache-owner-project").await;
+    let chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    let expected_owner = |actor: &Account, cache_owner: Option<&str>| {
+        vec![(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(actor.user.clone()),
+            Some("a".to_owned()),
+            cache_owner.map(str::to_owned),
+        )]
+    };
+
+    // Unshared project conversation -> `cache_owner = c.owner_user_id` (Alice).
+    let r_priv = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_priv).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+
+    // Self-share inserted directly in SQL must NOT switch to shared (`grantee_user_id <> owner`).
+    sqlx::query(
+        "WITH a AS (
+           INSERT INTO openmettle.grant_assignments
+               (scope_id, target_kind, conversation_id, grantee_kind, grantee_user_id,
+                assignment_format, assignment_version, assignment_key, source_kind,
+                created_by_user_id, last_revision)
+           VALUES ($1::uuid, 'conversation', $2::uuid, 'user', $3::uuid,
+                   'openmettle.resource-grant', 1, 'read', 'direct', $3::uuid, 1)
+           RETURNING id),
+         cid AS (SELECT gen_random_uuid() AS id)
+         INSERT INTO openmettle.grant_changes
+             (id, scope_id, assignment_id, revision, source_kind, actor_user_id, request_key,
+              decision, cycle_id, request_identity, request_digest)
+         SELECT cid.id, $1::uuid, a.id, 1, 'direct', $3::uuid, 'self-share-test',
+                'grant', cid.id, '\\x01'::bytea, sha256('self-share-test')
+           FROM a, cid",
+    )
+    .bind(&project_scope)
+    .bind(&chat)
+    .bind(&alice.user)
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    let r_self = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_self).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+
+    // 3. `Grantee::Project` share -> `cache_owner = NULL` for both Alice (owner) and Bob (editor).
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-bob-editor"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-share-proj"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::Project,
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let r_proj_alice = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    let r_proj_bob = handoff_round_on(&mut f, &bob, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_proj_alice).await,
+        expected_owner(&alice, None)
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_proj_bob).await,
+        expected_owner(&bob, None)
+    );
+    // Unshare `Grantee::Project` -> immediately back to `cache_owner = Alice`.
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-unshare-proj"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::Project,
+        )
+        .await,
+    );
+    let r_unshared = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_unshared).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+
+    // 4. `Grantee::User(bob)` direct project role -> `cache_owner = NULL`; then test stale Gate 2b
+    //    conditions on `bob`: disabled user, expired approval, inactive approval, retired provider,
+    //    revoked project role, and collaborator refusal when unshared between handoff & dispatch.
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-share-bob"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let r_bob_alice = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    let r_bob_collab = handoff_round_on(&mut f, &bob, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_alice).await,
+        expected_owner(&alice, None)
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_collab).await,
+        expected_owner(&bob, None)
+    );
+
+    // Disabled grantee user -> fail-closed to owner isolation.
+    applied(
+        store::disable_user(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-disable-bob"),
+            &bob.user,
+        )
+        .await,
+    );
+    let r_bob_disabled = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_disabled).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    f.owner_exec(
+        "UPDATE openmettle.users SET disabled_at = NULL WHERE id = $1::uuid",
+        &bob.user,
+    )
+    .await;
+
+    // Inactive grantee approval -> fail-closed to owner isolation.
+    f.owner_exec(
+        "UPDATE openmettle.local_identity_approvals SET active = false WHERE id = $1::uuid",
+        &bob.approval,
+    )
+    .await;
+    let r_bob_inact = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_inact).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    f.owner_exec(
+        "UPDATE openmettle.local_identity_approvals SET active = true WHERE id = $1::uuid",
+        &bob.approval,
+    )
+    .await;
+
+    // Expired grantee approval -> fail-closed to owner isolation.
+    f.owner_exec(
+        "UPDATE openmettle.local_identity_approvals SET expires_ms = 1 WHERE id = $1::uuid",
+        &bob.approval,
+    )
+    .await;
+    let r_bob_exp = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_exp).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    f.owner_exec(
+        "UPDATE openmettle.local_identity_approvals SET expires_ms = 4102444800000 WHERE id = $1::uuid",
+        &bob.approval,
+    )
+    .await;
+
+    // Retired grantee provider -> fail-closed to owner isolation without affecting Alice.
+    {
+        const RETIRABLE_PROVIDER: &str = "00000000-0000-4000-8000-00000000c201";
+        sqlx::query(
+            "INSERT INTO openmettle.login_providers
+                 (id, issuer, client_id, changed_by, change_reason)
+             VALUES ($1::uuid, 'https://authz-store.example.test', 'synthetic-retirable',
+                     'fixture-owner', 'synthetic retirable provider')",
+        )
+        .bind(RETIRABLE_PROVIDER)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+             VALUES ($1::uuid, 'v1')",
+        )
+        .bind(RETIRABLE_PROVIDER)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+        let grace = account(&mut f.owner, RETIRABLE_PROVIDER, true, FUTURE).await;
+        let grace_chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+        applied(
+            projects::set_project_member_role(
+                &mut connect(&f.db.0, API).await,
+                &ctx(&alice, "co-grace-viewer"),
+                &project_id,
+                &Grantee::User(grace.user.clone()),
+                ProjectRole::Viewer,
+            )
+            .await,
+        );
+        applied(
+            projects::share_resource(
+                &mut connect(&f.db.0, API).await,
+                &ctx(&alice, "co-share-grace"),
+                ResourceKind::Conversation,
+                &grace_chat,
+                &Grantee::User(grace.user.clone()),
+                ResourceAccess::Read,
+            )
+            .await,
+        );
+        let r_grace_live = handoff_round_on(&mut f, &alice, &project_scope, &grace_chat).await;
+        assert_eq!(
+            dispatch_scoped(&f, &r_grace_live).await,
+            expected_owner(&alice, None)
+        );
+        sqlx::query(
+            "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+             VALUES ($1::uuid, NULL)",
+        )
+        .bind(RETIRABLE_PROVIDER)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+        let r_grace_retired = handoff_round_on(&mut f, &alice, &project_scope, &grace_chat).await;
+        assert_eq!(
+            dispatch_scoped(&f, &r_grace_retired).await,
+            expected_owner(&alice, Some(&alice.user))
+        );
+    }
+
+    // Collaborator round handed off while shared, then Bob's project role is revoked BEFORE
+    // dispatch -> Alice's round falls back to `Some(alice)`, while Bob's stale in-flight round
+    // is refused (never enters Alice's private cache bucket!).
+    let r_bob_stale_inflight = handoff_round_on(&mut f, &bob, &project_scope, &chat).await;
+    applied(
+        projects::revoke_project_member(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-revoke-bob"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+        )
+        .await,
+    );
+    let r_bob_revoked = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_revoked).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_stale_inflight).await,
+        [],
+        "collaborator round whose share became ineffective must not enter owner private cache"
+    );
+    assert!(!f.stored(&r_bob_stale_inflight).await.3);
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-unshare-bob"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+        )
+        .await,
+    );
+
+    // 5. `Grantee::LocalGroup` and `Grantee::User(carol)` via local-group project membership.
+    let group_id = applied(
+        store::create_local_group(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-mk-grp"),
+            "cache-test-group",
+        )
+        .await,
+    );
+    applied(
+        store::add_local_group_member(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-add-carol"),
+            &group_id,
+            &carol.user,
+        )
+        .await,
+    );
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-grp-editor"),
+            &project_id,
+            &Grantee::LocalGroup(group_id.clone()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    // 5a. Direct share to `Grantee::LocalGroup` -> shared (`None`) for Alice & Carol.
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-share-grp"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::LocalGroup(group_id.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let r_lg_alice = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    let r_lg_carol = handoff_round_on(&mut f, &carol, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_lg_alice).await,
+        expected_owner(&alice, None)
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_lg_carol).await,
+        expected_owner(&carol, None)
+    );
+    // Disable local group -> Gate 2b fail-closed (`Some(alice)`).
+    applied(
+        store::disable_local_group(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-disable-grp"),
+            &group_id,
+        )
+        .await,
+    );
+    let r_lg_dis = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_lg_dis).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        store::enable_local_group(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-enable-grp"),
+            &group_id,
+        )
+        .await,
+    );
+    // Revoke local group's project role -> Gate 2b fail-closed (`Some(alice)`).
+    applied(
+        projects::revoke_project_member(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-revoke-grp-role"),
+            &project_id,
+            &Grantee::LocalGroup(group_id.clone()),
+        )
+        .await,
+    );
+    let r_lg_rev = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_lg_rev).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-unshare-grp"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::LocalGroup(group_id.clone()),
+        )
+        .await,
+    );
+
+    // 5b. Share to `Grantee::User(carol)` whose ONLY project membership is through `group_id`.
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-grp-viewer"),
+            &project_id,
+            &Grantee::LocalGroup(group_id.clone()),
+            ProjectRole::Viewer,
+        )
+        .await,
+    );
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-share-carol"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(carol.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let r_carol_lg = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_carol_lg).await,
+        expected_owner(&alice, None)
+    );
+    // Remove Carol from local group -> Carol loses project membership -> `Some(alice)`.
+    f.owner_exec(
+        "UPDATE openmettle.local_group_memberships SET active = false WHERE user_id = $1::uuid",
+        &carol.user,
+    )
+    .await;
+    let r_carol_removed = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_carol_removed).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-unshare-carol"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(carol.user.clone()),
+        )
+        .await,
+    );
+
+    // 6. `Grantee::OidcGroup` share & revocation (Gate 2b).
+    let oidc_team = "cache-oidc-team";
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-oidc-role"),
+            &project_id,
+            &Grantee::OidcGroup(oidc_team.into()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-share-oidc"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::OidcGroup(oidc_team.into()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let r_oidc = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_oidc).await,
+        expected_owner(&alice, None)
+    );
+    // Revoke OIDC group project role -> Gate 2b fail-closed (`Some(alice)`).
+    applied(
+        projects::revoke_project_member(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-revoke-oidc"),
+            &project_id,
+            &Grantee::OidcGroup(oidc_team.into()),
+        )
+        .await,
+    );
+    let r_oidc_rev = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_oidc_rev).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "co-unshare-oidc"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::OidcGroup(oidc_team.into()),
+        )
+        .await,
+    );
+
+    // 7. `Grantee::User` holding project membership via mapped `openmettle.project-member`:
+    //    - Dave: `selector_kind = 'app_role'` directly onto `project_id`
+    //    - Erin: `selector_kind = 'group'` directly onto `project_id`
+    //    - Frank: `selector_kind = 'group'` enrolled on ANOTHER project whose `claim_value`
+    //      matches a direct `oidc_group` `project-role` on `project_id`!
+    let now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let share_ctx = |key: &'static str| openmettle_core::authz::store::AuditContext {
+        now_ms,
+        ..ctx(&alice, key)
+    };
+    enroll_mapped_member(
+        &f.db,
+        &dave,
+        &project_id,
+        &project_scope,
+        "00000000-0000-4000-8000-00000000c101",
+        "app_role",
+        "project-viewer-role",
+        "dave-approle",
+    )
+    .await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-share-dave"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(dave.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let r_dave = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_dave).await,
+        expected_owner(&alice, None),
+        "mapped project-member with selector_kind = app_role must make user share effective"
+    );
+    // Expire Dave's observation -> stale -> fail-closed to `Some(alice)`.
+    f.owner_exec(
+        "UPDATE openmettle.membership_observations SET expires_ms = issued_ms WHERE approval_id = $1::uuid",
+        &dave.approval,
+    )
+    .await;
+    let r_dave_stale = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_dave_stale).await,
+        expected_owner(&alice, Some(&alice.user)),
+        "stale mapped observation must fail closed to owner cache isolation"
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-unshare-dave"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(dave.user.clone()),
+        )
+        .await,
+    );
+
+    // Erin: mapped `group` directly on `project_id`, then test absent & disabled & generation mismatch.
+    enroll_mapped_member(
+        &f.db,
+        &erin,
+        &project_id,
+        &project_scope,
+        "00000000-0000-4000-8000-00000000c102",
+        "group",
+        "mapped-direct-group",
+        "erin-group",
+    )
+    .await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-share-erin"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(erin.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let r_erin = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_erin).await,
+        expected_owner(&alice, None),
+        "mapped project-member with selector_kind = group must make user share effective"
+    );
+    // Bump Erin's user session_generation -> observation generation mismatch -> fail-closed.
+    f.owner_exec(
+        "UPDATE openmettle.users SET session_generation = session_generation + 1 WHERE id = $1::uuid",
+        &erin.user,
+    )
+    .await;
+    let r_erin_gen = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_erin_gen).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-unshare-erin"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(erin.user.clone()),
+        )
+        .await,
+    );
+
+    // Frank: `group` observation enrolled on a DIFFERENT project, matching direct `oidc_group`
+    // project-role on `project_id`.
+    let (other_proj, other_scope) =
+        run_admission::new_project(&f.db, &frank, "other-oidc-project").await;
+    enroll_mapped_member(
+        &f.db,
+        &frank,
+        &other_proj,
+        &other_scope,
+        "00000000-0000-4000-8000-00000000c103",
+        "group",
+        "cross-proj-oidc-team",
+        "frank-cross",
+    )
+    .await;
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-cross-oidc-role"),
+            &project_id,
+            &Grantee::OidcGroup("cross-proj-oidc-team".into()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-share-frank"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(frank.user.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let r_frank_alice = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    let r_frank_collab = handoff_round_on(&mut f, &frank, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_frank_alice).await,
+        expected_owner(&alice, None)
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_frank_collab).await,
+        expected_owner(&frank, None)
+    );
+    // Revoke the `oidc_group` project role -> Frank loses project membership -> `Some(alice)`.
+    applied(
+        projects::revoke_project_member(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-revoke-cross-oidc"),
+            &project_id,
+            &Grantee::OidcGroup("cross-proj-oidc-team".into()),
+        )
+        .await,
+    );
+    let r_frank_rev = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_frank_rev).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &share_ctx("co-unshare-frank"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(frank.user.clone()),
+        )
+        .await,
+    );
+
+    // 8. Archived and deleted project defense-in-depth at dispatch.
+    let r_arch = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    f.owner_exec(
+        "UPDATE openmettle.project_settings SET archived_at = greatest(created_at, clock_timestamp())
+          WHERE project_id = $1::uuid",
+        &project_id,
+    )
+    .await;
+    assert_eq!(dispatch_scoped(&f, &r_arch).await, []);
+    assert!(!f.stored(&r_arch).await.3);
+    f.owner_exec(
+        "UPDATE openmettle.project_settings SET archived_at = NULL, deleted_at = greatest(created_at, clock_timestamp())
+          WHERE project_id = $1::uuid",
+        &project_id,
+    )
+    .await;
+    assert_eq!(dispatch_scoped(&f, &r_arch).await, []);
+    assert!(!f.stored(&r_arch).await.3);
+    f.owner_exec(
+        "UPDATE openmettle.project_settings SET deleted_at = NULL WHERE project_id = $1::uuid",
+        &project_id,
+    )
+    .await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_arch).await,
+        expected_owner(&alice, Some(&alice.user))
+    );
+}
+
+/// Concurrent `unshare_resource` (holding `projects FOR NO KEY UPDATE`) serializes cleanly with
+/// `gateway_dispatch_scoped` (`projects FOR SHARE`), while a wrong bearer takes zero locks.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn gateway_dispatch_scoped_blocks_on_inflight_unshare_and_observes_revocation() {
+    use openmettle_core::grants::{
+        self, Assignment, ChangeInput, Decision, Grantee as GrantGrantee, Target,
+    };
+
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    let (project_id, project_scope) =
+        run_admission::new_project(&f.db, &alice, "concurrent-unshare-proj").await;
+    let chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "conc-share-proj"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::Project,
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let round = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+
+    // Hold `projects FOR NO KEY UPDATE` and revoke the `Grantee::Project` share uncommitted.
+    let mut writer = connect(&f.db.0, API).await;
+    let writer_pid = backend_pid(&mut writer).await;
+    let mut tx = WriteTransaction::begin(&mut writer).await.unwrap();
+    sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&project_id)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+    let (rev, cycle_id): (i64, Option<String>) = sqlx::query_as(
+        "SELECT ga.last_revision, gh.cycle_id::text
+           FROM openmettle.grant_assignments ga
+           JOIN openmettle.grant_changes gh
+             ON gh.assignment_id = ga.id AND gh.revision = ga.last_revision
+          WHERE ga.scope_id = $1::uuid AND ga.target_kind = 'conversation'
+            AND ga.target_id = $2::uuid AND ga.grantee_kind = 'project'
+            AND ga.assignment_format = 'openmettle.resource-grant'
+            AND ga.assignment_version = 1 AND ga.assignment_key = 'read'",
+    )
+    .bind(&project_scope)
+    .bind(&chat)
+    .fetch_one(tx.connection().unwrap())
+    .await
+    .unwrap();
+    grants::change_grant(
+        &mut tx,
+        &ChangeInput {
+            assignment: Assignment {
+                scope: &project_scope,
+                target: Target::Conversation(&chat),
+                grantee: GrantGrantee::Project,
+                format: "openmettle.resource-grant",
+                version: 1,
+                key: "read",
+                mapping_rule: None,
+            },
+            actor: &alice.user,
+            key: "conc-unshare-tx",
+            expected_revision: rev,
+            mapping_revision: None,
+            decision: Decision::Revoke(cycle_id.as_deref()),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Wrong bearer takes ZERO locks and returns immediately even while projects row is locked.
+    assert_eq!(
+        dispatch_scoped_as(&f.db, pg::GATEWAY, &round.request, &[0xdd; 32])
+            .await
+            .unwrap(),
+        []
+    );
+
+    // Valid bearer blocks behind `projects FOR NO KEY UPDATE`, then observes the committed revoke.
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    let (req_id, bearer) = (round.request.clone(), round.bearer);
+    let waiting = tokio::spawn(async move {
+        sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+            .bind(req_id)
+            .bind(bearer.as_slice())
+            .fetch_all(&mut gw)
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_peer(&f.db, writer_pid).await;
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        waiting.await.unwrap(),
+        [(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(alice.user.clone()),
+            Some("a".to_owned()),
+            Some(alice.user.clone()),
+        )]
+    );
+}
+
+/// Migration 35 -> 36 upgrade adds `openmettle.gateway_dispatch_scoped`, keeps 6-column
+/// `openmettle.gateway_dispatch` compatible, and dispatches pre-36 handed-off rounds cleanly.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_35_to_36_upgrade_adds_scoped_dispatch_and_preserves_existing_rounds() {
+    let mut f = Rounds::at(35).await;
+    let has_scoped: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.gateway_dispatch_scoped(uuid,bytea)') IS NOT NULL",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert!(!has_scoped);
+
+    let (_, project_scope) =
+        run_admission::new_project(&f.db, &f.actor.clone(), "upgrade-36-proj").await;
+    let chat = authz_runs::chat(&f.db, &project_scope, "project", &f.actor).await;
+    let alice = f.actor.clone();
+    let pre_upgrade_round = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    let pre_upgrade_personal = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&pre_upgrade_personal, "pre-36 personal round")
+        .await;
+
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(f.db.history().await, all_versions());
+
+    // Pre-36 unshared project round dispatches with `cache_owner = alice`.
+    assert_eq!(
+        dispatch_scoped(&f, &pre_upgrade_round).await,
+        [(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(alice.user.clone()),
+            Some("a".to_owned()),
+            Some(alice.user.clone()),
+        )]
+    );
+    // 6-column `gateway_dispatch` remains compatible on pre-36 personal round.
+    assert_eq!(f.dispatch(&pre_upgrade_personal).await, [f.routed()]);
 }

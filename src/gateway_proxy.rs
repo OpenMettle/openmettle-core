@@ -12,11 +12,15 @@
 //! - **Model.** The stored model must be the one this gateway serves, and the body's top-level
 //!   `model` must equal it. The upstream answers any model name from its loaded model, so
 //!   nothing else checks it.
-//! - **Forwarding.** The request body goes upstream byte for byte, with only `Content-Type`,
-//!   `Accept`, `Accept-Encoding: identity` and the request ID; `Authorization`, cookies and
-//!   fields the caller names in `Connection` are not forwarded. The upstream status,
-//!   `Content-Type` and body are relayed chunk by chunk as they arrive. Only identity bodies
-//!   pass in either direction, and only HTTP/1.1 callers are served.
+//! - **Forwarding and prefix-cache isolation.** Top-level proxy-owned SGLang cache/routing fields
+//!   (`cache_salt`, `extra_key`, `session_id`, `rid`, `lora_path`) are refused (`400 validation`,
+//!   `UsageGap::RequestBody`) before connecting upstream. Otherwise the proxy derives a 64-char
+//!   lowercase hex `cache_salt` (scoped per authorized scope/owner/model or fresh per request) and
+//!   appends it right before the JSON object's closing `}`, preserving caller bytes verbatim. Only
+//!   `Content-Type`, `Accept`, `Accept-Encoding: identity` and the request ID are forwarded;
+//!   `Authorization`, cookies and fields the caller names in `Connection` are not forwarded. The
+//!   upstream status, `Content-Type` and body are relayed chunk by chunk as they arrive. Only
+//!   identity bodies pass in either direction, and only HTTP/1.1 callers are served.
 //! - **Usage.** One relay task per request copies each upstream chunk to the caller and to the
 //!   usage reader and then writes one final report itself, so the write does not depend on the
 //!   caller staying connected. A completed 200 with a usage object is reported with its counts.
@@ -32,10 +36,13 @@
 mod usage;
 
 use crate::{
-    authz::gateway::{self, Consumed, Error as StoreError, Routing, settlement},
+    authz::{
+        gateway::{self, Consumed, Error as StoreError, Routing, settlement},
+        projects::hex,
+    },
     bounded_positive,
     provider_http::{gateway::UsageReport, inference::json},
-    runs::is_canonical_uuid,
+    runs::{digest, identity as framed_identity, is_canonical_uuid},
     telemetry::{self, RequestId, UsageGap},
     v1::{Problem, problem},
 };
@@ -54,6 +61,7 @@ use hyper::{
     client::conn::http1,
 };
 use hyper_util::rt::TokioIo;
+use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
 use std::{
     future::Future,
@@ -132,6 +140,19 @@ const BODY: Problem = problem(
     "validation",
     "The request body exceeds 2 MiB or did not arrive in time.",
 );
+const RESERVED_FIELD: Problem = problem(
+    StatusCode::BAD_REQUEST,
+    "validation",
+    "The request body must not set proxy-owned cache or routing fields.",
+);
+const RESERVED_KEYS: [&str; 5] = ["cache_salt", "extra_key", "session_id", "rid", "lora_path"];
+
+/// How the proxy derives `cache_salt` for upstream prefix-cache isolation (ADR 0044, increment 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheMode {
+    Scoped,
+    PerRequest,
+}
 const VERSION: Problem = problem(
     StatusCode::HTTP_VERSION_NOT_SUPPORTED,
     "http_version_not_supported",
@@ -169,13 +190,15 @@ pub(crate) struct Settings {
     upstream: Authority,
     /// The catalog model ID the upstream serves.
     model: String,
+    cache_mode: CacheMode,
     connect_timeout: Duration,
     idle_timeout: Duration,
 }
 
 impl Settings {
-    /// `UPSTREAM_URL` and `MODEL` (both required), `UPSTREAM_CONNECT_TIMEOUT_MS` and
-    /// `UPSTREAM_IDLE_TIMEOUT_MS`. Refusals name the key, never the value.
+    /// `UPSTREAM_URL` and `MODEL` (both required), optional `CACHE_MODE`,
+    /// `UPSTREAM_CONNECT_TIMEOUT_MS` and `UPSTREAM_IDLE_TIMEOUT_MS`. Refusals name the key, never
+    /// the value.
     pub(crate) fn parse(
         get: impl Fn(&str) -> Result<Option<String>, &'static str>,
     ) -> Result<Self, &'static str> {
@@ -186,6 +209,11 @@ impl Settings {
         if model.is_empty() || model.len() > 128 {
             return Err("invalid MODEL");
         }
+        let cache_mode = match get("CACHE_MODE")?.as_deref() {
+            None | Some("scoped") => CacheMode::Scoped,
+            Some("per_request") => CacheMode::PerRequest,
+            Some(_) => return Err("invalid CACHE_MODE"),
+        };
         let millis = |key, default, max| -> Result<Duration, &'static str> {
             Ok(Duration::from_millis(bounded_positive(
                 get(key)?,
@@ -196,6 +224,7 @@ impl Settings {
         Ok(Self {
             upstream,
             model,
+            cache_mode,
             connect_timeout: millis("UPSTREAM_CONNECT_TIMEOUT_MS", 5_000, 30_000)?,
             idle_timeout: millis("UPSTREAM_IDLE_TIMEOUT_MS", 120_000, 3_600_000)?,
         })
@@ -403,15 +432,113 @@ fn credential(headers: &HeaderMap) -> Result<[u8; 32], Problem> {
         .ok_or(UNAUTHENTICATED)
 }
 
-/// Whether `body` is one JSON object whose top-level `model` is the string `model`. Read with
-/// the worker decoder's parser, which refuses duplicate keys: no second `model` can reach an
-/// upstream that might prefer it.
-fn names_model(body: &[u8], model: &str) -> bool {
-    matches!(
-        json::parse(body),
-        Ok(serde_json::Value::Object(request))
-            if request.get("model").and_then(|named| named.as_str()) == Some(model)
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyRejection {
+    ModelMismatch,
+    ReservedField,
+}
+
+/// Validates that `body` is one unique-key JSON object whose top-level `model` equals `model`
+/// and that sets none of SGLang's proxy-owned cache/routing fields (`RESERVED_KEYS`).
+fn validate_body(body: &[u8], model: &str) -> Result<(), BodyRejection> {
+    let Ok(serde_json::Value::Object(request)) = json::parse(body) else {
+        return Err(BodyRejection::ModelMismatch);
+    };
+    if request.get("model").and_then(|named| named.as_str()) != Some(model) {
+        return Err(BodyRejection::ModelMismatch);
+    }
+    if RESERVED_KEYS.iter().any(|key| request.contains_key(*key)) {
+        return Err(BodyRejection::ReservedField);
+    }
+    Ok(())
+}
+
+/// Derives the 64-character lowercase hex SHA-256 `cache_salt` for `routing` under `mode`.
+/// Never logged, emitted in telemetry, or returned in error responses.
+fn derive_cache_salt(
+    mode: CacheMode,
+    routing: &Routing,
+    request_id: &str,
+) -> Result<String, Problem> {
+    let input = match mode {
+        CacheMode::Scoped => {
+            let (kind, owner): (&[u8], &[u8]) = match routing.cache_owner.as_deref() {
+                None => (b"shared", b""),
+                Some(owner) => (b"owner", owner.as_bytes()),
+            };
+            framed_identity(
+                b"openmettle.cache-salt.v1\0",
+                &[
+                    routing.installation.as_bytes(),
+                    routing.scope.as_bytes(),
+                    kind,
+                    owner,
+                    routing.model.as_bytes(),
+                ],
+            )
+        }
+        CacheMode::PerRequest => {
+            let mut nonce = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut nonce)
+                .map_err(|_| UNAVAILABLE)?;
+            framed_identity(
+                b"openmettle.cache-salt-request.v1\0",
+                &[
+                    routing.installation.as_bytes(),
+                    request_id.as_bytes(),
+                    &nonce,
+                ],
+            )
+        }
+    };
+    Ok(hex(&digest(&input)))
+}
+
+/// Appends `,"cache_salt":"<salt_hex>"` immediately before the validated JSON object's closing
+/// `}`, stripping only trailing RFC 8259 whitespace and leaving all caller bytes before `}`
+/// untouched.
+fn inject_cache_salt(body: &[u8], salt_hex: &str) -> Result<Bytes, Problem> {
+    debug_assert_eq!(salt_hex.len(), 64);
+    debug_assert!(
+        salt_hex
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    let trimmed_len = body
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    let trimmed = &body[..trimmed_len];
+    if trimmed.last() != Some(&b'}') {
+        return Err(MODEL);
+    }
+    const PREFIX: &[u8] = br#","cache_salt":""#;
+    const SUFFIX: &[u8] = br#""}"#;
+    let mut out =
+        Vec::with_capacity(trimmed.len() - 1 + PREFIX.len() + salt_hex.len() + SUFFIX.len());
+    out.extend_from_slice(&trimmed[..trimmed.len() - 1]);
+    out.extend_from_slice(PREFIX);
+    out.extend_from_slice(salt_hex.as_bytes());
+    out.extend_from_slice(SUFFIX);
+    Ok(Bytes::from(out))
+}
+
+fn prepare_outbound_body(
+    body: &[u8],
+    mode: CacheMode,
+    routing: &Routing,
+    request_id: &str,
+) -> Result<Bytes, (UsageGap, Problem)> {
+    if let Err(rejection) = validate_body(body, &routing.model) {
+        return Err(match rejection {
+            BodyRejection::ModelMismatch => (UsageGap::ModelMismatch, MODEL),
+            BodyRejection::ReservedField => (UsageGap::RequestBody, RESERVED_FIELD),
+        });
+    }
+    let salt = derive_cache_salt(mode, routing, request_id)
+        .map_err(|problem| (UsageGap::UpstreamConnect, problem))?;
+    inject_cache_salt(body, &salt).map_err(|problem| (UsageGap::ModelMismatch, problem))
 }
 
 impl Proxy {
@@ -464,16 +591,20 @@ impl Proxy {
             Ok(Ok(body)) => body,
             _ => return Err(BODY),
         };
-        if !names_model(&body, &routing.model) {
-            unrecorded.gap = Some(UsageGap::ModelMismatch);
-            return Err(MODEL);
-        }
+        let outbound_body =
+            match prepare_outbound_body(&body, self.settings.cache_mode, &routing, &id) {
+                Ok(outbound) => outbound,
+                Err((gap, problem)) => {
+                    unrecorded.gap = Some(gap);
+                    return Err(problem);
+                }
+            };
         let mut outbound = hyper::Request::post(ROUTE)
             .header(header::HOST, self.settings.upstream.as_str())
             .header(header::CONNECTION, "close")
             .header(header::ACCEPT_ENCODING, "identity")
             .header("x-request-id", &id)
-            .body(Full::new(body))
+            .body(Full::new(outbound_body))
             .map_err(|_| CORRELATION)?;
         for name in [header::CONTENT_TYPE, header::ACCEPT] {
             for value in end_to_end(&parts.headers, &name) {
@@ -1055,8 +1186,14 @@ mod tests {
 
     #[test]
     fn the_body_must_name_the_reserved_model_once() {
-        assert!(names_model(br#"{"model":"a","messages":[]}"#, "a"));
-        assert!(names_model(br#" {"messages":[],"model":"a"} "#, "a"));
+        assert_eq!(
+            validate_body(br#"{"model":"a","messages":[]}"#, "a"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_body(br#" {"messages":[],"model":"a"} "#, "a"),
+            Ok(())
+        );
         for body in [
             &br#"{"model":"b","messages":[]}"#[..],
             br#"{"messages":[]}"#,
@@ -1075,7 +1212,12 @@ mod tests {
             br#"{"model":"a""#,
             b"",
         ] {
-            assert!(!names_model(body, "a"), "{}", String::from_utf8_lossy(body));
+            assert_eq!(
+                validate_body(body, "a"),
+                Err(BodyRejection::ModelMismatch),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
         }
     }
 
@@ -1088,7 +1230,165 @@ mod tests {
             scope: "00000000-0000-4000-8000-000000000003".into(),
             source: "00000000-0000-4000-8000-000000000004".into(),
             model: SERVED.1.into(),
+            cache_owner: None,
         }
+    }
+
+    #[test]
+    fn cache_mode_setting_is_validated() {
+        let url = ("UPSTREAM_URL", "http://127.0.0.1:30000");
+        assert_eq!(parse(&[url, SERVED]).unwrap().cache_mode, CacheMode::Scoped);
+        assert_eq!(
+            parse(&[url, SERVED, ("CACHE_MODE", "scoped")])
+                .unwrap()
+                .cache_mode,
+            CacheMode::Scoped
+        );
+        assert_eq!(
+            parse(&[url, SERVED, ("CACHE_MODE", "per_request")])
+                .unwrap()
+                .cache_mode,
+            CacheMode::PerRequest
+        );
+        for bad in [
+            "",
+            "SCOPED",
+            "per-request",
+            "off",
+            " scoped",
+            "per_request ",
+        ] {
+            assert_eq!(
+                parse(&[url, SERVED, ("CACHE_MODE", bad)]).err(),
+                Some("invalid CACHE_MODE"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_salt_derivation_is_deterministic_domain_separated_and_random_per_request() {
+        let is_hex64 =
+            |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let base = routing();
+        let shared = derive_cache_salt(CacheMode::Scoped, &base, ID).unwrap();
+        assert!(is_hex64(&shared), "{shared}");
+        assert_eq!(
+            shared,
+            derive_cache_salt(
+                CacheMode::Scoped,
+                &base,
+                "11111111-1111-4111-8111-111111111111"
+            )
+            .unwrap()
+        );
+        // Domain and field-boundary collision resistance: None vs Some("") vs Some("shared"),
+        // and ("ab", "c") vs ("a", "bc").
+        let empty_owner = Routing {
+            cache_owner: Some(String::new()),
+            ..base.clone()
+        };
+        let named_shared = Routing {
+            cache_owner: Some("shared".into()),
+            ..base.clone()
+        };
+        let owned = Routing {
+            cache_owner: Some("00000000-0000-4000-8000-0000000000aa".into()),
+            ..base.clone()
+        };
+        let s_empty = derive_cache_salt(CacheMode::Scoped, &empty_owner, ID).unwrap();
+        let s_named = derive_cache_salt(CacheMode::Scoped, &named_shared, ID).unwrap();
+        let s_owned = derive_cache_salt(CacheMode::Scoped, &owned, ID).unwrap();
+        for salt in [&s_empty, &s_named, &s_owned] {
+            assert!(is_hex64(salt), "{salt}");
+        }
+        assert_ne!(shared, s_empty);
+        assert_ne!(shared, s_named);
+        assert_ne!(s_empty, s_named);
+        assert_ne!(shared, s_owned);
+
+        let left = Routing {
+            scope: "ab".into(),
+            model: "c".into(),
+            ..base.clone()
+        };
+        let right = Routing {
+            scope: "a".into(),
+            model: "bc".into(),
+            ..base.clone()
+        };
+        assert_ne!(
+            derive_cache_salt(CacheMode::Scoped, &left, ID).unwrap(),
+            derive_cache_salt(CacheMode::Scoped, &right, ID).unwrap()
+        );
+
+        let pr_1 = derive_cache_salt(CacheMode::PerRequest, &base, ID).unwrap();
+        let pr_2 = derive_cache_salt(CacheMode::PerRequest, &base, ID).unwrap();
+        assert!(is_hex64(&pr_1), "{pr_1}");
+        assert!(is_hex64(&pr_2), "{pr_2}");
+        assert_ne!(pr_1, pr_2);
+        assert_ne!(pr_1, shared);
+    }
+
+    #[test]
+    fn body_validation_and_injection_preserve_bytes_and_reject_reserved_fields() {
+        let base = routing();
+        // Exact byte-preserving injection: preserves key order, whitespace, nested strings
+        // mentioning reserved keys, and exact float literals (e.g. 0.70, 1e-5, 1.0).
+        let raw = br#"{  "temperature": 0.70, "top_p": 1.0, "eps": 1e-5, "model": "synthetic-model", "messages": [{"role":"user","content":"{\"cache_salt\":\"ignored\",\"extra_key\":\"ok\"}"}], "metadata": {"extra_key": "nested-ok"} }  "#;
+        let out = prepare_outbound_body(raw, CacheMode::Scoped, &base, ID).unwrap();
+        let expected_salt = derive_cache_salt(CacheMode::Scoped, &base, ID).unwrap();
+        let expected_prefix = br#"{  "temperature": 0.70, "top_p": 1.0, "eps": 1e-5, "model": "synthetic-model", "messages": [{"role":"user","content":"{\"cache_salt\":\"ignored\",\"extra_key\":\"ok\"}"}], "metadata": {"extra_key": "nested-ok"} ,"cache_salt":""#;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(expected_prefix);
+        expected.extend_from_slice(expected_salt.as_bytes());
+        expected.extend_from_slice(br#""}"#);
+        assert_eq!(out.as_ref(), expected.as_slice());
+        // Result is valid unique-key JSON carrying the derived `cache_salt`.
+        let parsed = json::parse(&out).unwrap();
+        assert_eq!(
+            parsed.get("cache_salt").and_then(|v| v.as_str()),
+            Some(expected_salt.as_str())
+        );
+
+        // A full MAX_REQUEST_BYTES (2 MiB) caller body is accepted and rewritten cleanly.
+        let head = br#"{"model":"synthetic-model","pad":""#;
+        let tail = br#""}"#;
+        let pad_len = MAX_REQUEST_BYTES - head.len() - tail.len();
+        let mut max_body = Vec::with_capacity(MAX_REQUEST_BYTES);
+        max_body.extend_from_slice(head);
+        max_body.resize(head.len() + pad_len, b'a');
+        max_body.extend_from_slice(tail);
+        assert_eq!(max_body.len(), MAX_REQUEST_BYTES);
+        let max_out = prepare_outbound_body(&max_body, CacheMode::Scoped, &base, ID).unwrap();
+        assert_eq!(
+            max_out.len(),
+            MAX_REQUEST_BYTES + br#","cache_salt":""#.len() + 64 + 1
+        );
+        assert!(json::parse(&max_out).is_ok());
+
+        // Every top-level reserved field is refused (including null and unicode-escaped keys).
+        for key in RESERVED_KEYS {
+            for val in [r#""x""#, "null", "123"] {
+                let body = format!(r#"{{"model":"synthetic-model","{key}":{val}}}"#);
+                assert_eq!(
+                    prepare_outbound_body(body.as_bytes(), CacheMode::Scoped, &base, ID),
+                    Err((UsageGap::RequestBody, RESERVED_FIELD)),
+                    "{body}"
+                );
+            }
+        }
+        let escaped = br#"{"model":"synthetic-model","\u0063ache_salt":"sneaky"}"#;
+        assert_eq!(
+            prepare_outbound_body(escaped, CacheMode::Scoped, &base, ID),
+            Err((UsageGap::RequestBody, RESERVED_FIELD))
+        );
+        // Duplicate keys still fail as ModelMismatch.
+        let dup = br#"{"model":"synthetic-model","messages":[],"messages":[]}"#;
+        assert_eq!(
+            prepare_outbound_body(dup, CacheMode::Scoped, &base, ID),
+            Err((UsageGap::ModelMismatch, MODEL))
+        );
     }
 
     #[test]

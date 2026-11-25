@@ -201,6 +201,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "family policy tables",
         sql: include_str!("../migrations/0035_family_policy_tables.sql"),
     },
+    Source {
+        version: 36,
+        description: "gateway cache separation",
+        sql: include_str!("../migrations/0036_gateway_cache_separation.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

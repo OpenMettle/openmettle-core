@@ -3,10 +3,12 @@
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
 2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
 3b (migration 32), 3c (migration 33), proxy cost-hold settlement (migration 34, issue #166) and
-increment 4 family policy tables & enforcement (migration 35): see
+increment 4 family policy tables & enforcement (migration 35), and 25 November 2026 with
+increment 5 prefix-cache separation and caller body sanitation (migration 36): see
 [requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage),
-[cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing)
-and [family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement).
+[cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing),
+[family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement)
+and [prefix-cache separation](#amendment-25-november-2026-prefix-cache-separation).
 Refs #7, #9, #17, #166.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
@@ -264,7 +266,7 @@ exists.
 | 3e | Proxy cost-hold settlement (issue #166): record immutable `Profile.cost_bound` (`cost_fixed_micros`, `cost_micros_per_token`) on `gateway_requests` at `gateway_handoff_round`, derive `usage_cost_micros` in `quota_gateway_fold` from reported tokens and forbid caller-supplied `cost`/`unit` on unbound requests; migration 34 (delivered 24 November 2026, see the amendment). |
 | 3d | Running usage for cut streams. |
 | 4 | Family policy tables, SQL evaluator, four-point enforcement, audited store API and `openmettle-admin family` CLI; migration 35 (delivered 24 November 2026, see the amendment). |
-| 5 | Cache separation. |
+| 5 | Prefix-cache separation (`cache_salt`) and caller body sanitation; migration 36 (delivered 25 November 2026, see the amendment). |
 | 6 | Removal of the superseded code and tables. |
 | 7 | Deployment, TLS and network policy. |
 
@@ -629,3 +631,85 @@ execution, handoff or proxy dispatch.
   `34 -> 35` upgrade.
 - `tests/model_config.rs` and `src/authz/gateway/family.rs`: `Catalog::resolve_with_fallback`,
   strict `HH:MM-HH:MM` window parsing and `openmettle-admin family` argument parsing.
+
+## Amendment, 25 November 2026: prefix-cache separation
+
+Increment 5 (migration 36). Refs #7, #9.
+
+### Problem
+
+SGLang's `RadixCache` shares prefix KV nodes across requests carrying identical token prefixes
+unless requests are partitioned by a caller-unforgeable `cache_salt`. Forwarding caller JSON
+verbatim left two gaps: distinct users and private project conversations sharing a model could
+hit one another's cached prefixes, and a caller could set SGLang's cache or routing keys
+(`cache_salt`, `extra_key`, `session_id`, `rid`, `lora_path`) directly.
+
+### Decision
+
+- **Scoped dispatch function and lock order (migration 36).**
+  `openmettle.gateway_dispatch_scoped(uuid, bytea)` (`SECURITY DEFINER`, `SET search_path =
+  pg_catalog`, `openmettle_gateway` only) extends the 6-column routing result with `cache_owner
+  text`, while `openmettle.gateway_dispatch(uuid, bytea)` becomes a thin 1-query wrapper over it
+  preserving its exact 6-column signature and privileges. Wrong bearers still take zero locks.
+  For valid bearers, `gateway_dispatch_scoped` acquires canonical shared authorization locks in
+  ADR 0040 / migration 35 order (`account_admin_lock -> projects -> login_providers/approvals ->
+  users -> runs -> gateway_requests`) so concurrent `share_resource`/`unshare_resource`, project
+  membership/lifecycle changes, user/group administration, approval withdrawals and run
+  cancellations serialize without lock-order inversions. It preserves every migration 35 check,
+  refuses archived or deleted projects (`project_settings`) and non-owner dispatches on unshared
+  project conversations, and computes `cache_owner` at the single `clock_timestamp()` reading:
+  - **Personal scope (`scopes.kind = 'personal'`):** `cache_owner = NULL`, sharing prefix cache
+    within `(installation, scope_id, model)`.
+  - **Project scope (`scopes.kind = 'project'`):** `cache_owner = NULL` (shared within
+    `(installation, scope_id, model)`) if and only if the conversation holds at least one
+    effective direct `openmettle.resource-grant` v1 (`read`/`write`) under [ADR 0027](0027-authorization-and-private-projects.md)
+    (project-wide, enabled local group holding a project role, OIDC group holding a project role,
+    or another enabled user with an active unexpired approval on a non-retired provider holding
+    direct, local-group or fresh `'present'` mapped/OIDC project membership); otherwise
+    `cache_owner = conversations.owner_user_id::text`, isolating private conversations to
+    `(installation, scope_id, owner_user_id, model)`.
+  - **Rolling-upgrade fallback.** `gateway::consume` probes
+    `to_regprocedure('openmettle.gateway_dispatch_scoped(uuid,bytea)')` and falls back to
+    `gateway_dispatch` with `cache_owner = Some(principal)` on pre-36 schemas so distinct users
+    never share prefixes before migration 36 applies.
+- **Proxy cache mode and derivation (`OPENMETTLE_GATEWAY_CACHE_MODE`).**
+  - `scoped` (default): `SHA-256` over length-prefixed domain `openmettle.cache-salt.v1\0` and
+    `(installation, scope_id, "shared" | "owner", "" | cache_owner, model)`.
+  - `per_request`: `SHA-256` over length-prefixed domain `openmettle.cache-salt-request.v1\0` and
+    `(installation, request_id, 32-byte SystemRandom nonce)`, disabling cross-request prefix reuse.
+    An RNG failure before upstream connect refuses with `503 unavailable` and settles the spent
+    hold as `upstream_connect` (`0` charged).
+  - Invalid values exit `78` with `configuration error: invalid CACHE_MODE` (value-free). The
+    derived 64-character lowercase hex `cache_salt` is never logged, emitted in telemetry or
+    returned in error responses.
+- **Caller body sanitation and byte-preserving injection.** After spending the dispatch and
+  parsing the unique-key JSON object once (`provider_http::inference::json::parse`), any top-level
+  `cache_salt`, `extra_key`, `session_id`, `rid` or `lora_path` key (including `null` or
+  unicode-escaped spellings; nested strings inside `messages` are allowed) is refused with
+  `400 validation` (`UsageGap::RequestBody`), sending zero bytes upstream and closing token and
+  cost holds at `0`. Valid bodies have trailing RFC 8259 whitespace trimmed and
+  `,"cache_salt":"<64 hex>"` appended directly before the closing `}`, preserving caller key
+  order, internal whitespace and float literals byte for byte while `hyper` sets the updated
+  `Content-Length` (including for full 2 MiB caller bodies).
+- **Qualification boundary.** Unit and PostgreSQL 18 tests verify namespace derivation, ADR 0027
+  share transitions, concurrency serialization and wire injection against the stand-in SGLang.
+  Live verification that `cache_salt` isolates cached prefixes on the deployment's `serving-fork`
+  and elastic KV tail (`0031–0033`) remains an owner-gated live check (`#7` / `#9`); operators
+  can set `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` to disable cross-request prefix reuse where
+  live backend qualification is pending (`ARCHITECTURE-v1.md`).
+
+### Evidence
+
+- `src/gateway_proxy.rs` and `tests/runtime.rs`: `CACHE_MODE` parsing and exit-78 refusal,
+  domain/boundary collision resistance, `per_request` uniqueness, byte-preserving injection up to
+  `MAX_REQUEST_BYTES` and top-level reserved-field refusal.
+- `tests/schema/gateway_rounds.rs`: `gateway_dispatch_scoped` across personal, private project,
+  all ADR 0027 effective shares (`project`, `local_group`, `oidc_group`, `user` direct/local-group/
+  mapped `app_role`/mapped `group`/cross-project OIDC group) and Gate 2b stale/revoked fail-closed
+  cases, archived/deleted project refusal, concurrent `unshare_resource` serialization, 6-column
+  `gateway_dispatch` compatibility and `35 -> 36` upgrade.
+- `tests/schema/gateway_proxy.rs` and `tests/schema/live_turns/worker_gateway.rs`: stand-in
+  SGLang inspection of personal, private project, shared/unshared project, `per_request` and
+  pre-36 fallback `cache_salt`s; reserved-key `400 validation` + `request_body` zero-charge token
+  and cost settlement with zero drift; and packaged `openmettle-worker` -> `openmettle-gateway`
+  end-to-end `cache_salt` forwarding.
