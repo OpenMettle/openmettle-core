@@ -13,7 +13,7 @@ use env_support::scrub_env;
 #[path = "support/proc.rs"]
 mod proc_support;
 use proc_support::{
-    PipeDrain, Process, read_string_bounded, run_bounded, wait_exit_bounded,
+    PipeDrain, Process, read_string_bounded, run_bounded, wait_exit_bounded, wait_for_pipes,
     wait_http_status_bounded, wait_output_bounded,
 };
 #[path = "auth_config_support/mod.rs"]
@@ -3639,17 +3639,85 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         "PipeDrain::finish_string did not wake its 25ms idle wait within 12ms across 5 attempts"
     );
 
-    // Two-descriptor isolation: stdout closing before the deadline must not grant stderr an extra
-    // post-deadline read when stderr stays open past the deadline (subshell closes fd 1 via
-    // `exec >/dev/null` so only stderr remains open past 35 ms).
+    // Two-descriptor isolation: direct `(true, false)` / `(false, true)` / `(false, false)` checks
+    // when one pipe is at EOF and the sibling is idle (including under a tight deadline), plus an
+    // end-to-end `run_bounded` check using a preview marker distinct from the context label.
+    {
+        use std::os::fd::AsFd;
+        let (out_r, out_w) = std::io::pipe().unwrap();
+        let (err_r, _err_w_open) = std::io::pipe().unwrap();
+        let out_flags = rustix::fs::fcntl_getfl(&out_r).unwrap();
+        rustix::fs::fcntl_setfl(&out_r, out_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let err_flags = rustix::fs::fcntl_getfl(&err_r).unwrap();
+        rustix::fs::fcntl_setfl(&err_r, err_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        drop(out_w);
+        let mut verified_1ms_pair = false;
+        for _ in 0..5 {
+            if wait_for_pipes(
+                Some(out_r.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(1),
+                None,
+                None,
+            ) == (true, false)
+            {
+                verified_1ms_pair = true;
+                break;
+            }
+        }
+        assert!(
+            verified_1ms_pair,
+            "idle stderr suppressed 1ms stdout readiness in wait_for_pipes"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(out_r.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (true, false),
+            "closed stdout + idle stderr must report (true, false)"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(err_r.as_fd()),
+                Some(out_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (false, true),
+            "idle first + closed second must report (false, true)"
+        );
+        let (idle_a, _keep_a) = std::io::pipe().unwrap();
+        let a_flags = rustix::fs::fcntl_getfl(&idle_a).unwrap();
+        rustix::fs::fcntl_setfl(&idle_a, a_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        assert_eq!(
+            wait_for_pipes(
+                Some(idle_a.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(5),
+                None,
+                None,
+            ),
+            (false, false),
+            "two idle pipes must report (false, false) on timeout"
+        );
+    }
+
     let mut mixed_pipes = Command::new("sh");
-    mixed_pipes.args(["-c", "(exec >/dev/null; sleep 0.08) & echo stdout-early"]);
+    mixed_pipes.args([
+        "-c",
+        "(exec >/dev/null; sleep 0.08) & echo distinct-stdout-payload",
+    ]);
     let began = Instant::now();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_bounded(
             &mut mixed_pipes,
             Duration::from_millis(35),
-            "synthetic-stdout-early-stderr-late",
+            "synthetic-mixed-pipe-label",
         )
     }))
     .expect_err("post-deadline stderr close must time out despite early stdout EOF");
@@ -3660,7 +3728,8 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     );
     let message = panic_text(err);
     assert!(
-        message.contains("synthetic-stdout-early-stderr-late") && message.contains("stdout-early"),
+        message.contains("synthetic-mixed-pipe-label")
+            && message.contains("distinct-stdout-payload"),
         "missing label or stdout preview on mixed-pipe timeout: {message}"
     );
 

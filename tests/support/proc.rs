@@ -507,7 +507,8 @@ impl<R: Read + AsFd> PipeCollector<R> {
     }
 }
 
-fn wait_for_pipes(
+#[allow(dead_code)]
+pub(crate) fn wait_for_pipes(
     first: Option<BorrowedFd<'_>>,
     second: Option<BorrowedFd<'_>>,
     until: Instant,
@@ -581,22 +582,19 @@ fn wait_for_pipes(
                             (false, true)
                         }
                         (Some(r1), Some(r2)) => {
-                            tokio::select! {
-                                _ = r1.readable() => {
-                                    let r2_also =
-                                        tokio::time::timeout(Duration::ZERO, r2.readable())
-                                            .await
-                                            .is_ok();
-                                    (true, r2_also)
+                            use std::future::Future;
+                            let mut f1 = std::pin::pin!(r1.readable());
+                            let mut f2 = std::pin::pin!(r2.readable());
+                            std::future::poll_fn(|cx| {
+                                let r1_ok = f1.as_mut().poll(cx).is_ready();
+                                let r2_ok = f2.as_mut().poll(cx).is_ready();
+                                if r1_ok || r2_ok {
+                                    std::task::Poll::Ready((r1_ok, r2_ok))
+                                } else {
+                                    std::task::Poll::Pending
                                 }
-                                _ = r2.readable() => {
-                                    let r1_also =
-                                        tokio::time::timeout(Duration::ZERO, r1.readable())
-                                            .await
-                                            .is_ok();
-                                    (r1_also, true)
-                                }
-                            }
+                            })
+                            .await
                         }
                     }
                 } => {
