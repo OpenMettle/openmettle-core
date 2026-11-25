@@ -175,6 +175,7 @@ jobs:
           persist-credentials: false
       - run: docker build --target api --tag openmettle-api:test .
       - run: docker build --target worker --tag openmettle-worker:test .
+      - run: docker build --target gateway --tag openmettle-gateway:test .
       - run: docker build --target migrate --tag openmettle-migrate:test .
       - name: Exercise isolated runtime images
         run: bash runtime/verify-images.sh

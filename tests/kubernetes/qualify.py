@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify the core API/worker process contract on an ephemeral kind cluster (V1-01).
+"""Qualify the core API/worker/gateway process contract on an ephemeral kind cluster (V1-01/V1-06).
 
 Test fixture only: this is not an installer, Helm chart or deployment manifest. The harness
 creates a uniquely named kind cluster classified `dev`, uses a temporary kubeconfig, builds
@@ -12,6 +12,7 @@ Requires Python 3.10+, docker, and the pinned kind/kubectl from install-tools.sh
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -42,12 +43,19 @@ CLUSTER_NAME = re.compile(r"openmettle-dev-qual-[0-9a-f]{8}")
 APP_NAMESPACE = "openmettle-qualification"
 DB_NAMESPACE = "openmettle-qualification-db"
 FINALIZER = "openmettle.dev/observe-termination"
-ROLES = ("api", "worker")
+ROLES = ("api", "worker", "gateway")
 # Exercised fixture values. They differ per process to prove independent configuration;
 # they are not production sizing or tuning.
 FIXTURE_SETTINGS = {
     "api": {"DB_MAX_CONNECTIONS": "4", "DB_TIMEOUT_MS": "2000", "SHUTDOWN_TIMEOUT_MS": "5000"},
     "worker": {"DB_MAX_CONNECTIONS": "2", "DB_TIMEOUT_MS": "1500", "SHUTDOWN_TIMEOUT_MS": "4000"},
+    "gateway": {
+        "DB_MAX_CONNECTIONS": "3",
+        "DB_TIMEOUT_MS": "1800",
+        "SHUTDOWN_TIMEOUT_MS": "4500",
+        "UPSTREAM_URL": "http://127.0.0.1:30000",
+        "MODEL": "synthetic-model",
+    },
 }
 IMAGE_USER = "65532:65532"
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -107,8 +115,8 @@ def validate_contract(data: object) -> dict:
             if not isinstance(spec.get(key), str) or not spec[key].startswith("/"):
                 raise ContractError(f"{role}: {key} must be an absolute path")
     for key in ("port", "serviceAccountName", "configurationPrefix"):
-        if data["api"][key] == data["worker"][key]:
-            raise ContractError(f"api and worker must not share {key}")
+        if len({data[role][key] for role in ROLES}) != len(ROLES):
+            raise ContractError(f"processes must not share {key}")
     return data
 
 
@@ -125,7 +133,7 @@ def process_settings(role: str) -> dict:
 
 
 def render_manifests(contract: dict, images: dict, passwords: dict, run_id: str) -> dict:
-    """Return a kubectl List. passwords holds synthetic per-run values for admin/api/worker."""
+    """Return a kubectl List. passwords holds synthetic per-run values for admin/api/worker/gateway."""
     labels = {"openmettle.dev/environment": "dev", "openmettle.dev/qualification-run": run_id}
     items = [
         {"apiVersion": "v1", "kind": "Namespace",
@@ -210,7 +218,7 @@ def render_manifests(contract: dict, images: dict, passwords: dict, run_id: str)
                      "spec": {
                          "serviceAccountName": spec["serviceAccountName"],
                          "automountServiceAccountToken": spec["automountServiceAccountToken"],
-                         # Service links would inject OPENMETTLE_API_* variables into every pod.
+                         # Service links would inject OPENMETTLE_<ROLE>_* variables into every pod.
                          "enableServiceLinks": False,
                          "terminationGracePeriodSeconds": 15,
                          "securityContext": {"runAsNonRoot": True,
@@ -233,12 +241,14 @@ def render_manifests(contract: dict, images: dict, passwords: dict, run_id: str)
                          }],
                      }}}},
         ]
-    api = contract["api"]
-    items.append(
-        {"apiVersion": "v1", "kind": "Service",
-         "metadata": {"name": "openmettle-api", "namespace": APP_NAMESPACE},
-         "spec": {"selector": {"app.kubernetes.io/name": "openmettle-api"},
-                  "ports": [{"name": "http", "port": api["port"], "targetPort": "http"}]}})
+    for service_role in ("api", "gateway"):
+        service_spec = contract[service_role]
+        service_name = f"openmettle-{service_role}"
+        items.append(
+            {"apiVersion": "v1", "kind": "Service",
+             "metadata": {"name": service_name, "namespace": APP_NAMESPACE},
+             "spec": {"selector": {"app.kubernetes.io/name": service_name},
+                      "ports": [{"name": "http", "port": service_spec["port"], "targetPort": "http"}]}})
     return {"apiVersion": "v1", "kind": "List", "items": items}
 
 
@@ -371,6 +381,12 @@ class PortForward:
             if match:
                 self.port = int(match.group(1))
                 return
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def close(self):
         if self.proc.poll() is None:
@@ -510,7 +526,7 @@ class Qualification:
     def observe_process(self, role: str) -> dict:
         """Inspect one ready pod's live spec, ServiceAccount, process and HTTP endpoints."""
         spec = self.contract[role]
-        other = "worker" if role == "api" else "api"
+        others = [r for r in ROLES if r != role]
         pods = self.pods(role)
         self.expect(len(pods) >= 1, f"no {role} pod")
         pod = pods[0]
@@ -546,8 +562,9 @@ class Qualification:
         configured = sorted(k for k in env if k.startswith("OPENMETTLE_"))
         self.expect(all(k.startswith(spec["configurationPrefix"]) for k in configured),
                     f"{role} process sees foreign OPENMETTLE_ variables: {configured}")
-        self.expect(not any(k.startswith(self.contract[other]["configurationPrefix"]) for k in env),
-                    f"{role} process sees {other} configuration")
+        for other in others:
+            self.expect(not any(k.startswith(self.contract[other]["configurationPrefix"]) for k in env),
+                        f"{role} process sees {other} configuration")
         self.expect(not any(k.startswith("PG") for k in env), f"{role} process sees PG* defaults")
         self.expect(f"{spec['configurationPrefix']}DATABASE_URL" in env,
                     f"{role} process has no database URL")
@@ -617,8 +634,10 @@ class Qualification:
                          "-U", "fixture_admin", "-d", "fixture", input=sql).stdout.strip()
 
     def prepare_sweeps(self):
-        # Use the release schema and its worker grants inside this disposable database.
-        self.fixture_sql("CREATE ROLE openmettle_owner; CREATE ROLE openmettle_issuance; CREATE ROLE openmettle_gateway;"
+        # Use the release schema and its grants inside this disposable database.
+        # openmettle_api, openmettle_worker and openmettle_gateway are provisioned with LOGIN
+        # in roles.sql during PostgreSQL initialization.
+        self.fixture_sql("CREATE ROLE openmettle_owner; CREATE ROLE openmettle_issuance;"
                          "ALTER DATABASE fixture OWNER TO openmettle_owner;"
                          "SET ROLE openmettle_owner; CREATE SCHEMA openmettle;"
                          "SET search_path TO pg_catalog,pg_temp;\n" + "\n".join(
@@ -674,74 +693,104 @@ class Qualification:
                     restarts=replacement["restartCount"])
 
     def scenario(self):
-        api, worker = self.contract["api"], self.contract["worker"]
+        api, gateway = self.contract["api"], self.contract["gateway"]
         baseline = {role: self.observe_process(role) for role in ROLES}
-        self.expect(baseline["api"]["serviceAccount"] != baseline["worker"]["serviceAccount"],
-                    "api and worker share a ServiceAccount")
-        self.expect(baseline["api"]["settings"] != baseline["worker"]["settings"],
-                    "api and worker settings are not independent")
+        self.expect(len({baseline[role]["serviceAccount"] for role in ROLES}) == len(ROLES),
+                    "processes share a ServiceAccount")
+        self.expect(
+            len({tuple(sorted(baseline[role]["settings"].items())) for role in ROLES}) == len(ROLES),
+            "process settings are not independent",
+        )
         api_pod = baseline["api"]["pod"]
-        slices = self.kube_json(["--namespace", APP_NAMESPACE, "get", "endpointslices",
-                                 "--selector", "kubernetes.io/service-name=openmettle-api",
-                                 "--output=json"])["items"]
-        ready_targets = [e["targetRef"]["name"] for s in slices for e in s.get("endpoints", [])
-                         if e.get("conditions", {}).get("ready")]
-        self.expect(ready_targets == [api_pod], f"API Service endpoints: {ready_targets}")
-        self.passed("API Service routes to ready API pod", endpoints=ready_targets)
+        gateway_pod = baseline["gateway"]["pod"]
+        for service_role, expected_pod in (("api", api_pod), ("gateway", gateway_pod)):
+            service_name = f"openmettle-{service_role}"
+            slices = self.kube_json(["--namespace", APP_NAMESPACE, "get", "endpointslices",
+                                     "--selector", f"kubernetes.io/service-name={service_name}",
+                                     "--output=json"])["items"]
+            ready_targets = [e["targetRef"]["name"] for s in slices for e in s.get("endpoints", [])
+                             if e.get("conditions", {}).get("ready")]
+            self.expect(ready_targets == [expected_pod],
+                        f"{service_name} Service endpoints: {ready_targets}")
+            self.passed(f"{service_name} Service routes to ready pod", endpoints=ready_targets)
 
         self.forced_worker_recovery()
 
-        # Stop every worker while continuously probing the API.
-        forward = PortForward(self.kubectl, self.env, f"pod/{api_pod}", api["port"])
-        results: list = []
+        # Stop every worker while continuously probing the API and gateway.
+        api_results: list = []
+        gateway_results: list = []
         stop = threading.Event()
+        with contextlib.ExitStack() as stack:
+            api_forward = stack.enter_context(
+                PortForward(self.kubectl, self.env, f"pod/{api_pod}", api["port"]))
+            gateway_forward = stack.enter_context(
+                PortForward(self.kubectl, self.env, f"pod/{gateway_pod}", gateway["port"]))
 
-        def probe():
-            while not stop.is_set():
-                results.append(http_get(forward.port, api["readinessPath"]))
-                time.sleep(0.25)
-        prober = threading.Thread(target=probe, daemon=True)
-        prober.start()
-        try:
-            worker_exits = self.scale_down_observing_exit("worker")
-            time.sleep(10)  # several kubelet readiness periods with no worker
-        finally:
-            stop.set()
-            prober.join(timeout=10)
-            forward.close()
-        failures = [r for r in results if r != (200, "ready\n")]
-        self.expect(len(results) >= 20 and not failures,
-                    f"API readiness during worker stop: {len(failures)} failures of {len(results)}")
+            def probe():
+                while not stop.is_set():
+                    api_results.append(http_get(api_forward.port, api["readinessPath"]))
+                    gateway_results.append(http_get(gateway_forward.port, gateway["readinessPath"]))
+                    time.sleep(0.25)
+
+            prober = threading.Thread(target=probe, daemon=True)
+            prober.start()
+            try:
+                worker_exits = self.scale_down_observing_exit("worker")
+                time.sleep(10)  # several kubelet readiness periods with no worker
+            finally:
+                stop.set()
+                prober.join(timeout=10)
+        api_failures = [r for r in api_results if r != (200, "ready\n")]
+        gateway_failures = [r for r in gateway_results if r != (200, "ready\n")]
+        self.expect(len(api_results) >= 20 and not api_failures,
+                    f"API readiness during worker stop: {len(api_failures)} failures of {len(api_results)}")
+        self.expect(
+            len(gateway_results) >= 20 and not gateway_failures,
+            f"gateway readiness during worker stop: {len(gateway_failures)} failures of {len(gateway_results)}",
+        )
         deployment = self.deployment("worker")
         self.expect(deployment["spec"]["replicas"] == 0
                     and deployment["status"].get("replicas", 0) == 0, "worker did not reach zero")
-        api_now = self.pods("api")
-        self.expect([p["metadata"]["name"] for p in api_now] == [api_pod], "API pod was replaced")
-        api_ready = self.deployment("api")["status"].get("readyReplicas")
-        self.expect(api_ready == 1, "API Deployment lost readiness with worker at zero")
-        self.observe_process("api")
-        self.passed("API survives worker scaled to zero", worker_exit_codes=worker_exits,
-                    api_readiness_probes=len(results), api_ready_replicas=api_ready)
+        for survivor, expected_pod in (("api", api_pod), ("gateway", gateway_pod)):
+            now = self.pods(survivor)
+            self.expect([p["metadata"]["name"] for p in now] == [expected_pod],
+                        f"{survivor} pod was replaced")
+            ready = self.deployment(survivor)["status"].get("readyReplicas")
+            self.expect(ready == 1, f"{survivor} Deployment lost readiness with worker at zero")
+            self.observe_process(survivor)
+        self.passed("API and gateway survive worker scaled to zero", worker_exit_codes=worker_exits,
+                    api_readiness_probes=len(api_results),
+                    gateway_readiness_probes=len(gateway_results),
+                    api_ready_replicas=1, gateway_ready_replicas=1)
 
-        # Independent scaling: worker to 2 while the API stays at 1.
+        # Independent scaling: worker to 2 while the API and gateway stay at 1.
         self.seed_sweeps("graceful")
         self.scale("worker", 2)
         self.kube("--namespace", APP_NAMESPACE, "rollout", "status", "deployment/openmettle-worker",
                   "--timeout=180s", timeout=210)
         counts = {role: self.deployment(role)["status"].get("readyReplicas") for role in ROLES}
-        self.expect(counts == {"api": 1, "worker": 2}, f"independent scale not observed: {counts}")
+        self.expect(counts == {"api": 1, "worker": 2, "gateway": 1},
+                    f"independent scale not observed: {counts}")
         self.observe_process("worker")
         self.assert_sweeps("graceful")
         self.passed("independent scaling", ready_replicas=counts)
 
         # Database loss affects readiness, not liveness; recovery needs no restart.
         self.scale("postgres", 0, namespace=DB_NAMESPACE, name="postgres")
-        forward = PortForward(self.kubectl, self.env, f"pod/{api_pod}", api["port"])
-        try:
+        with contextlib.ExitStack() as stack:
+            api_forward = stack.enter_context(
+                PortForward(self.kubectl, self.env, f"pod/{api_pod}", api["port"]))
+            gateway_forward = stack.enter_context(
+                PortForward(self.kubectl, self.env, f"pod/{gateway_pod}", gateway["port"]))
             self.wait_for("API readiness 503 without PostgreSQL",
-                          lambda: http_get(forward.port, api["readinessPath"])[0] == 503, timeout=90)
-            self.expect(http_get(forward.port, api["livenessPath"]) == (200, "ok\n"),
+                          lambda: http_get(api_forward.port, api["readinessPath"])[0] == 503, timeout=90)
+            self.expect(http_get(api_forward.port, api["livenessPath"]) == (200, "ok\n"),
                         "API liveness failed while PostgreSQL was down")
+            self.wait_for("gateway readiness 503 without PostgreSQL",
+                          lambda: http_get(gateway_forward.port, gateway["readinessPath"])[0] == 503,
+                          timeout=90)
+            self.expect(http_get(gateway_forward.port, gateway["livenessPath"]) == (200, "ok\n"),
+                        "gateway liveness failed while PostgreSQL was down")
             for role in ROLES:
                 self.wait_for(f"{role} pods NotReady", lambda role=role: all(
                     {c["type"]: c["status"] for c in p["status"].get("conditions", [])}.get("Ready")
@@ -750,10 +799,11 @@ class Qualification:
             self.kube("--namespace", DB_NAMESPACE, "rollout", "status", "deployment/postgres",
                       "--timeout=300s", timeout=330)
             self.wait_for("API readiness recovery",
-                          lambda: http_get(forward.port, api["readinessPath"]) == (200, "ready\n"),
+                          lambda: http_get(api_forward.port, api["readinessPath"]) == (200, "ready\n"),
                           timeout=90)
-        finally:
-            forward.close()
+            self.wait_for("gateway readiness recovery",
+                          lambda: http_get(gateway_forward.port, gateway["readinessPath"]) == (200, "ready\n"),
+                          timeout=90)
         for role in ROLES:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
                       f"deployment/openmettle-{role}", "--timeout=120s", timeout=150)
@@ -763,10 +813,11 @@ class Qualification:
                         f"{role} restarted during database loss: {restarts}")
         self.passed("database loss gates readiness only; recovery without restart")
 
-        # Clean shutdown of both processes.
+        # Clean shutdown of all processes.
         worker_exits = self.scale_down_observing_exit("worker")
+        gateway_exits = self.scale_down_observing_exit("gateway")
         api_exits = self.scale_down_observing_exit("api")
-        self.passed("clean SIGTERM shutdown", worker=worker_exits, api=api_exits)
+        self.passed("clean SIGTERM shutdown", worker=worker_exits, gateway=gateway_exits, api=api_exits)
         self.report["contract"] = {role: {k: self.contract[role][k] for k in (
             "serviceAccountName", "requests", "port")} for role in ROLES}
         self.report["result"] = "passed"

@@ -1,7 +1,11 @@
-# Gateway proxy (not deployable)
+# Gateway proxy
 
-> **Not deployable.** There is no image target, chart or network policy for it yet (increment
-> 7). Run it only on an isolated test host with synthetic data.
+> **Packaging and qualification status.** Increment 7a delivers the `Dockerfile` `gateway`
+> image target, the `gateway` entry in `runtime/process-contract.json`, and CI/ephemeral `kind`
+> image, process-contract and OTLP telemetry qualification in `openmettle-core`. Opt-in Helm
+> chart packaging and `NetworkPolicy` templates live in `openmettle-deploy`
+> (`charts/openmettle-core`, Increment 7b), and live upstream `cache_salt` qualification on the
+> serving fork remains an owner-gated check (`#7` / `#9`).
 
 `openmettle-gateway` is OpenMettle's own inference proxy (V1-06,
 [ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)). It sits between a
@@ -258,6 +262,36 @@ A refusal exits 78 with one fixed line, for example `configuration error: UPSTRE
 required`, `configuration error: UPSTREAM_URL must use http://`, `configuration error:
 invalid UPSTREAM_URL`, `configuration error: MODEL is required`, `configuration error:
 invalid MODEL` or `configuration error: invalid CACHE_MODE`. The line never contains the value.
+
+## Deployment, TLS and network policy
+
+- **Container image (`Dockerfile` target `gateway`).** Build an isolated non-root image with
+  `docker build --target gateway -t openmettle-gateway:test .`. The runtime stage runs as
+  `65532:65532` with `STOPSIGNAL SIGTERM`, the Debian CA bundle, default
+  `OPENMETTLE_GATEWAY_BIND=0.0.0.0:8082`, `EXPOSE 8082` and only
+  `/usr/local/bin/openmettle-gateway` (no `openmettle-api`, `openmettle-worker`,
+  `openmettle-migrate` or `openmettle-admin` binary).
+- **Process contract (`runtime/process-contract.json`).** Declares the `gateway` process entry
+  (`imageTarget: "gateway"`, `configurationPrefix: "OPENMETTLE_GATEWAY_"`, port `8082`,
+  `serviceAccountName: "openmettle-gateway"`, `automountServiceAccountToken: false`,
+  `/healthz`, `/readyz` and example resource requests). Deploy pods with `enableServiceLinks: false`
+  so Kubernetes does not inject `OPENMETTLE_GATEWAY_*` service-link variables into containers.
+- **Per-model topology and strict `NetworkPolicy`.** Run one gateway Deployment per served
+  `MODEL` (each instance serves exactly one upstream origin and one catalog model ID). Restrict
+  ingress on TCP `8082` solely to `openmettle-worker` pods—or, when TLS is terminated externally,
+  solely to the external/operator-managed TLS terminator placed in front of the gateway—and
+  restrict egress solely to the configured SGLang upstream, the PostgreSQL primary, cluster DNS
+  and (when OTLP export is enabled) the OTLP collector.
+- **Plain HTTP vs external TLS termination.** The gateway listens on plain HTTP on port `8082`
+  and has no TLS listener of its own. Inside a private cluster, `openmettle-worker` may reach it
+  over `http://` (constrained to `private_cidrs` and admitted only by `NetworkPolicy`), or an
+  external/operator-managed TLS terminator can sit in front of TCP `8082` while the worker uses
+  an `https://` route with the matching CA bundle and egress rules (see
+  [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster)).
+- **Helm packaging.** Opt-in Kubernetes packaging (`worker.inference` and `0..N` named per-model
+  `gateways` with Deployments, Services, ServiceAccounts, `NetworkPolicy` ingress/egress hooks
+  and worker CA mounts, off by default) belongs to `openmettle-deploy`
+  (`charts/openmettle-core`, Increment 7b).
 
 ## Bounds
 

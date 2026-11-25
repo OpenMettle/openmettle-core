@@ -91,11 +91,12 @@ class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.contract = qualify.load_contract()
         self.alerts_yaml = qualify.load_alerts_text()
-        self.passwords = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32}
+        self.passwords = {"admin": "a" * 32, "api": "b" * 32, "worker": "c" * 32, "gateway": "d" * 32}
         self.tls = {"ca_crt": "FAKE-CA", "tls_crt": "FAKE-CERT", "tls_key": "FAKE-KEY"}
         images = {
             "api": "openmettle-api:telemetry-qual-x",
             "worker": "openmettle-worker:telemetry-qual-x",
+            "gateway": "openmettle-gateway:telemetry-qual-x",
         }
         self.items = qualify.render_manifests(
             self.contract, images, self.passwords, self.tls, self.alerts_yaml, "0123abcd"
@@ -114,7 +115,7 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(labels["openmettle.dev/environment"], "dev")
             self.assertEqual(labels["openmettle.dev/qualification-run"], "0123abcd")
 
-    def test_api_and_worker_enable_https_otlp_with_ca_and_private_ranges(self):
+    def test_api_worker_and_gateway_enable_https_otlp_with_ca_and_private_ranges(self):
         for role in qualify.ROLES:
             prefix = self.contract[role]["configurationPrefix"]
             pod = self.find("Deployment", f"openmettle-{role}")["spec"]["template"]["spec"]
@@ -131,6 +132,9 @@ class ManifestTests(unittest.TestCase):
             )
             self.assertEqual(env[f"{prefix}OTLP_CA_FILE"], qualify.OTLP_CA_FILE)
             self.assertEqual(env[f"{prefix}OTLP_PRIVATE_RANGES"], qualify.OTLP_PRIVATE_RANGES)
+            if role == "gateway":
+                self.assertEqual(env["OPENMETTLE_GATEWAY_UPSTREAM_URL"], "http://127.0.0.1:30000")
+                self.assertEqual(env["OPENMETTLE_GATEWAY_MODEL"], "synthetic-model")
             self.assertEqual(
                 container["volumeMounts"],
                 [{"name": "otlp-ca", "mountPath": qualify.OTLP_CA_MOUNT_DIR, "readOnly": True}],
@@ -167,6 +171,7 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         self.contract = qualify.load_telemetry_contract()
         self.uuid_api = "11111111-1111-4111-8111-111111111111"
         self.uuid_worker = "22222222-2222-4222-9222-222222222222"
+        self.uuid_gateway = "33333333-3333-4333-8333-333333333333"
 
     def test_accepts_valid_contract_series(self):
         series = [
@@ -193,6 +198,26 @@ class SeriesValidationAndParserTests(unittest.TestCase):
             },
             {
                 "metric": {
+                    "__name__": "openmettle_http_server_requests_total",
+                    "job": "openmettle-gateway",
+                    "instance": self.uuid_gateway,
+                    "http_request_method": "POST",
+                    "openmettle_route_class": "v1",
+                    "http_response_status_class": "4xx",
+                },
+                "value": [1, "3"],
+            },
+            {
+                "metric": {
+                    "__name__": "openmettle_db_readiness_checks_total",
+                    "job": "openmettle-gateway",
+                    "instance": self.uuid_gateway,
+                    "outcome": "ok",
+                },
+                "value": [1, "2"],
+            },
+            {
+                "metric": {
                     "__name__": "openmettle_telemetry_dropped_total",
                     "job": "openmettle-api",
                     "instance": self.uuid_api,
@@ -202,9 +227,22 @@ class SeriesValidationAndParserTests(unittest.TestCase):
             },
         ]
         summary = qualify.validate_prometheus_series(series, self.contract)
-        self.assertEqual(summary["series_count"], 3)
+        self.assertEqual(summary["series_count"], 5)
         self.assertEqual(summary["instances_by_job"]["openmettle-api"], [self.uuid_api])
         self.assertEqual(summary["instances_by_job"]["openmettle-worker"], [self.uuid_worker])
+        self.assertEqual(summary["instances_by_job"]["openmettle-gateway"], [self.uuid_gateway])
+
+    def test_rejects_unexpected_job_label(self):
+        bad_job = [{
+            "metric": {
+                "__name__": "openmettle_db_readiness_checks_total",
+                "job": "openmettle-unknown",
+                "instance": self.uuid_gateway,
+                "outcome": "ok",
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, "unexpected job label"):
+            qualify.validate_prometheus_series(bad_job, self.contract)
 
     def test_cancellation_counter_allows_only_the_two_reasons(self):
         metric = {"__name__": "openmettle_runs_cancellations_total", "job": "openmettle-worker",

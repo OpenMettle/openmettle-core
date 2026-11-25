@@ -31,10 +31,9 @@
 //!   `gateway.usage.unrecorded` event.
 //!
 //! The listener is plain HTTP. The packaged worker may call it so inside the cluster, or
-//! through a TLS terminator in front of it. Not deployable yet (no image target, chart or
-//! network policy, increment 7). Requests that were never dispatched, or whose report the proxy
-//! could not write, are closed by the worker's maintenance sweep at revision 0 (increment 3b).
-//! See `docs/operator/gateway-proxy.md`.
+//! through a TLS terminator in front of it. Requests that were never dispatched, or whose
+//! report the proxy could not write, are closed by the worker's maintenance sweep at
+//! revision 0 (increment 3b). See `docs/operator/gateway-proxy.md`.
 mod usage;
 
 use crate::{

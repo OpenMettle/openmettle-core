@@ -4,14 +4,16 @@ Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a an
 2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
 3b (migration 32), 3c (migration 33), proxy cost-hold settlement (migration 34, issue #166) and
 increment 4 family policy tables & enforcement (migration 35), and 25 November 2026 with
-increment 5 prefix-cache separation and caller body sanitation (migration 36) and increment 6
+increment 5 prefix-cache separation and caller body sanitation (migration 36), increment 6
 removal of superseded code/tables and function-only `openmettle_gateway` database boundary
-(migration 37): see
+(migration 37) and increment 7a container target, process contract and ephemeral `kind`
+qualification: see
 [requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage),
 [cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing),
 [family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement),
-[prefix-cache separation](#amendment-25-november-2026-prefix-cache-separation) and
-[removal of superseded code and tables](#amendment-25-november-2026-removal-of-superseded-code-and-tables).
+[prefix-cache separation](#amendment-25-november-2026-prefix-cache-separation),
+[removal of superseded code and tables](#amendment-25-november-2026-removal-of-superseded-code-and-tables)
+and [container target, process contract and kind qualification](#amendment-25-november-2026-container-target-process-contract-and-kind-qualification).
 Refs #7, #9, #17, #166.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
@@ -276,7 +278,8 @@ caller-owned completion route will be designed fresh on binding-free dispatch.
 | 4 | Family policy tables, SQL evaluator, four-point enforcement, audited store API and `openmettle-admin family` CLI; migration 35 (delivered 24 November 2026, see the amendment). |
 | 5 | Prefix-cache separation (`cache_salt`) and caller body sanitation; migration 36 (delivered 25 November 2026, see the amendment). |
 | 6 | Removal of the superseded ADR 0037 code, tables and unwired caller-session scaffolding, plus function-only `openmettle_gateway` database boundary (`gateway_settle_report`); migration 37 (delivered 25 November 2026, see the amendment). |
-| 7 | Deployment, TLS and network policy. |
+| 7a | `Dockerfile` `gateway` target, `runtime/process-contract.json` `gateway` entry, CI image isolation/fail-closed/recovery verification and ephemeral `kind` process-contract + OTLP telemetry qualification in `openmettle-core` (delivered 25 November 2026, see the amendment). |
+| 7b | Opt-in Helm chart packaging (`worker.inference` + `0..N` per-model `gateways`, strict `NetworkPolicy`, external TLS terminator ingress/CA hooks) and plain-HTTP + Traefik TLS `kind-smoke` qualification in `openmettle-deploy` (pending). |
 
 ## Open points
 
@@ -291,7 +294,9 @@ caller-owned completion route will be designed fresh on binding-free dispatch.
   the upstream's own usage. The bearer authorizes one dispatch of one request; a NetworkPolicy admitting
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
-  later option. The proxy stays undeployable until increments 3 and 7.
+  later option. Increment 7a delivers the container target, process contract and `openmettle-core`
+  CI/kind qualification; Helm chart packaging and `NetworkPolicy` templates remain in Increment 7b
+  (`openmettle-deploy`).
 - **Broad database role (resolved in increment 6).** Migration 37 revoked all table, column and
   internal quota helper privileges from `openmettle_gateway`, leaving only `CONNECT`, schema
   `USAGE` and `EXECUTE` on `gateway_dispatch`, `gateway_dispatch_scoped` and
@@ -796,3 +801,49 @@ Increment 6 (migration 37). Refs #7.
   `55P03` and `PoolTimedOut` retention across `>= 4` lock-waiting attempts) and settling all 24
   streams cleanly through `gateway_settle_report`, boundary-tamper refusals and `36 -> 37`
   fail-closed preflight plus populated upgrade replay with zero accounting drift.
+
+## Amendment, 25 November 2026: container target, process contract and kind qualification
+
+Increment 7a (`OpenMettle/openmettle-core`). Refs #7.
+
+### Decision
+
+Increment 7 splits across two sequential PRs because `openmettle-deploy`'s `kind-smoke` workflow
+requires its pinned `CORE_COMMIT` to be an ancestor of `OpenMettle/openmettle-core` `main`:
+
+- **Increment 7a (`openmettle-core`, delivered here):**
+  1. **Isolated `gateway` container target (`Dockerfile`).** Builds `openmettle-gateway` alongside
+     the other core binaries and packages it in a dedicated `FROM runtime AS gateway` stage
+     (`USER 65532:65532`, `STOPSIGNAL SIGTERM`, CA bundle, `ENV OPENMETTLE_GATEWAY_BIND=0.0.0.0:8082`,
+     `EXPOSE 8082`, containing only `/usr/local/bin/openmettle-gateway` and none of the API,
+     worker, migrate or admin binaries).
+  2. **Process contract (`runtime/process-contract.json`).** Adds the `"gateway"` entry
+     (`imageTarget: "gateway"`, `configurationPrefix: "OPENMETTLE_GATEWAY_"`, port `8082`,
+     `serviceAccountName: "openmettle-gateway"`, `automountServiceAccountToken: false`,
+     `/healthz`, `/readyz` and example resource requests), keeping all three serving roles pairwise
+     disjoint in port, ServiceAccount and configuration prefix.
+  3. **CI and ephemeral `kind` qualification.** Extends `.github/workflows/checks.yml` (`images`)
+     and `runtime/verify-images.sh` to verify binary isolation across `api`/`worker`/`gateway`,
+     fail-closed exit `78` when required gateway settings are missing or
+     `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present, worker-stop survival, PostgreSQL
+     loss/recovery without restart and clean `SIGTERM` exit `0`. Extends both ephemeral `kind`
+     harnesses (`tests/kubernetes` and `tests/telemetry_kind`) to qualify `openmettle-gateway`
+     under the `restricted` Pod Security Standard alongside `api` and `worker` (independent
+     ServiceAccount/settings/Service routing, DB loss/recovery, OTLP/HTTPS trace and metric
+     ingestion with `service.name="openmettle-gateway"`, distinct UUIDv4 `service.instance.id`,
+     canary redaction on `POST /v1/chat/completions`, collector-outage resilience and clean
+     `SIGTERM` exit `0`).
+- **Increment 7b (`openmettle-deploy`, pending after 7a merges):** advances `CORE_COMMIT`,
+  packages opt-in `worker.inference` and `0..N` named per-model `gateways` (off by default) in
+  `charts/openmettle-core` with strict `NetworkPolicy` ingress/egress and external/operator-managed
+  TLS termination hooks (no third-party proxy image in the chart), and exercises plain-HTTP and
+  Traefik TLS-terminated end-to-end turn execution in `kind-smoke`.
+
+### Evidence
+
+- `Dockerfile`, `runtime/process-contract.json`, `runtime/verify-images.sh`,
+  `.github/workflows/checks.yml` (`CPU images and dependency recovery`).
+- `tests/kubernetes/qualify.py`, `tests/kubernetes/test_qualify.py`
+  (`Process contract on ephemeral kind (dev)`).
+- `tests/telemetry_kind/qualify.py`, `tests/telemetry_kind/test_qualify.py`,
+  `tests/telemetry_contract.rs` (`Telemetry contract on ephemeral kind (Alloy + Prometheus)`).
