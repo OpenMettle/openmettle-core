@@ -2083,3 +2083,835 @@ async fn review_regressions_live_refs_holds_receipts_concealment_unshare_and_adm
     assert_no_canary_in_logs(&log_path, &[CANARY_FILENAME]);
     assert_no_canary_in_audit_or_journal(&db, &[CANARY_FILENAME]).await;
 }
+
+/// Review #2 P1 #2, P1 #3, and P2 #4 regressions against mounted `v1::router` and PostgreSQL 18:
+/// - P1 #2: a multi-chunk (> 64 KiB) HTTP download paused after chunk 1 across a full
+///   `restore::lock -> restore_gate_open -> retain` cycle aborts without serving retained bytes.
+/// - P1 #3: `ListRunApprovals` blocked on `runs FOR UPDATE` while `restore::lock` closes the gate
+///   returns `503 unavailable` (never `200` with `arguments_json` / `destination`), and
+///   `ListMessages` serializes inside its `READ COMMITTED` tx against `restore_gate_lock`.
+/// - P2 #4: `StreamRunEvents` over a backpressured HTTP transport pauses mid-stream after event 1;
+///   closing the restore gate terminates the stream before the tail of the seeded events can leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure() {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Request, client::conn::http1};
+    use hyper_util::rt::TokioIo;
+    use openmettle_core::{
+        artifact_fs::Store,
+        auth_config,
+        authz::{
+            approvals::park,
+            leases::LeaseSettings,
+            runs::{self as queue, ClaimLimits},
+        },
+        browser_auth::{BrowserAuth, native::NativeAuth},
+        v1,
+        worker::StepTasks,
+    };
+    use sqlx::PgPool;
+    use std::{
+        collections::VecDeque,
+        io,
+        pin::Pin,
+        sync::Mutex,
+        task::{Context, Poll, Waker},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct PipeBuf {
+        buf: VecDeque<u8>,
+        cap: usize,
+        closed: bool,
+        read_waker: Option<Waker>,
+        write_waker: Option<Waker>,
+    }
+
+    struct PipeEnd {
+        rx: Arc<Mutex<PipeBuf>>,
+        tx: Arc<Mutex<PipeBuf>>,
+    }
+
+    impl Drop for PipeEnd {
+        fn drop(&mut self) {
+            if let Ok(mut tx) = self.tx.lock() {
+                tx.closed = true;
+                if let Some(w) = tx.read_waker.take() {
+                    w.wake();
+                }
+            }
+            if let Ok(mut rx) = self.rx.lock() {
+                rx.closed = true;
+                if let Some(w) = rx.write_waker.take() {
+                    w.wake();
+                }
+            }
+        }
+    }
+
+    impl AsyncRead for PipeEnd {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut rx = self.rx.lock().unwrap();
+            if !rx.buf.is_empty() {
+                let n = rx.buf.len().min(buf.remaining());
+                for _ in 0..n {
+                    buf.put_slice(&[rx.buf.pop_front().unwrap()]);
+                }
+                if let Some(w) = rx.write_waker.take() {
+                    w.wake();
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if rx.closed {
+                return Poll::Ready(Ok(()));
+            }
+            rx.read_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PipeEnd {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut tx = self.tx.lock().unwrap();
+            if tx.closed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+            }
+            let avail = tx.cap.saturating_sub(tx.buf.len());
+            if avail == 0 {
+                tx.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let n = avail.min(data.len());
+            tx.buf.extend(&data[..n]);
+            if let Some(w) = tx.read_waker.take() {
+                w.wake();
+            }
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut tx = self.tx.lock().unwrap();
+            if tx.closed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+            }
+            let mut avail = tx.cap.saturating_sub(tx.buf.len());
+            if avail == 0 {
+                tx.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let mut written = 0;
+            for slice in bufs {
+                if avail == 0 {
+                    break;
+                }
+                let n = avail.min(slice.len());
+                tx.buf.extend(&slice[..n]);
+                written += n;
+                avail -= n;
+            }
+            if written > 0
+                && let Some(w) = tx.read_waker.take()
+            {
+                w.wake();
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut tx = self.tx.lock().unwrap();
+            tx.closed = true;
+            if let Some(w) = tx.read_waker.take() {
+                w.wake();
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn pipe_pair(c2s_cap: usize, s2c_cap: usize) -> (PipeEnd, PipeEnd) {
+        let c2s = Arc::new(Mutex::new(PipeBuf {
+            buf: VecDeque::new(),
+            cap: c2s_cap,
+            closed: false,
+            read_waker: None,
+            write_waker: None,
+        }));
+        let s2c = Arc::new(Mutex::new(PipeBuf {
+            buf: VecDeque::new(),
+            cap: s2c_cap,
+            closed: false,
+            read_waker: None,
+            write_waker: None,
+        }));
+        (
+            PipeEnd {
+                rx: s2c.clone(),
+                tx: c2s.clone(),
+            },
+            PipeEnd { rx: c2s, tx: s2c },
+        )
+    }
+
+    struct MemListener {
+        rx: tokio::sync::mpsc::UnboundedReceiver<PipeEnd>,
+    }
+
+    impl axum::serve::Listener for MemListener {
+        type Io = PipeEnd;
+        type Addr = ();
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            match self.rx.recv().await {
+                Some(io) => (io, ()),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<Self::Addr> {
+            Ok(())
+        }
+    }
+
+    struct AbortTask<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortTask<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    seed_token_quotas(&mut owner).await;
+    sqlx::query(
+        "UPDATE openmettle.retention_policy
+            SET min_grace_seconds = 0, max_grace_seconds = 86400, grace_seconds = 3600
+          WHERE id",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let dir = Dir::new();
+    let art_root = PathBuf::from(dir.path("artifacts"));
+    fs::create_dir(&art_root).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let auth_path = dir.write("auth.json", &serde_json::to_vec(&doc).unwrap());
+    let (mut settings, profile) = auth_config::load_browser(Path::new(&auth_path)).unwrap();
+    let native_cfg = settings.native().unwrap().clone();
+    let v1_extensions = v1::AuthExtensions::take(&mut settings);
+    let api_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(role_options(&db.0, API))
+        .await
+        .unwrap();
+    let issuance_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, ISSUANCE))
+        .await
+        .unwrap();
+    let store = Store::open(&art_root).unwrap();
+    store.initialize_api(&api_pool).await.unwrap();
+    let browser = Arc::new(BrowserAuth::new(settings, api_pool.clone(), issuance_pool));
+    let n = native_cfg.settings();
+    let native_auth = NativeAuth::new(
+        browser.clone(),
+        n.provider,
+        n.issuer,
+        n.callback,
+        n.client,
+        n.redirect,
+        n.max_in_flight,
+    )
+    .unwrap();
+    let router = v1_extensions
+        .apply(v1::router(
+            browser,
+            Some(Arc::new(native_auth)),
+            profile.handoff().origin,
+            api_pool.clone(),
+            Some(store),
+        ))
+        .layer(axum::Extension(v1::ApprovalDisplayPolicy(Arc::new(
+            crate::approvals::Policy::default(),
+        ))));
+
+    let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _server = AbortTask(tokio::spawn(async move {
+        let _ = axum::serve(MemListener { rx: conn_rx }, router).await;
+    }));
+
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_tok = native(&db, &alice, 1).await;
+    let personal_scope = personal_of(&db, &alice).await;
+    let auth_hdr = format!("Bearer {alice_tok}");
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, OWNER))
+        .await
+        .unwrap();
+
+    let open_req = |s2c_cap: usize,
+                    method: &str,
+                    uri: &str,
+                    key: Option<&str>,
+                    content_type: Option<&str>,
+                    body: Vec<u8>| {
+        let conn_tx = conn_tx.clone();
+        let auth_hdr = auth_hdr.clone();
+        let method = method.to_owned();
+        let uri = uri.to_owned();
+        let key = key.map(str::to_owned);
+        let content_type = content_type.map(str::to_owned);
+        async move {
+            let (client_io, server_io) = pipe_pair(1024 * 1024, s2c_cap);
+            conn_tx.send(server_io).unwrap();
+            let (mut sender, conn) = http1::handshake(TokioIo::new(client_io)).await.unwrap();
+            let guard = AbortTask(tokio::spawn(conn));
+            let mut builder = Request::builder()
+                .method(method.as_str())
+                .uri(uri.as_str())
+                .header("host", "app.example.test")
+                .header("authorization", auth_hdr);
+            if let Some(k) = key {
+                builder = builder.header("idempotency-key", k);
+            }
+            if let Some(ct) = content_type {
+                builder = builder.header("content-type", ct);
+            }
+            let resp = sender
+                .send_request(builder.body(Full::new(Bytes::from(body))).unwrap())
+                .await
+                .unwrap();
+            (resp, guard)
+        }
+    };
+
+    async fn head_state(pool: &PgPool) -> (i64, Option<i64>, i64, String) {
+        sqlx::query_as::<_, (i64, Option<i64>, i64, String)>(
+            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    journal_seq,
+                    encode(chain_digest, 'hex')
+               FROM openmettle.deletion_journal_head WHERE id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn reopen_gate(
+        pool: &PgPool,
+        origin_us: i64,
+        lc_origin: Option<i64>,
+        head_seq: i64,
+        head_digest: String,
+    ) {
+        sqlx::query(
+            "SELECT openmettle.restore_gate_open(
+                        c.restore_run_id,
+                        c.volume_claim_token,
+                        $1,
+                        $2,
+                        decode($3, 'hex'),
+                        (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                        $4
+                    )
+               FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+        )
+        .bind(origin_us)
+        .bind(head_seq)
+        .bind(&head_digest)
+        .bind(lc_origin)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // --- P1 #2: multi-chunk (512 KiB = 8 x 64 KiB) download paused across close -> reopen -> retain ---
+    let big_len = 512 * 1024;
+    let big_payload = "Z".repeat(big_len);
+    let upload_body = form(
+        "r2-big",
+        &[
+            file_part(Some("big.txt"), "text/plain", &big_payload),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (up_resp, _up_guard) = open_req(
+        64 * 1024,
+        "POST",
+        "/v1/artifacts",
+        Some("r2-big-up"),
+        Some("multipart/form-data; boundary=r2-big"),
+        upload_body.into_bytes(),
+    )
+    .await;
+    assert_eq!(up_resp.status(), 201);
+    let up_json: Value =
+        serde_json::from_slice(&up_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let art_id = up_json["artifact_id"].as_str().unwrap().to_owned();
+    let rev_id = up_json["revision_id"].as_str().unwrap().to_owned();
+
+    // Use a 256-byte server-to-client pipe so Hyper cannot drain the 512 KiB file ahead of the client.
+    let (dl_resp, _dl_guard) = open_req(
+        256,
+        "GET",
+        &format!("/v1/artifacts/{art_id}/revisions/{rev_id}/content"),
+        None,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(dl_resp.status(), 200);
+    let mut dl_body = dl_resp.into_body();
+    let first = dl_body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(!first.is_empty());
+    let mut total_downloaded = first.len();
+
+    // Pause client after reading the first slice across a FULL close -> reopen -> retain cycle!
+    let (origin_us, lc_origin, head_seq, head_digest) = head_state(&owner_pool).await;
+    restore::lock(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        head_seq,
+        &head_digest,
+        true,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    reopen_gate(&owner_pool, origin_us, lc_origin, head_seq, head_digest).await;
+    let (del_resp, _del_guard) = open_req(
+        64 * 1024,
+        "DELETE",
+        &format!("/v1/artifacts/{art_id}/revisions/{rev_id}"),
+        Some("r2-big-del"),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(del_resp.status(), 200);
+    let _ = del_resp.into_body().collect().await.unwrap();
+
+    // Drain the paused download: once buffered bytes from chunk 1 clear, Content::poll_frame must
+    // abort with an error before serving the retained remainder of the 512 KiB payload.
+    let mut saw_error = false;
+    while let Some(frame) = dl_body.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    total_downloaded += data.len();
+                }
+            }
+            Err(_) => {
+                saw_error = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_error && total_downloaded < big_len,
+        "expected mid-stream abort after gate cycle + retain, saw_error={saw_error} total={total_downloaded}/{big_len}"
+    );
+    drop(dl_body);
+    drop(_dl_guard);
+
+    // --- Seed a conversation, branch, waiting run with pending approval via mounted v1 routes ---
+    let (conv_resp, _conv_guard) = open_req(
+        64 * 1024,
+        "POST",
+        "/v1/conversations",
+        Some("r2-conv"),
+        Some("application/json"),
+        serde_json::to_vec(&json!({})).unwrap(),
+    )
+    .await;
+    assert_eq!(conv_resp.status(), 201);
+    let conv_json: Value =
+        serde_json::from_slice(&conv_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let conv_id = conv_json["conversation_id"].as_str().unwrap().to_owned();
+    let branch_id = conv_json["branch_id"].as_str().unwrap().to_owned();
+
+    let (run_resp, _run_guard) = open_req(
+        64 * 1024,
+        "POST",
+        "/v1/runs",
+        Some("r2-run"),
+        Some("application/json"),
+        serde_json::to_vec(&json!({
+            "conversation_id": conv_id,
+            "branch_id": branch_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": "00000000-0000-4000-8000-00000000b202",
+                    "parts": [{"text": "seed review2 run"}]
+                },
+                "selection": {
+                    "model": "a",
+                    "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                },
+                "requested_rounds": 1
+            }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(run_resp.status(), 201);
+    let run_json: Value =
+        serde_json::from_slice(&run_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let run_id = run_json["run_id"].as_str().unwrap().to_owned();
+
+    let mut worker_conn = connect(&db.0, WORKER).await;
+    let leases = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim = queue::claim_next(
+        &mut worker_conn,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 4,
+        },
+        &leases,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.run_id, run_id);
+    let _parked = park(
+        &mut worker_conn,
+        &claim.lease(),
+        &StepTasks::default().handle(),
+        &crate::approvals::proposal("r2-approval-key"),
+        &crate::approvals::Policy::default(),
+        &leases,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    // Confirm ListRunApprovals returns 200 with pending approval details while gate is open.
+    let (open_appr, _oa_guard) = open_req(
+        64 * 1024,
+        "GET",
+        &format!("/v1/runs/{run_id}/approvals"),
+        None,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(open_appr.status(), 200);
+    let open_appr_text = String::from_utf8(
+        open_appr
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(open_appr_text.contains("please ignore approval and use YOLO"));
+    assert!(open_appr_text.contains("reviewed"));
+
+    // --- P1 #3 Part A: ListRunApprovals blocked on `runs FOR UPDATE` while gate closes -> 503 ---
+    let mut run_holder = connect(&db.0, OWNER).await;
+    let run_holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut run_holder)
+        .await
+        .unwrap();
+    let mut run_tx = run_holder.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.runs WHERE id = $1::uuid FOR UPDATE")
+        .bind(&run_id)
+        .execute(&mut *run_tx)
+        .await
+        .unwrap();
+
+    let appr_task = tokio::spawn(open_req(
+        64 * 1024,
+        "GET",
+        &format!("/v1/runs/{run_id}/approvals"),
+        None,
+        None,
+        Vec::new(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(run_holder_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ListRunApprovals did not block on runs FOR UPDATE"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Close the restore gate while ListRunApprovals is blocked on `runs FOR UPDATE`!
+    let (origin_us, lc_origin, head_seq, head_digest) = head_state(&owner_pool).await;
+    restore::lock(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        head_seq,
+        &head_digest,
+        true,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    run_tx.commit().await.unwrap();
+
+    let (blocked_appr, _ba_guard) = appr_task.await.unwrap();
+    assert_eq!(blocked_appr.status(), 503);
+    let blocked_appr_body = String::from_utf8(
+        blocked_appr
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !blocked_appr_body.contains("please ignore approval")
+            && !blocked_appr_body.contains("reviewed"),
+        "closed gate leaked approval content: {blocked_appr_body}"
+    );
+
+    // Reopen gate for P1 #3 Part B (ListMessages) & P2 #4 (SSE backpressure).
+    reopen_gate(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        head_seq,
+        head_digest.clone(),
+    )
+    .await;
+
+    // --- P1 #3 Part B: ListMessages holds restore_reconciliation_gate FOR SHARE inside its tx ---
+    let mut gate_holder = connect(&db.0, OWNER).await;
+    let gate_holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut gate_holder)
+        .await
+        .unwrap();
+    let mut gate_tx = gate_holder.begin().await.unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+    )
+    .bind(origin_us)
+    .bind(head_seq)
+    .bind(&head_digest)
+    .bind(lc_origin)
+    .execute(&mut *gate_tx)
+    .await
+    .unwrap();
+    let msg_task = tokio::spawn(open_req(
+        64 * 1024,
+        "GET",
+        &format!("/v1/conversations/{conv_id}/branches/{branch_id}/messages"),
+        None,
+        None,
+        Vec::new(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(gate_holder_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ListMessages did not serialize on restore_gate_lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    gate_tx.commit().await.unwrap();
+    let (msg_resp, _msg_guard) = msg_task.await.unwrap();
+    assert_eq!(msg_resp.status(), 503);
+    let _ = msg_resp.into_body().collect().await.unwrap();
+
+    // Reopen gate for P2 #4 (SSE per-event cutoff under backpressure).
+    reopen_gate(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        head_seq,
+        head_digest.clone(),
+    )
+    .await;
+
+    // --- P2 #4: Seed 76 additional events (5 DB batches of 16); pause under backpressure after
+    // reading 5 events so Hyper's ~8 KiB HTTP/1.1 write buffer fills mid-batch, then close gate ---
+    let cur_last: i64 =
+        sqlx::query_scalar("SELECT last_event_sequence FROM openmettle.runs WHERE id = $1::uuid")
+            .bind(&run_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let target_last = cur_last + 76;
+    sqlx::query(
+        "INSERT INTO openmettle.run_events
+            (scope_id, run_id, sequence, append_key, format, format_version, payload, identity, digest)
+         SELECT $1::uuid, $2::uuid, s, 'r2-sse-' || s, 'openmettle.run-resumed', 1, '{}'::bytea,
+                decode('00', 'hex'), sha256(convert_to('r2-sse-' || s, 'UTF8'))
+           FROM generate_series($3::bigint, $4::bigint) AS s",
+    )
+    .bind(&personal_scope)
+    .bind(&run_id)
+    .bind(cur_last + 1)
+    .bind(target_last)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE openmettle.runs SET last_event_sequence = $2 WHERE id = $1::uuid")
+        .bind(&run_id)
+        .bind(target_last)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+
+    let (sse_resp, _sse_guard) = open_req(
+        256,
+        "GET",
+        &format!("/v1/runs/{run_id}/events"),
+        None,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(sse_resp.status(), 200);
+    let mut sse_body = sse_resp.into_body();
+    let mut raw_buf = Vec::new();
+    let mut delivered_seqs: Vec<i64> = Vec::new();
+    let parse_blocks = |buf: &mut Vec<u8>, seqs: &mut Vec<i64>| {
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = buf.drain(..pos + 2).collect();
+            if let Ok(text) = std::str::from_utf8(&block)
+                && let Some(data_line) = text.lines().find_map(|l| l.strip_prefix("data: "))
+                && let Ok(v) = serde_json::from_str::<Value>(data_line)
+                && let Some(seq) = v["sequence"].as_str().and_then(|s| s.parse::<i64>().ok())
+            {
+                seqs.push(seq);
+            }
+        }
+    };
+    while delivered_seqs.len() < 5 {
+        let frame = sse_body.frame().await.unwrap().unwrap();
+        if let Ok(data) = frame.into_data() {
+            raw_buf.extend_from_slice(&data);
+            parse_blocks(&mut raw_buf, &mut delivered_seqs);
+        }
+    }
+    assert_eq!(delivered_seqs[0], 1);
+
+    // Yield long enough that an un-backpressured stream would drain all 80 events; with vectored
+    // WriteStrategy::Queue (MAX_BUF_LIST_BUFFERS = 16) + mpsc::channel(1), the producer parks
+    // genuinely on tx.reserve() mid-batch inside batch 2 (17..=32).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Close the restore gate while the producer is backpressured mid-batch!
+    restore::lock(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        head_seq,
+        &head_digest,
+        true,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+
+    // Drain remaining buffered frames to EOF and verify the stream cut off mid-batch before
+    // the remainder of the seeded events could be sent.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Some(frame) = tokio::time::timeout_at(drain_deadline, sse_body.frame())
+        .await
+        .expect("backpressured SSE stream did not terminate after gate close")
+    {
+        if let Ok(frame) = frame
+            && let Ok(bytes) = frame.into_data()
+        {
+            raw_buf.extend_from_slice(&bytes);
+            parse_blocks(&mut raw_buf, &mut delivered_seqs);
+        }
+    }
+    let last_delivered = *delivered_seqs.last().unwrap();
+    assert!(
+        !delivered_seqs.contains(&target_last),
+        "tail event {target_last} must never be delivered after gate close: {delivered_seqs:?}"
+    );
+    assert!(
+        last_delivered < target_last - 20,
+        "backpressured SSE stream must cut off well before tail ({last_delivered} of {target_last}): {delivered_seqs:?}"
+    );
+    assert_ne!(
+        last_delivered % 16,
+        0,
+        "expected intra-batch cutoff under backpressure (not only at BATCH_LIMIT=16 boundary), got last={last_delivered}"
+    );
+}

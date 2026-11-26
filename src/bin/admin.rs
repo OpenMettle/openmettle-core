@@ -67,6 +67,7 @@ fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
 struct RestoreLockArgs {
     origin_us: i64,
     lifecycle_origin_us: Option<i64>,
+    lifecycle_baseline_digest: Option<String>,
     required_seq: i64,
     required_digest: String,
     export_complete: bool,
@@ -75,9 +76,10 @@ struct RestoreLockArgs {
 }
 
 fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static str> {
-    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
+    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
     let mut origin_us = None;
     let mut lifecycle_origin_us = None;
+    let mut lifecycle_baseline_digest = None;
     let mut required_seq = None;
     let mut required_digest = None;
     let mut export_complete = false;
@@ -103,6 +105,19 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
                     .get(i)
                     .ok_or("missing --required-lifecycle-origin value")?;
                 lifecycle_origin_us = Some(raw.parse().map_err(|_| "invalid lifecycle origin")?);
+            }
+            "--required-lifecycle-baseline-digest" => {
+                if lifecycle_baseline_digest.is_some() {
+                    return Err("duplicate --required-lifecycle-baseline-digest");
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or("missing --required-lifecycle-baseline-digest value")?;
+                if !restore::is_valid_digest(raw) {
+                    return Err("invalid lifecycle baseline digest");
+                }
+                lifecycle_baseline_digest = Some(raw.clone());
             }
             "--required-seq" => {
                 if required_seq.is_some() {
@@ -157,6 +172,9 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
     if new_restore_flag && replace_restore_run.is_none() {
         return Err("--new-restore requires --replace-restore-run");
     }
+    if lifecycle_baseline_digest.is_some() && lifecycle_origin_us.is_none() {
+        return Err("--required-lifecycle-baseline-digest requires --required-lifecycle-origin");
+    }
     let origin_us = origin_us.ok_or(usage)?;
     let required_seq = required_seq.ok_or(usage)?;
     let required_digest = required_digest.ok_or(usage)?;
@@ -164,6 +182,7 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
     Ok(RestoreLockArgs {
         origin_us,
         lifecycle_origin_us,
+        lifecycle_baseline_digest,
         required_seq,
         required_digest,
         export_complete,
@@ -268,23 +287,46 @@ async fn journal(
             {
                 println!("{lc}");
             }
+            if let Some(lb) = text
+                .lines()
+                .nth(3)
+                .filter(|line| line.starts_with("lifecycle_baseline "))
+            {
+                println!("{lb}");
+            }
         }
         (Some("restore"), Some("lock")) => {
             let lock_args = parse_restore_lock_args(args)?;
-            let locked = restore::lock(
+            let locked = restore::lock_gate(
                 &pool(1).await?,
-                lock_args.origin_us,
-                lock_args.lifecycle_origin_us,
-                lock_args.required_seq,
-                &lock_args.required_digest,
-                lock_args.export_complete,
-                lock_args.replace_restore_run.as_deref(),
-                lock_args.new_restore,
+                &restore::GateLockRequest {
+                    origin_us: lock_args.origin_us,
+                    lifecycle_origin_us: lock_args.lifecycle_origin_us,
+                    lifecycle_baseline_digest: lock_args.lifecycle_baseline_digest.as_deref(),
+                    required_seq: lock_args.required_seq,
+                    required_digest: &lock_args.required_digest,
+                    coverage_complete: lock_args.export_complete,
+                    replace_restore_run: lock_args.replace_restore_run.as_deref(),
+                    new_restore: lock_args.new_restore,
+                },
             )
             .await
             .map_err(failed("restore lock"))?;
-            match locked.lifecycle_origin_us {
-                Some(lc) => println!(
+            match (
+                locked.lifecycle_origin_us,
+                locked.lifecycle_baseline_digest.as_deref(),
+            ) {
+                (Some(lc), Some(lb)) => println!(
+                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, lifecycle_baseline {}, snapshot {}, required {}, coverage_complete {}",
+                    locked.restore_run_id,
+                    locked.origin_us,
+                    lc,
+                    lb,
+                    locked.snapshot_seq,
+                    locked.required_seq,
+                    locked.coverage_complete
+                ),
+                (Some(lc), None) => println!(
                     "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, snapshot {}, required {}, coverage_complete {}",
                     locked.restore_run_id,
                     locked.origin_us,
@@ -293,7 +335,7 @@ async fn journal(
                     locked.required_seq,
                     locked.coverage_complete
                 ),
-                None => println!(
+                (None, _) => println!(
                     "restore gate closed: restore_run {}, origin {}, snapshot {}, required {}, coverage_complete {}",
                     locked.restore_run_id,
                     locked.origin_us,
@@ -358,7 +400,7 @@ async fn journal(
         }
         _ => {
             return Err(
-                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
+                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
             );
         }
     }

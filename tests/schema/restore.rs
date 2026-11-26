@@ -575,7 +575,8 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
         }
     };
 
-    // Export lines: [0]=header, [1]=origin, [2]=lifecycle_origin, [3..=8]=rec1..rec6, [9]=watermark, [10]=sha256.
+    // Export lines: [0]=header, [1]=origin, [2]=lifecycle_origin, [3]=lifecycle_baseline,
+    // [4..=9]=rec1..rec6, [10]=watermark, [11]=sha256.
     let lines: Vec<&str> = full.lines().collect();
     let edit = |index: usize, field: usize| -> Vec<String> {
         let mut out: Vec<String> = lines[..lines.len() - 1]
@@ -604,18 +605,18 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
             "checksum mismatch",
         ),
         (
-            pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
                 .iter()
                 .map(|l| format!("{l}\n"))
                 .collect(),
             "missing checksum",
         ),
         (
-            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 8, 9])),
+            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 10])),
             "records out of sequence",
         ),
         (
-            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 8, 7, 9])),
+            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 8, 10])),
             "records out of sequence",
         ),
     ] {
@@ -626,7 +627,7 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
     }
     // A record altered after the restored head breaks the chain; one at or below it differs from
     // the restored record. Either refusal rolls the whole replay back.
-    for altered in [edit(8, 6), edit(4, 6)] {
+    for altered in [edit(9, 6), edit(5, 6)] {
         assert_eq!(
             sqlstate_of(replay(&owner, &store, &reseal(&altered)).await.unwrap_err()),
             "OMR03"
@@ -663,7 +664,7 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
     .fetch_one(&forged_owner)
     .await
     .unwrap();
-    let mut extended = pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut extended = pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let content: String = Sha256::digest(b"forged")
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -3676,9 +3677,12 @@ async fn replay_preserves_disassociated_deadlines_admin_adjustments_and_pre_expi
     );
 }
 
-/// Review #1 P1 #1 regression: a schema-41 backup predating migration 42's lifecycle journaling
-/// cannot assert `--export-complete` (`OMR04`) and cannot open the gate without an audited
-/// `'operator'` `restore.accept_coverage_gap` row, even when `coverage_started_at` matches.
+/// Review #1 P1 #1 + Review #2 P1 #1 regression: a schema-41 backup predating migration 42's
+/// lifecycle journaling cannot assert `--export-complete` (`OMR04`) and cannot open the gate
+/// without an audited `'operator'` `restore.accept_coverage_gap` row, AND migration 42's immutable
+/// `retention_upgrade_baseline` replays every pre-42 `retained`/`purging` revision and deadline
+/// onto the restored backup before post-42 `deletion_journal` records so pre-42 disassociations
+/// never resurrect as `active` and post-42 restores/purges layer cleanly on top.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requires_gap_acceptance()
@@ -3689,58 +3693,157 @@ async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requi
     configure(&live, Some(1000), Some(1000), Some(1000)).await;
     retention_grace(&live, 3600).await;
     let c = Context::new(&live).await;
-    let doc = new_uuid(&live).await;
+    let doc1 = new_uuid(&live).await;
+    let doc2 = new_uuid(&live).await;
+    let doc3 = new_uuid(&live).await;
     // On schema 41, openmettle_api lacks EXECUTE on restore_gate_lock_open() and fails closed
-    // (P1 #3); seed the pre-42 revision and disassociation as OWNER to simulate a pre-42 workload.
+    // (P1 #3); seed the pre-42 revisions and disassociations as OWNER to simulate a pre-42 workload.
     assert!(
         reserve(
             &live,
             API,
-            &input(&c.scope, &c.actor, "pre42-api-refused", &doc, 10)
+            &input(&c.scope, &c.actor, "pre42-api-refused", &doc1, 10)
         )
         .await
         .is_err()
     );
-    let r = reserve(&live, OWNER, &input(&c.scope, &c.actor, "pre42", &doc, 10))
+    let seed_rev = async |key: &str, doc: &str, bytes: &[u8]| -> String {
+        let r = reserve(
+            &live,
+            OWNER,
+            &input(&c.scope, &c.actor, key, doc, bytes.len() as i64),
+        )
         .await
         .unwrap();
-    let mut live_owner = connect(&live.0, OWNER).await;
-    crate::mark_storage_payload_published(&mut live_owner, &r.id).await;
-    let mut settle_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
-    let digest = Sha256::digest(b"pre42-data").to_vec();
-    let rev = openmettle_core::storage::settle(
-        &mut settle_tx,
-        &openmettle_core::storage::Settlement {
-            scope: &c.scope,
-            reservation: &r.id,
-            size_bytes: 10,
-            content_digest: &digest,
-            media_type: "text/plain",
-            display_name: None,
-        },
-    )
-    .await
-    .unwrap();
-    settle_tx.commit().await.unwrap();
-    live_owner.close().await.unwrap();
-    // Capture backup at schema 41 while revision is still active.
+        let mut live_owner = connect(&live.0, OWNER).await;
+        crate::mark_storage_payload_published(&mut live_owner, &r.id).await;
+        let mut settle_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        let digest = Sha256::digest(bytes).to_vec();
+        let rev = openmettle_core::storage::settle(
+            &mut settle_tx,
+            &openmettle_core::storage::Settlement {
+                scope: &c.scope,
+                reservation: &r.id,
+                size_bytes: bytes.len() as i64,
+                content_digest: &digest,
+                media_type: "text/plain",
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle_tx.commit().await.unwrap();
+        live_owner.close().await.unwrap();
+        rev
+    };
+    let rev1 = seed_rev("pre42-r1", &doc1, b"pre42-r1!!").await; // 10 bytes -> retained at schema 41
+    let rev2 = seed_rev("pre42-r2", &doc2, b"pre42-r2!!!!").await; // 12 bytes -> purging at schema 41
+    let rev3 = seed_rev("pre42-r3", &doc3, b"pre42-r3!!!!!!").await; // 14 bytes -> retained at 41, restored at 42
+    // Capture backup at schema 41 while all three revisions are still active (36 active_bytes).
     let pre42_backup = backup(&live).await;
 
-    // Disassociate on schema 41 (NOT journaled before migration 42), then upgrade live to 42.
-    let mut live_owner = connect(&live.0, OWNER).await;
-    let mut retain_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
-    openmettle_core::storage::retain_revision(&mut retain_tx, &c.scope, &rev)
-        .await
-        .unwrap();
-    retain_tx.commit().await.unwrap();
-    live_owner.close().await.unwrap();
+    // On schema 41 (before migration 42), retain R1 and R3 with 3600s grace, then retain + claim
+    // R2 into 'purging' with 0s grace. None of these append to deletion_journal on schema 41.
+    {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        for rev in [&rev1, &rev3] {
+            let mut retain_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+            openmettle_core::storage::retain_revision(&mut retain_tx, &c.scope, rev)
+                .await
+                .unwrap();
+            retain_tx.commit().await.unwrap();
+        }
+        live_owner.close().await.unwrap();
+    }
+    retention_grace(&live, 0).await;
+    {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        let mut retain_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::retain_revision(&mut retain_tx, &c.scope, &rev2)
+            .await
+            .unwrap();
+        retain_tx.commit().await.unwrap();
+        let mut claim_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::begin_purge(&mut claim_tx, &c.scope, &rev2)
+            .await
+            .unwrap();
+        claim_tx.commit().await.unwrap();
+        live_owner.close().await.unwrap();
+    }
+
+    // Upgrade live to schema 42: captures R1, R2, R3 in immutable openmettle.retention_upgrade_baseline.
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert!(journal(&live).await.is_empty());
+
+    // Verify retention_upgrade_baseline captured all 3 rows, is immutable (OMR01), and grants
+    // nothing to openmettle_api or openmettle_worker.
+    let live_deadlines: Vec<(String, i64, i64)> = {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        let baseline_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM openmettle.retention_upgrade_baseline")
+                .fetch_one(&mut live_owner)
+                .await
+                .unwrap();
+        assert_eq!(baseline_count, 3);
+        let ins_err = sqlx::query(
+            "INSERT INTO openmettle.retention_upgrade_baseline
+                (artifact_revision_id, scope_id, retained_at, original_purge_after, content_digest)
+             VALUES (gen_random_uuid(), $1::uuid, clock_timestamp(), clock_timestamp(), decode(repeat('00', 32), 'hex'))",
+        )
+        .bind(&c.scope)
+        .execute(&mut live_owner)
+        .await;
+        assert_eq!(sqlstate(ins_err), "OMR01");
+        let upd_err =
+            sqlx::query("UPDATE openmettle.retention_upgrade_baseline SET policy_revision = 99")
+                .execute(&mut live_owner)
+                .await;
+        assert_eq!(sqlstate(upd_err), "OMR01");
+        let del_err = sqlx::query("DELETE FROM openmettle.retention_upgrade_baseline")
+            .execute(&mut live_owner)
+            .await;
+        assert_eq!(sqlstate(del_err), "OMR01");
+        let trunc_err = sqlx::query("TRUNCATE openmettle.retention_upgrade_baseline")
+            .execute(&mut live_owner)
+            .await;
+        assert_eq!(sqlstate(trunc_err), "OMR01");
+        for role in [API, WORKER] {
+            let mut rconn = connect(&live.0, role).await;
+            let denied = sqlx::query("SELECT count(*) FROM openmettle.retention_upgrade_baseline")
+                .execute(&mut rconn)
+                .await;
+            assert_eq!(sqlstate(denied), "42501");
+        }
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT id::text,
+                    round(extract(epoch FROM retained_at) * 1000000)::bigint,
+                    round(extract(epoch FROM purge_after) * 1000000)::bigint
+               FROM openmettle.artifact_revisions
+              WHERE id = ANY($1::uuid[])
+              ORDER BY id",
+        )
+        .bind(vec![rev1.as_str(), rev2.as_str()])
+        .fetch_all(&mut live_owner)
+        .await
+        .unwrap();
+        // Now restore R3 on schema 42 (appending seq 1 artifact_revision.restored on top of the baseline).
+        let mut restore_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::restore_revision(&mut restore_tx, &c.scope, &rev3)
+            .await
+            .unwrap();
+        restore_tx.commit().await.unwrap();
+        live_owner.close().await.unwrap();
+        rows
+    };
+
     let export = Export::parse(&restore::export(&pool(&live, OWNER).await).await.unwrap()).unwrap();
     assert!(export.lifecycle_origin_us.is_some());
+    assert!(export.lifecycle_baseline_digest.is_some());
+    assert_eq!(export.baseline_len(), 3);
+    assert_eq!(export.seq, 1);
 
     // Migrate the schema-41 backup to 42 after a clock tick: same coverage_started_at, distinct
-    // lifecycle_coverage_started_at.
+    // lifecycle_coverage_started_at and empty backup baseline.
     tokio::time::sleep(Duration::from_millis(20)).await;
     migrate::apply(&pre42_backup.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
@@ -3755,36 +3858,63 @@ async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requi
     // Asserting complete coverage on a pre-42 backup fails closed with OMR04.
     assert_eq!(
         sqlstate_of(
-            restore::lock(
+            restore::lock_gate(
                 &owner,
-                export.origin_us,
-                export.lifecycle_origin_us,
-                export.seq,
-                &export.digest,
-                true,
-                None,
-                true,
+                &restore::GateLockRequest {
+                    origin_us: export.origin_us,
+                    lifecycle_origin_us: export.lifecycle_origin_us,
+                    lifecycle_baseline_digest: export.lifecycle_baseline_digest.as_deref(),
+                    required_seq: export.seq,
+                    required_digest: &export.digest,
+                    coverage_complete: true,
+                    replace_restore_run: None,
+                    new_restore: true,
+                },
             )
             .await
             .unwrap_err()
         ),
         "OMR04"
     );
-    // Locking with coverage_complete = false succeeds and replay completes the DB phase, but
-    // opening the gate stays blocked with OMR04 until audited restore.accept_coverage_gap runs.
-    let locked = restore::lock(
+    // Locking with coverage_complete = false and required_lifecycle_baseline_digest succeeds.
+    let locked = restore::lock_gate(
         &owner,
-        export.origin_us,
-        export.lifecycle_origin_us,
-        export.seq,
-        &export.digest,
-        false,
-        None,
-        true,
+        &restore::GateLockRequest {
+            origin_us: export.origin_us,
+            lifecycle_origin_us: export.lifecycle_origin_us,
+            lifecycle_baseline_digest: export.lifecycle_baseline_digest.as_deref(),
+            required_seq: export.seq,
+            required_digest: &export.digest,
+            coverage_complete: false,
+            replace_restore_run: None,
+            new_restore: true,
+        },
     )
     .await
     .unwrap();
+    assert_eq!(
+        locked.lifecycle_baseline_digest,
+        export.lifecycle_baseline_digest
+    );
+
+    // Claiming volume phase BEFORE replaying the upgrade baseline fails closed with OMR04.
+    let claim_before_apply = sqlx::query(
+        "SELECT * FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'))",
+    )
+    .bind(export.origin_us)
+    .bind(export.seq)
+    .bind(&export.digest)
+    .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
+    .execute(&owner)
+    .await;
+    assert_eq!(sqlstate(claim_before_apply), "OMR04");
+
+    // Replaying applies the 3-entry baseline BEFORE seq 1 (R3 restored); rerunning apply is idempotent.
+    assert_eq!(restore::apply(&owner, &export).await.unwrap(), 1);
     assert_eq!(restore::apply(&owner, &export).await.unwrap(), 0);
+
+    // Opening the gate stays blocked with OMR04 until audited restore.accept_coverage_gap runs.
     let open_without_gap = sqlx::query(
         "SELECT openmettle.restore_gate_open(
                     c.restore_run_id,
@@ -3793,14 +3923,16 @@ async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requi
                     $2,
                     decode($3, 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $4
+                    $4,
+                    decode($5, 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) c",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
     .execute(&owner)
     .await;
     assert_eq!(sqlstate(open_without_gap), "OMR04");
@@ -3822,14 +3954,16 @@ async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requi
                     $2,
                     decode($3, 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $4
+                    $4,
+                    decode($5, 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) c",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
     .execute(&owner)
     .await;
     assert_eq!(sqlstate(open_without_audit), "OMR04");
@@ -3862,18 +3996,48 @@ async fn schema_41_backup_with_untracked_disassociation_fails_complete_and_requi
                     $2,
                     decode($3, 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $4
+                    $4,
+                    decode($5, 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) c",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
     .execute(&owner)
     .await
     .unwrap();
     assert!(gate(&pre42_backup).await.0);
+
+    // Verify R1 and R2 did NOT resurrect as active: both are 'retained' with the primary's exact
+    // pre-42 deadlines, R3 is 'active' via post-42 seq 1 restore, and byte accounting matches.
+    assert_eq!(state(&pre42_backup, &rev1).await.0, "retained");
+    assert_eq!(state(&pre42_backup, &rev2).await.0, "retained");
+    assert_eq!(state(&pre42_backup, &rev3).await.0, "active");
+    let restored_deadlines: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT id::text,
+                round(extract(epoch FROM retained_at) * 1000000)::bigint,
+                round(extract(epoch FROM purge_after) * 1000000)::bigint
+           FROM openmettle.artifact_revisions
+          WHERE id = ANY($1::uuid[])
+          ORDER BY id",
+    )
+    .bind(vec![rev1.as_str(), rev2.as_str()])
+    .fetch_all(&owner)
+    .await
+    .unwrap();
+    assert_eq!(restored_deadlines, live_deadlines);
+    assert_eq!(account(&pre42_backup, &c.scope).await, (14, 22, 0));
+    let instance_totals: (i64, i64, i64) = sqlx::query_as(
+        "SELECT active_bytes, retained_bytes, reserved_bytes FROM openmettle.storage_instance",
+    )
+    .fetch_one(&owner)
+    .await
+    .unwrap();
+    assert_eq!(instance_totals, (14, 22, 0));
+    assert_chain(&pre42_backup).await;
 }
 
 /// Review #1 P1 #2 regression: setting `openmettle.replaying_deletion_journal = 'on'` in an
@@ -4013,9 +4177,11 @@ async fn lock_open_gate_fails_closed_for_api_role_on_schema_41() {
     );
 }
 
-/// Review #1 P1 #4 deterministic mid-stream cutoff regression: `Store::read_gated_for_test`
-/// verifies `restore::lock_open_gate` before each 64 KiB chunk, aborts immediately once the gate
-/// closes after chunk 1, and drops the payload `File` so an exclusive `try_lock` succeeds at once.
+/// Review #1 P1 #4 + Review #2 P1 #2 deterministic mid-stream cutoff regression:
+/// `Store::read_gated_for_test` holds a bounded `READ COMMITTED` transaction verifying both
+/// `gate_generation` and `artifact_revisions.state = 'active'` across each 64 KiB chunk read,
+/// aborting immediately both when the gate closes AND when a slow reader pauses across a full
+/// `close -> retain -> reopen` cycle (incrementing `gate_generation`), dropping `LOCK_SH` at once.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn gated_download_stream_aborts_mid_stream_and_releases_lock_when_gate_closes() {
@@ -4027,11 +4193,18 @@ async fn gated_download_stream_aborts_mid_stream_and_releases_lock_when_gate_clo
     let stored = f.payload_sized("large-dl", &payload, 256 * 1024).await;
     let api_pool = pool(&f.db, API).await;
     let mut conn = api_pool.acquire().await.unwrap();
+    let gen1: i64 = sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(gen1, 1);
     let mut content = f
         .store
         .read_gated_for_test(
             &mut conn,
             api_pool.clone(),
+            gen1,
+            &stored.revision,
             &stored.reservation,
             payload.len() as i64,
             0,
@@ -4055,7 +4228,7 @@ async fn gated_download_stream_aborts_mid_stream_and_releases_lock_when_gate_clo
         "active gated download must hold LOCK_SH while streaming"
     );
 
-    // Close the restore gate mid-stream.
+    // Close the restore gate mid-stream (bumps gate_generation 1 -> 2).
     let owner = pool(&f.db, OWNER).await;
     let origin = origin_of(&f.db).await;
     let lc_origin = lifecycle_origin_of(&f.db).await;
@@ -4074,6 +4247,99 @@ async fn gated_download_stream_aborts_mid_stream_and_releases_lock_when_gate_clo
     probe
         .try_lock()
         .expect("mid-stream gate cutoff must release LOCK_SH immediately");
+    probe.unlock().unwrap();
+
+    // Reopen the gate (generation is now 2), start a second download, read chunk 1, then pause
+    // across a FULL close (gen 2 -> 3) -> retain revision -> reopen cycle; chunk 2 must still abort!
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open(
+                    c.restore_run_id,
+                    c.volume_claim_token,
+                    $1,
+                    0,
+                    decode(repeat('00', 32), 'hex'),
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                    $2
+                )
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'), $2) c",
+    )
+    .bind(origin)
+    .bind(lc_origin)
+    .execute(&owner)
+    .await
+    .unwrap();
+    let mut conn2 = api_pool.acquire().await.unwrap();
+    let gen2: i64 = sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
+        .fetch_one(&mut *conn2)
+        .await
+        .unwrap();
+    assert_eq!(gen2, 2);
+    let mut content2 = f
+        .store
+        .read_gated_for_test(
+            &mut conn2,
+            api_pool.clone(),
+            gen2,
+            &stored.revision,
+            &stored.reservation,
+            payload.len() as i64,
+            0,
+            payload.len() as u64,
+        )
+        .await
+        .unwrap();
+    drop(conn2);
+    let c2_first = content2
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(c2_first.len(), 64 * 1024);
+
+    // Cycle close -> reopen (generation 2 -> 3) AND retain the revision while client is paused.
+    restore::lock(&owner, origin, lc_origin, 0, GENESIS, true, None, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open(
+                    c.restore_run_id,
+                    c.volume_claim_token,
+                    $1,
+                    0,
+                    decode(repeat('00', 32), 'hex'),
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                    $2
+                )
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'), $2) c",
+    )
+    .bind(origin)
+    .bind(lc_origin)
+    .execute(&owner)
+    .await
+    .unwrap();
+    let gen3: i64 = sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
+        .fetch_one(&owner)
+        .await
+        .unwrap();
+    assert_eq!(gen3, 3);
+    step(&f.db.0, &f.c.scope, &stored.revision, Step::Retain)
+        .await
+        .unwrap();
+
+    // Even though the gate is open again, gate_generation changed (2 != 3) and state != 'active':
+    // chunk 2 must abort and release LOCK_SH immediately!
+    let c2_second = content2.frame().await.unwrap().unwrap_err();
+    assert!(
+        c2_second
+            .to_string()
+            .contains("restore reconciliation pending"),
+        "{c2_second}"
+    );
+    probe
+        .try_lock()
+        .expect("generation-cycle cutoff must release LOCK_SH immediately");
 }
 
 /// Review #1 P1 #6 regression: a closed restore gate rejects settled upload retries in
@@ -4230,13 +4496,8 @@ async fn closed_gate_rejects_settled_upload_replay_and_fences_in_flight_publish(
     close_tx.commit().await.unwrap();
     let err = ingest_task.await.unwrap().unwrap_err();
     assert!(
-        matches!(
-            err,
-            artifact_fs::Error::Storage(openmettle_core::runs::Error::Database(
-                sqlx::Error::Protocol(_)
-            ))
-        ),
-        "expected closed-gate Protocol error on fenced publish, got {err:?}"
+        matches!(err, artifact_fs::Error::GateClosed),
+        "expected GateClosed error on fenced publish, got {err:?}"
     );
     assert!(
         !f.root.join("revisions").join(&res_id).exists(),
@@ -4431,4 +4692,211 @@ async fn contended_deletion_journal_head_enforces_approval_expiry_before_commit(
     .await
     .unwrap();
     assert_eq!(audit_del, 0);
+}
+
+/// Review #2 P2 #5 regression: an in-flight paused multipart upload holding `LOCK_SH` on its
+/// staging file detects restore-gate closure promptly, releases `LOCK_SH` without calling `abort`,
+/// and returns `Error::GateClosed` so `restore::finish` (`scrub_unsettled_on_restore`) succeeds.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn paused_upload_releases_staging_lock_on_gate_close_so_restore_scrub_succeeds() {
+    use axum::body::{Bytes, HttpBody};
+    use hyper::body::Frame;
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+    use tokio::sync::mpsc;
+
+    struct ChannelBody(mpsc::Receiver<Bytes>);
+    impl HttpBody for ChannelBody {
+        type Data = Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|item| item.map(|b| Ok(Frame::data(b))))
+        }
+    }
+
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let body_bytes: &[u8] = b"--x\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\npaused-upload-bytes\r\n--x--\r\n";
+    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    // Send only the opening half so the upload stages the file and then pauses mid-body.
+    tx.send(Bytes::copy_from_slice(&body_bytes[..body_bytes.len() / 2]))
+        .await
+        .unwrap();
+
+    let upload_task = tokio::spawn({
+        let api_pool = f.api.clone();
+        let store = f.store.clone();
+        let scope = f.c.scope.clone();
+        let actor = f.c.actor.clone();
+        async move {
+            let upload = openmettle_core::artifact_fs::Upload {
+                scope: &scope,
+                actor: &actor,
+                key: "paused-mid-body",
+                artifact: &doc,
+                max_bytes: 100,
+                content_type: "multipart/form-data; boundary=x",
+            };
+            openmettle_core::artifact_fs::ingest(
+                &api_pool,
+                &store,
+                &upload,
+                ChannelBody(rx),
+                |form| form.metadata == b"{}",
+            )
+            .await
+        }
+    });
+
+    // Wait until staging/<res> exists and holds LOCK_SH.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let res_id: String = loop {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT id::text FROM openmettle.storage_reservations
+              WHERE idempotency_key = 'paused-mid-body' AND payload_ino IS NOT NULL",
+        )
+        .fetch_optional(&mut f.db.admin().await)
+        .await
+        .unwrap();
+        if let Some(id) = found
+            && f.root.join("staging").join(&id).exists()
+        {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "upload did not stage in time");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let stage_path = f.root.join("staging").join(&res_id);
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&stage_path)
+        .unwrap();
+    assert!(
+        probe.try_lock().is_err(),
+        "paused upload must hold LOCK_SH on staging file"
+    );
+
+    // Export current clean journal, then close the restore gate while keeping `tx` open/paused.
+    let owner = pool(&f.db, OWNER).await;
+    let export = Export::parse(&restore::export(&owner).await.unwrap()).unwrap();
+    restore::lock_gate(
+        &owner,
+        &restore::GateLockRequest {
+            origin_us: export.origin_us,
+            lifecycle_origin_us: export.lifecycle_origin_us,
+            lifecycle_baseline_digest: export.lifecycle_baseline_digest.as_deref(),
+            required_seq: export.seq,
+            required_digest: &export.digest,
+            coverage_complete: true,
+            replace_restore_run: None,
+            new_restore: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Without closing `tx`, ingest must detect gate closure within the poll window, return
+    // Error::GateClosed, and release LOCK_SH immediately.
+    let err = tokio::time::timeout(Duration::from_secs(5), upload_task)
+        .await
+        .expect("paused upload did not abort promptly when gate closed")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, openmettle_core::artifact_fs::Error::GateClosed),
+        "expected GateClosed, got {err:?}"
+    );
+    probe
+        .try_lock()
+        .expect("GateClosed abort must release staging LOCK_SH immediately");
+    probe.unlock().unwrap();
+    drop(tx);
+
+    // Restore apply + finish (scrub_unsettled_on_restore) must succeed cleanly and open the gate.
+    assert_eq!(restore::apply(&owner, &export).await.unwrap(), 0);
+    restore::finish(&owner, Some(&f.store), &export)
+        .await
+        .unwrap();
+    assert!(gate(&f.db).await.0);
+    assert_eq!(
+        fs::metadata(&stage_path).unwrap().len(),
+        0,
+        "scrub_unsettled_on_restore must truncate the paused staging payload to 0 bytes"
+    );
+    assert!(f.files("revisions").is_empty());
+}
+
+/// Review #2 P2 #7 regression: on a `max_connections(1)` pool, releasing the checked-out
+/// connection before `quarantine_writer` recovers cleanly after a publish commit failure without
+/// self-deadlocking and marks the reservation `adoption_unverified = true, publish_pending = false`.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn quarantine_after_commit_failure_does_not_deadlock_single_connection_pool() {
+    use sqlx::postgres::PgPoolOptions;
+
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let res = reserve(
+        &f.db,
+        API,
+        &input(&f.c.scope, &f.c.actor, "single-pool-quarantine", &doc, 32),
+    )
+    .await
+    .unwrap();
+    let ino: u64 = 424_242;
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations
+            SET stage_claimed = true, payload_ino = $2::text::numeric, publish_pending = true
+          WHERE id = $1::uuid",
+    )
+    .bind(&res.id)
+    .bind(ino.to_string())
+    .execute(&mut connect(&f.db.0, OWNER).await)
+    .await
+    .unwrap();
+
+    let single_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_with(role_options(&f.db.0, API))
+        .await
+        .unwrap();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        openmettle_core::artifact_fs::quarantine_after_commit_failure_for_test(
+            &single_pool,
+            &res.id,
+            ino,
+            true,
+        ),
+    )
+    .await
+    .expect("quarantine recovery deadlocked on max_connections(1) pool")
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        openmettle_core::artifact_fs::Error::Storage(openmettle_core::runs::Error::Database(_))
+    ));
+    let (unverified, pending): (bool, bool) = sqlx::query_as(
+        "SELECT adoption_unverified, publish_pending
+           FROM openmettle.storage_reservations
+          WHERE id = $1::uuid",
+    )
+    .bind(&res.id)
+    .fetch_one(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    assert!(unverified);
+    assert!(!pending);
 }

@@ -160,10 +160,21 @@ impl Api {
                     })))
                 }
                 (Op::ListConversations, _) => conversations(c, &actor, page.as_ref().ok_or(INTERNAL)?, now).await,
-                (_, content) => {
-                    if op == Op::ListMessages {
-                        crate::restore::require_open_gate(c).await?;
+                (Op::ListMessages, _) => {
+                    let page = page.as_ref().ok_or(INTERNAL)?;
+                    let mut tx = crate::authz::store::begin(c).await?;
+                    let result = async {
+                        let conn = tx.connection()?;
+                        crate::restore::require_open_gate(conn).await?;
+                        let view = projects::read_resource(conn, &actor, ResourceKind::Conversation, target, now).await?;
+                        let chat = Conversation { id: target, scope: &view.scope_id };
+                        messages(conn, &actor, chat, branch, page, now).await
                     }
+                    .await;
+                    let _ = tx.rollback().await;
+                    result
+                }
+                (_, content) => {
                     let view = projects::read_resource(c, &actor, ResourceKind::Conversation, target, now).await?;
                     let chat = Conversation { id: target, scope: &view.scope_id };
                     match (op,content) {
@@ -181,7 +192,6 @@ impl Api {
                         }
                         (Op::GetBranch, _) => Ok(reply(StatusCode::OK, select_branch(c, chat, branch).await?)),
                         (Op::ListBranches, _) => branch_page(c, chat, page.as_ref().ok_or(INTERNAL)?).await,
-                        (Op::ListMessages, _) => messages(c, &actor, chat, branch, page.as_ref().ok_or(INTERNAL)?, now).await,
                         (_, Content::Preview(proposal)) => submission::preview(c, call, &actor, &view, branch, catalog, &proposal).await,
                         _ => Err(INTERNAL),
                     }

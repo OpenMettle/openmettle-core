@@ -10,8 +10,10 @@
 //! Export format, one line each, `\n` terminated:
 //! - header `openmettle.deletion_journal.export/1`
 //! - `origin <coverage_started_us>` (Unix microseconds of `deletion_journal_head.coverage_started_at`)
-//! - optional `lifecycle_origin <lifecycle_coverage_started_us>` (emitted on schema 42+ for
-//!   `deletion_journal_head.lifecycle_coverage_started_at`; absent on pre-42 exports)
+//! - optional schema-42+ lifecycle upgrade baseline section (absent on pre-42 exports):
+//!   - `lifecycle_origin <lifecycle_coverage_started_us>`
+//!   - `lifecycle_baseline <lifecycle_baseline_digest_hex>`
+//!   - zero or more sorted `baseline <entity_id> <scope_id> <retained_us> <original_purge_after_us> <content_digest_hex> <policy_revision|->` lines
 //! - zero or more record lines (times in Unix microseconds, digests in 64-character lowercase hex,
 //!   canonical UUIDs, `-` for NULL optional columns):
 //!   - `artifact_revision.purged` (10 fields):
@@ -40,6 +42,23 @@ const VOLUME_PHASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Strict 64-character lowercase hexadecimal SHA-256 digest check.
 pub fn is_valid_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn decode_hex_digest(s: &str) -> Result<Vec<u8>, Error> {
+    if !is_valid_digest(s) {
+        return Err(Error::Export("malformed digest"));
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => unreachable!(),
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(32);
+    for &[hi, lo] in bytes.as_chunks::<2>().0 {
+        out.push((nibble(hi) << 4) | nibble(lo));
+    }
+    Ok(out)
 }
 
 fn valid_trimmed_text(s: &str, max_bytes: usize) -> bool {
@@ -96,6 +115,36 @@ struct Record {
     retained_us: Option<i64>,
 }
 
+/// One exported `openmettle.retention_upgrade_baseline` record (pre-42 `retained`/`purging`
+/// revision captured during migration 42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineEntry {
+    entity_id: String,
+    scope_id: String,
+    retained_us: i64,
+    original_purge_after_us: i64,
+    content_digest: String,
+    policy_revision: Option<i64>,
+}
+
+fn baseline_step(prev_hex: &str, entry: &BaselineEntry) -> String {
+    let policy = entry
+        .policy_revision
+        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+    let input = format!(
+        "{prev_hex}:{}:{}:{}:{}:{}:{policy}",
+        entry.entity_id,
+        entry.scope_id,
+        entry.retained_us,
+        entry.original_purge_after_us,
+        entry.content_digest,
+    );
+    hex(&digest(input.as_bytes()))
+}
+
+/// Raw SQL tuple matching [`export`] for `retention_upgrade_baseline`.
+type BaselineRow = (String, String, i64, i64, String, Option<i64>);
+
 /// Raw SQL tuple matching [`export`].
 type ExportRow = (
     i64,
@@ -111,15 +160,37 @@ type ExportRow = (
     Option<i64>,
 );
 
-/// A checksummed export: installation origin, optional schema-42 lifecycle origin, every record
-/// from 1 in order, and watermark.
+/// A checksummed export: installation origin, optional schema-42 lifecycle origin and upgrade
+/// baseline, every record from 1 in order, and watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Export {
+    baseline: Vec<BaselineEntry>,
     records: Vec<Record>,
     pub origin_us: i64,
     pub lifecycle_origin_us: Option<i64>,
+    pub lifecycle_baseline_digest: Option<String>,
     pub seq: i64,
     pub digest: String,
+}
+
+impl Export {
+    /// Number of pre-42 retention upgrade baseline entries carried by this export.
+    pub fn baseline_len(&self) -> usize {
+        self.baseline.len()
+    }
+}
+
+/// Arguments to [`lock_gate`].
+#[derive(Debug, Clone, Copy)]
+pub struct GateLockRequest<'a> {
+    pub origin_us: i64,
+    pub lifecycle_origin_us: Option<i64>,
+    pub lifecycle_baseline_digest: Option<&'a str>,
+    pub required_seq: i64,
+    pub required_digest: &'a str,
+    pub coverage_complete: bool,
+    pub replace_restore_run: Option<&'a str>,
+    pub new_restore: bool,
 }
 
 /// Result of closing or updating the restore reconciliation gate.
@@ -128,6 +199,7 @@ pub struct GateLock {
     pub restore_run_id: String,
     pub origin_us: i64,
     pub lifecycle_origin_us: Option<i64>,
+    pub lifecycle_baseline_digest: Option<String>,
     pub snapshot_seq: i64,
     pub required_seq: i64,
     pub coverage_complete: bool,
@@ -176,6 +248,39 @@ pub(crate) async fn lock_open_gate(c: &mut PgConnection) -> Result<bool, sqlx::E
     sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open()")
         .fetch_one(c)
         .await
+}
+
+/// Lock the restore reconciliation gate `FOR SHARE` inside the caller's transaction, returning
+/// `Some(gate_generation)` when open (`Some(0)` on pre-41 schemas where
+/// `restore_reconciliation_gate` does not exist) and `None` when closed. On schema 41+, invokes
+/// `openmettle.restore_gate_lock_open_generation()` unconditionally so a role lacking `EXECUTE`
+/// or an older schema fails closed.
+pub(crate) async fn lock_open_gate_generation(
+    c: &mut PgConnection,
+) -> Result<Option<i64>, sqlx::Error> {
+    let gated: bool = sqlx::query_scalar(
+        "SELECT to_regclass('openmettle.restore_reconciliation_gate') IS NOT NULL",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if !gated {
+        return Ok(Some(0));
+    }
+    sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
+        .fetch_one(c)
+        .await
+}
+
+/// Lock the restore reconciliation gate `FOR SHARE`, returning the open `gate_generation` or a
+/// `StoreError::Database` (`503 unavailable` on `/v1`) when the gate is closed.
+pub(crate) async fn require_open_gate_generation(
+    c: &mut PgConnection,
+) -> Result<i64, crate::authz::store::StoreError> {
+    lock_open_gate_generation(c).await?.ok_or_else(|| {
+        crate::authz::store::StoreError::Database(sqlx::Error::Protocol(
+            "restore reconciliation pending".into(),
+        ))
+    })
 }
 
 /// Lock the restore reconciliation gate `FOR SHARE` and refuse with a `StoreError::Database`
@@ -236,26 +341,90 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
     )
     .fetch_one(&mut *tx)
     .await?;
+    let has_lifecycle_baseline: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM pg_catalog.pg_attribute
+              WHERE attrelid = to_regclass('openmettle.deletion_journal_head')
+                AND attname = 'lifecycle_baseline_digest'
+                AND NOT attisdropped
+         )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     let lifecycle_origin_expr = if has_lifecycle_origin {
         us("lifecycle_coverage_started_at")
     } else {
         "NULL::bigint".to_owned()
     };
-    let (seq, chain, origin_us, lifecycle_origin_us, at): (i64, String, i64, Option<i64>, i64) =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT journal_seq, encode(chain_digest, 'hex'), {}, {}, {}
-               FROM openmettle.deletion_journal_head WHERE id",
-            us("coverage_started_at"),
-            lifecycle_origin_expr,
-            us("clock_timestamp()")
-        )))
-        .fetch_one(&mut *tx)
-        .await?;
+    let lifecycle_baseline_expr = if has_lifecycle_baseline {
+        "encode(lifecycle_baseline_digest, 'hex')".to_owned()
+    } else {
+        "NULL::text".to_owned()
+    };
+    let (seq, chain, origin_us, lifecycle_origin_us, lifecycle_baseline_digest, at): (
+        i64,
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        i64,
+    ) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT journal_seq, encode(chain_digest, 'hex'), {}, {}, {}, {}
+           FROM openmettle.deletion_journal_head WHERE id",
+        us("coverage_started_at"),
+        lifecycle_origin_expr,
+        lifecycle_baseline_expr,
+        us("clock_timestamp()")
+    )))
+    .fetch_one(&mut *tx)
+    .await?;
+    let baseline_rows: Vec<BaselineRow> = if has_lifecycle_baseline {
+        sqlx::query_as(
+            "SELECT artifact_revision_id::text,
+                    scope_id::text,
+                    round(extract(epoch FROM retained_at) * 1000000)::bigint,
+                    round(extract(epoch FROM original_purge_after) * 1000000)::bigint,
+                    encode(content_digest, 'hex'),
+                    policy_revision
+               FROM openmettle.retention_upgrade_baseline
+              ORDER BY artifact_revision_id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        Vec::new()
+    };
     tx.commit().await?;
     let fmt_opt = |v: Option<i64>| v.map_or_else(|| "-".to_owned(), |n| n.to_string());
     let mut text = format!("{HEADER}\norigin {origin_us}\n");
     if let Some(lifecycle_origin_us) = lifecycle_origin_us {
+        let baseline_digest = lifecycle_baseline_digest
+            .as_deref()
+            .ok_or(Error::Export("missing lifecycle baseline digest"))?;
+        let mut folded = GENESIS.to_owned();
         let _ = writeln!(text, "lifecycle_origin {lifecycle_origin_us}");
+        let _ = writeln!(text, "lifecycle_baseline {baseline_digest}");
+        for b in &baseline_rows {
+            let entry = BaselineEntry {
+                entity_id: b.0.clone(),
+                scope_id: b.1.clone(),
+                retained_us: b.2,
+                original_purge_after_us: b.3,
+                content_digest: b.4.clone(),
+                policy_revision: b.5,
+            };
+            folded = baseline_step(&folded, &entry);
+            let policy = fmt_opt(b.5);
+            let _ = writeln!(
+                text,
+                "baseline {} {} {} {} {} {policy}",
+                b.0, b.1, b.2, b.3, b.4
+            );
+        }
+        if folded != baseline_digest {
+            return Err(Error::Export("lifecycle baseline digest mismatch"));
+        }
     }
     for (i, r) in rows.iter().enumerate() {
         if r.0 != i as i64 + 1 {
@@ -335,6 +504,75 @@ impl Export {
                 ["lifecycle_origin", origin] => Some(number(origin)?),
                 _ => return Err(Error::Export("malformed lifecycle origin")),
             }
+        } else {
+            None
+        };
+        let mut baseline = Vec::new();
+        let lifecycle_baseline_digest = if lifecycle_origin_us.is_some() {
+            let line = lines
+                .next()
+                .ok_or(Error::Export("missing lifecycle baseline"))?;
+            let declared = match line.split(' ').collect::<Vec<_>>()[..] {
+                ["lifecycle_baseline", digest_hex] => {
+                    if !is_valid_digest(digest_hex) {
+                        return Err(Error::Export("malformed digest"));
+                    }
+                    digest_hex.to_owned()
+                }
+                _ => return Err(Error::Export("malformed lifecycle baseline")),
+            };
+            let mut folded = GENESIS.to_owned();
+            let mut prev_entity: Option<String> = None;
+            while lines
+                .peek()
+                .is_some_and(|line| line.starts_with("baseline "))
+            {
+                let line = lines.next().unwrap_or_default();
+                let fields: Vec<&str> = line.split(' ').collect();
+                let ["baseline", entity, scope, retained, after, content, policy] = fields[..]
+                else {
+                    return Err(Error::Export("malformed baseline line"));
+                };
+                if !runs::is_canonical_uuid(entity) || !runs::is_canonical_uuid(scope) {
+                    return Err(Error::Export("malformed uuid"));
+                }
+                if prev_entity.as_deref().is_some_and(|prev| entity <= prev) {
+                    return Err(Error::Export("baseline out of order"));
+                }
+                if !is_valid_digest(content) {
+                    return Err(Error::Export("malformed digest"));
+                }
+                let retained_us = number(retained)?;
+                let original_purge_after_us = number(after)?;
+                if original_purge_after_us < retained_us {
+                    return Err(Error::Export("malformed number"));
+                }
+                let policy_revision = match policy {
+                    "-" => None,
+                    p => {
+                        let rev = number(p)?;
+                        if rev <= 0 {
+                            return Err(Error::Export("malformed number"));
+                        }
+                        Some(rev)
+                    }
+                };
+                let entry = BaselineEntry {
+                    entity_id: entity.into(),
+                    scope_id: scope.into(),
+                    retained_us,
+                    original_purge_after_us,
+                    content_digest: content.into(),
+                    policy_revision,
+                };
+                folded = baseline_step(&folded, &entry);
+                prev_entity = Some(entry.entity_id.clone());
+                baseline.push(entry);
+            }
+            if folded != declared {
+                return Err(Error::Export("lifecycle baseline digest mismatch"));
+            }
+            Some(declared)
         } else {
             None
         };
@@ -503,13 +741,76 @@ impl Export {
             return Err(Error::Export("watermark does not match the last record"));
         }
         Ok(Self {
+            baseline,
             records,
             origin_us,
             lifecycle_origin_us,
+            lifecycle_baseline_digest,
             seq,
             digest,
         })
     }
+}
+
+/// Closes or updates the gate after a restore (migration 41/42's `restore_gate_lock`), including
+/// optional `lifecycle_origin_us` and `lifecycle_baseline_digest`.
+pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateLock, Error> {
+    if req.required_seq < 0 {
+        return Err(Error::Invalid("invalid sequence"));
+    }
+    if !is_valid_digest(req.required_digest) {
+        return Err(Error::Invalid("invalid chain digest"));
+    }
+    if let Some(baseline) = req.lifecycle_baseline_digest {
+        if !is_valid_digest(baseline) {
+            return Err(Error::Invalid("invalid lifecycle baseline digest"));
+        }
+        if req.lifecycle_origin_us.is_none() {
+            return Err(Error::Invalid(
+                "lifecycle baseline digest requires lifecycle origin",
+            ));
+        }
+    }
+    if let Some(run_id) = req.replace_restore_run
+        && !runs::is_canonical_uuid(run_id)
+    {
+        return Err(Error::Invalid("invalid restore run id"));
+    }
+    let mut tx = read_committed(pool).await?;
+    let (
+        restore_run_id,
+        required_origin_us,
+        required_lifecycle_origin_us,
+        required_lifecycle_baseline_digest,
+        snapshot_seq,
+        required_seq,
+        coverage_complete,
+    ): (String, i64, Option<i64>, Option<String>, i64, i64, bool) = sqlx::query_as(
+        "SELECT restore_run_id::text, required_origin_us, required_lifecycle_origin_us,
+                encode(required_lifecycle_baseline_digest, 'hex'),
+                snapshot_journal_seq, required_journal_seq, coverage_complete
+           FROM openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), $4, $5::uuid, $6, $7, decode($8, 'hex'))",
+    )
+    .bind(req.origin_us)
+    .bind(req.required_seq)
+    .bind(req.required_digest)
+    .bind(req.coverage_complete)
+    .bind(req.replace_restore_run)
+    .bind(req.new_restore)
+    .bind(req.lifecycle_origin_us)
+    .bind(req.lifecycle_baseline_digest)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(GateLock {
+        restore_run_id,
+        origin_us: required_origin_us,
+        lifecycle_origin_us: required_lifecycle_origin_us,
+        lifecycle_baseline_digest: required_lifecycle_baseline_digest,
+        snapshot_seq,
+        required_seq,
+        coverage_complete,
+    })
 }
 
 /// Closes or updates the gate after a restore (migration 41/42's `restore_gate_lock`) with the
@@ -527,48 +828,20 @@ pub async fn lock(
     replace_restore_run: Option<&str>,
     new_restore: bool,
 ) -> Result<GateLock, Error> {
-    if required_seq < 0 {
-        return Err(Error::Invalid("invalid sequence"));
-    }
-    if !is_valid_digest(required_digest) {
-        return Err(Error::Invalid("invalid chain digest"));
-    }
-    if let Some(run_id) = replace_restore_run
-        && !runs::is_canonical_uuid(run_id)
-    {
-        return Err(Error::Invalid("invalid restore run id"));
-    }
-    let mut tx = read_committed(pool).await?;
-    let (
-        restore_run_id,
-        required_origin_us,
-        required_lifecycle_origin_us,
-        snapshot_seq,
-        required_seq,
-        coverage_complete,
-    ): (String, i64, Option<i64>, i64, i64, bool) = sqlx::query_as(
-        "SELECT restore_run_id::text, required_origin_us, required_lifecycle_origin_us,
-                snapshot_journal_seq, required_journal_seq, coverage_complete
-           FROM openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), $4, $5::uuid, $6, $7)",
+    lock_gate(
+        pool,
+        &GateLockRequest {
+            origin_us,
+            lifecycle_origin_us,
+            lifecycle_baseline_digest: None,
+            required_seq,
+            required_digest,
+            coverage_complete,
+            replace_restore_run,
+            new_restore,
+        },
     )
-    .bind(origin_us)
-    .bind(required_seq)
-    .bind(required_digest)
-    .bind(coverage_complete)
-    .bind(replace_restore_run)
-    .bind(new_restore)
-    .bind(lifecycle_origin_us)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(GateLock {
-        restore_run_id,
-        origin_us: required_origin_us,
-        lifecycle_origin_us: required_lifecycle_origin_us,
-        snapshot_seq,
-        required_seq,
-        coverage_complete,
-    })
+    .await
 }
 
 /// Audited operator break-glass acceptance of an unexported purge window after the last surviving
@@ -620,19 +893,64 @@ pub async fn check_rebind(pool: &PgPool, store: &Store) -> Result<(), Error> {
     Ok(())
 }
 
-/// The database phase: verifies installation origin and locked watermark via
-/// `restore_verify_export`, replays every record, and verifies all pinned checkpoints via
-/// `restore_verify_checkpoints` in ONE `READ COMMITTED` transaction, rolling everything back on
-/// any mismatch. Returns how many records were new to the restored journal.
+/// The database phase: verifies installation origin, lifecycle origin/baseline digest and locked
+/// watermark via `restore_verify_export`, replays any schema-42 pre-upgrade baseline via
+/// `restore_replay_baseline`, replays every journal record, and verifies all pinned checkpoints
+/// via `restore_verify_checkpoints` in ONE `READ COMMITTED` transaction, rolling everything back
+/// on any mismatch. Returns how many journal records were new to the restored journal.
 pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
     let mut tx = read_committed(pool).await?;
-    sqlx::query("SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4)")
-        .bind(export.origin_us)
-        .bind(export.seq)
-        .bind(&export.digest)
-        .bind(export.lifecycle_origin_us)
+    sqlx::query(
+        "SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'))",
+    )
+    .bind(export.origin_us)
+    .bind(export.seq)
+    .bind(&export.digest)
+    .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
+    .execute(&mut *tx)
+    .await?;
+    if let (Some(lc_origin), Some(lc_baseline)) = (
+        export.lifecycle_origin_us,
+        export.lifecycle_baseline_digest.as_deref(),
+    ) {
+        let mut entity_ids = Vec::with_capacity(export.baseline.len());
+        let mut scope_ids = Vec::with_capacity(export.baseline.len());
+        let mut retained_us = Vec::with_capacity(export.baseline.len());
+        let mut purge_after_us = Vec::with_capacity(export.baseline.len());
+        let mut content_digests = Vec::with_capacity(export.baseline.len());
+        let mut policy_revisions = Vec::with_capacity(export.baseline.len());
+        for b in &export.baseline {
+            entity_ids.push(b.entity_id.as_str());
+            scope_ids.push(b.scope_id.as_str());
+            retained_us.push(b.retained_us);
+            purge_after_us.push(b.original_purge_after_us);
+            content_digests.push(decode_hex_digest(&b.content_digest)?);
+            policy_revisions.push(b.policy_revision);
+        }
+        sqlx::query(
+            "SELECT openmettle.restore_replay_baseline(
+                        $1,
+                        decode($2, 'hex'),
+                        $3::uuid[],
+                        $4::uuid[],
+                        $5,
+                        $6,
+                        $7,
+                        $8
+                    )",
+        )
+        .bind(lc_origin)
+        .bind(lc_baseline)
+        .bind(&entity_ids)
+        .bind(&scope_ids)
+        .bind(&retained_us)
+        .bind(&purge_after_us)
+        .bind(&content_digests)
+        .bind(&policy_revisions)
         .execute(&mut *tx)
         .await?;
+    }
     let mut applied = 0;
     for r in &export.records {
         let new: bool = sqlx::query_scalar(
@@ -665,12 +983,13 @@ async fn claim_volume_phase(pool: &PgPool, export: &Export) -> Result<(String, S
     let mut tx = read_committed(pool).await?;
     let lease: (String, String) = sqlx::query_as(
         "SELECT restore_run_id::text, volume_claim_token::text
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4)",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'))",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -950,7 +1269,7 @@ async fn finish_claimed(
         }
     };
     if let Err(err) = sqlx::query(
-        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid, $7)",
+        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid, $7, decode($8, 'hex'))",
     )
     .bind(restore_run_id)
     .bind(claim_token)
@@ -959,6 +1278,7 @@ async fn finish_claimed(
     .bind(&export.digest)
     .bind(expected_volume_id.as_deref())
     .bind(export.lifecycle_origin_us)
+    .bind(export.lifecycle_baseline_digest.as_deref())
     .execute(&mut *open_tx)
     .await
     {
@@ -1106,10 +1426,10 @@ mod tests {
         assert_eq!(parsed.digest, d);
         assert_eq!(parsed.lifecycle_origin_us, None);
 
-        // PR3 lifecycle commitment event kinds (11 fields) require lifecycle_origin and enforce
-        // per-kind invariants.
+        // PR3 lifecycle commitment event kinds (11 fields) require lifecycle_origin +
+        // lifecycle_baseline and enforce per-kind invariants.
         let valid_lifecycle = seal(&format!(
-            "{HEADER}\norigin 1\nlifecycle_origin 2\n\
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
              1 10 artifact_revision.retained {entity} {scope} 100 - {d} 1 {d} 50\n\
              2 20 artifact_revision.deadline_adjusted {entity} {scope} 80 - {d} 2 {d} 50\n\
              3 30 artifact_revision.restored {entity} {scope} - - {d} - {d} -\n\
@@ -1118,6 +1438,8 @@ mod tests {
         ));
         let parsed = Export::parse(&valid_lifecycle).unwrap();
         assert_eq!(parsed.lifecycle_origin_us, Some(2));
+        assert_eq!(parsed.lifecycle_baseline_digest.as_deref(), Some(GENESIS));
+        assert_eq!(parsed.baseline_len(), 0);
         assert_eq!(parsed.seq, 4);
         assert_eq!(parsed.records[0].retained_us, Some(50));
         assert_eq!(parsed.records[0].original_purge_after_us, Some(100));
@@ -1125,6 +1447,70 @@ mod tests {
         assert_eq!(parsed.records[2].retained_us, None);
         assert_eq!(parsed.records[2].original_purge_after_us, None);
         assert_eq!(parsed.records[3].purged_us, Some(95));
+
+        // Non-empty sorted upgrade baseline verifies folded SHA-256 and refuses tampering/unsorted.
+        let entry1 = BaselineEntry {
+            entity_id: entity.into(),
+            scope_id: scope.into(),
+            retained_us: 10,
+            original_purge_after_us: 20,
+            content_digest: d.clone(),
+            policy_revision: Some(1),
+        };
+        let entity2 = "00000000-0000-4000-8000-000000000009";
+        let entry2 = BaselineEntry {
+            entity_id: entity2.into(),
+            scope_id: scope.into(),
+            retained_us: 15,
+            original_purge_after_us: 25,
+            content_digest: d.clone(),
+            policy_revision: None,
+        };
+        let b_digest = baseline_step(&baseline_step(GENESIS, &entry1), &entry2);
+        let valid_baseline = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {b_digest}\n\
+             baseline {entity} {scope} 10 20 {d} 1\n\
+             baseline {entity2} {scope} 15 25 {d} -\n\
+             watermark 1 0 {GENESIS} 3\n"
+        ));
+        let parsed_b = Export::parse(&valid_baseline).unwrap();
+        assert_eq!(parsed_b.baseline_len(), 2);
+        assert_eq!(
+            parsed_b.lifecycle_baseline_digest.as_deref(),
+            Some(b_digest.as_str())
+        );
+
+        // Tampered baseline digest is refused.
+        let bad_b_digest = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             baseline {entity} {scope} 10 20 {d} 1\n\
+             watermark 1 0 {GENESIS} 3\n"
+        ));
+        assert!(matches!(
+            Export::parse(&bad_b_digest),
+            Err(Error::Export("lifecycle baseline digest mismatch"))
+        ));
+
+        // Unsorted baseline entries are refused.
+        let unsorted_b = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {b_digest}\n\
+             baseline {entity2} {scope} 15 25 {d} -\n\
+             baseline {entity} {scope} 10 20 {d} 1\n\
+             watermark 1 0 {GENESIS} 3\n"
+        ));
+        assert!(matches!(
+            Export::parse(&unsorted_b),
+            Err(Error::Export("baseline out of order"))
+        ));
+
+        // lifecycle_origin without lifecycle_baseline is refused.
+        let missing_b_hdr = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nwatermark 1 0 {GENESIS} 3\n"
+        ));
+        assert!(matches!(
+            Export::parse(&missing_b_hdr),
+            Err(Error::Export("malformed lifecycle baseline"))
+        ));
 
         // 11-field lifecycle event without lifecycle_origin header is refused.
         let missing_lc = seal(&format!(
@@ -1144,7 +1530,7 @@ mod tests {
             Err(Error::Export("malformed number"))
         ));
         let dup_lc = seal(&format!(
-            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_origin 3\nwatermark 1 0 {GENESIS} 4\n"
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\nlifecycle_origin 3\nwatermark 1 0 {GENESIS} 4\n"
         ));
         assert!(matches!(
             Export::parse(&dup_lc),
@@ -1153,7 +1539,7 @@ mod tests {
 
         // Retained record with purge_after < retained_at is refused.
         let bad_order = seal(&format!(
-            "{HEADER}\norigin 1\nlifecycle_origin 2\n1 10 artifact_revision.retained {entity} {scope} 40 - {d} 1 {d} 50\nwatermark 1 1 {d} 11\n"
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n1 10 artifact_revision.retained {entity} {scope} 40 - {d} 1 {d} 50\nwatermark 1 1 {d} 11\n"
         ));
         assert!(matches!(
             Export::parse(&bad_order),
@@ -1162,7 +1548,7 @@ mod tests {
 
         // Restored record carrying a timestamp is refused.
         let bad_restored = seal(&format!(
-            "{HEADER}\norigin 1\nlifecycle_origin 2\n1 10 artifact_revision.restored {entity} {scope} 40 - {d} - {d} -\nwatermark 1 1 {d} 11\n"
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n1 10 artifact_revision.restored {entity} {scope} 40 - {d} - {d} -\nwatermark 1 1 {d} 11\n"
         ));
         assert!(matches!(
             Export::parse(&bad_restored),

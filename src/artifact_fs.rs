@@ -31,7 +31,7 @@ use std::{
     path::Path,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use std::{
     os::unix::fs::MetadataExt,
@@ -51,6 +51,17 @@ const READ_CHUNK: u64 = 64 * 1024;
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Largest batch one reconciliation call handles.
 pub const MAX_BATCH: i64 = 1000;
+/// Transaction-local idle timeout for transactions that span synchronous filesystem I/O so a
+/// strict session default cannot drop the PostgreSQL fencing locks early.
+pub(super) const FS_TX_IDLE_TIMEOUT: &str =
+    "SET LOCAL idle_in_transaction_session_timeout = '300s'";
+/// Monotonic deadline strictly shorter than `FS_TX_IDLE_TIMEOUT` (and the 300 s restore
+/// volume-phase lease): if synchronous filesystem I/O stalls past this window, abort before any
+/// subsequent filesystem mutation so no mutation runs after the DB fence expires.
+pub(super) const TX_FENCE_BUDGET: Duration = Duration::from_secs(240);
+/// Bounded poll slice while awaiting client upload frames so a paused upload releases its
+/// staging `LOCK_SH` promptly if the restore reconciliation gate closes.
+const UPLOAD_GATE_POLL: Duration = Duration::from_millis(200);
 
 /// The artifacts directory was refused. It deliberately carries no path or OS detail.
 #[derive(Debug, PartialEq, Eq)]
@@ -72,6 +83,8 @@ pub enum Error {
     Io,
     /// A settled revision's payload is missing or has another size.
     Missing,
+    /// Restore reconciliation closed the gate (or rotated `gate_generation`).
+    GateClosed,
     /// A persistence helper refused or failed (ADR 0005).
     Storage(runs::Error),
 }
@@ -110,6 +123,7 @@ impl fmt::Display for Error {
             Self::Body => f.write_str("request body could not be read"),
             Self::Io => f.write_str("artifact storage I/O failed"),
             Self::Missing => f.write_str("settled artifact payload is missing"),
+            Self::GateClosed => f.write_str("restore reconciliation pending"),
         }
     }
 }
@@ -306,41 +320,68 @@ impl Store {
             .await
     }
 
-    /// [`Self::read_on`] for `/v1` downloads: verifies the restore reconciliation gate before
-    /// reading each streamed chunk via `gate_pool`, aborting mid-stream and dropping the shared
-    /// payload lock immediately if the gate closes.
+    /// [`Self::read_on`] for `/v1` downloads: verifies the restore reconciliation gate generation
+    /// and active revision state inside a bounded `READ COMMITTED` transaction held across each
+    /// streamed chunk read via `gate_pool`, aborting mid-stream and dropping the shared payload
+    /// lock immediately if the gate closes, cycles, or the revision leaves `'active'`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_gated_on(
         &self,
         c: &mut PgConnection,
         gate_pool: PgPool,
+        expected_generation: i64,
+        revision_id: &str,
         reservation: &str,
         size: i64,
         start: u64,
         len: u64,
     ) -> Result<Content, Error> {
-        self.open_content(c, Some(gate_pool), reservation, size, start, len)
-            .await
+        self.open_content(
+            c,
+            Some(DownloadGateGuard {
+                pool: gate_pool,
+                expected_generation,
+                revision_id: revision_id.to_owned(),
+            }),
+            reservation,
+            size,
+            start,
+            len,
+        )
+        .await
     }
 
     /// Deterministic integration-test entry point for [`Self::read_gated_on`].
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_gated_for_test(
         &self,
         c: &mut PgConnection,
         gate_pool: PgPool,
+        expected_generation: i64,
+        revision_id: &str,
         reservation: &str,
         size: i64,
         start: u64,
         len: u64,
     ) -> Result<Content, Error> {
-        self.read_gated_on(c, gate_pool, reservation, size, start, len)
-            .await
+        self.read_gated_on(
+            c,
+            gate_pool,
+            expected_generation,
+            revision_id,
+            reservation,
+            size,
+            start,
+            len,
+        )
+        .await
     }
 
     async fn open_content(
         &self,
         c: &mut PgConnection,
-        gate_pool: Option<PgPool>,
+        gate: Option<DownloadGateGuard>,
         reservation: &str,
         size: i64,
         start: u64,
@@ -380,7 +421,7 @@ impl Store {
         Ok(Content {
             file: Some(file),
             remaining: len,
-            gate_pool,
+            gate,
             pending: None,
         })
     }
@@ -423,11 +464,14 @@ impl Staged {
         Ok(())
     }
 
-    fn publish(&self) -> Result<(), Error> {
+    fn publish(&self, fence_deadline: Instant) -> Result<(), Error> {
         let f = self.file.as_ref().ok_or(Error::Io)?;
         self.volume.recheck()?;
         self.volume
             .matches(f, &self.volume.staging, &self.id, self.ino)?;
+        if Instant::now() >= fence_deadline {
+            return Err(Error::Io);
+        }
         at::linkat(
             &self.volume.staging,
             self.id.as_str(),
@@ -442,6 +486,16 @@ impl Staged {
     }
 }
 
+/// Gate binding for a `/v1` download stream: verifies both the monotonic restore-gate generation
+/// and that the target revision remains `'active'` while holding `restore_reconciliation_gate
+/// FOR SHARE` across each chunk `read_exact`.
+#[derive(Clone)]
+struct DownloadGateGuard {
+    pool: PgPool,
+    expected_generation: i64,
+    revision_id: String,
+}
+
 /// One blocking read: the file back and the chunk it filled.
 type PendingRead = JoinHandle<std::io::Result<(fs::File, Vec<u8>)>>;
 
@@ -452,8 +506,9 @@ pub struct Content {
     /// `None` while a read is pending.
     file: Option<fs::File>,
     remaining: u64,
-    /// When set, each streamed chunk verifies `restore::lock_open_gate` before reading.
-    gate_pool: Option<PgPool>,
+    /// When set, each streamed chunk holds a bounded `READ COMMITTED` transaction verifying
+    /// `gate_generation` and `artifact_revisions.state = 'active'` across `read_exact`.
+    gate: Option<DownloadGateGuard>,
     pending: Option<PendingRead>,
 }
 
@@ -476,24 +531,62 @@ impl HttpBody for Content {
             };
             // At most READ_CHUNK, so the cast cannot truncate.
             let chunk_len = this.remaining.min(READ_CHUNK) as usize;
-            if let Some(pool) = this.gate_pool.clone() {
+            if let Some(guard) = this.gate.clone() {
                 this.pending = Some(tokio::spawn(async move {
-                    let open = match pool.acquire().await {
-                        Ok(mut conn) => crate::restore::lock_open_gate(&mut conn)
-                            .await
-                            .unwrap_or(false),
-                        Err(_) => false,
+                    let mut tx = match guard.pool.begin().await {
+                        Ok(tx) => tx,
+                        Err(_) => {
+                            drop(file);
+                            return Err(std::io::Error::other("restore reconciliation pending"));
+                        }
                     };
-                    if !open {
+                    let allowed = async {
+                        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '30s'")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("SET LOCAL statement_timeout = '10s'")
+                            .execute(&mut *tx)
+                            .await?;
+                        let current = crate::restore::lock_open_gate_generation(&mut tx).await?;
+                        if current != Some(guard.expected_generation) {
+                            return Ok::<bool, sqlx::Error>(false);
+                        }
+                        if guard.expected_generation > 0 {
+                            let active: bool = sqlx::query_scalar(
+                                "SELECT EXISTS (
+                                     SELECT 1
+                                       FROM openmettle.artifact_revisions
+                                      WHERE id = $1::uuid
+                                        AND state = 'active'
+                                 )",
+                            )
+                            .bind(&guard.revision_id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            return Ok(active);
+                        }
+                        Ok(true)
+                    }
+                    .await
+                    .unwrap_or(false);
+                    if !allowed {
+                        let _ = tx.rollback().await;
                         drop(file);
                         return Err(std::io::Error::other("restore reconciliation pending"));
                     }
-                    blocking(move || {
+                    // Hold `tx` (and `restore_reconciliation_gate FOR SHARE`) across `read_exact`,
+                    // then release immediately after the chunk finishes.
+                    let read_result = blocking(move || {
                         let mut chunk = vec![0; chunk_len];
                         file.read_exact(&mut chunk)?;
                         Ok((file, chunk))
                     })
-                    .await
+                    .await;
+                    let _ = tx.rollback().await;
+                    read_result
                 }));
             } else {
                 this.pending = Some(tokio::task::spawn_blocking(move || {
@@ -638,9 +731,9 @@ where
     let reservation =
         committed::<_, Error>(pool, async |tx| Ok(storage::reserve(tx, &input).await?)).await?;
     let id = reservation.id;
-    let staged = match reservation.state {
+    let (staged, gate_generation) = match reservation.state {
         ReservationState::Released => return Err(runs::Error::Conflict.into()),
-        ReservationState::Settled => None,
+        ReservationState::Settled => (None, None),
         ReservationState::Reserved => {
             committed(pool, async |tx| {
                 lock_writer(tx, &id, pin.as_deref(), false, None, false).await?;
@@ -648,13 +741,17 @@ where
                     .bind(&id).execute(tx.connection()?).await?;
                 Ok::<_, Error>(())
             }).await?;
-            let staged = committed(pool, async |tx| {
-                sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+            let (staged, gate_gen) = committed(pool, async |tx| {
+                sqlx::query(FS_TX_IDLE_TIMEOUT)
                     .execute(tx.connection()?)
                     .await?;
-                lock_writer(tx, &id, pin.as_deref(), true, None, false).await?;
+                let stage_deadline = Instant::now() + TX_FENCE_BUDGET;
+                let gate_gen = lock_writer(tx, &id, pin.as_deref(), true, None, false).await?;
                 if let Some(pin) = pin.as_deref() {
                     store.volume.verify(pin)?;
+                }
+                if Instant::now() >= stage_deadline {
+                    return Err(Error::Io);
                 }
                 let staged = store.stage(&id).await?;
                 store.volume.matches(
@@ -668,9 +765,9 @@ where
                     .bind(staged.ino.to_string())
                     .execute(tx.connection()?)
                     .await?;
-                Ok::<_, Error>(staged)
+                Ok::<_, Error>((staged, gate_gen))
             }).await?;
-            Some(staged)
+            (Some(staged), Some(gate_gen))
         }
     };
     let fresh = staged.is_some();
@@ -681,13 +778,32 @@ where
         staged,
     };
     let received = async {
-        while let Some(frame) = body.frame().await {
+        loop {
+            let next = if let Some(expected) = gate_generation {
+                match tokio::time::timeout(UPLOAD_GATE_POLL, body.frame()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        ensure_gate_generation(pool, expected).await?;
+                        continue;
+                    }
+                }
+            } else {
+                body.frame().await
+            };
+            let Some(frame) = next else {
+                break;
+            };
             let Ok(bytes) = frame.map_err(|_| Error::Body)?.into_data() else {
                 continue; // trailers carry no file bytes
             };
             let file = parser.feed(&bytes).map_err(Error::Multipart)?;
             if !file.is_empty() {
-                sink.write(file).await?;
+                for chunk in file.chunks(READ_CHUNK as usize) {
+                    if let Some(expected) = gate_generation {
+                        ensure_gate_generation(pool, expected).await?;
+                    }
+                    sink.write(chunk.to_vec()).await?;
+                }
             }
         }
         let form = parser.finish().map_err(Error::Multipart)?;
@@ -700,6 +816,12 @@ where
     .await;
     let form = match received {
         Ok(form) => form,
+        Err(Error::GateClosed) => {
+            // Drop `sink` immediately to release `LOCK_SH` without calling `abort(...)` so
+            // `scrub_unsettled_on_restore` can acquire `LOCK_EX` cleanly.
+            drop(sink);
+            return Err(Error::GateClosed);
+        }
         Err(error) if fresh => {
             drop(sink); // release the shared file lock before reclamation
             return Err(abort(pool, store, upload.scope, &id, error).await);
@@ -709,11 +831,17 @@ where
     let size_bytes = sink.size as i64;
     let content_digest: [u8; 32] = sink.hasher.finalize().into();
     let mut staged = sink.staged.take();
-    if let Some(file) = &mut staged
-        && let Err(error) = file.sync().await
-    {
-        drop(staged);
-        return Err(abort(pool, store, upload.scope, &id, error).await);
+    if let Some(file) = &mut staged {
+        if let Some(expected) = gate_generation
+            && let Err(error) = ensure_gate_generation(pool, expected).await
+        {
+            drop(staged);
+            return Err(error);
+        }
+        if let Err(error) = file.sync().await {
+            drop(staged);
+            return Err(abort(pool, store, upload.scope, &id, error).await);
+        }
     }
     let settlement = Settlement {
         scope: upload.scope,
@@ -727,10 +855,17 @@ where
         let mut connection = pool.acquire().await.map_err(runs::Error::from)?;
         let mut tx = WriteTransaction::begin(&mut connection).await?;
         let published = async {
-            sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+            sqlx::query(FS_TX_IDLE_TIMEOUT)
                 .execute(tx.connection()?)
                 .await?;
-            lock_writer(&mut tx, &id, pin.as_deref(), true, Some(file.ino), false).await?;
+            let fence_deadline = Instant::now() + TX_FENCE_BUDGET;
+            let pub_gen =
+                lock_writer(&mut tx, &id, pin.as_deref(), true, Some(file.ino), false).await?;
+            if let Some(expected) = gate_generation
+                && pub_gen != expected
+            {
+                return Err(Error::GateClosed);
+            }
             store.volume.matches(
                 file.file.as_ref().ok_or(Error::Io)?,
                 &store.volume.staging,
@@ -746,7 +881,7 @@ where
             if let Some(pin) = &pin {
                 store.volume.verify(pin)?;
             }
-            if file.publish().is_err() {
+            if file.publish(fence_deadline).is_err() {
                 sqlx::query(
                     "UPDATE openmettle.storage_reservations
                         SET adoption_unverified=true, publish_pending=false
@@ -762,29 +897,44 @@ where
             Ok(true)
         }
         .await;
-        match published {
-            Ok(true) => {
-                if let Err(err) = tx.commit().await {
-                    let _ = quarantine_writer(pool, &id, file.ino).await;
-                    return Err(err.into());
-                }
-            }
-            Ok(false) => {
-                if let Err(err) = tx.commit().await {
-                    let _ = quarantine_writer(pool, &id, file.ino).await;
-                    return Err(err.into());
-                }
-                return Err(Error::Io);
-            }
+        let commit_result = match published {
+            Ok(flag) => tx.commit().await.map(|()| flag),
             Err(error) => {
                 let _ = tx.rollback().await;
+                drop(connection);
                 return Err(error);
+            }
+        };
+        match commit_result {
+            Ok(true) => drop(connection),
+            Ok(false) => {
+                drop(connection);
+                return Err(Error::Io);
+            }
+            Err(err) => {
+                // Close and release the checked-out connection before `quarantine_writer` acquires
+                // from `pool` so a 1-connection pool never deadlocks on commit failure.
+                let _ = connection.close().await;
+                if let Err(q_err) = quarantine_writer(pool, &id, file.ino).await {
+                    tracing::error!(
+                        reservation_id = %id,
+                        "failed to quarantine artifact reservation after publish commit failure"
+                    );
+                    return Err(q_err);
+                }
+                return Err(err.into());
             }
         }
     }
     let revision = committed(pool, async |tx| {
         if let Some(file) = staged.as_ref() {
-            lock_writer(tx, &id, pin.as_deref(), true, Some(file.ino), true).await?;
+            let settle_gen =
+                lock_writer(tx, &id, pin.as_deref(), true, Some(file.ino), true).await?;
+            if let Some(expected) = gate_generation
+                && settle_gen != expected
+            {
+                return Err(Error::GateClosed);
+            }
         }
         let revision = storage::settle(tx, &settlement).await?;
         if let Some(file) = staged.as_ref() {
@@ -809,8 +959,13 @@ where
     .await;
     if matches!(revision, Err(Error::Io))
         && let Some(file) = staged.as_ref()
+        && let Err(q_err) = quarantine_writer(pool, &id, file.ino).await
     {
-        quarantine_writer(pool, &id, file.ino).await?;
+        tracing::error!(
+            reservation_id = %id,
+            "failed to quarantine artifact reservation after settlement I/O failure"
+        );
+        return Err(q_err);
     }
     let revision = revision?;
     if let Some(file) = staged {
@@ -829,6 +984,14 @@ where
     })
 }
 
+async fn ensure_gate_generation(pool: &PgPool, expected: i64) -> Result<(), Error> {
+    let mut conn = pool.acquire().await.map_err(runs::Error::from)?;
+    match crate::restore::lock_open_gate_generation(&mut conn).await? {
+        Some(current) if current == expected => Ok(()),
+        _ => Err(Error::GateClosed),
+    }
+}
+
 async fn quarantine_writer(pool: &PgPool, id: &str, ino: u64) -> Result<(), Error> {
     sqlx::query(
         "UPDATE openmettle.storage_reservations SET adoption_unverified=true,publish_pending=false
@@ -842,6 +1005,44 @@ async fn quarantine_writer(pool: &PgPool, id: &str, ino: u64) -> Result<(), Erro
     Ok(())
 }
 
+/// Deterministic integration-test hook verifying `quarantine_writer` recovery after a failed
+/// commit on a 1-connection pool releases the checked-out connection before re-acquiring.
+#[doc(hidden)]
+pub async fn quarantine_after_commit_failure_for_test(
+    pool: &PgPool,
+    id: &str,
+    ino: u64,
+    simulate_commit_err: bool,
+) -> Result<(), Error> {
+    let mut connection = pool.acquire().await.map_err(runs::Error::from)?;
+    let tx = WriteTransaction::begin(&mut connection).await?;
+    let outcome: Result<(), runs::Error> = if simulate_commit_err {
+        let _ = tx.rollback().await;
+        Err(runs::Error::Database(sqlx::Error::Protocol(
+            "simulated commit failure".into(),
+        )))
+    } else {
+        tx.commit().await
+    };
+    match outcome {
+        Ok(()) => {
+            drop(connection);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = connection.close().await;
+            if let Err(q_err) = quarantine_writer(pool, id, ino).await {
+                tracing::error!(
+                    reservation_id = %id,
+                    "failed to quarantine artifact reservation after publish commit failure"
+                );
+                return Err(q_err);
+            }
+            Err(err.into())
+        }
+    }
+}
+
 async fn lock_writer(
     tx: &mut WriteTransaction<'_>,
     id: &str,
@@ -849,7 +1050,7 @@ async fn lock_writer(
     claimed: bool,
     ino: Option<u64>,
     pending: bool,
-) -> Result<(), Error> {
+) -> Result<i64, Error> {
     let ok: Option<bool> = sqlx::query_scalar(
         "SELECT stage_claimed=$2 AND publish_pending=$4 AND payload_ino IS NOT DISTINCT FROM $3::text::numeric
         AND NOT adoption_unverified AND reclaim_state='none' FROM openmettle.storage_reservations
@@ -864,11 +1065,10 @@ async fn lock_writer(
     if ok != Some(true) {
         return Err(Error::InProgress);
     }
-    if !crate::restore::lock_open_gate(tx.connection()?).await? {
-        return Err(Error::Storage(runs::Error::Database(
-            sqlx::Error::Protocol("restore reconciliation pending".into()),
-        )));
-    }
+    let Some(generation) = crate::restore::lock_open_gate_generation(tx.connection()?).await?
+    else {
+        return Err(Error::GateClosed);
+    };
     let (vol, adopting): (Option<String>, bool) = sqlx::query_as(
         "SELECT volume_id::text,adoption_run_id IS NOT NULL
         FROM openmettle.storage_volume_control WHERE id",
@@ -881,7 +1081,7 @@ async fn lock_writer(
     if let Some(expected) = pin {
         reclaim::lock_pin(tx, expected).await?;
     }
-    Ok(())
+    Ok(generation)
 }
 async fn abort(pool: &PgPool, store: &Store, scope: &str, id: &str, error: Error) -> Error {
     let _ = reclaim::release(pool, store, scope, id, None, false).await;

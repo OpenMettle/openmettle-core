@@ -216,12 +216,13 @@ fn revision_json(r: &Revision) -> Result<Value, Problem> {
 
 fn ingest_problem(error: artifact_fs::Error) -> Problem {
     use artifact_fs::Error::{
-        Body, InProgress, Io, Missing, Multipart, Rejected, Storage, TooLarge,
+        Body, GateClosed, InProgress, Io, Missing, Multipart, Rejected, Storage, TooLarge,
     };
     match error {
         Multipart(_) | Rejected | Body => BODY,
         TooLarge => TOO_LARGE,
         InProgress => IN_PROGRESS,
+        GateClosed => UNAVAILABLE,
         Io | Missing => INTERNAL,
         Storage(error) => storage_problem(error),
     }
@@ -421,7 +422,7 @@ impl Api {
                 let outcome = async {
                     let conn = tx.connection()?;
                     let principal = principal(conn, &context).await?;
-                    restore::require_open_gate(conn).await?;
+                    let expected_generation = restore::require_open_gate_generation(conn).await?;
                     let now = context.observed_ms();
                     projects::authorize_artifact(conn, &principal, artifact, Action::Download, now)
                         .await?;
@@ -443,6 +444,8 @@ impl Api {
                         .read_gated_on(
                             conn,
                             self.pool.clone(),
+                            expected_generation,
+                            &revision.id,
                             &revision.reservation_id,
                             revision.size_bytes,
                             first,
@@ -450,7 +453,8 @@ impl Api {
                         )
                         .await
                         .map_err(|err| match err {
-                            artifact_fs::Error::Storage(runs::Error::Database(_)) => UNAVAILABLE,
+                            artifact_fs::Error::GateClosed
+                            | artifact_fs::Error::Storage(runs::Error::Database(_)) => UNAVAILABLE,
                             _ => INTERNAL,
                         })?;
                     Ok::<_, Problem>(DownloadPlan::Stream(Box::new(DownloadStream {

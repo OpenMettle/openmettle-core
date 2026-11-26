@@ -259,7 +259,7 @@ async fn publish(
         if step.stop.borrow().is_some() || Instant::now() >= step.deadline {
             return Err(Error::InProgress);
         }
-        stage.0.publish()?;
+        stage.0.publish(step.deadline.into())?;
         stage.0.volume.verify(&pin_copy)?;
         Ok::<_, Error>(Arc::new(stage))
     })

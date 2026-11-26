@@ -828,6 +828,38 @@ struct Api {
     streams: Arc<Semaphore>,
 }
 
+/// Optional validated catalog, admission limits and cursor keys extracted from `AuthConfig` and
+/// attached as Axum extensions onto a `/v1` router.
+#[doc(hidden)]
+pub struct AuthExtensions {
+    catalog: Option<crate::model_config::Catalog>,
+    admission_limits: Option<crate::authz::runs::AdmissionLimits>,
+    cursor_keys: Option<crate::auth_config::CursorKeys>,
+}
+
+impl AuthExtensions {
+    pub fn take(settings: &mut crate::auth_config::AuthConfig) -> Self {
+        Self {
+            catalog: settings.catalog.take(),
+            admission_limits: settings.admission_limits.take(),
+            cursor_keys: settings.cursor_keys.take(),
+        }
+    }
+
+    pub fn apply(self, mut router: Router) -> Router {
+        if let Some(catalog) = self.catalog {
+            router = router.layer(axum::Extension(Arc::new(catalog)));
+        }
+        if let Some(limits) = self.admission_limits {
+            router = router.layer(axum::Extension(limits));
+        }
+        if let Some(keys) = self.cursor_keys {
+            router = router.layer(axum::Extension(Arc::new(keys)));
+        }
+        router
+    }
+}
+
 /// Builds the `/v1` routes over the mounted browser service, the optional native service, the
 /// configured browser origin, the primary pool and the optional artifact store. Mount it with
 /// `Router::merge`; the sign-in settings checks refuse every `/v1` path

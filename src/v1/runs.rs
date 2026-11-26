@@ -17,7 +17,7 @@ use tokio::{
 
 pub(super) const SSE_MAX_IN_FLIGHT: usize = 128;
 const BATCH_LIMIT: i64 = 16;
-const CHANNEL_FRAMES: usize = 8;
+const CHANNEL_FRAMES: usize = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const REAUTH_INTERVAL: Duration = Duration::from_secs(10);
@@ -304,14 +304,21 @@ impl Api {
     ) -> Result<Response, Problem> {
         let row = self
             .database(async |c| {
-                crate::restore::require_open_gate(c).await?;
-                let row = sqlx::query(SNAPSHOT)
-                    .bind(run)
-                    .fetch_optional(&mut *c)
-                    .await?
-                    .ok_or(StoreError::NotFound)?;
-                authorize(c, context, &row, min_now_ms).await?;
-                Ok(row)
+                let mut tx = authz::store::begin(c).await?;
+                let result = async {
+                    let conn = tx.connection()?;
+                    crate::restore::require_open_gate(conn).await?;
+                    let row = sqlx::query(SNAPSHOT)
+                        .bind(run)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .ok_or(StoreError::NotFound)?;
+                    authorize(conn, context, &row, min_now_ms).await?;
+                    Ok::<_, StoreError>(row)
+                }
+                .await;
+                let _ = tx.rollback().await;
+                result
             })
             .await?;
         let last = last_sequence(&row)?;
@@ -385,6 +392,7 @@ impl Api {
             keys,
             position,
             authorized_at: Instant::now(),
+            gate_generation: None,
         };
         let first = stream.batch(true).await?;
         if let Some(cursor) = cursor? {
@@ -445,6 +453,7 @@ struct Subscription {
     keys: Arc<CursorKeys>,
     position: i64,
     authorized_at: Instant,
+    gate_generation: Option<i64>,
 }
 impl Subscription {
     fn binding<'a>(&'a self, scope: &'a str) -> Binding<'a> {
@@ -455,31 +464,97 @@ impl Subscription {
         }
     }
 
+    async fn check_gate_generation(&self) -> Result<(), Problem> {
+        let Some(expected) = self.gate_generation else {
+            return Ok(());
+        };
+        let current = self
+            .api
+            .database(async |c| {
+                Ok::<_, StoreError>(crate::restore::lock_open_gate_generation(c).await?)
+            })
+            .await?;
+        if current != Some(expected) {
+            return Err(UNAVAILABLE);
+        }
+        Ok(())
+    }
+
+    async fn send_gated(&self, tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
+        // Wait for backpressure clearance BEFORE checking the restore gate so any gate closure
+        // or close/reopen generation cycle that happened while blocked aborts delivery immediately.
+        let permit = reserve_send(tx).await?;
+        if let Err(err) = self.check_gate_generation().await {
+            drop(permit);
+            return Err(err);
+        }
+        permit.send(bytes);
+        Ok(())
+    }
+
     /// The native and browser validators manage their own checkout. Release the batch
     /// checkout first, so revalidation works even with a single primary pool slot.
     async fn batch(&mut self, first: bool) -> Result<Batch, Problem> {
         tokio::time::timeout(OPERATION_TIMEOUT, async {
-            let row = self
+            let expected_gen = self.gate_generation;
+            let (generation, row) = self
                 .api
                 .database(async |c| {
-                    crate::restore::require_open_gate(c).await?;
-                    sqlx::query(BATCH)
-                        .bind(&self.run)
-                        .bind(self.position)
-                        .bind(BATCH_LIMIT)
-                        .fetch_optional(c)
-                        .await?
-                        .ok_or(StoreError::NotFound)
+                    let mut tx = authz::store::begin(c).await?;
+                    let result = async {
+                        let conn = tx.connection()?;
+                        let generation = crate::restore::require_open_gate_generation(conn).await?;
+                        if let Some(expected) = expected_gen
+                            && generation != expected
+                        {
+                            return Err(StoreError::Database(sqlx::Error::Protocol(
+                                "restore reconciliation pending".into(),
+                            )));
+                        }
+                        let row = sqlx::query(BATCH)
+                            .bind(&self.run)
+                            .bind(self.position)
+                            .bind(BATCH_LIMIT)
+                            .fetch_optional(&mut *conn)
+                            .await?
+                            .ok_or(StoreError::NotFound)?;
+                        Ok::<_, StoreError>((generation, row))
+                    }
+                    .await;
+                    let _ = tx.rollback().await;
+                    result
                 })
                 .await?;
+            if self.gate_generation.is_none() {
+                self.gate_generation = Some(generation);
+            }
             let events: Vec<StoredEvent> = row.get("events");
             if first || !events.is_empty() || self.authorized_at.elapsed() >= REAUTH_INTERVAL {
                 let context = self.api.authenticate(&self.session).await?;
                 if context.user_id() != self.user {
                     return Err(UNAUTHENTICATED);
                 }
+                let expected_gen = self.gate_generation;
                 self.api
-                    .database(async |c| authorize(c, &context, &row, context.observed_ms()).await)
+                    .database(async |c| {
+                        let mut tx = authz::store::begin(c).await?;
+                        let result = async {
+                            let conn = tx.connection()?;
+                            let generation =
+                                crate::restore::require_open_gate_generation(conn).await?;
+                            if let Some(expected) = expected_gen
+                                && generation != expected
+                            {
+                                return Err(StoreError::Database(sqlx::Error::Protocol(
+                                    "restore reconciliation pending".into(),
+                                )));
+                            }
+                            authorize(conn, &context, &row, context.observed_ms()).await
+                        }
+                        .await;
+                        let _ = tx.rollback().await;
+                        result
+                    })
                     .await?;
                 self.authorized_at = Instant::now();
             }
@@ -495,7 +570,7 @@ impl Subscription {
     }
 
     async fn deliver(&mut self, mut batch: Batch, tx: &mpsc::Sender<Bytes>) -> Result<(), Problem> {
-        send(tx, HEARTBEAT).await?;
+        self.send_gated(tx, HEARTBEAT).await?;
         let mut last_write = Instant::now();
         loop {
             let full = batch.events.len() == BATCH_LIMIT as usize;
@@ -503,7 +578,7 @@ impl Subscription {
                 let sequence = stored.0;
                 if let Some(event) = event(&self.run, &stored)? {
                     let id = self.binding(&batch.scope).sign(&self.keys, sequence);
-                    send(tx, frame(&id, &event)?).await?;
+                    self.send_gated(tx, frame(&id, &event)?).await?;
                     last_write = Instant::now();
                 }
                 self.position = sequence;
@@ -512,7 +587,7 @@ impl Subscription {
                 return Ok(());
             }
             if last_write.elapsed() >= HEARTBEAT_INTERVAL {
-                send(tx, HEARTBEAT).await?;
+                self.send_gated(tx, HEARTBEAT).await?;
                 last_write = Instant::now();
             }
             if !full {
@@ -523,8 +598,8 @@ impl Subscription {
     }
 }
 
-async fn send(tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
-    tokio::time::timeout(WRITE_TIMEOUT, tx.send(bytes))
+async fn reserve_send(tx: &mpsc::Sender<Bytes>) -> Result<mpsc::Permit<'_, Bytes>, Problem> {
+    tokio::time::timeout(WRITE_TIMEOUT, tx.reserve())
         .await
         .map_err(|_| TIMEOUT)?
         .map_err(|_| UNAVAILABLE)
@@ -718,7 +793,11 @@ mod tests {
                 biased;
                 _ = stopping(Some(stop_rx)) => Ok(()),
                 _ = tx.closed() => Ok(()),
-                result = send(&tx, Bytes::from_static(b"overflow")) => result,
+                result = async {
+                    let permit = reserve_send(&tx).await?;
+                    permit.send(Bytes::from_static(b"overflow"));
+                    Ok(())
+                } => result,
             }
         });
 

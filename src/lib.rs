@@ -402,11 +402,9 @@ fn app(
         return Ok((operational, None));
     };
     let (mut settings, profile) = auth_config::load_browser(path)?;
-    let catalog = settings.catalog.take();
-    let admission_limits = settings.admission_limits;
-    let cursor_keys = settings.cursor_keys.take();
     let native = settings.native().cloned();
     let issuance = lazy_pool(issuance, *connections, config.database_timeout);
+    let v1_extensions = v1::AuthExtensions::take(&mut settings);
     let service = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance.clone()));
     let handoff = LoginHandoff::new(service.clone(), profile.handoff())
         .map_err(auth_config::Error::BrowserHandoff)?;
@@ -426,16 +424,7 @@ fn app(
         bearer = Some(auth);
     }
     let origin = profile.handoff().origin;
-    let mut v1 = v1::router(service, bearer, origin, pool.clone(), artifacts);
-    if let Some(catalog) = catalog {
-        v1 = v1.layer(axum::Extension(Arc::new(catalog)));
-    }
-    if let Some(limits) = admission_limits {
-        v1 = v1.layer(axum::Extension(limits));
-    }
-    if let Some(keys) = cursor_keys {
-        v1 = v1.layer(axum::Extension(Arc::new(keys)));
-    }
+    let v1 = v1_extensions.apply(v1::router(service, bearer, origin, pool.clone(), artifacts));
     Ok((app.merge(v1), Some(issuance)))
 }
 

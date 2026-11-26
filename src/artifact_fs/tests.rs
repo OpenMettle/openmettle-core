@@ -162,11 +162,12 @@ async fn publish_never_replaces_a_collision_and_preserves_both_links_until_detac
         staged.write(chunk).await.unwrap();
     }
     staged.sync().await.unwrap();
-    assert!(staged.publish().is_err());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    assert!(staged.publish(deadline).is_err());
     let published = Path::new(&dir.path("root/revisions")).join(RESERVATION);
     assert_eq!(fs::read(&published).unwrap(), b"stale");
     fs::remove_file(&published).unwrap();
-    staged.publish().unwrap();
+    staged.publish(deadline).unwrap();
     let ino = staged.ino;
     assert_eq!(fs::metadata(&published).unwrap().ino(), ino);
     assert_eq!(mode(&published), 0o600);
@@ -312,4 +313,25 @@ fn unlink_before_refuses_expired_deadline_and_leaves_file_intact() {
     v.unlink_before(&v.staging, RESERVATION, ino, valid)
         .unwrap();
     assert!(!file_path.exists());
+}
+
+#[tokio::test]
+async fn publish_refuses_expired_fence_deadline_without_linking_revision() {
+    let dir = Dir::new();
+    let store = store(&dir);
+    let mut staged = store.stage(RESERVATION).await.unwrap();
+    staged.write(b"fenced-payload".to_vec()).await.unwrap();
+    staged.sync().await.unwrap();
+
+    let expired = Instant::now() - Duration::from_secs(1);
+    assert!(matches!(staged.publish(expired), Err(Error::Io)));
+    let published = Path::new(&dir.path("root/revisions")).join(RESERVATION);
+    assert!(
+        !published.exists(),
+        "expired fence deadline must abort before at::linkat"
+    );
+
+    let valid = Instant::now() + Duration::from_secs(60);
+    staged.publish(valid).unwrap();
+    assert_eq!(fs::read(&published).unwrap(), b"fenced-payload");
 }

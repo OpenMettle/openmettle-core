@@ -1,9 +1,12 @@
 -- V1-16 migration 42 (ADR 0041 PR3): journaled deadline commitments and pre-expiry restores,
+-- immutable pre-42 upgrade baseline (retention_upgrade_baseline + lifecycle_baseline_digest),
 -- lifecycle journal origin cutoff (rejecting pre-42 backups under --export-complete unless
--- explicitly accepted via audited break-glass), extended restore-gate guards on artifact_revisions,
--- live-reference and hold check helpers for disassociation/restore, least-privilege API
--- restore-gate helper execution, idempotent retention_set_grace, audited account_admin deadline
--- preview/apply, and audited admin_retention_status projection. Released migrations are immutable.
+-- explicitly accepted via audited break-glass), monotonic restore-gate generation counter and
+-- generation-returning lock helper (restore_gate_lock_open_generation), extended restore-gate
+-- guards on artifact_revisions, live-reference and hold check helpers for disassociation/restore,
+-- least-privilege API restore-gate helper execution, idempotent retention_set_grace, audited
+-- account_admin deadline preview/apply, and audited admin_retention_status projection. Released
+-- migrations are immutable.
 -- Runs once per release as openmettle_owner in one transaction with search_path
 -- pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
 --
@@ -59,30 +62,143 @@ BEGIN
 END
 $$;
 
--- Record when lifecycle commitment journaling began (migration 42 installation) so a backup taken
--- at schema <= 41 and migrated to 42 during recovery gets a distinct lifecycle_coverage_started_at
--- timestamp and cannot reopen under --export-complete without audited break-glass acceptance.
+-- Capture an immutable, owner-only baseline snapshot of all pre-42 retained/purging revisions so
+-- restoring an older schema-41 backup (where those revisions were still active) replays every
+-- pre-42 disassociation and deadline deterministically before post-42 deletion_journal records,
+-- without mutating deletion_journal during migration 42.
+CREATE TABLE openmettle.retention_upgrade_baseline (
+    artifact_revision_id uuid PRIMARY KEY,
+    scope_id uuid NOT NULL,
+    retained_at timestamptz NOT NULL,
+    original_purge_after timestamptz NOT NULL,
+    content_digest bytea NOT NULL CHECK (pg_catalog.octet_length(content_digest) = 32),
+    policy_revision bigint CHECK (policy_revision IS NULL OR policy_revision >= 1),
+    CHECK (original_purge_after >= retained_at)
+);
+REVOKE ALL ON TABLE openmettle.retention_upgrade_baseline FROM PUBLIC;
+
+INSERT INTO openmettle.retention_upgrade_baseline (
+    artifact_revision_id,
+    scope_id,
+    retained_at,
+    original_purge_after,
+    content_digest,
+    policy_revision
+)
+SELECT id,
+       scope_id,
+       retained_at,
+       purge_after,
+       content_digest,
+       retention_policy_revision
+  FROM openmettle.artifact_revisions
+ WHERE state IN ('retained', 'purging')
+ ORDER BY id ASC;
+
+CREATE FUNCTION openmettle.retention_upgrade_baseline_immutable()
+RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+BEGIN
+    RAISE EXCEPTION 'retention_upgrade_baseline is immutable' USING ERRCODE = 'OMR01';
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.retention_upgrade_baseline_immutable() FROM PUBLIC;
+
+CREATE TRIGGER retention_upgrade_baseline_no_mutate
+    BEFORE INSERT OR UPDATE OR DELETE ON openmettle.retention_upgrade_baseline
+    FOR EACH ROW
+    EXECUTE FUNCTION openmettle.retention_upgrade_baseline_immutable();
+
+CREATE TRIGGER retention_upgrade_baseline_no_truncate
+    BEFORE TRUNCATE ON openmettle.retention_upgrade_baseline
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION openmettle.retention_upgrade_baseline_immutable();
+
+-- Canonical folded SHA-256 step over retention_upgrade_baseline rows ordered by
+-- artifact_revision_id ASC (starting from 32 zero bytes when empty).
+CREATE FUNCTION openmettle.retention_baseline_step(
+    p_previous bytea,
+    p_entity_id uuid,
+    p_scope_id uuid,
+    p_retained_us bigint,
+    p_original_purge_after_us bigint,
+    p_content_digest bytea,
+    p_policy_revision bigint)
+RETURNS bytea LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$
+    SELECT sha256(convert_to(
+        encode(p_previous, 'hex') || ':' ||
+        p_entity_id::text || ':' ||
+        p_scope_id::text || ':' ||
+        p_retained_us::text || ':' ||
+        p_original_purge_after_us::text || ':' ||
+        encode(p_content_digest, 'hex') || ':' ||
+        coalesce(p_policy_revision::text, '-'),
+        'UTF8'
+    ))
+$$;
+REVOKE ALL ON FUNCTION openmettle.retention_baseline_step(bytea, uuid, uuid, bigint, bigint, bytea, bigint) FROM PUBLIC;
+
+-- Record when lifecycle commitment journaling began (migration 42 installation) and commit the
+-- canonical digest of retention_upgrade_baseline so a backup taken at schema <= 41 and migrated
+-- to 42 during recovery gets a distinct lifecycle_coverage_started_at timestamp, cannot reopen
+-- under --export-complete without audited break-glass acceptance, and replays the primary's
+-- pre-42 retained/purging baseline before deletion_journal records.
 ALTER TABLE openmettle.deletion_journal_head
-    ADD COLUMN lifecycle_coverage_started_at timestamptz;
+    ADD COLUMN lifecycle_coverage_started_at timestamptz,
+    ADD COLUMN lifecycle_baseline_digest bytea;
 DO $$
 DECLARE
     v_started timestamptz;
+    v_baseline_digest bytea := pg_catalog.decode(pg_catalog.repeat('00', 32), 'hex');
+    r record;
 BEGIN
     IF pg_catalog.to_regclass('openmettle._sqlx_migrations') IS NOT NULL THEN
         EXECUTE 'SELECT installed_on FROM openmettle._sqlx_migrations WHERE version = 42'
            INTO v_started;
     END IF;
+    FOR r IN
+        SELECT artifact_revision_id,
+               scope_id,
+               round(extract(epoch FROM retained_at) * 1000000)::bigint AS retained_us,
+               round(extract(epoch FROM original_purge_after) * 1000000)::bigint AS purge_after_us,
+               content_digest,
+               policy_revision
+          FROM openmettle.retention_upgrade_baseline
+         ORDER BY artifact_revision_id ASC
+    LOOP
+        v_baseline_digest := openmettle.retention_baseline_step(
+            v_baseline_digest,
+            r.artifact_revision_id,
+            r.scope_id,
+            r.retained_us,
+            r.purge_after_us,
+            r.content_digest,
+            r.policy_revision
+        );
+    END LOOP;
     UPDATE openmettle.deletion_journal_head
-       SET lifecycle_coverage_started_at = coalesce(v_started, pg_catalog.clock_timestamp())
+       SET lifecycle_coverage_started_at = coalesce(v_started, pg_catalog.clock_timestamp()),
+           lifecycle_baseline_digest = v_baseline_digest
      WHERE id;
 END
 $$;
 ALTER TABLE openmettle.deletion_journal_head
     ALTER COLUMN lifecycle_coverage_started_at SET NOT NULL,
-    ALTER COLUMN lifecycle_coverage_started_at SET DEFAULT clock_timestamp();
+    ALTER COLUMN lifecycle_coverage_started_at SET DEFAULT clock_timestamp(),
+    ALTER COLUMN lifecycle_baseline_digest SET NOT NULL,
+    ALTER COLUMN lifecycle_baseline_digest SET DEFAULT decode(repeat('00', 32), 'hex'),
+    ADD CONSTRAINT deletion_journal_head_lifecycle_baseline_digest_check
+        CHECK (pg_catalog.octet_length(lifecycle_baseline_digest) = 32);
 
 ALTER TABLE openmettle.restore_reconciliation_gate
     ADD COLUMN required_lifecycle_origin_us bigint,
+    ADD COLUMN required_lifecycle_baseline_digest bytea
+        CHECK (required_lifecycle_baseline_digest IS NULL
+            OR pg_catalog.octet_length(required_lifecycle_baseline_digest) = 32),
+    ADD COLUMN replayed_lifecycle_baseline_digest bytea
+        CHECK (replayed_lifecycle_baseline_digest IS NULL
+            OR pg_catalog.octet_length(replayed_lifecycle_baseline_digest) = 32),
+    ADD COLUMN gate_generation bigint NOT NULL DEFAULT 1
+        CHECK (gate_generation >= 1),
     DROP CONSTRAINT restore_reconciliation_gate_closed_check,
     ADD CONSTRAINT restore_reconciliation_gate_closed_check CHECK (
         (
@@ -90,6 +206,8 @@ ALTER TABLE openmettle.restore_reconciliation_gate
             AND restore_run_id IS NULL
             AND required_origin_us IS NULL
             AND required_lifecycle_origin_us IS NULL
+            AND required_lifecycle_baseline_digest IS NULL
+            AND replayed_lifecycle_baseline_digest IS NULL
             AND checkpoints = '[]'::jsonb
             AND volume_claim_token IS NULL
             AND volume_lease_until IS NULL
@@ -325,10 +443,13 @@ CREATE CONSTRAINT TRIGGER artifact_revisions_lifecycle_journal
     )
     EXECUTE FUNCTION openmettle.deletion_journal_append_lifecycle();
 
--- Owner only: close or update the restore reconciliation gate, enforcing both coverage_started_at
--- (migration 28) and lifecycle_coverage_started_at (migration 42). Backups predating migration 42
--- or exports lacking a matching lifecycle_origin cannot set coverage_complete = true (OMR04) and
--- require audited restore.accept_coverage_gap before the gate may open.
+-- Owner only: close or update the restore reconciliation gate, enforcing coverage_started_at
+-- (migration 28), lifecycle_coverage_started_at (migration 42), and optional
+-- required_lifecycle_baseline_digest. Increments gate_generation whenever transitioning from
+-- open to closed so slow downloads, SSE streams and uploads cannot span a close/replay/reopen
+-- cycle. Backups predating migration 42 or exports lacking a matching lifecycle_origin cannot
+-- set coverage_complete = true (OMR04) and require audited restore.accept_coverage_gap before
+-- the gate may open.
 DROP FUNCTION openmettle.restore_gate_lock(bigint, bigint, bytea, boolean, uuid, boolean);
 
 CREATE FUNCTION openmettle.restore_gate_lock(
@@ -338,7 +459,8 @@ CREATE FUNCTION openmettle.restore_gate_lock(
     p_coverage_complete boolean,
     p_replace_restore_run uuid DEFAULT NULL,
     p_new_restore boolean DEFAULT true,
-    p_lifecycle_origin_us bigint DEFAULT NULL)
+    p_lifecycle_origin_us bigint DEFAULT NULL,
+    p_lifecycle_baseline_digest bytea DEFAULT NULL)
 RETURNS openmettle.restore_reconciliation_gate
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
@@ -357,7 +479,9 @@ BEGIN
     END IF;
     IF p_origin_us IS NULL OR p_required_seq IS NULL OR p_required_seq < 0
        OR p_required_digest IS NULL OR octet_length(p_required_digest) <> 32
-       OR p_coverage_complete IS NULL OR p_new_restore IS NULL THEN
+       OR p_coverage_complete IS NULL OR p_new_restore IS NULL
+       OR (p_lifecycle_baseline_digest IS NOT NULL AND octet_length(p_lifecycle_baseline_digest) <> 32)
+       OR (p_lifecycle_baseline_digest IS NOT NULL AND p_lifecycle_origin_us IS NULL) THEN
         RAISE EXCEPTION 'invalid restore gate lock parameters' USING ERRCODE = '22023';
     END IF;
     IF p_required_seq = 0 AND p_required_digest <> v_genesis THEN
@@ -369,6 +493,7 @@ BEGIN
             RAISE EXCEPTION 'cannot replace a restore run while the restore gate is open'
                 USING ERRCODE = 'OMR02';
         END IF;
+        g.gate_generation := g.gate_generation + 1;
     ELSE
         IF p_replace_restore_run IS NULL OR p_replace_restore_run IS DISTINCT FROM g.restore_run_id THEN
             RAISE EXCEPTION 'restore gate is already closed; pass --replace-restore-run matching current restore_run_id'
@@ -392,6 +517,12 @@ BEGIN
        AND (p_lifecycle_origin_us IS NULL OR p_lifecycle_origin_us IS DISTINCT FROM v_head_lifecycle_origin_us) THEN
         RAISE EXCEPTION 'cannot assert complete export coverage when lifecycle journal origin % does not match restored %',
             p_lifecycle_origin_us, v_head_lifecycle_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_coverage_complete
+       AND p_lifecycle_baseline_digest IS NOT NULL
+       AND p_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'cannot assert complete export coverage when lifecycle baseline digest does not match restored head'
+            USING ERRCODE = 'OMR04';
     END IF;
     IF p_required_seq <= head.journal_seq THEN
         IF p_required_seq = 0 THEN
@@ -421,6 +552,8 @@ BEGIN
         g.restore_run_id := gen_random_uuid();
         g.required_origin_us := p_origin_us;
         g.required_lifecycle_origin_us := p_lifecycle_origin_us;
+        g.required_lifecycle_baseline_digest := p_lifecycle_baseline_digest;
+        g.replayed_lifecycle_baseline_digest := NULL;
         g.snapshot_journal_seq := head.journal_seq;
         g.locked_at := clock_timestamp();
         g.opened_at := NULL;
@@ -453,6 +586,14 @@ BEGIN
         END IF;
         IF g.required_lifecycle_origin_us IS NULL AND p_lifecycle_origin_us IS NOT NULL THEN
             g.required_lifecycle_origin_us := p_lifecycle_origin_us;
+        END IF;
+        IF g.required_lifecycle_baseline_digest IS NOT NULL
+           AND p_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+            RAISE EXCEPTION 'required lifecycle baseline digest conflicts with locked restore baseline'
+                USING ERRCODE = 'OMR04';
+        END IF;
+        IF g.required_lifecycle_baseline_digest IS NULL AND p_lifecycle_baseline_digest IS NOT NULL THEN
+            g.required_lifecycle_baseline_digest := p_lifecycle_baseline_digest;
         END IF;
         IF EXISTS (
             SELECT FROM pg_catalog.jsonb_array_elements(g.checkpoints) AS c
@@ -488,6 +629,9 @@ BEGIN
            restore_run_id = g.restore_run_id,
            required_origin_us = g.required_origin_us,
            required_lifecycle_origin_us = g.required_lifecycle_origin_us,
+           required_lifecycle_baseline_digest = g.required_lifecycle_baseline_digest,
+           replayed_lifecycle_baseline_digest = g.replayed_lifecycle_baseline_digest,
+           gate_generation = g.gate_generation,
            snapshot_journal_seq = g.snapshot_journal_seq,
            required_journal_seq = g.required_journal_seq,
            required_chain_digest = g.required_chain_digest,
@@ -502,29 +646,36 @@ BEGIN
     RETURN g;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.restore_gate_lock(bigint, bigint, bytea, boolean, uuid, boolean, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_lock(bigint, bigint, bytea, boolean, uuid, boolean, bigint, bytea) FROM PUBLIC;
 
--- Owner only: validate an export's watermark, installation origin and lifecycle origin against the
--- closed restore gate before deletion_journal_replay writes any row.
+-- Owner only: validate an export's watermark, installation origin, lifecycle origin and
+-- lifecycle baseline digest against the closed restore gate before replay writes any row.
 DROP FUNCTION openmettle.restore_verify_export(bigint, bigint, bytea);
 
 CREATE FUNCTION openmettle.restore_verify_export(
     p_origin_us bigint,
     p_export_seq bigint,
     p_export_digest bytea,
-    p_lifecycle_origin_us bigint DEFAULT NULL)
+    p_lifecycle_origin_us bigint DEFAULT NULL,
+    p_lifecycle_baseline_digest bytea DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
     head openmettle.deletion_journal_head%ROWTYPE;
     v_origin_us bigint;
+    v_head_lifecycle_origin_us bigint;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'export verification requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
     IF p_origin_us IS NULL OR p_export_seq IS NULL OR p_export_seq < 0
-       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32 THEN
+       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32
+       OR (p_lifecycle_baseline_digest IS NOT NULL AND octet_length(p_lifecycle_baseline_digest) <> 32) THEN
         RAISE EXCEPTION 'invalid export verification parameters' USING ERRCODE = '22023';
+    END IF;
+    IF (p_lifecycle_origin_us IS NULL) <> (p_lifecycle_baseline_digest IS NULL) THEN
+        RAISE EXCEPTION 'schema-42 export must carry both lifecycle_origin and lifecycle_baseline'
+            USING ERRCODE = 'OMR03';
     END IF;
     SELECT * INTO g FROM openmettle.restore_reconciliation_gate WHERE id AND NOT open FOR SHARE;
     IF NOT FOUND THEN
@@ -553,33 +704,259 @@ BEGIN
         RAISE EXCEPTION 'export lifecycle origin % does not match locked requirement %',
             p_lifecycle_origin_us, g.required_lifecycle_origin_us USING ERRCODE = 'OMR04';
     END IF;
+    IF g.required_lifecycle_baseline_digest IS NOT NULL
+       AND p_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'export lifecycle baseline digest does not match locked requirement'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+    IF p_lifecycle_origin_us IS NOT NULL
+       AND p_lifecycle_origin_us = v_head_lifecycle_origin_us
+       AND p_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'export lifecycle baseline digest does not match restored installation head'
+            USING ERRCODE = 'OMR03';
+    END IF;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.restore_verify_export(bigint, bigint, bytea, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.restore_verify_export(bigint, bigint, bytea, bigint, bytea) FROM PUBLIC;
 
--- Owner only: claim the exclusive volume-phase lease, checking both origins, watermark and
--- pinned checkpoints.
+-- Owner only: verify the canonical folded SHA-256 of an exported pre-42 retention upgrade
+-- baseline inside PostgreSQL, replay its retained/deadline entries onto a restored pre-42 backup
+-- before deletion_journal records (shifting active_bytes -> retained_bytes and tightening
+-- existing retained/purging deadlines), and pin replayed_lifecycle_baseline_digest on the closed
+-- restore gate so reruns stay idempotent and restore_gate_open requires baseline completion.
+CREATE FUNCTION openmettle.restore_replay_baseline(
+    p_lifecycle_origin_us bigint,
+    p_expected_digest bytea,
+    p_entity_ids uuid[],
+    p_scope_ids uuid[],
+    p_retained_us bigint[],
+    p_original_purge_after_us bigint[],
+    p_content_digests bytea[],
+    p_policy_revisions bigint[])
+RETURNS integer
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    head openmettle.deletion_journal_head%ROWTYPE;
+    v_len integer;
+    v_idx integer;
+    v_head_lifecycle_origin_us bigint;
+    v_apply boolean;
+    v_digest bytea := decode(repeat('00', 32), 'hex');
+    v_prev_entity_id uuid;
+    v_entity_id uuid;
+    v_scope_id uuid;
+    v_retained_us bigint;
+    v_purge_after_us bigint;
+    v_content_digest bytea;
+    v_policy_revision bigint;
+    v_rev_scope uuid;
+    v_state text;
+    v_size bigint;
+    v_content bytea;
+    v_cur_retained timestamptz;
+    v_cur_purge_after timestamptz;
+    v_target_retained timestamptz;
+    v_target_purge_after timestamptz;
+    v_new_retained timestamptz;
+    v_new_purge_after timestamptz;
+    v_applied integer := 0;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'baseline replay requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_lifecycle_origin_us IS NULL
+       OR p_expected_digest IS NULL OR octet_length(p_expected_digest) <> 32
+       OR p_entity_ids IS NULL OR p_scope_ids IS NULL
+       OR p_retained_us IS NULL OR p_original_purge_after_us IS NULL
+       OR p_content_digests IS NULL OR p_policy_revisions IS NULL THEN
+        RAISE EXCEPTION 'invalid baseline replay parameters' USING ERRCODE = '22023';
+    END IF;
+    v_len := coalesce(array_length(p_entity_ids, 1), 0);
+    IF coalesce(array_length(p_scope_ids, 1), 0) <> v_len
+       OR coalesce(array_length(p_retained_us, 1), 0) <> v_len
+       OR coalesce(array_length(p_original_purge_after_us, 1), 0) <> v_len
+       OR coalesce(array_length(p_content_digests, 1), 0) <> v_len
+       OR coalesce(array_length(p_policy_revisions, 1), 0) <> v_len THEN
+        RAISE EXCEPTION 'mismatched baseline replay array lengths' USING ERRCODE = 'OMR03';
+    END IF;
+    IF v_len > 0 AND (
+        array_lower(p_entity_ids, 1) <> 1
+        OR array_lower(p_scope_ids, 1) <> 1
+        OR array_lower(p_retained_us, 1) <> 1
+        OR array_lower(p_original_purge_after_us, 1) <> 1
+        OR array_lower(p_content_digests, 1) <> 1
+        OR array_lower(p_policy_revisions, 1) <> 1
+    ) THEN
+        RAISE EXCEPTION 'baseline replay arrays must be 1-based' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
+    IF g.open THEN
+        RAISE EXCEPTION 'baseline replay requires a closed restore gate' USING ERRCODE = 'OMR02';
+    END IF;
+    IF g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp() THEN
+        RAISE EXCEPTION 'restore volume phase is active' USING ERRCODE = 'OMR02';
+    END IF;
+    IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+        RAISE EXCEPTION 'baseline lifecycle origin % does not match locked requirement %',
+            p_lifecycle_origin_us, g.required_lifecycle_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+    IF g.required_lifecycle_baseline_digest IS NOT NULL
+       AND p_expected_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'baseline digest does not match locked restore requirement'
+            USING ERRCODE = 'OMR03';
+    END IF;
+
+    SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id;
+    v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+    v_apply := (v_head_lifecycle_origin_us IS DISTINCT FROM p_lifecycle_origin_us)
+        AND (g.replayed_lifecycle_baseline_digest IS NULL);
+
+    FOR v_idx IN 1..v_len LOOP
+        v_entity_id := p_entity_ids[v_idx];
+        v_scope_id := p_scope_ids[v_idx];
+        v_retained_us := p_retained_us[v_idx];
+        v_purge_after_us := p_original_purge_after_us[v_idx];
+        v_content_digest := p_content_digests[v_idx];
+        v_policy_revision := p_policy_revisions[v_idx];
+
+        IF v_entity_id IS NULL OR v_scope_id IS NULL
+           OR v_retained_us IS NULL OR v_purge_after_us IS NULL
+           OR v_purge_after_us < v_retained_us
+           OR v_content_digest IS NULL OR octet_length(v_content_digest) <> 32
+           OR (v_policy_revision IS NOT NULL AND v_policy_revision <= 0) THEN
+            RAISE EXCEPTION 'invalid baseline entry at index %', v_idx USING ERRCODE = 'OMR03';
+        END IF;
+        IF v_prev_entity_id IS NOT NULL AND v_entity_id <= v_prev_entity_id THEN
+            RAISE EXCEPTION 'baseline entries must be strictly ordered by artifact_revision_id'
+                USING ERRCODE = 'OMR03';
+        END IF;
+        v_prev_entity_id := v_entity_id;
+
+        v_digest := openmettle.retention_baseline_step(
+            v_digest,
+            v_entity_id,
+            v_scope_id,
+            v_retained_us,
+            v_purge_after_us,
+            v_content_digest,
+            v_policy_revision
+        );
+
+        IF v_apply THEN
+            SELECT scope_id, state, size_bytes, content_digest, retained_at, purge_after
+              INTO v_rev_scope, v_state, v_size, v_content, v_cur_retained, v_cur_purge_after
+              FROM openmettle.artifact_revisions
+             WHERE id = v_entity_id
+               FOR UPDATE;
+            IF FOUND THEN
+                IF v_rev_scope IS DISTINCT FROM v_scope_id
+                   OR v_content IS DISTINCT FROM v_content_digest THEN
+                    RAISE EXCEPTION 'baseline entry % does not match artifact revision scope or content',
+                        v_entity_id USING ERRCODE = 'OMR02';
+                END IF;
+                v_target_retained := timestamptz 'epoch' + v_retained_us * interval '1 microsecond';
+                v_target_purge_after := timestamptz 'epoch' + v_purge_after_us * interval '1 microsecond';
+                IF v_state = 'active' THEN
+                    PERFORM openmettle.storage_lock_pinned_volume()
+                       FROM openmettle.storage_volume_control
+                      WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL);
+                    UPDATE openmettle.storage_accounts
+                       SET active_bytes = active_bytes - v_size,
+                           retained_bytes = retained_bytes + v_size
+                     WHERE scope_id = v_scope_id;
+                    IF NOT FOUND THEN
+                        RAISE EXCEPTION 'storage account missing' USING ERRCODE = 'P0002';
+                    END IF;
+                    UPDATE openmettle.storage_instance
+                       SET active_bytes = active_bytes - v_size,
+                           retained_bytes = retained_bytes + v_size;
+                    PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'on', true);
+                    UPDATE openmettle.artifact_revisions
+                       SET state = 'retained',
+                           retained_at = v_target_retained,
+                           purge_after = v_target_purge_after,
+                           retention_policy_revision = v_policy_revision
+                     WHERE scope_id = v_scope_id AND id = v_entity_id;
+                    PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'off', true);
+                    v_applied := v_applied + 1;
+                ELSIF v_state IN ('retained', 'purging') THEN
+                    v_new_retained := least(v_cur_retained, v_target_retained);
+                    v_new_purge_after := greatest(least(v_cur_purge_after, v_target_purge_after), v_new_retained);
+                    IF v_new_retained IS DISTINCT FROM v_cur_retained
+                       OR v_new_purge_after IS DISTINCT FROM v_cur_purge_after THEN
+                        PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'on', true);
+                        UPDATE openmettle.artifact_revisions
+                           SET retained_at = v_new_retained,
+                               purge_after = v_new_purge_after
+                         WHERE scope_id = v_scope_id AND id = v_entity_id;
+                        PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'off', true);
+                        v_applied := v_applied + 1;
+                    END IF;
+                END IF;
+            END IF;
+            IF v_policy_revision IS NOT NULL THEN
+                UPDATE openmettle.retention_policy
+                   SET revision = v_policy_revision + 1
+                 WHERE id AND revision <= v_policy_revision;
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF v_digest IS DISTINCT FROM p_expected_digest THEN
+        RAISE EXCEPTION 'computed lifecycle baseline digest does not match export header'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    IF v_head_lifecycle_origin_us = p_lifecycle_origin_us
+       AND v_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest does not match restored head'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    IF g.replayed_lifecycle_baseline_digest IS NOT NULL
+       AND v_digest IS DISTINCT FROM g.replayed_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest conflicts with previously replayed baseline'
+            USING ERRCODE = 'OMR03';
+    END IF;
+
+    UPDATE openmettle.restore_reconciliation_gate
+       SET replayed_lifecycle_baseline_digest = v_digest
+     WHERE id;
+    RETURN v_applied;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_replay_baseline(bigint, bytea, uuid[], uuid[], bigint[], bigint[], bytea[], bigint[]) FROM PUBLIC;
+
+-- Owner only: claim the exclusive volume-phase lease, checking both origins, lifecycle baseline
+-- replay status, watermark and pinned checkpoints.
 DROP FUNCTION openmettle.restore_claim_volume_phase(bigint, bigint, bytea);
 
 CREATE FUNCTION openmettle.restore_claim_volume_phase(
     p_origin_us bigint,
     p_export_seq bigint,
     p_export_digest bytea,
-    p_lifecycle_origin_us bigint DEFAULT NULL)
+    p_lifecycle_origin_us bigint DEFAULT NULL,
+    p_lifecycle_baseline_digest bytea DEFAULT NULL)
 RETURNS TABLE(restore_run_id uuid, volume_claim_token uuid)
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
     head openmettle.deletion_journal_head%ROWTYPE;
     v_origin_us bigint;
+    v_lifecycle_origin_us bigint;
     v_token uuid;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'restore volume phase claim requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
     IF p_origin_us IS NULL OR p_export_seq IS NULL OR p_export_seq < 0
-       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32 THEN
+       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32
+       OR (p_lifecycle_baseline_digest IS NOT NULL AND octet_length(p_lifecycle_baseline_digest) <> 32) THEN
         RAISE EXCEPTION 'invalid restore volume phase parameters' USING ERRCODE = '22023';
+    END IF;
+    IF p_lifecycle_baseline_digest IS NOT NULL AND p_lifecycle_origin_us IS NULL THEN
+        RAISE EXCEPTION 'lifecycle baseline digest requires lifecycle origin' USING ERRCODE = 'OMR03';
     END IF;
     SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
     IF g.open THEN
@@ -590,11 +967,35 @@ BEGIN
     END IF;
     SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR SHARE;
     v_origin_us := (extract(epoch FROM head.coverage_started_at) * 1000000)::bigint;
+    v_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
     IF p_origin_us IS DISTINCT FROM g.required_origin_us OR p_origin_us IS DISTINCT FROM v_origin_us THEN
         RAISE EXCEPTION 'journal origin mismatch' USING ERRCODE = 'OMR04';
     END IF;
     IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
         RAISE EXCEPTION 'lifecycle journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF g.required_lifecycle_baseline_digest IS NOT NULL
+       AND p_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest does not match locked requirement' USING ERRCODE = 'OMR03';
+    END IF;
+    IF p_lifecycle_origin_us IS NOT NULL AND p_lifecycle_origin_us = v_lifecycle_origin_us THEN
+        IF p_lifecycle_baseline_digest IS NOT NULL
+           AND p_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+            RAISE EXCEPTION 'lifecycle baseline digest does not match restored head' USING ERRCODE = 'OMR03';
+        END IF;
+        IF g.required_lifecycle_baseline_digest IS NOT NULL
+           AND g.required_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+            RAISE EXCEPTION 'locked lifecycle baseline digest does not match restored head' USING ERRCODE = 'OMR03';
+        END IF;
+    ELSIF p_lifecycle_origin_us IS NOT NULL THEN
+        IF g.replayed_lifecycle_baseline_digest IS NULL
+           OR (p_lifecycle_baseline_digest IS NOT NULL
+               AND g.replayed_lifecycle_baseline_digest IS DISTINCT FROM p_lifecycle_baseline_digest)
+           OR (g.required_lifecycle_baseline_digest IS NOT NULL
+               AND g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest) THEN
+            RAISE EXCEPTION 'lifecycle upgrade baseline must be replayed before claiming volume phase'
+                USING ERRCODE = 'OMR04';
+        END IF;
     END IF;
     IF p_export_seq IS DISTINCT FROM head.journal_seq OR head.journal_seq <> g.required_journal_seq THEN
         RAISE EXCEPTION 'journal export sequence does not match restored head or locked requirement'
@@ -613,7 +1014,7 @@ BEGIN
     RETURN QUERY SELECT g.restore_run_id, v_token;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.restore_claim_volume_phase(bigint, bigint, bytea, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.restore_claim_volume_phase(bigint, bigint, bytea, bigint, bytea) FROM PUBLIC;
 
 -- Owner only: replay any of the four deletion_journal event kinds in strict journal_seq order.
 -- Replaces migration 41's 10-arg form with an 11-arg form whose trailing p_retained_us defaults
@@ -810,8 +1211,9 @@ REVOKE ALL ON FUNCTION openmettle.deletion_journal_replay(bigint, bigint, text, 
     bigint, bytea, bigint, bytea, bigint) FROM PUBLIC;
 
 -- Require only 'artifact_revision.purged' journal rows to have state = 'purged' before opening
--- the restore gate, and require matching lifecycle_coverage_started_at unless an audited owner
--- restore.accept_coverage_gap record explicitly accepted the coverage gap for this restore_run_id.
+-- the restore gate, require matching lifecycle_coverage_started_at unless an audited owner
+-- restore.accept_coverage_gap record explicitly accepted the coverage gap for this restore_run_id,
+-- and require any locked or pre-42 lifecycle upgrade baseline to have been replayed.
 DROP FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid);
 
 CREATE FUNCTION openmettle.restore_gate_open(
@@ -821,7 +1223,8 @@ CREATE FUNCTION openmettle.restore_gate_open(
     p_export_seq bigint,
     p_export_digest bytea,
     p_expected_volume_id uuid,
-    p_lifecycle_origin_us bigint DEFAULT NULL)
+    p_lifecycle_origin_us bigint DEFAULT NULL,
+    p_lifecycle_baseline_digest bytea DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
@@ -836,8 +1239,12 @@ BEGIN
     END IF;
     IF p_restore_run_id IS NULL OR p_claim_token IS NULL
        OR p_origin_us IS NULL OR p_export_seq IS NULL OR p_export_seq < 0
-       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32 THEN
+       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32
+       OR (p_lifecycle_baseline_digest IS NOT NULL AND octet_length(p_lifecycle_baseline_digest) <> 32) THEN
         RAISE EXCEPTION 'invalid restore gate open parameters' USING ERRCODE = '22023';
+    END IF;
+    IF p_lifecycle_baseline_digest IS NOT NULL AND p_lifecycle_origin_us IS NULL THEN
+        RAISE EXCEPTION 'lifecycle baseline digest requires lifecycle origin' USING ERRCODE = 'OMR03';
     END IF;
     SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
     IF g.open THEN
@@ -870,6 +1277,29 @@ BEGIN
     END IF;
     IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
         RAISE EXCEPTION 'lifecycle journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF g.required_lifecycle_baseline_digest IS NOT NULL
+       AND p_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest does not match locked requirement' USING ERRCODE = 'OMR03';
+    END IF;
+    IF p_lifecycle_origin_us IS NOT NULL AND p_lifecycle_origin_us = v_lifecycle_origin_us THEN
+        IF p_lifecycle_baseline_digest IS NOT NULL
+           AND p_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+            RAISE EXCEPTION 'lifecycle baseline digest does not match restored head' USING ERRCODE = 'OMR03';
+        END IF;
+        IF g.required_lifecycle_baseline_digest IS NOT NULL
+           AND g.required_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+            RAISE EXCEPTION 'locked lifecycle baseline digest does not match restored head' USING ERRCODE = 'OMR03';
+        END IF;
+    ELSIF p_lifecycle_origin_us IS NOT NULL THEN
+        IF g.replayed_lifecycle_baseline_digest IS NULL
+           OR (p_lifecycle_baseline_digest IS NOT NULL
+               AND g.replayed_lifecycle_baseline_digest IS DISTINCT FROM p_lifecycle_baseline_digest)
+           OR (g.required_lifecycle_baseline_digest IS NOT NULL
+               AND g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest) THEN
+            RAISE EXCEPTION 'lifecycle upgrade baseline must be replayed before opening restore gate'
+                USING ERRCODE = 'OMR04';
+        END IF;
     END IF;
     IF (p_lifecycle_origin_us IS NULL OR p_lifecycle_origin_us IS DISTINCT FROM v_lifecycle_origin_us)
        AND NOT EXISTS (
@@ -907,15 +1337,18 @@ BEGIN
            restore_run_id = NULL,
            required_origin_us = NULL,
            required_lifecycle_origin_us = NULL,
+           required_lifecycle_baseline_digest = NULL,
+           replayed_lifecycle_baseline_digest = NULL,
            checkpoints = '[]'::jsonb,
            volume_claim_token = NULL,
            volume_lease_until = NULL
      WHERE id;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid, bigint, bytea) FROM PUBLIC;
 
--- Record required_lifecycle_origin_us alongside required_origin_us in break-glass audit details.
+-- Record required_lifecycle_origin_us and required_lifecycle_baseline_digest alongside
+-- required_origin_us in break-glass audit details.
 CREATE OR REPLACE FUNCTION openmettle.restore_accept_coverage_gap(
     p_restore_run_id uuid,
     p_operator_id uuid,
@@ -951,6 +1384,7 @@ BEGIN
         'restore_run_id', g.restore_run_id,
         'required_origin_us', g.required_origin_us,
         'required_lifecycle_origin_us', g.required_lifecycle_origin_us,
+        'required_lifecycle_baseline_digest', encode(g.required_lifecycle_baseline_digest, 'hex'),
         'snapshot_journal_seq', g.snapshot_journal_seq,
         'required_journal_seq', g.required_journal_seq,
         'required_chain_digest', encode(g.required_chain_digest, 'hex')
@@ -984,8 +1418,29 @@ BEGIN
 END
 $$;
 
--- Least-privilege restore-gate check for openmettle_api: acquires FOR SHARE when open without
--- granting openmettle_api direct SELECT on restore_reconciliation_gate.
+-- Least-privilege restore-gate helpers for openmettle_api and openmettle_worker: acquire FOR SHARE
+-- when open without granting openmettle_api direct SELECT on restore_reconciliation_gate, and
+-- return the monotonic gate_generation so long-lived streams/uploads detect any close/reopen cycle.
+CREATE FUNCTION openmettle.restore_gate_lock_open_generation()
+RETURNS bigint LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    v_generation bigint;
+BEGIN
+    SELECT gate_generation
+      INTO v_generation
+      FROM openmettle.restore_reconciliation_gate
+     WHERE id AND open
+       FOR SHARE;
+    RETURN v_generation;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_lock_open_generation() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.restore_gate_lock_open_generation() TO openmettle_api, openmettle_worker;
+
+CREATE OR REPLACE FUNCTION openmettle.restore_gate_lock_open()
+RETURNS boolean LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog AS $$
+    SELECT openmettle.restore_gate_lock_open_generation() IS NOT NULL
+$$;
 GRANT EXECUTE ON FUNCTION openmettle.restore_gate_lock_open() TO openmettle_api;
 
 -- Least-privilege live-reference check for disassociation (active -> retained): true when any

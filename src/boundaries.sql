@@ -58,12 +58,15 @@
 -- (`SELECT` only for `openmettle_worker`), the worker-only `restore_gate_lock_open()` helper, and
 -- owner-only restore gate, export/checkpoint verification, volume-phase lease, journal replay and
 -- coverage-gap break-glass functions (ADR 0041, V1-16 PR2b).
--- Version 42 extends `deletion_journal` with nullable `retained_at` and lifecycle commitment
--- events (`deletion_journal_append_lifecycle`, no role may call), replaces
--- `deletion_journal_replay` with the 11-arg overload (owner only), grants `openmettle_api`
--- `EXECUTE` on `restore_gate_lock_open()`, adds internal `retention_assert_active_admin` (owner
--- only), and adds API-only `SECURITY DEFINER` `retention_preview_deadlines`,
--- `retention_apply_deadlines`, and `admin_retention_status` (ADR 0041, V1-16 PR3).
+-- Version 42 adds the owner-only immutable `retention_upgrade_baseline` table, extends
+-- `deletion_journal` with nullable `retained_at` and lifecycle commitment events
+-- (`deletion_journal_append_lifecycle`, no role may call), adds `gate_generation` and
+-- `restore_gate_lock_open_generation()` (`openmettle_api` and `openmettle_worker`), replaces
+-- `deletion_journal_replay` with the 11-arg overload and restore gate/baseline functions (owner
+-- only), grants `openmettle_api` `EXECUTE` on `restore_gate_lock_open()`, adds internal
+-- `retention_assert_active_admin` (owner only), and adds API-only `SECURITY DEFINER`
+-- `retention_preview_deadlines`, `retention_apply_deadlines`, and `admin_retention_status`
+-- (ADR 0041, V1-16 PR3).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -325,12 +328,16 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[])) AS f WHERE $1 = 41
     UNION ALL SELECT * FROM (VALUES
+        ('openmettle.retention_upgrade_baseline_immutable()',false,ARRAY[]::text[]),
+        ('openmettle.retention_baseline_step(bytea,uuid,uuid,bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock_open_generation()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.restore_gate_is_closed_for_owner()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.deletion_journal_append_lifecycle()',true,ARRAY[]::text[]),
-        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean,bigint)',false,ARRAY[]::text[]),
-        ('openmettle.restore_verify_export(bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
-        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_export(bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_replay_baseline(bigint,bytea,uuid[],uuid[],bigint[],bigint[],bytea[],bigint[])',false,ARRAY[]::text[]),
+        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea,bigint)',false,ARRAY[]::text[]),
         ('openmettle.artifact_revision_live_referenced(uuid,uuid)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.artifact_revision_has_hold(uuid,uuid)',true,ARRAY['openmettle_api']::text[]),
