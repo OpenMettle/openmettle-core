@@ -1478,12 +1478,15 @@ impl<R: TurnRoutes> Executor for TurnExecutor<R> {
 
     async fn reconcile(
         &self,
-        _: &ActiveRun,
-        _: &UnresolvedOperation,
-        _: StepContext,
+        run: &ActiveRun,
+        operation: &UnresolvedOperation,
+        cx: StepContext,
     ) -> Option<OwnedObservation> {
-        // No authoritative downstream lookup was supplied. Never repeat an uncertain effect.
-        None
+        let effects = self.effects.as_ref()?;
+        effects
+            .adapter
+            .reconcile_operation(run, operation, cx)
+            .await
     }
 }
 

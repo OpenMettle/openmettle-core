@@ -37,7 +37,8 @@ use tokio::{
 /// Pinned MCP Streamable HTTP protocol revision (ADR 0039).
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 /// Maximum outbound HTTP/1.1 request header block bytes (request line + headers).
-pub const MAX_REQUEST_HEADER_BYTES: usize = 2 * 1024;
+/// Sized at 8 KiB so `Authorization: Bearer <4096-byte token>` fits alongside required MCP headers.
+pub const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
 /// Maximum outbound JSON-RPC request body bytes.
 pub const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 /// Maximum decoded HTTP/1.1 response body bytes across `application/json`, chunked, and SSE.

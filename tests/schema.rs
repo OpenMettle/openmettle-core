@@ -499,7 +499,7 @@ struct AdditiveTable {
 const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
 const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000","lifecycle_baseline_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
-const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_lifecycle_origin_us":null,"snapshot_lifecycle_baseline_digest":null,"required_lifecycle_origin_us":null,"required_lifecycle_baseline_digest":null,"replayed_lifecycle_baseline_digest":null,"gate_generation":1,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
+const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_lifecycle_origin_us":null,"snapshot_lifecycle_baseline_digest":null,"required_lifecycle_origin_us":null,"required_lifecycle_baseline_digest":null,"replayed_lifecycle_baseline_digest":null,"snapshot_connection_origin_us":null,"required_connection_origin_us":null,"connection_gap_reconciled":false,"gate_generation":1,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -911,6 +911,30 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         table: "restore_reconciliation_gate",
         column: "gate_generation",
         default: ColumnDefault::Int(1),
+    },
+    AdditiveColumn {
+        since: 43,
+        table: "deletion_journal_head",
+        column: "connection_coverage_started_at",
+        default: ColumnDefault::AnyNonNull,
+    },
+    AdditiveColumn {
+        since: 43,
+        table: "restore_reconciliation_gate",
+        column: "snapshot_connection_origin_us",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 43,
+        table: "restore_reconciliation_gate",
+        column: "required_connection_origin_us",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 43,
+        table: "restore_reconciliation_gate",
+        column: "connection_gap_reconciled",
+        default: ColumnDefault::Bool(false),
     },
 ];
 
@@ -1432,7 +1456,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "49a30070ef07ae4471f0e7d2035c54a605a15e4abab24f2e6bff69953ee4f3ff",
         "3fb443c44eb91d520bff06b7b0eaef3615c15d0e86c2f1bfc768c1d5dcff96ca",
         "3d6e5c6d44cb3ee77cbcf26dc77e4ca5d460bfc658a17d5c48307b067fcdd6d6",
-        "8a37e1cc57d6f33ae216886c2b78459e1bf76684f0f31ae6c9a39ad5bfb3c318",
+        "e1a33c05088d4954d053997b1d3de0d81a96fbfd69731e0fc79ff40150a77f65",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

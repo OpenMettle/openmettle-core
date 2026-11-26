@@ -262,6 +262,7 @@ struct ToggleReconcileAuth {
 impl DestinationAuthorizer for ToggleReconcileAuth {
     fn authorize_reconcile<'a>(
         &'a self,
+        _conn: &'a mut PgConnection,
         _target: ReconcileTarget<'a>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
@@ -338,6 +339,7 @@ fn test_registry(expires_us: i64) -> ExternalRegistry {
         true,
         Some(ReconcileSpec {
             lookup_tool: "mcp.status".into(),
+            lookup_scope: "status.read".into(),
             handle_argument: Some("handle".into()),
             deterministic_key_argument: Some("idem_key".into()),
             status_field: "status".into(),
@@ -352,6 +354,7 @@ fn test_registry(expires_us: i64) -> ExternalRegistry {
         true,
         Some(ReconcileSpec {
             lookup_tool: "mcp.status".into(),
+            lookup_scope: "status.read".into(),
             handle_argument: Some("handle".into()),
             deterministic_key_argument: None,
             status_field: "status".into(),
@@ -366,6 +369,7 @@ fn test_registry(expires_us: i64) -> ExternalRegistry {
         true,
         Some(ReconcileSpec {
             lookup_tool: "mcp.status".into(),
+            lookup_scope: "status.read".into(),
             handle_argument: Some("handle".into()),
             deterministic_key_argument: Some("logical_key".into()),
             status_field: "status".into(),

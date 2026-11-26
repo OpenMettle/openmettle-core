@@ -9082,7 +9082,7 @@
           "access_token": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 16384,
+            "maxLength": 4096,
             "writeOnly": true
           },
           "refresh_token": {

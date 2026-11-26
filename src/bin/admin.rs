@@ -68,6 +68,7 @@ struct RestoreLockArgs {
     origin_us: i64,
     lifecycle_origin_us: Option<i64>,
     lifecycle_baseline_digest: Option<String>,
+    connection_origin_us: Option<i64>,
     required_seq: i64,
     required_digest: String,
     export_complete: bool,
@@ -76,10 +77,11 @@ struct RestoreLockArgs {
 }
 
 fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static str> {
-    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
+    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] [--required-connection-origin ORIGIN_US] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
     let mut origin_us = None;
     let mut lifecycle_origin_us = None;
     let mut lifecycle_baseline_digest = None;
+    let mut connection_origin_us = None;
     let mut required_seq = None;
     let mut required_digest = None;
     let mut export_complete = false;
@@ -118,6 +120,16 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
                     return Err("invalid lifecycle baseline digest");
                 }
                 lifecycle_baseline_digest = Some(raw.clone());
+            }
+            "--required-connection-origin" => {
+                if connection_origin_us.is_some() {
+                    return Err("duplicate --required-connection-origin");
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or("missing --required-connection-origin value")?;
+                connection_origin_us = Some(raw.parse().map_err(|_| "invalid connection origin")?);
             }
             "--required-seq" => {
                 if required_seq.is_some() {
@@ -185,6 +197,7 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
         origin_us,
         lifecycle_origin_us,
         lifecycle_baseline_digest,
+        connection_origin_us,
         required_seq,
         required_digest,
         export_complete,
@@ -296,10 +309,16 @@ async fn journal(
             {
                 println!("{lb}");
             }
+            if let Some(co) = text
+                .lines()
+                .find(|line| line.starts_with("connection_origin "))
+            {
+                println!("{co}");
+            }
         }
         (Some("restore"), Some("lock")) => {
             let lock_args = parse_restore_lock_args(args)?;
-            let locked = restore::lock_gate(
+            let locked = restore::lock_gate_with_connection_origin(
                 &pool(1).await?,
                 &restore::GateLockRequest {
                     origin_us: lock_args.origin_us,
@@ -311,15 +330,19 @@ async fn journal(
                     replace_restore_run: lock_args.replace_restore_run.as_deref(),
                     new_restore: lock_args.new_restore,
                 },
+                lock_args.connection_origin_us,
             )
             .await
             .map_err(failed("restore lock"))?;
+            let conn_suffix = locked
+                .connection_origin_us
+                .map_or_else(String::new, |co| format!(", connection_origin {co}"));
             match (
                 locked.lifecycle_origin_us,
                 locked.lifecycle_baseline_digest.as_deref(),
             ) {
                 (Some(lc), Some(lb)) => println!(
-                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, lifecycle_baseline {}, snapshot {}, required {}, coverage_complete {}",
+                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, lifecycle_baseline {}{conn_suffix}, snapshot {}, required {}, coverage_complete {}",
                     locked.restore_run_id,
                     locked.origin_us,
                     lc,
@@ -329,7 +352,7 @@ async fn journal(
                     locked.coverage_complete
                 ),
                 (Some(lc), None) => println!(
-                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, snapshot {}, required {}, coverage_complete {}",
+                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}{conn_suffix}, snapshot {}, required {}, coverage_complete {}",
                     locked.restore_run_id,
                     locked.origin_us,
                     lc,
@@ -338,7 +361,7 @@ async fn journal(
                     locked.coverage_complete
                 ),
                 (None, _) => println!(
-                    "restore gate closed: restore_run {}, origin {}, snapshot {}, required {}, coverage_complete {}",
+                    "restore gate closed: restore_run {}, origin {}{conn_suffix}, snapshot {}, required {}, coverage_complete {}",
                     locked.restore_run_id,
                     locked.origin_us,
                     locked.snapshot_seq,
@@ -791,13 +814,24 @@ async fn vault_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stati
             })?;
             if report.replayed {
                 println!(
-                    "replayed vault.rotated target_key_id={} rotated={} skipped={}",
-                    report.target_key_id, report.rotated_rows, report.skipped_rows
+                    "replayed vault.rotated target_key_id={} rotated={} skipped={} deferred_active_refresh={}",
+                    report.target_key_id,
+                    report.rotated_rows,
+                    report.skipped_rows,
+                    report.deferred_active_refresh
                 );
             } else {
                 println!(
-                    "applied vault.rotated target_key_id={} rotated={} skipped={}",
-                    report.target_key_id, report.rotated_rows, report.skipped_rows
+                    "applied vault.rotated target_key_id={} rotated={} skipped={} deferred_active_refresh={}",
+                    report.target_key_id,
+                    report.rotated_rows,
+                    report.skipped_rows,
+                    report.deferred_active_refresh
+                );
+            }
+            if !report.replayed && (report.skipped_rows > 0 || report.deferred_active_refresh > 0) {
+                return Err(
+                    "vault rotation incomplete: authorized rows remain on older key versions (active refresh claims deferred); retry with the same --request-key",
                 );
             }
             Ok(())

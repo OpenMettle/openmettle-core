@@ -42,12 +42,13 @@ use crate::{
 };
 use hyper::{Method, StatusCode, header};
 use ring::{
-    aead, hkdf,
+    aead, hkdf, hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use rustls::crypto::SharedSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -73,8 +74,13 @@ pub const KEY_BYTES: usize = 32;
 pub const SALT_BYTES: usize = 32;
 /// Byte length of the per-seal AES-256-GCM nonce.
 pub const NONCE_BYTES: usize = 12;
-/// Maximum plaintext credential size (16 KiB; ciphertext plus 16-byte GCM tag <= 16,400 bytes).
-pub const MAX_SECRET_BYTES: usize = 16 * 1024;
+/// Maximum plaintext access-token size (4 KiB; ciphertext plus 16-byte GCM tag <= 4,112 bytes;
+/// aligns with MCP `MAX_REQUEST_HEADER_BYTES = 8 KiB` for `Authorization: Bearer <token>`).
+pub const MAX_ACCESS_TOKEN_BYTES: usize = 4 * 1024;
+/// Maximum plaintext refresh-token size (16 KiB; ciphertext plus 16-byte GCM tag <= 16,400 bytes).
+pub const MAX_REFRESH_TOKEN_BYTES: usize = 16 * 1024;
+/// Maximum plaintext credential size across secret kinds (alias for [`MAX_REFRESH_TOKEN_BYTES`]).
+pub const MAX_SECRET_BYTES: usize = MAX_REFRESH_TOKEN_BYTES;
 /// Maximum number of scopes on a single external connection.
 pub const MAX_SCOPES: usize = 64;
 /// Maximum size of a vault keyring JSON configuration document.
@@ -87,6 +93,8 @@ const MAX_REFRESH_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_EXPIRES_IN_SECS: u64 = 31_536_000;
 
 const HKDF_INFO: &[u8] = b"openmettle.vault.dek/1";
+const IDEMPOTENCY_SALT: &[u8] = b"openmettle.vault.idempotency.salt/1";
+const IDEMPOTENCY_INFO: &[u8] = b"openmettle.vault.idempotency/1";
 const AAD_DOMAIN: &[u8] = b"openmettle.vault.aad/1\0";
 
 /// Dedicated process-wide DNS lookup slot pool isolated from OIDC, gateway inference, and MCP.
@@ -159,16 +167,36 @@ impl From<sqlx::Error> for VaultError {
 pub struct SecretText(SharedSecret);
 
 impl SecretText {
-    /// Validate and copy visible ASCII token bytes (`0x21..=0x7E`, `1..=MAX_SECRET_BYTES`).
-    pub fn new(raw: &str) -> Result<Self, VaultError> {
+    /// Validate and copy visible ASCII token bytes (`0x21..=0x7E`, `1..=max_bytes`).
+    fn with_limit(raw: &str, max_bytes: usize) -> Result<Self, VaultError> {
         let bytes = raw.as_bytes();
         if bytes.is_empty()
-            || bytes.len() > MAX_SECRET_BYTES
+            || bytes.len() > max_bytes
             || !bytes.iter().all(|b| (0x21..=0x7e).contains(b))
         {
             return Err(VaultError::InvalidSecret);
         }
         Ok(Self(SharedSecret::from(bytes)))
+    }
+
+    /// Validate and copy visible ASCII token bytes (`1..=MAX_REFRESH_TOKEN_BYTES`).
+    pub fn new(raw: &str) -> Result<Self, VaultError> {
+        Self::with_limit(raw, MAX_REFRESH_TOKEN_BYTES)
+    }
+
+    /// Validate an access token (`1..=MAX_ACCESS_TOKEN_BYTES`, aligned with MCP 8 KiB request headers).
+    pub fn new_access(raw: &str) -> Result<Self, VaultError> {
+        Self::with_limit(raw, MAX_ACCESS_TOKEN_BYTES)
+    }
+
+    /// Validate a refresh token (`1..=MAX_REFRESH_TOKEN_BYTES`).
+    pub fn new_refresh(raw: &str) -> Result<Self, VaultError> {
+        Self::with_limit(raw, MAX_REFRESH_TOKEN_BYTES)
+    }
+
+    /// Validate a token according to its [`SecretKind`] ceiling.
+    pub fn new_for_kind(kind: SecretKind, raw: &str) -> Result<Self, VaultError> {
+        Self::with_limit(raw, kind.max_plaintext_bytes())
     }
 
     pub fn expose(&self) -> &str {
@@ -195,6 +223,13 @@ impl SecretKind {
         match self {
             Self::Access => "access",
             Self::Refresh => "refresh",
+        }
+    }
+
+    pub const fn max_plaintext_bytes(self) -> usize {
+        match self {
+            Self::Access => MAX_ACCESS_TOKEN_BYTES,
+            Self::Refresh => MAX_REFRESH_TOKEN_BYTES,
         }
     }
 }
@@ -366,6 +401,9 @@ impl VaultKeyRing {
         if binding.credential_generation < 1 {
             return Err(VaultError::Crypto);
         }
+        if plaintext.expose().len() > binding.secret_kind.max_plaintext_bytes() {
+            return Err(VaultError::InvalidSecret);
+        }
         let master = self.key_bytes(&self.active_key_id)?;
         let rng = SystemRandom::new();
         let mut salt = [0u8; SALT_BYTES];
@@ -396,9 +434,9 @@ impl VaultKeyRing {
         binding: &SecretBinding<'_>,
         sealed: &SealedSecret,
     ) -> Result<SecretText, VaultError> {
+        let max_ct_len = binding.secret_kind.max_plaintext_bytes() + aead::AES_256_GCM.tag_len();
         if binding.credential_generation < 1
-            || !(17..=(MAX_SECRET_BYTES + aead::AES_256_GCM.tag_len()))
-                .contains(&sealed.ciphertext.len())
+            || !(17..=max_ct_len).contains(&sealed.ciphertext.len())
         {
             return Err(VaultError::Crypto);
         }
@@ -416,9 +454,57 @@ impl VaultKeyRing {
         };
         let result = std::str::from_utf8(opened)
             .map_err(|_| VaultError::Crypto)
-            .and_then(SecretText::new);
+            .and_then(|s| SecretText::new_for_kind(binding.secret_kind, s));
         buf.fill(0);
         result
+    }
+
+    /// Derive a keyed HMAC-SHA256 digest binding secret authorization inputs for
+    /// `authorizeConnection` idempotency replay detection without storing plaintext or
+    /// reversible token material in `authorization_audit`.
+    pub fn idempotency_mac_hex(
+        &self,
+        connection_id: &str,
+        scope_id: &str,
+        access_token: &SecretText,
+        refresh_token: Option<&SecretText>,
+        granted_scopes: &[String],
+        expires_at: Option<&str>,
+    ) -> Result<String, VaultError> {
+        let master = self.key_bytes(&self.active_key_id)?;
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, IDEMPOTENCY_SALT).extract(master);
+        let okm = prk
+            .expand(&[IDEMPOTENCY_INFO], hmac::HMAC_SHA256)
+            .map_err(|_| VaultError::Crypto)?;
+        let mac_key = hmac::Key::from(okm);
+        let mut ctx = hmac::Context::with_key(&mac_key);
+        let push = |ctx: &mut hmac::Context, bytes: &[u8]| {
+            ctx.update(&(bytes.len() as u64).to_be_bytes());
+            ctx.update(bytes);
+        };
+        push(&mut ctx, connection_id.as_bytes());
+        push(&mut ctx, scope_id.as_bytes());
+        push(&mut ctx, access_token.expose().as_bytes());
+        match refresh_token {
+            Some(tok) => {
+                ctx.update(&[1u8]);
+                push(&mut ctx, tok.expose().as_bytes());
+            }
+            None => ctx.update(&[0u8]),
+        }
+        ctx.update(&(granted_scopes.len() as u64).to_be_bytes());
+        for scope in granted_scopes {
+            push(&mut ctx, scope.as_bytes());
+        }
+        match expires_at {
+            Some(exp) => {
+                ctx.update(&[1u8]);
+                push(&mut ctx, exp.as_bytes());
+            }
+            None => ctx.update(&[0u8]),
+        }
+        let tag = ctx.sign();
+        Ok(crate::authz::projects::hex(tag.as_ref()))
     }
 }
 
@@ -549,6 +635,11 @@ pub fn validate_scope_token(value: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Returns `true` when `value` is a valid canonical lowercase ASCII scope token.
+pub fn is_valid_scope_token(value: &str) -> bool {
+    validate_scope_token(value).is_ok()
+}
+
 /// Validate, sort canonically, and reject duplicates on a scope array.
 pub fn normalize_scopes(raw: &[String], allow_empty: bool) -> Result<Vec<String>, StoreError> {
     if raw.is_empty() {
@@ -573,6 +664,19 @@ pub fn normalize_scopes(raw: &[String], allow_empty: bool) -> Result<Vec<String>
 
 fn scopes_are_subset(granted: &[String], allowed: &[String]) -> bool {
     granted.iter().all(|g| allowed.binary_search(g).is_ok())
+}
+
+/// Canonical SHA-256 digest of a sorted scope slice so `authorization_audit.details` stays
+/// strictly within its 4,096-byte JSONB ceiling even with 64 maximum-length scopes.
+fn scopes_sha256_hex(scopes: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openmettle.vault.scopes/1\0");
+    hasher.update((scopes.len() as u64).to_be_bytes());
+    for scope in scopes {
+        hasher.update((scope.len() as u64).to_be_bytes());
+        hasher.update(scope.as_bytes());
+    }
+    crate::authz::projects::hex(&hasher.finalize())
 }
 
 // --- connection metadata & authorization model -------------------------------------------------
@@ -733,13 +837,10 @@ fn evaluate_read_access(principal: &Principal, scope: &Scope, shares: &[Grantee]
     }
 }
 
-/// Require management authority (`personal` scope owner, or `ProjectRole::Owner`). Conceals
-/// invisible targets (`404`) and refuses visible non-managers with `403 policy`.
-fn require_manager(
-    principal: &Principal,
-    scope: &Scope,
-    shares: &[Grantee],
-) -> Result<(), StoreError> {
+/// Require scope-level management authority for creating a new connection:
+/// personal scope owner (`404` otherwise), or project `Owner` (`403` for visible non-owner
+/// project members, `404` for non-members).
+fn require_scope_manager(principal: &Principal, scope: &Scope) -> Result<(), StoreError> {
     authz::require(Some(principal)).map_err(StoreError::Denied)?;
     match scope {
         Scope::Personal {
@@ -748,10 +849,6 @@ fn require_manager(
         } => {
             if *scope_id == principal.personal_scope_id && *owner_user_id == principal.user_id {
                 Ok(())
-            } else if principal_matches_shares(principal, scope, shares) {
-                Err(StoreError::Denied(DenialReason::Policy(
-                    PolicyReason::NotShareManager,
-                )))
             } else {
                 Err(CONCEALED)
             }
@@ -763,6 +860,24 @@ fn require_manager(
             ))),
             None => Err(CONCEALED),
         },
+    }
+}
+
+/// Require management authority on an existing connection. Mirrors [`evaluate_read_access`] so
+/// unshared project connections are concealed (`404 not_found`) even from project `Editor` and
+/// `Viewer` members, while visible non-managers (active `'use'` share holders) receive `403`.
+fn require_connection_manager(
+    principal: &Principal,
+    scope: &Scope,
+    shares: &[Grantee],
+) -> Result<(), StoreError> {
+    authz::require(Some(principal)).map_err(StoreError::Denied)?;
+    match evaluate_read_access(principal, scope, shares) {
+        Some(true) => Ok(()),
+        Some(false) => Err(StoreError::Denied(DenialReason::Policy(
+            PolicyReason::NotShareManager,
+        ))),
+        None => Err(CONCEALED),
     }
 }
 
@@ -907,7 +1022,8 @@ pub async fn create_connection(
             "provider_kind": input.provider_kind,
             "account_id": input.account_id,
             "origin": input.origin,
-            "allowed_scopes": allowed_scopes,
+            "allowed_scope_count": allowed_scopes.len(),
+            "allowed_scopes_sha256": scopes_sha256_hex(&allowed_scopes),
         }),
     };
 
@@ -937,7 +1053,7 @@ pub async fn create_connection(
             post_lock_ctx.now_ms,
         )
         .await?;
-        require_manager(&actor, &scope, &[])?;
+        require_scope_manager(&actor, &scope)?;
         if archived {
             return Err(ARCHIVED);
         }
@@ -969,7 +1085,7 @@ pub async fn create_connection(
             fresh_ctx.now_ms,
         )
         .await?;
-        require_manager(&fresh_actor, &fresh_scope, &[])?;
+        require_scope_manager(&fresh_actor, &fresh_scope)?;
         Ok(outcome)
     })
     .await
@@ -1066,20 +1182,17 @@ pub async fn authorize_connection(
     input: &AuthorizeConnectionInput<'_>,
 ) -> Result<WriteOutcome, VaultError> {
     uuid(connection_id, "connection_id")?;
-    let access_secret = SecretText::new(input.access_token)?;
-    let refresh_secret = input.refresh_token.map(SecretText::new).transpose()?;
+    let access_secret = SecretText::new_access(input.access_token)?;
+    let refresh_secret = input
+        .refresh_token
+        .map(SecretText::new_refresh)
+        .transpose()?;
     let granted_scopes = normalize_scopes(input.granted_scopes, false)?;
-
-    let change = Change {
-        action: "connection.authorized",
-        target_kind: "external_connection",
-        target_id: Some(connection_id.to_owned()),
-        details: json!({
-            "granted_scopes": granted_scopes,
-            "has_refresh": refresh_secret.is_some(),
-            "expires_at": input.expires_at,
-        }),
-    };
+    if let Some(exp) = input.expires_at
+        && (exp.is_empty() || exp.len() > 64 || !exp.is_ascii())
+    {
+        return Err(StoreError::InvalidInput("expires_at").into());
+    }
 
     let result: Result<WriteOutcome, VaultError> = async {
         ctx.validate()?;
@@ -1131,7 +1244,7 @@ pub async fn authorize_connection(
             )
             .await?;
             let shares = load_active_shares(conn, connection_id).await?;
-            require_manager(&actor, &scope, &shares)?;
+            require_connection_manager(&actor, &scope, &shares)?;
             if archived {
                 return Err(ARCHIVED.into());
             }
@@ -1142,6 +1255,26 @@ pub async fn authorize_connection(
             if !scopes_are_subset(&granted_scopes, &allowed_scopes) {
                 return Err(VaultError::ScopeWidening);
             }
+            let credentials_mac = keyring.idempotency_mac_hex(
+                connection_id,
+                &located.scope_id,
+                &access_secret,
+                refresh_secret.as_ref(),
+                &granted_scopes,
+                input.expires_at,
+            )?;
+            let change = Change {
+                action: "connection.authorized",
+                target_kind: "external_connection",
+                target_id: Some(connection_id.to_owned()),
+                details: json!({
+                    "granted_scope_count": granted_scopes.len(),
+                    "granted_scopes_sha256": scopes_sha256_hex(&granted_scopes),
+                    "has_refresh": refresh_secret.is_some(),
+                    "expires_at": input.expires_at,
+                    "credentials_mac": credentials_mac,
+                }),
+            };
             let outcome = record(conn, &post_lock_ctx, &change).await?;
             if matches!(outcome, WriteOutcome::Applied { .. }) {
                 if state == ConnectionState::Disconnected.as_str() {
@@ -1217,7 +1350,7 @@ pub async fn authorize_connection(
             )
             .await?;
             let fresh_shares = load_active_shares(conn, connection_id).await?;
-            require_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
+            require_connection_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
             Ok(outcome)
         }
         .await;
@@ -1284,7 +1417,7 @@ pub async fn disconnect_connection(
         )
         .await?;
         let shares = load_active_shares(c, connection_id).await?;
-        require_manager(&actor, &scope, &shares)?;
+        require_connection_manager(&actor, &scope, &shares)?;
         let outcome = record(c, &post_lock_ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
             if state == ConnectionState::Disconnected.as_str() {
@@ -1323,7 +1456,7 @@ pub async fn disconnect_connection(
         )
         .await?;
         let fresh_shares = load_active_shares(c, connection_id).await?;
-        require_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
+        require_connection_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
         Ok(outcome)
     })
     .await
@@ -1453,7 +1586,7 @@ async fn connection_share_change(
         )
         .await?;
         let shares = load_active_shares(c, connection_id).await?;
-        require_manager(&actor, &scope, &shares)?;
+        require_connection_manager(&actor, &scope, &shares)?;
         if grant {
             if archived {
                 return Err(ARCHIVED);
@@ -1549,7 +1682,7 @@ async fn connection_share_change(
         )
         .await?;
         let fresh_shares = load_active_shares(c, connection_id).await?;
-        require_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
+        require_connection_manager(&fresh_actor, &fresh_scope, &fresh_shares)?;
         if grant {
             validate_share_recipient(c, &fresh_scope, grantee, fresh_ctx.now_ms).await?;
         }
@@ -1575,6 +1708,7 @@ pub struct VaultRotateReport {
     pub target_key_id: String,
     pub rotated_rows: i64,
     pub skipped_rows: i64,
+    pub deferred_active_refresh: i64,
     pub replayed: bool,
 }
 
@@ -1616,8 +1750,10 @@ pub async fn vault_status(pool: &PgPool) -> Result<VaultStatusReport, VaultError
 
 /// Re-encrypt authorized connection credentials from historical `key_id`s to
 /// `keyring.active_key_id()` in bounded `READ COMMITTED` `FOR UPDATE SKIP LOCKED` batches with
-/// `credential_generation` compare-and-set. Refuses fail-closed if any stored source `key_id` is
-/// missing from `keyring`, and records an audited `vault.rotated` operator event.
+/// `credential_generation` compare-and-set, deferring rows with an active worker refresh claim
+/// so in-flight refreshes are not invalidated mid-flight. Refuses fail-closed if any stored
+/// source `key_id` is missing from `keyring`, and records an audited `vault.rotated` operator
+/// event only once all old-key rows have been rotated (`skipped_rows == 0`).
 pub async fn vault_rotate(
     pool: &PgPool,
     keyring: &VaultKeyRing,
@@ -1625,6 +1761,29 @@ pub async fn vault_rotate(
     request_key: &str,
     reason: &str,
     batch_size: usize,
+) -> Result<VaultRotateReport, VaultError> {
+    vault_rotate_with_wait(
+        pool,
+        keyring,
+        operator_id,
+        request_key,
+        reason,
+        batch_size,
+        Duration::from_secs(2),
+    )
+    .await
+}
+
+/// Like [`vault_rotate`], with an explicit bounded retry window for rows deferred by active
+/// worker refresh claims.
+pub async fn vault_rotate_with_wait(
+    pool: &PgPool,
+    keyring: &VaultKeyRing,
+    operator_id: &str,
+    request_key: &str,
+    reason: &str,
+    batch_size: usize,
+    defer_wait: Duration,
 ) -> Result<VaultRotateReport, VaultError> {
     uuid(operator_id, "operator_id")?;
     if !runs::bounded(request_key, 128) {
@@ -1669,6 +1828,10 @@ pub async fn vault_rotate(
                     .get("skipped_rows")
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
+                deferred_active_refresh: details
+                    .get("deferred_active_refresh")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
                 replayed: true,
             });
         }
@@ -1692,6 +1855,7 @@ pub async fn vault_rotate(
     }
 
     let mut rotated_rows = 0i64;
+    let wait_deadline = Instant::now() + defer_wait;
     loop {
         let mut tx = pool.begin().await?;
         let rows = sqlx::query(
@@ -1703,6 +1867,7 @@ pub async fn vault_rotate(
               WHERE state = 'authorized'
                 AND encryption_key_id IS NOT NULL
                 AND encryption_key_id <> $1
+                AND (refresh_claim_token IS NULL OR refresh_lease_until <= clock_timestamp())
               ORDER BY id
               LIMIT $2
                 FOR UPDATE SKIP LOCKED",
@@ -1713,6 +1878,22 @@ pub async fn vault_rotate(
         .await?;
         if rows.is_empty() {
             tx.rollback().await?;
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT count(*)
+                   FROM openmettle.external_connections
+                  WHERE state = 'authorized'
+                    AND encryption_key_id IS NOT NULL
+                    AND encryption_key_id <> $1",
+            )
+            .bind(&target_key_id)
+            .fetch_one(pool)
+            .await?;
+            if remaining > 0 && Instant::now() < wait_deadline {
+                let pause = Duration::from_millis(50)
+                    .min(wait_deadline.saturating_duration_since(Instant::now()));
+                sleep(pause).await;
+                continue;
+            }
             break;
         }
         for row in rows {
@@ -1803,7 +1984,8 @@ pub async fn vault_rotate(
                   WHERE id = $1::uuid
                     AND state = 'authorized'
                     AND encryption_key_id = $10
-                    AND credential_generation = $11",
+                    AND credential_generation = $11
+                    AND (refresh_claim_token IS NULL OR refresh_lease_until <= clock_timestamp())",
             )
             .bind(&conn_id)
             .bind(&new_access.key_id)
@@ -1824,8 +2006,12 @@ pub async fn vault_rotate(
         tx.commit().await?;
     }
 
-    let skipped_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*)
+    let (skipped_rows, deferred_active_refresh): (i64, i64) = sqlx::query_as(
+        "SELECT count(*),
+                count(*) FILTER (
+                    WHERE refresh_claim_token IS NOT NULL
+                      AND refresh_lease_until > clock_timestamp()
+                )
            FROM openmettle.external_connections
           WHERE state = 'authorized'
             AND encryption_key_id IS NOT NULL
@@ -1835,10 +2021,21 @@ pub async fn vault_rotate(
     .fetch_one(pool)
     .await?;
 
+    if skipped_rows > 0 {
+        return Ok(VaultRotateReport {
+            target_key_id,
+            rotated_rows,
+            skipped_rows,
+            deferred_active_refresh,
+            replayed: false,
+        });
+    }
+
     let details = json!({
         "target_key_id": target_key_id,
         "rotated_rows": rotated_rows,
         "skipped_rows": skipped_rows,
+        "deferred_active_refresh": deferred_active_refresh,
     });
     let inserted = sqlx::query(
         "INSERT INTO openmettle.authorization_audit
@@ -1861,6 +2058,7 @@ pub async fn vault_rotate(
         target_key_id,
         rotated_rows,
         skipped_rows,
+        deferred_active_refresh,
         replayed: false,
     })
 }
@@ -1921,10 +2119,14 @@ impl fmt::Debug for RefreshedCredential {
 #[derive(Debug)]
 pub enum RefreshOutcome {
     Refreshed(RefreshedCredential),
-    /// Deterministic rejection (`400`/`401`/`403`, redirect, or malformed payload).
+    /// Confirmed OAuth rejection (`401`/`403`, `400` with permanent OAuth `error`, or malformed
+    /// `200` token/scope payload). Transitions the connection to `reauth_required`.
     Refused,
-    /// Transient fault (`408`/`429`/`502`/`503`/`504`, timeout, or network error).
+    /// Transient fault (`408`/`429`/`5xx`, non-OAuth `400`, TLS/network/timeout/framing).
+    /// Preserves stored credentials.
     Transient,
+    /// No provider- and origin-bound refresh route matches the connection. Non-destructive.
+    Unconfigured,
 }
 
 /// Pluggable upstream refresh seam used by [`VaultCredentialProvider`].
@@ -1952,11 +2154,15 @@ impl Default for RefreshTimeouts {
     }
 }
 
-/// Bounded HTTPS/1.1 OAuth2 `refresh_token` client built over [`crate::provider_http::transport`].
+/// Bounded HTTPS/1.1 OAuth2 `refresh_token` client built over [`crate::provider_http::transport`],
+/// strictly bound to one `provider_kind` and explicit allowlist of MCP `endpoint_origin`s so a
+/// refresh token can never be dispatched to a mismatched provider's authorization server.
 /// Enforces canonical HTTPS URLs, SSRF address policy, explicit `rustls` (ring) TLS 1.2/1.3,
 /// isolated DNS lookup slots, zero redirects/retries/pooling, and fully redacted error handling.
 #[derive(Clone)]
 pub struct HttpsRefreshClient {
+    provider_kind: String,
+    allowed_origins: BTreeSet<String>,
     endpoint: transport::Endpoint,
     allowed: Vec<transport::Range>,
     tls: Arc<rustls::ClientConfig>,
@@ -1976,18 +2182,34 @@ impl fmt::Debug for HttpsRefreshClient {
 
 impl HttpsRefreshClient {
     pub fn new(
+        provider_kind: &str,
+        allowed_origins: &[&str],
         token_endpoint_url: &str,
         trust: Trust<'_>,
         private_ranges: &[&str],
         client_id: Option<String>,
         timeouts: RefreshTimeouts,
     ) -> Result<Self, provider_http::Error> {
-        if private_ranges.len() > MAX_PRIVATE_RANGES
+        if validate_provider_kind(provider_kind).is_err()
+            || allowed_origins.is_empty()
+            || allowed_origins.len() > 64
+            || private_ranges.len() > MAX_PRIVATE_RANGES
             || timeouts.setup.is_zero()
             || timeouts.total.is_zero()
             || timeouts.total > Duration::from_secs(60)
         {
             return Err(provider_http::Error::Configuration);
+        }
+        if let Some(id) = client_id.as_deref()
+            && (id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+        {
+            return Err(provider_http::Error::Configuration);
+        }
+        let mut origins = BTreeSet::new();
+        for origin in allowed_origins {
+            if validate_endpoint_origin(origin).is_err() || !origins.insert((*origin).to_owned()) {
+                return Err(provider_http::Error::Configuration);
+            }
         }
         let endpoint = transport::endpoint(token_endpoint_url)?;
         let allowed = private_ranges
@@ -1997,6 +2219,8 @@ impl HttpsRefreshClient {
         let roots = transport::roots(trust)?;
         let tls = transport::client_config(roots)?;
         Ok(Self {
+            provider_kind: provider_kind.to_owned(),
+            allowed_origins: origins,
             endpoint,
             allowed,
             tls,
@@ -2009,6 +2233,14 @@ impl HttpsRefreshClient {
         })
     }
 
+    pub fn provider_kind(&self) -> &str {
+        &self.provider_kind
+    }
+
+    pub fn allowed_origins(&self) -> &BTreeSet<String> {
+        &self.allowed_origins
+    }
+
     fn route(&self) -> transport::Route<'_> {
         transport::Route {
             endpoint: &self.endpoint,
@@ -2018,6 +2250,64 @@ impl HttpsRefreshClient {
             slots: &self.slots,
             #[cfg(test)]
             loopback: self.loopback,
+        }
+    }
+}
+
+/// Provider- and origin-bound registry of trusted OAuth token refresh clients.
+///
+/// Keys each configured [`HttpsRefreshClient`] by `(provider_kind, mcp_endpoint_origin)` so
+/// connections for one provider or MCP origin can never dispatch refresh tokens to another
+/// provider's authorization server. Connections without a matching route receive
+/// [`RefreshOutcome::Unconfigured`] without contacting any remote host or wiping stored tokens.
+#[derive(Clone, Default)]
+pub struct VaultRefreshRegistry {
+    routes: BTreeMap<(String, String), Arc<HttpsRefreshClient>>,
+}
+
+impl fmt::Debug for VaultRefreshRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("VaultRefreshRegistry(..)")
+    }
+}
+
+impl VaultRefreshRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, client: Arc<HttpsRefreshClient>) -> Result<(), VaultError> {
+        for origin in client.allowed_origins() {
+            let key = (client.provider_kind().to_owned(), origin.clone());
+            if self.routes.contains_key(&key) {
+                return Err(VaultError::Configuration("duplicate vault refresh route"));
+            }
+        }
+        for origin in client.allowed_origins() {
+            let key = (client.provider_kind().to_owned(), origin.clone());
+            self.routes.insert(key, Arc::clone(&client));
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+}
+
+impl RefreshClient for VaultRefreshRegistry {
+    fn refresh<'a>(
+        &'a self,
+        request: RefreshRequest<'a>,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = RefreshOutcome> + Send + 'a>> {
+        let key = (
+            request.provider_kind.to_owned(),
+            request.endpoint_origin.to_owned(),
+        );
+        match self.routes.get(&key) {
+            Some(client) => client.refresh(request, deadline),
+            None => Box::pin(async { RefreshOutcome::Unconfigured }),
         }
     }
 }
@@ -2053,11 +2343,11 @@ fn parse_oauth_refresh_reply(body: &[u8]) -> Result<RefreshedCredential, VaultEr
     }
     let parsed: OAuthTokenReply =
         serde_json::from_value(value).map_err(|_| VaultError::RefreshRefused)?;
-    let access_token = SecretText::new(&parsed.access_token)?;
+    let access_token = SecretText::new_access(&parsed.access_token)?;
     let refresh_token = parsed
         .refresh_token
         .as_deref()
-        .map(SecretText::new)
+        .map(SecretText::new_refresh)
         .transpose()?;
     let granted_scopes = match parsed.scope {
         Some(raw) => {
@@ -2083,6 +2373,16 @@ fn parse_oauth_refresh_reply(body: &[u8]) -> Result<RefreshedCredential, VaultEr
     })
 }
 
+fn is_permanent_oauth_400(body: &[u8]) -> bool {
+    let Ok(Value::Object(map)) = unique(body) else {
+        return false;
+    };
+    matches!(
+        map.get("error").and_then(Value::as_str),
+        Some("invalid_grant" | "invalid_client" | "unauthorized_client" | "invalid_scope")
+    )
+}
+
 impl RefreshClient for HttpsRefreshClient {
     fn refresh<'a>(
         &'a self,
@@ -2090,6 +2390,11 @@ impl RefreshClient for HttpsRefreshClient {
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = RefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
+            if request.provider_kind != self.provider_kind
+                || !self.allowed_origins.contains(request.endpoint_origin)
+            {
+                return RefreshOutcome::Unconfigured;
+            }
             let now = Instant::now();
             if now >= deadline {
                 return RefreshOutcome::Transient;
@@ -2139,22 +2444,17 @@ impl RefreshClient for HttpsRefreshClient {
                         Ok(cred) => RefreshOutcome::Refreshed(cred),
                         Err(_) => RefreshOutcome::Refused,
                     },
-                    StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                        RefreshOutcome::Refused
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => RefreshOutcome::Refused,
+                    StatusCode::BAD_REQUEST => {
+                        if is_permanent_oauth_400(response.body()) {
+                            RefreshOutcome::Refused
+                        } else {
+                            RefreshOutcome::Transient
+                        }
                     }
-                    StatusCode::REQUEST_TIMEOUT
-                    | StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::GATEWAY_TIMEOUT => RefreshOutcome::Transient,
-                    _ => RefreshOutcome::Refused,
+                    _ => RefreshOutcome::Transient,
                 },
-                Err(
-                    provider_http::Error::Timeout
-                    | provider_http::Error::Resolve
-                    | provider_http::Error::Connect,
-                ) => RefreshOutcome::Transient,
-                Err(_) => RefreshOutcome::Refused,
+                Err(_) => RefreshOutcome::Transient,
             }
         })
     }
@@ -2329,7 +2629,7 @@ impl VaultCredentialProvider {
 
         loop {
             if Instant::now() >= deadline {
-                return CredentialOutcome::Unavailable;
+                return CredentialOutcome::Transient;
             }
             let Ok(mut conn) = self.pool.acquire().await else {
                 return CredentialOutcome::Unavailable;
@@ -2337,6 +2637,16 @@ impl VaultCredentialProvider {
             let Ok(mut tx) = conn.begin().await else {
                 return CredentialOutcome::Unavailable;
             };
+            // Consistent single MVCC snapshot across restore gate, scope/actor authority, shares,
+            // and encrypted connection metadata with zero row locks on projects/users/connections.
+            if sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await
+                .is_err()
+            {
+                let _ = tx.rollback().await;
+                return CredentialOutcome::Unavailable;
+            }
             if crate::restore::require_open_gate(&mut tx).await.is_err() {
                 let _ = tx.rollback().await;
                 return CredentialOutcome::Unavailable;
@@ -2450,10 +2760,15 @@ impl VaultCredentialProvider {
             let _ = tx.rollback().await;
             drop(conn);
 
-            // Expired with no refresh secret or no refresh client -> transition to reauth_required.
-            if !has_refresh || self.refresher.is_none() {
+            // Expired with no refresh secret -> transition to reauth_required.
+            if !has_refresh {
                 self.mark_expired_reauth_required(&request).await;
                 return CredentialOutcome::Unavailable;
+            }
+            // Expired with a valid refresh secret but no refresher configured -> non-destructive
+            // transient refusal; preserve stored credentials.
+            if self.refresher.is_none() {
+                return CredentialOutcome::Transient;
             }
 
             // Single-flight refresh attempt (claim lease or wait behind active leader).
@@ -2465,11 +2780,12 @@ impl VaultCredentialProvider {
                 RefreshStep::Wait => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return CredentialOutcome::Unavailable;
+                        return CredentialOutcome::Transient;
                     }
                     sleep(self.config.waiter_poll.min(remaining)).await;
                 }
                 RefreshStep::RetryRead => continue,
+                RefreshStep::Transient => return CredentialOutcome::Transient,
                 RefreshStep::Unavailable => return CredentialOutcome::Unavailable,
             }
         }
@@ -2486,15 +2802,11 @@ impl VaultCredentialProvider {
             let _ = tx.rollback().await;
             return;
         }
-        let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
-            let _ = tx.rollback().await;
-            return;
-        };
         let row = sqlx::query(
             "SELECT state, revocation_generation,
                     CASE WHEN expires_at IS NOT NULL
                          THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
-                    has_refresh
+                    has_refresh, endpoint_origin, allowed_scopes, granted_scopes
                FROM openmettle.external_connections
               WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
                 FOR UPDATE",
@@ -2508,13 +2820,47 @@ impl VaultCredentialProvider {
             let _ = tx.rollback().await;
             return;
         };
+        // Re-verify live caller authority AFTER holding the connection row lock.
+        let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
+            let _ = tx.rollback().await;
+            return;
+        };
+        let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
+            &mut tx,
+            request.scope_id,
+            request.actor_user_id,
+            request.actor_approval_id,
+            now_ms,
+        )
+        .await
+        else {
+            let _ = tx.rollback().await;
+            return;
+        };
+        let Ok(shares) = load_active_shares(&mut tx, request.connection_id).await else {
+            let _ = tx.rollback().await;
+            return;
+        };
+        if !can_execute_connection(&actor, &scope, &shares) {
+            let _ = tx.rollback().await;
+            return;
+        }
         let state: String = row.try_get(0).unwrap_or_default();
         let rev_gen: i64 = row.try_get(1).unwrap_or(0);
         let exp_ms: Option<i64> = row.try_get(2).unwrap_or(None);
         let has_refresh: bool = row.try_get(3).unwrap_or(false);
+        let endpoint_origin: String = row.try_get(4).unwrap_or_default();
+        let allowed_scopes: Vec<String> = row.try_get(5).unwrap_or_default();
+        let granted_scopes: Vec<String> = row.try_get(6).unwrap_or_default();
         if state != ConnectionState::Authorized.as_str()
             || !exp_ms.is_some_and(|exp| exp <= now_ms)
-            || (has_refresh && self.refresher.is_some())
+            || has_refresh
+            || request
+                .expected_origin
+                .is_some_and(|exp| exp != endpoint_origin)
+            || request.required_scope.is_some_and(|req| {
+                !granted_scopes.iter().any(|s| s == req) || !allowed_scopes.iter().any(|s| s == req)
+            })
         {
             let _ = tx.rollback().await;
             return;
@@ -2574,11 +2920,12 @@ impl VaultCredentialProvider {
         deadline: Instant,
     ) -> RefreshStep {
         let Some(refresher) = self.refresher.as_ref() else {
-            return RefreshStep::Unavailable;
+            return RefreshStep::Transient;
         };
 
-        // Phase 1: lock row, check if another worker already refreshed or holds a live lease,
-        // else acquire refresh lease and decrypt ONLY the refresh secret before releasing DB lock.
+        // Phase 1: lock gate (FOR SHARE) then connection row (FOR UPDATE) FIRST, re-verify live
+        // caller authority + state + expiry AFTER holding the row lock, and claim the single-flight
+        // refresh lease before releasing DB locks.
         let claim = {
             let Ok(mut conn) = self.pool.acquire().await else {
                 return RefreshStep::Unavailable;
@@ -2590,6 +2937,29 @@ impl VaultCredentialProvider {
                 let _ = tx.rollback().await;
                 return RefreshStep::Unavailable;
             }
+            let row = sqlx::query(
+                "SELECT provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
+                        CASE WHEN expires_at IS NOT NULL
+                             THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
+                        encryption_key_id,
+                        refresh_salt, refresh_nonce, refresh_ciphertext,
+                        credential_generation, revocation_generation,
+                        refresh_claim_token::text,
+                        CASE WHEN refresh_lease_until IS NOT NULL
+                             THEN floor(extract(epoch FROM refresh_lease_until) * 1000)::bigint END
+                   FROM openmettle.external_connections
+                  WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
+                    FOR UPDATE",
+            )
+            .bind(request.connection_id)
+            .bind(request.scope_id)
+            .bind(request.account_id)
+            .fetch_optional(&mut *tx)
+            .await;
+            let Ok(Some(row)) = row else {
+                let _ = tx.rollback().await;
+                return RefreshStep::Unavailable;
+            };
             let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
                 let _ = tx.rollback().await;
                 return RefreshStep::Unavailable;
@@ -2615,29 +2985,6 @@ impl VaultCredentialProvider {
                 return RefreshStep::Unavailable;
             }
 
-            let row = sqlx::query(
-                "SELECT provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
-                        CASE WHEN expires_at IS NOT NULL
-                             THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
-                        encryption_key_id,
-                        refresh_salt, refresh_nonce, refresh_ciphertext,
-                        credential_generation, revocation_generation,
-                        refresh_claim_token::text,
-                        CASE WHEN refresh_lease_until IS NOT NULL
-                             THEN floor(extract(epoch FROM refresh_lease_until) * 1000)::bigint END
-                   FROM openmettle.external_connections
-                  WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
-                    FOR UPDATE",
-            )
-            .bind(request.connection_id)
-            .bind(request.scope_id)
-            .bind(request.account_id)
-            .fetch_optional(&mut *tx)
-            .await;
-            let Ok(Some(row)) = row else {
-                let _ = tx.rollback().await;
-                return RefreshStep::Unavailable;
-            };
             let provider_kind: String = match row.try_get(0) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
@@ -2692,7 +3039,7 @@ impl VaultCredentialProvider {
                 (key_id, r_salt, r_nonce, r_ct)
             else {
                 let _ = tx.rollback().await;
-                return RefreshStep::Unavailable;
+                return RefreshStep::RetryRead;
             };
             let Ok(sealed_refresh) = decode_sealed(&key_id, r_salt, r_nonce, r_ct) else {
                 let _ = tx.rollback().await;
@@ -2764,12 +3111,13 @@ impl VaultCredentialProvider {
             )
             .await;
 
-        // Phase 3: re-lock row and fence commit against concurrent disconnect/reauth/rotation.
+        // Phase 3: re-lock gate (FOR SHARE) then connection row (FOR UPDATE) and fence commit
+        // against concurrent disconnect/reauth/rotation.
         let Ok(mut conn) = self.pool.acquire().await else {
-            return RefreshStep::Unavailable;
+            return RefreshStep::Transient;
         };
         let Ok(mut tx) = conn.begin().await else {
-            return RefreshStep::Unavailable;
+            return RefreshStep::Transient;
         };
         if crate::restore::require_open_gate(&mut tx).await.is_err() {
             let _ = tx.rollback().await;
@@ -2777,7 +3125,10 @@ impl VaultCredentialProvider {
         }
         let fenced = sqlx::query(
             "SELECT state, credential_generation, revocation_generation,
-                    refresh_claim_token::text, allowed_scopes, granted_scopes
+                    refresh_claim_token::text, allowed_scopes, granted_scopes,
+                    CASE WHEN expires_at IS NOT NULL
+                         THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
+                    encryption_key_id, access_salt, access_nonce, access_ciphertext
                FROM openmettle.external_connections
               WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
                 FOR UPDATE",
@@ -2797,6 +3148,7 @@ impl VaultCredentialProvider {
         let cur_claim: Option<String> = fenced.try_get(3).unwrap_or(None);
         let allowed_scopes: Vec<String> = fenced.try_get(4).unwrap_or_default();
         let existing_granted: Vec<String> = fenced.try_get(5).unwrap_or_default();
+        let cur_expires_ms: Option<i64> = fenced.try_get(6).unwrap_or(None);
 
         // Disconnect, revocation, concurrent re-authorize, or lease takeover wins!
         if state != ConnectionState::Authorized.as_str()
@@ -2810,14 +3162,16 @@ impl VaultCredentialProvider {
 
         match outcome {
             RefreshOutcome::Refreshed(refreshed) => {
+                // RFC 6749 §6: refresh cannot widen beyond prior `granted_scopes` (or `allowed_scopes`).
+                // Omitting `scope` preserves `existing_granted`.
                 let next_granted = match refreshed.granted_scopes {
                     Some(scopes) => {
-                        let subset_ok = scopes_are_subset(&scopes, &allowed_scopes);
+                        let within_granted = scopes_are_subset(&scopes, &existing_granted);
+                        let within_allowed = scopes_are_subset(&scopes, &allowed_scopes);
                         let required_ok = request
                             .required_scope
                             .is_none_or(|req| scopes.iter().any(|s| s == req));
-                        if !subset_ok || !required_ok {
-                            // Upstream widened beyond allowed_scopes or omitted required scope.
+                        if !within_granted || !within_allowed || !required_ok {
                             self.commit_reauth_required(
                                 tx,
                                 request,
@@ -2833,7 +3187,10 @@ impl VaultCredentialProvider {
                         let required_ok = request
                             .required_scope
                             .is_none_or(|req| existing_granted.iter().any(|s| s == req));
-                        if existing_granted.is_empty() || !required_ok {
+                        if existing_granted.is_empty()
+                            || !scopes_are_subset(&existing_granted, &allowed_scopes)
+                            || !required_ok
+                        {
                             self.commit_reauth_required(
                                 tx,
                                 request,
@@ -2978,7 +3335,7 @@ impl VaultCredentialProvider {
                     .await;
                 RefreshStep::Unavailable
             }
-            RefreshOutcome::Transient => {
+            RefreshOutcome::Transient | RefreshOutcome::Unconfigured => {
                 let _ = sqlx::query(
                     "UPDATE openmettle.external_connections
                         SET refresh_claim_token = NULL,
@@ -2996,8 +3353,60 @@ impl VaultCredentialProvider {
                 .bind(claim.rev_gen)
                 .execute(&mut *tx)
                 .await;
+                let now_ms = post_lock_clock_ms(&mut tx, 0).await.ok();
+                let live_ok = match now_ms {
+                    Some(ms) => match load_worker_scope_and_actor(
+                        &mut tx,
+                        request.scope_id,
+                        request.actor_user_id,
+                        request.actor_approval_id,
+                        ms,
+                    )
+                    .await
+                    {
+                        Ok(Some((scope, actor))) => {
+                            match load_active_shares(&mut tx, request.connection_id).await {
+                                Ok(shares) => can_execute_connection(&actor, &scope, &shares),
+                                Err(_) => false,
+                            }
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                };
                 let _ = tx.commit().await;
-                RefreshStep::Unavailable
+                if !live_ok {
+                    return RefreshStep::Unavailable;
+                }
+                // If this was a proactive refresh while the stored access token is still
+                // unexpired, continue serving the existing unexpired token; otherwise surface
+                // `Transient` so callers can retry without wiping valid credentials.
+                if let Some(ms) = now_ms
+                    && cur_expires_ms.is_none_or(|exp| exp > ms)
+                {
+                    let key_id: Option<String> = fenced.try_get(7).unwrap_or(None);
+                    let salt: Option<Vec<u8>> = fenced.try_get(8).unwrap_or(None);
+                    let nonce: Option<Vec<u8>> = fenced.try_get(9).unwrap_or(None);
+                    let ct: Option<Vec<u8>> = fenced.try_get(10).unwrap_or(None);
+                    if let (Some(key_id), Some(salt), Some(nonce), Some(ct)) =
+                        (key_id, salt, nonce, ct)
+                        && let Ok(sealed) = decode_sealed(&key_id, salt, nonce, ct)
+                        && let Ok(plain) = self.keyring.open(
+                            &SecretBinding {
+                                connection_id: request.connection_id,
+                                scope_id: request.scope_id,
+                                account_id: request.account_id,
+                                secret_kind: SecretKind::Access,
+                                credential_generation: claim.cred_gen,
+                                allowed_scopes: &allowed_scopes,
+                            },
+                            &sealed,
+                        )
+                    {
+                        return RefreshStep::Ready(McpCredential::bearer(plain.expose()));
+                    }
+                }
+                RefreshStep::Transient
             }
         }
     }
@@ -3081,6 +3490,7 @@ enum RefreshStep {
     Ready(McpCredential),
     Wait,
     RetryRead,
+    Transient,
     Unavailable,
 }
 
@@ -3094,109 +3504,93 @@ impl McpCredentialProvider for VaultCredentialProvider {
 }
 
 /// Worker-side destination authorizer (`impl DestinationAuthorizer`) verifying live connection
-/// state, destination tuple, pinned HTTPS origin, granted scopes, actor/share authority, and
-/// `restore_reconciliation_gate` strictly before reconciliation credential lookups.
-#[derive(Clone)]
-pub struct VaultDestinationAuthorizer {
-    pool: PgPool,
-}
-
-impl fmt::Debug for VaultDestinationAuthorizer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("VaultDestinationAuthorizer(..)")
-    }
-}
+/// state, destination tuple, pinned HTTPS origin, contract `lookup_scope`, actor/share authority,
+/// and `restore_reconciliation_gate` directly on the caller's existing `Fence::Hold` connection
+/// strictly before reconciliation credential lookups.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VaultDestinationAuthorizer;
 
 impl VaultDestinationAuthorizer {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new() -> Self {
+        Self
     }
 
-    async fn authorize_inner(&self, target: ReconcileTarget<'_>) -> bool {
+    async fn authorize_inner(&self, conn: &mut PgConnection, target: ReconcileTarget<'_>) -> bool {
         if runs::uuid(target.connection_id).is_err()
             || runs::uuid(target.scope_id).is_err()
             || runs::uuid(target.actor_user_id).is_err()
             || target
                 .actor_approval_id
                 .is_some_and(|id| runs::uuid(id).is_err())
+            || !is_valid_scope_token(target.lookup_scope)
         {
             return false;
         }
-        let Some((dest_conn, dest_acct, dest_action)) = parse_destination_tuple(target.destination)
+        let Some((dest_conn, dest_acct, _dest_action)) =
+            parse_destination_tuple(target.destination)
         else {
             return false;
         };
         if dest_conn != target.connection_id || dest_acct != target.account_id {
             return false;
         }
-        let Ok(mut conn) = self.pool.acquire().await else {
+        if crate::restore::require_open_gate(&mut *conn).await.is_err() {
             return false;
-        };
-        let Ok(mut tx) = conn.begin().await else {
-            return false;
-        };
-        let allowed = async {
-            if crate::restore::require_open_gate(&mut tx).await.is_err() {
-                return false;
-            }
-            let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
-                return false;
-            };
-            let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
-                &mut tx,
-                target.scope_id,
-                target.actor_user_id,
-                target.actor_approval_id,
-                now_ms,
-            )
-            .await
-            else {
-                return false;
-            };
-            let Ok(shares) = load_active_shares(&mut tx, target.connection_id).await else {
-                return false;
-            };
-            if !can_execute_connection(&actor, &scope, &shares) {
-                return false;
-            }
-            let row = sqlx::query(
-                "SELECT endpoint_origin, allowed_scopes, granted_scopes, state,
-                        CASE WHEN expires_at IS NOT NULL
-                             THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
-                        has_refresh
-                   FROM openmettle.external_connections
-                  WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3",
-            )
-            .bind(target.connection_id)
-            .bind(target.scope_id)
-            .bind(target.account_id)
-            .fetch_optional(&mut *tx)
-            .await;
-            let Ok(Some(row)) = row else {
-                return false;
-            };
-            let origin: String = row.try_get(0).unwrap_or_default();
-            let allowed_scopes: Vec<String> = row.try_get(1).unwrap_or_default();
-            let granted_scopes: Vec<String> = row.try_get(2).unwrap_or_default();
-            let state: String = row.try_get(3).unwrap_or_default();
-            let expires_ms: Option<i64> = row.try_get(4).unwrap_or(None);
-            let has_refresh: bool = row.try_get(5).unwrap_or(false);
-            if state != ConnectionState::Authorized.as_str() {
-                return false;
-            }
-            if target.expected_origin.is_some_and(|exp| exp != origin) {
-                return false;
-            }
-            if !granted_scopes.iter().any(|s| s == &dest_action)
-                || !allowed_scopes.iter().any(|s| s == &dest_action)
-            {
-                return false;
-            }
-            expires_ms.is_none_or(|exp| exp > now_ms) || has_refresh
         }
+        let Ok(now_ms) = post_lock_clock_ms(&mut *conn, 0).await else {
+            return false;
+        };
+        let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
+            &mut *conn,
+            target.scope_id,
+            target.actor_user_id,
+            target.actor_approval_id,
+            now_ms,
+        )
+        .await
+        else {
+            return false;
+        };
+        let Ok(shares) = load_active_shares(&mut *conn, target.connection_id).await else {
+            return false;
+        };
+        if !can_execute_connection(&actor, &scope, &shares) {
+            return false;
+        }
+        let row = sqlx::query(
+            "SELECT endpoint_origin, allowed_scopes, granted_scopes, state,
+                    CASE WHEN expires_at IS NOT NULL
+                         THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
+                    has_refresh
+               FROM openmettle.external_connections
+              WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3",
+        )
+        .bind(target.connection_id)
+        .bind(target.scope_id)
+        .bind(target.account_id)
+        .fetch_optional(&mut *conn)
         .await;
-        let _ = tx.rollback().await;
-        allowed
+        let Ok(Some(row)) = row else {
+            return false;
+        };
+        let origin: String = row.try_get(0).unwrap_or_default();
+        let allowed_scopes: Vec<String> = row.try_get(1).unwrap_or_default();
+        let granted_scopes: Vec<String> = row.try_get(2).unwrap_or_default();
+        let state: String = row.try_get(3).unwrap_or_default();
+        let expires_ms: Option<i64> = row.try_get(4).unwrap_or(None);
+        let has_refresh: bool = row.try_get(5).unwrap_or(false);
+        if state != ConnectionState::Authorized.as_str() {
+            return false;
+        }
+        if target.expected_origin.is_some_and(|exp| exp != origin) {
+            return false;
+        }
+        if !granted_scopes.iter().any(|s| s == target.lookup_scope)
+            || !allowed_scopes.iter().any(|s| s == target.lookup_scope)
+        {
+            return false;
+        }
+        expires_ms.is_none_or(|exp| exp > now_ms) || has_refresh
     }
 }
 
@@ -3217,9 +3611,10 @@ fn parse_destination_tuple(destination: &str) -> Option<(String, String, String)
 impl DestinationAuthorizer for VaultDestinationAuthorizer {
     fn authorize_reconcile<'a>(
         &'a self,
+        conn: &'a mut PgConnection,
         target: ReconcileTarget<'a>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move { self.authorize_inner(target).await })
+        Box::pin(async move { self.authorize_inner(conn, target).await })
     }
 }
 
@@ -3452,5 +3847,91 @@ mod tests {
         assert!(SecretText::new("").is_err());
         assert!(SecretText::new("has space").is_err());
         assert!(SecretText::new("line\nbreak").is_err());
+        assert!(SecretText::new_access(&"a".repeat(MAX_ACCESS_TOKEN_BYTES)).is_ok());
+        assert!(SecretText::new_access(&"a".repeat(MAX_ACCESS_TOKEN_BYTES + 1)).is_err());
+        assert!(SecretText::new_refresh(&"r".repeat(MAX_REFRESH_TOKEN_BYTES)).is_ok());
+        assert!(SecretText::new_refresh(&"r".repeat(MAX_REFRESH_TOKEN_BYTES + 1)).is_err());
+
+        // Idempotency MAC binds secret tokens and non-secret parameters without leaking plaintext.
+        let ring = test_ring();
+        let a1 = SecretText::new_access("CANARY-ACCESS-ONE").unwrap();
+        let a2 = SecretText::new_access("CANARY-ACCESS-TWO").unwrap();
+        let r1 = SecretText::new_refresh("CANARY-REFRESH-ONE").unwrap();
+        let scopes = vec!["issues.read".to_owned()];
+        let mac1 = ring
+            .idempotency_mac_hex("c1", "s1", &a1, Some(&r1), &scopes, None)
+            .unwrap();
+        let mac1_again = ring
+            .idempotency_mac_hex("c1", "s1", &a1, Some(&r1), &scopes, None)
+            .unwrap();
+        let mac2 = ring
+            .idempotency_mac_hex("c1", "s1", &a2, Some(&r1), &scopes, None)
+            .unwrap();
+        let mac_no_ref = ring
+            .idempotency_mac_hex("c1", "s1", &a1, None, &scopes, None)
+            .unwrap();
+        assert_eq!(mac1.len(), 64);
+        assert_eq!(mac1, mac1_again);
+        assert_ne!(mac1, mac2);
+        assert_ne!(mac1, mac_no_ref);
+        assert!(!mac1.contains("CANARY"));
+
+        // Permanent OAuth 400 classification preserves non-OAuth 400s as transient.
+        assert!(is_permanent_oauth_400(br#"{"error":"invalid_grant"}"#));
+        assert!(is_permanent_oauth_400(br#"{"error":"invalid_client"}"#));
+        assert!(is_permanent_oauth_400(
+            br#"{"error":"unauthorized_client"}"#
+        ));
+        assert!(is_permanent_oauth_400(br#"{"error":"invalid_scope"}"#));
+        assert!(!is_permanent_oauth_400(br#"{"error":"server_error"}"#));
+        assert!(!is_permanent_oauth_400(b"Bad Request from proxy"));
+    }
+
+    #[tokio::test]
+    async fn refresh_registry_binds_provider_and_origin_non_destructively() {
+        let ca = crate::provider_http::fixture::Ca::new();
+        let client = Arc::new(
+            HttpsRefreshClient::new(
+                "github",
+                &["https://mcp.vendor.example.test"],
+                "https://oauth.vendor.example.test/token",
+                Trust::Bundle(&ca.pem()),
+                &[],
+                Some("synthetic-client".into()),
+                RefreshTimeouts::default(),
+            )
+            .unwrap(),
+        );
+        let mut reg = VaultRefreshRegistry::new();
+        reg.register(Arc::clone(&client)).unwrap();
+        // Duplicate (provider_kind, origin) is refused.
+        assert!(reg.register(client).is_err());
+
+        let refresh_tok = SecretText::new_refresh("CANARY-UNROUTED-REFRESH").unwrap();
+        let scopes = vec!["issues.read".to_owned()];
+        // Wrong provider_kind or wrong MCP origin returns Unconfigured without network I/O.
+        for (provider_kind, origin) in [
+            ("gitlab", "https://mcp.vendor.example.test"),
+            ("github", "https://other.vendor.example.test"),
+        ] {
+            let outcome = reg
+                .refresh(
+                    RefreshRequest {
+                        connection_id: "00000000-0000-4000-8000-000000000001",
+                        provider_kind,
+                        account_id: "acct-1",
+                        endpoint_origin: origin,
+                        refresh_token: &refresh_tok,
+                        allowed_scopes: &scopes,
+                        current_granted_scopes: &scopes,
+                    },
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await;
+            assert!(
+                matches!(outcome, RefreshOutcome::Unconfigured),
+                "expected Unconfigured for ({provider_kind}, {origin}), got {outcome:?}"
+            );
+        }
     }
 }

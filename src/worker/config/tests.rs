@@ -421,7 +421,9 @@ async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
     route.as_object_mut().unwrap().remove("trust");
     route["private_cidrs"] = json!(["10.20.0.0/16"]);
     let config = fixture.load().unwrap();
-    let InferenceConfig { catalog, routes } = config;
+    let InferenceConfig {
+        catalog, routes, ..
+    } = config;
     let (gateway, _) = routes.models.into_iter().next().unwrap().1;
     let mut gateway = Arc::try_unwrap(gateway).ok().unwrap();
     let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -461,4 +463,99 @@ async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
     );
     let reached = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
     assert!(reached.is_err(), "the plain route reached the server");
+}
+
+#[test]
+fn external_mcp_configuration_validates_transports_refresh_routes_and_contracts() {
+    let mut fixture = Fixture::new();
+    let ca_path = fixture.dir.write("mcp-ca.pem", &Ca::new().pem());
+    let conn_id = "00000000-0000-4000-8000-000000004551";
+    fixture.document["routes"]["a"]["functions"] = json!("flat");
+    fixture.document["external_mcp"] = json!({
+        "connections": {
+            conn_id: {
+                "endpoint": "https://mcp.vendor.example.test/mcp",
+                "trust": { "roots": "bundle", "bundle_path": ca_path },
+                "private_cidrs": ["10.20.0.0/16"],
+                "setup_timeout_milliseconds": 2000,
+                "idle_read_timeout_milliseconds": 5000,
+                "call_timeout_milliseconds": 10000
+            }
+        },
+        "refresh_routes": [{
+            "provider_kind": "github",
+            "allowed_origins": ["https://mcp.vendor.example.test"],
+            "token_endpoint": "https://oauth.vendor.example.test/token",
+            "trust": { "roots": "bundle", "bundle_path": ca_path },
+            "private_cidrs": ["10.20.0.0/16"],
+            "client_id": "synthetic-client",
+            "setup_timeout_milliseconds": 2000,
+            "total_timeout_milliseconds": 5000
+        }],
+        "tools": [{
+            "tool_id": "gh_list_issues",
+            "remote_name": "list_issues",
+            "version": "1",
+            "description": "List issues from synthetic MCP server",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["repo"],
+                "properties": {
+                    "repo": { "type": "string", "minLength": 1, "maxLength": 64 }
+                }
+            },
+            "connection_id": conn_id,
+            "account_id": "acct-1",
+            "action": "issues.read",
+            "resource_field": "repo",
+            "fixed_resource": "default",
+            "class": "read",
+            "capability": "tool.github",
+            "gate": "on_by_default",
+            "tool_policy": "mcp.v1",
+            "destination_policy": "synth.v1",
+            "endpoint_id": "gh-mcp",
+            "endpoint_version": "1",
+            "authoritative_lookup": false,
+            "semantic_errors_are_side_effect_free": true,
+            "reconcile": {
+                "lookup_tool": "lookup_issue",
+                "lookup_scope": "issues.read",
+                "handle_argument": "handle",
+                "status_field": "status"
+            },
+            "call_timeout_milliseconds": 5000
+        }]
+    });
+    let loaded = fixture.load().unwrap();
+    let ext = loaded
+        .external_mcp
+        .expect("external_mcp runtime config loaded");
+    assert!(ext.transports.contains_key(conn_id));
+    assert!(ext.refresh_registry.is_some());
+    assert!(ext.registry.get("gh_list_issues", "1").is_some());
+
+    // Invalid reconcile lookup_scope, unknown connection_id, or plain http MCP endpoint fail closed.
+    assert_eq!(
+        fixture.with(
+            "/external_mcp/tools/0/reconcile/lookup_scope",
+            json!("INVALID SCOPE")
+        ),
+        Error::ExternalMcp
+    );
+    assert_eq!(
+        fixture.with(
+            "/external_mcp/tools/0/connection_id",
+            json!("00000000-0000-4000-8000-000000009999")
+        ),
+        Error::ExternalMcp
+    );
+    assert_eq!(
+        fixture.with(
+            &format!("/external_mcp/connections/{conn_id}/endpoint"),
+            json!("http://mcp.vendor.example.test/mcp")
+        ),
+        Error::ExternalMcp
+    );
 }

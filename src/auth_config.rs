@@ -151,6 +151,9 @@ impl Object {
     pub(crate) fn take(&mut self, name: &str) -> Result<Value, Error> {
         self.0.remove(name).ok_or(Error::MissingField)
     }
+    pub(crate) fn take_optional(&mut self, name: &str) -> Option<Value> {
+        self.0.remove(name)
+    }
     pub(crate) fn object(&mut self, name: &str) -> Result<Self, Error> {
         Self::new(self.take(name)?)
     }

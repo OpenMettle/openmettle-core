@@ -196,9 +196,9 @@ impl super::Api {
             Op::AuthorizeConnection => {
                 let req: AuthorizeConnectionBody = parse_unique(body)?;
                 validate_optional_reason(req.reason.as_deref())?;
-                vault::SecretText::new(&req.access_token).map_err(|_| BODY)?;
+                vault::SecretText::new_access(&req.access_token).map_err(|_| BODY)?;
                 if let Some(refresh) = req.refresh_token.as_deref() {
-                    vault::SecretText::new(refresh).map_err(|_| BODY)?;
+                    vault::SecretText::new_refresh(refresh).map_err(|_| BODY)?;
                 }
                 vault::normalize_scopes(&req.granted_scopes, false).map_err(|_| BODY)?;
                 let expires_at = req

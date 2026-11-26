@@ -623,7 +623,7 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
     };
 
     // Export lines: [0]=header, [1]=origin, [2]=lifecycle_origin, [3]=lifecycle_baseline,
-    // [4..=9]=rec1..rec6, [10]=watermark, [11]=sha256.
+    // [4]=connection_origin, [5..=10]=rec1..rec6, [11]=watermark, [12]=sha256.
     let lines: Vec<&str> = full.lines().collect();
     let edit = |index: usize, field: usize| -> Vec<String> {
         let mut out: Vec<String> = lines[..lines.len() - 1]
@@ -652,18 +652,18 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
             "checksum mismatch",
         ),
         (
-            pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
                 .iter()
                 .map(|l| format!("{l}\n"))
                 .collect(),
             "missing checksum",
         ),
         (
-            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 10])),
+            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11])),
             "records out of sequence",
         ),
         (
-            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 8, 10])),
+            reseal(&pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 11])),
             "records out of sequence",
         ),
     ] {
@@ -674,7 +674,7 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
     }
     // A record altered after the restored head breaks the chain; one at or below it differs from
     // the restored record. Either refusal rolls the whole replay back.
-    for altered in [edit(9, 6), edit(5, 6)] {
+    for altered in [edit(10, 6), edit(6, 6)] {
         assert_eq!(
             sqlstate_of(replay(&owner, &store, &reseal(&altered)).await.unwrap_err()),
             "OMR03"
@@ -711,7 +711,7 @@ async fn replay_fails_closed_on_damaged_tampered_lagging_and_stale_exports() {
     .fetch_one(&forged_owner)
     .await
     .unwrap();
-    let mut extended = pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    let mut extended = pick(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     let content: String = Sha256::digest(b"forged")
         .iter()
         .map(|b| format!("{b:02x}"))

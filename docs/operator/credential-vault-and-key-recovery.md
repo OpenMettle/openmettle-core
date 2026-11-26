@@ -57,8 +57,13 @@ Rotation runs online alongside active `openmettle-api` and `openmettle-worker` t
    ```
 
    - If any stored `encryption_key_id` in PostgreSQL is missing from `--vault-keys`, `vault rotate` refuses fail-closed before modifying any row.
-   - Re-running with the same `--operator-id` and `--request-key` for the same `active_key_id` replays cleanly without modifying rows.
-   - Verify `openmettle-admin vault status` shows zero remaining rows under `vault-k1` (`skipped=0`).
+   - Rows holding an active worker refresh claim (`refresh_claim_token IS NOT NULL AND refresh_lease_until > clock_timestamp()`) are deferred rather than overwritten mid-flight. `vault rotate` retries briefly; if any old-key rows remain deferred (`skipped > 0` / `deferred_active_refresh > 0`), it exits non-zero **without** consuming `--request-key` so you can re-run with the same `--request-key` once in-flight refreshes settle.
+   - Re-running with the same `--operator-id` and `--request-key` for the same `active_key_id` after completion (`skipped=0`) replays cleanly without modifying rows.
+   - Verify `openmettle-admin vault status` shows zero remaining rows under `vault-k1` (`skipped=0 deferred_active_refresh=0`).
+
+## Worker external MCP & refresh-route configuration
+
+When `openmettle-worker` executes reviewed external MCP tools (`OPENMETTLE_WORKER_INFERENCE_CONFIG`), configure an optional `external_mcp` block with pinned HTTPS `connections`, reviewed `tools` (including `reconcile.lookup_scope` when reconciliation is enabled), and optional provider-bound `refresh_routes` mapping `(provider_kind, allowed_origins)` to each provider's trusted OAuth token endpoint URI. Mount `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` alongside it so `VaultCredentialProvider` and `VaultDestinationAuthorizer` are wired at worker startup; omitting `OPENMETTLE_WORKER_VAULT_KEYS_CONFIG` keeps external MCP tool dispatch fail-closed.
 
 ## Backup retention and retired key retention
 
@@ -69,7 +74,7 @@ Rotation runs online alongside active `openmettle-api` and `openmettle-worker` t
 
 ### Normal database + artifact restore
 
-1. Complete the PostgreSQL and artifact restore reconciliation runbook ([Restoring a matched database and artifact volume](restore-artifact-volume.md)). While `restore_reconciliation_gate` is closed, all connection writes (`POST`/`PUT`) and worker credential lookups fail closed (`503 unavailable` / `CredentialOutcome::Unavailable`).
+1. Complete the PostgreSQL and artifact restore reconciliation runbook ([Restoring a matched database and artifact volume](restore-artifact-volume.md)), passing `--required-connection-origin` from the schema-43+ `journal export` when locking the gate. Replaying the complete journal enforces post-backup connection disconnects, transitions superseded credentials to `reauth_required`, and deactivates revoked shares; if journal coverage is incomplete, `openmettle-admin restore accept-coverage-gap` transitions all `authorized` connections to `reauth_required` and deactivates all active shares before the gate can open. While `restore_reconciliation_gate` is closed, all connection writes (`POST`/`PUT`) and worker credential lookups fail closed (`503 unavailable` / `CredentialOutcome::Unavailable`).
 2. Ensure the mounted `VAULT_KEYS_CONFIG` on `openmettle-api` and `openmettle-worker` includes every `encryption_key_id` reported by `openmettle-admin vault status` against the restored database.
 3. After the restore gate opens, if the restored snapshot contains rows under an older key version, run `openmettle-admin vault rotate` to re-encrypt them under the current `active_key_id`.
 

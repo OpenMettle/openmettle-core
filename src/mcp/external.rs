@@ -30,7 +30,7 @@ use crate::{
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -93,8 +93,11 @@ pub struct CredentialRequest<'a> {
 #[derive(Debug)]
 pub enum CredentialOutcome {
     Ready(McpCredential),
-    /// Credential is missing, revoked, or gated (e.g. pending V1-28 vault storage).
+    /// Credential is missing, revoked, unauthorized, or gated (non-retryable).
     Unavailable,
+    /// Transient refresh, upstream, transport, or unconfigured-refresher outage (retryable;
+    /// stored credentials were preserved).
+    Transient,
 }
 
 /// Server-side credential lookup seam (production external storage stays gated on V1-28 `#25`).
@@ -131,14 +134,17 @@ pub struct ReconcileTarget<'a> {
     pub tool_version: &'a str,
     pub destination: &'a str,
     pub capability: &'a str,
+    /// Canonical lowercase ASCII scope required by the contract's reconciliation lookup tool.
+    pub lookup_scope: &'a str,
     pub expected_origin: Option<&'a str>,
 }
 
-/// Live destination authorization seam checked inside `Fence::Hold` before any reconciliation
-/// credential lookup or read-only lookup call.
+/// Live destination authorization seam checked inside `Fence::Hold` on the caller's existing
+/// transaction connection before any reconciliation credential lookup or read-only lookup call.
 pub trait DestinationAuthorizer: Send + Sync {
     fn authorize_reconcile<'a>(
         &'a self,
+        conn: &'a mut PgConnection,
         target: ReconcileTarget<'a>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }
@@ -541,11 +547,13 @@ impl ExternalMcpAdapter {
             });
         };
 
+        let reconcile_spec = contract.reconcile.as_ref()?;
         let transport = self.transports.get(&contract.connection_id)?;
         let expected_origin = transport.origin();
 
         // Check BOTH `recheck_decision` AND live destination read/reconcile authorization inside
-        // `Fence::Hold` strictly BEFORE any `McpCredentialProvider` lookup or outbound HTTP call.
+        // `Fence::Hold` on the existing transaction connection strictly BEFORE any
+        // `McpCredentialProvider` lookup or outbound HTTP call.
         let authorized = {
             let mut c = self.pool.acquire().await.ok()?;
             let capabilities = [CapabilityUse {
@@ -563,6 +571,7 @@ impl ExternalMcpAdapter {
                 tool_version: &contract.version,
                 destination: proposal.destination(),
                 capability: &op.capability,
+                lookup_scope: &reconcile_spec.lookup_scope,
                 expected_origin: Some(&expected_origin),
             };
             let reconcile_auth = self.reconcile_auth.clone();
@@ -590,7 +599,7 @@ impl ExternalMcpAdapter {
                 ) {
                     return Ok(false);
                 }
-                Ok(reconcile_auth.authorize_reconcile(target).await)
+                Ok(reconcile_auth.authorize_reconcile(conn, target).await)
             })
             .await
             .unwrap_or(false)
@@ -608,7 +617,7 @@ impl ExternalMcpAdapter {
                 actor_user_id: &actor_user_id,
                 actor_approval_id: Some(&run.claim.actor_approval_id),
                 expected_origin: Some(&expected_origin),
-                required_scope: Some(&contract.action),
+                required_scope: Some(&reconcile_spec.lookup_scope),
             },
             call_deadline,
             &step.stop,
@@ -633,14 +642,16 @@ impl ExternalMcpAdapter {
             )
             .await
             .ok()?;
-        let reconcile_spec = contract.reconcile.as_ref()?;
         let status = extract_reconcile_status(&response, &reconcile_spec.status_field)?;
-        let remote_handle =
-            match extract_downstream_handle(&response, contract.handle_field.as_deref()) {
-                ExtractedHandle::Absent => None,
-                ExtractedHandle::Valid(h) => Some(h),
-                ExtractedHandle::Malformed => return None,
-            };
+        let remote_handle = match extract_downstream_handle(
+            &response,
+            contract.handle_field.as_deref(),
+            credential.bearer_token(),
+        ) {
+            ExtractedHandle::Absent => None,
+            ExtractedHandle::Valid(h) => Some(h),
+            ExtractedHandle::Malformed => return None,
+        };
         let handle = match (&op.downstream_handle, remote_handle) {
             // Never overwrite an already-recorded downstream handle with a conflicting one.
             (Some(existing), Some(remote)) if remote != *existing => return None,
@@ -700,6 +711,7 @@ async fn resolve_credential_bounded(
         resolved = timeout_at(deadline, provider.resolve(request)) => match resolved {
             Ok(CredentialOutcome::Ready(cred)) => Ok(cred),
             Ok(CredentialOutcome::Unavailable) => Err(PreflightError::Refused),
+            Ok(CredentialOutcome::Transient) => Err(PreflightError::Transient),
             Err(_) => Err(PreflightError::Transient),
         },
     }
@@ -787,7 +799,11 @@ enum ExtractedHandle {
     Malformed,
 }
 
-fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) -> ExtractedHandle {
+fn extract_downstream_handle(
+    response: &ToolCallSuccess,
+    field: Option<&str>,
+    bearer_token: Option<&str>,
+) -> ExtractedHandle {
     let Some(field) = field else {
         return ExtractedHandle::Absent;
     };
@@ -805,24 +821,44 @@ fn extract_downstream_handle(response: &ToolCallSuccess, field: Option<&str>) ->
     if candidate.is_empty()
         || candidate.len() > 256
         || !candidate.bytes().all(|b| b.is_ascii_graphic())
+        || bearer_token.is_some_and(|secret| !secret.is_empty() && candidate.contains(secret))
     {
         return ExtractedHandle::Malformed;
     }
     ExtractedHandle::Valid(candidate.to_owned())
 }
 
-fn choose_safe_marker(handle: &str) -> String {
-    if !handle.contains('[') && !handle.contains(']') && !"[REDACTED]".contains(handle) {
-        return "[REDACTED]".to_owned();
+fn choose_safe_marker_with(secret: &str, preferred: &str) -> String {
+    if !secret.contains('[') && !secret.contains(']') && !preferred.contains(secret) {
+        return preferred.to_owned();
     }
     for b in b"*~^@#%!+=:;?|/".iter().copied().chain(0x21u8..=0x7eu8) {
-        if !handle.as_bytes().contains(&b) {
+        if !secret.as_bytes().contains(&b) {
             return std::iter::repeat_n(char::from(b), 3).collect();
         }
     }
-    // `handle` contains all 94 ASCII graphic bytes (`handle.len() >= 94`), so `"[REDACTED]"`
-    // (len 10) cannot contain `handle` and each replacement shrinks byte length by `>= 84`.
-    "[REDACTED]".to_owned()
+    // `secret` contains all 94 ASCII graphic bytes (`secret.len() >= 94`), so `preferred`
+    // (len <= 21) cannot contain `secret` and each replacement shrinks byte length.
+    preferred.to_owned()
+}
+
+fn choose_safe_marker(handle: &str) -> String {
+    choose_safe_marker_with(handle, "[REDACTED]")
+}
+
+fn choose_credential_marker(secret: &str) -> String {
+    choose_safe_marker_with(secret, "[REDACTED_CREDENTIAL]")
+}
+
+fn redact_plain_str_with(input: &str, needle: &str, marker: &str) -> String {
+    if needle.is_empty() || !input.contains(needle) {
+        return input.to_owned();
+    }
+    let mut out = input.replace(needle, marker);
+    while out.contains(needle) {
+        out = out.replace(needle, marker);
+    }
+    out
 }
 
 fn redact_plain_str(input: &str, handle: &str) -> String {
@@ -830,11 +866,7 @@ fn redact_plain_str(input: &str, handle: &str) -> String {
         return input.to_owned();
     }
     let marker = choose_safe_marker(handle);
-    let mut out = input.replace(handle, &marker);
-    while out.contains(handle) {
-        out = out.replace(handle, &marker);
-    }
-    out
+    redact_plain_str_with(input, handle, &marker)
 }
 
 fn disambiguate_redacted_key(
@@ -886,16 +918,19 @@ fn disambiguate_redacted_key(
     unreachable!("pigeonhole bound guarantees an unused key in 1..=max_probe")
 }
 
-fn redact_value_strings(value: &mut Value, handle: &str) {
+fn redact_value_strings_with(value: &mut Value, needle: &str, marker: &str) {
+    if needle.is_empty() {
+        return;
+    }
     match value {
         Value::String(s) => {
-            if s.contains(handle) {
-                *s = redact_plain_str(s, handle);
+            if s.contains(needle) {
+                *s = redact_plain_str_with(s, needle, marker);
             }
         }
         Value::Array(items) => {
             for item in items {
-                redact_value_strings(item, handle);
+                redact_value_strings_with(item, needle, marker);
             }
         }
         Value::Object(map) => {
@@ -904,10 +939,10 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
             let mut cursors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
             let mut out = Map::with_capacity(entries.len());
             for (k, mut v) in entries {
-                redact_value_strings(&mut v, handle);
-                let new_key = if k.contains(handle) {
-                    let base = redact_plain_str(&k, handle);
-                    disambiguate_redacted_key(base, handle, &out, &original_keys, &mut cursors)
+                redact_value_strings_with(&mut v, needle, marker);
+                let new_key = if k.contains(needle) {
+                    let base = redact_plain_str_with(&k, needle, marker);
+                    disambiguate_redacted_key(base, needle, &out, &original_keys, &mut cursors)
                 } else {
                     k
                 };
@@ -917,6 +952,11 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
         }
         _ => {}
     }
+}
+
+fn redact_value_strings(value: &mut Value, handle: &str) {
+    let marker = choose_safe_marker(handle);
+    redact_value_strings_with(value, handle, &marker);
 }
 
 fn has_json_escape_sequence(s: &str) -> bool {
@@ -978,11 +1018,22 @@ fn is_json_number_literal(trimmed: &str) -> bool {
 
 const JSON_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 
-fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&str>) -> String {
-    if handle_field.is_none() && handle.is_none() {
+fn sanitize_text_block(
+    block: &str,
+    handle_field: Option<&str>,
+    handle: Option<&str>,
+    bearer_token: Option<&str>,
+) -> String {
+    let secret = bearer_token.filter(|s| !s.is_empty());
+    if handle_field.is_none() && handle.is_none() && secret.is_none() {
         return block.to_owned();
     }
     let json_trimmed = block.trim_matches(JSON_WHITESPACE);
+    if let Some(s) = secret
+        && json_trimmed == s
+    {
+        return choose_credential_marker(s);
+    }
     if let Some(h) = handle
         && json_trimmed == h
     {
@@ -1002,10 +1053,14 @@ fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&
         if let Some(h) = handle {
             redact_value_strings(&mut parsed, h);
         }
+        if let Some(s) = secret {
+            let marker = choose_credential_marker(s);
+            redact_value_strings_with(&mut parsed, s, &marker);
+        }
         parsed.sort_all_objects();
         return parsed.to_string();
     }
-    match handle {
+    let mut out = match handle {
         Some(h) => {
             // Withhold any JSON-looking block that failed `serde_json::from_str` (e.g. exceeding
             // recursion depth or truncated JSON) or any non-JSON text retaining JSON string escape
@@ -1015,20 +1070,32 @@ fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&
             }
             let plain = redact_plain_str(block, h);
             if has_json_escape_sequence(&plain) {
-                choose_safe_marker(h)
-            } else {
-                plain
+                return choose_safe_marker(h);
             }
+            plain
         }
         None => block.to_owned(),
+    };
+    if let Some(s) = secret {
+        let marker = choose_credential_marker(s);
+        if out.trim_ascii().starts_with(['{', '[', '"']) && has_json_escape_sequence(&out) {
+            return marker;
+        }
+        out = redact_plain_str_with(&out, s, &marker);
+        if out.contains(s) {
+            return marker;
+        }
     }
+    out
 }
 
 fn sanitize_tool_success(
     success: &ToolCallSuccess,
     handle_field: Option<&str>,
+    bearer_token: Option<&str>,
 ) -> Result<(String, Option<String>), ToolFault> {
-    let handle = match extract_downstream_handle(success, handle_field) {
+    let secret = bearer_token.filter(|s| !s.is_empty());
+    let handle = match extract_downstream_handle(success, handle_field, secret) {
         ExtractedHandle::Absent => None,
         ExtractedHandle::Valid(h) => Some(h),
         ExtractedHandle::Malformed => return Err(ToolFault::TerminalRefusal),
@@ -1039,7 +1106,12 @@ fn sanitize_tool_success(
     let text = if !success.content_blocks.is_empty() {
         let mut sanitized_blocks = Vec::with_capacity(success.content_blocks.len());
         for block in &success.content_blocks {
-            sanitized_blocks.push(sanitize_text_block(block, handle_field, handle.as_deref()));
+            sanitized_blocks.push(sanitize_text_block(
+                block,
+                handle_field,
+                handle.as_deref(),
+                secret,
+            ));
         }
         sanitized_blocks.join("\n")
     } else if let Some(structured) = &success.structured {
@@ -1050,13 +1122,22 @@ fn sanitize_tool_success(
         if let Some(h) = handle.as_deref() {
             redact_value_strings(&mut sanitized, h);
         }
+        if let Some(s) = secret {
+            let marker = choose_credential_marker(s);
+            redact_value_strings_with(&mut sanitized, s, &marker);
+        }
         sanitized.sort_all_objects();
         sanitized.to_string()
     } else {
-        match handle.as_deref() {
+        let mut plain = match handle.as_deref() {
             Some(h) => redact_plain_str(&success.text, h),
             None => success.text.clone(),
+        };
+        if let Some(s) = secret {
+            let marker = choose_credential_marker(s);
+            plain = redact_plain_str_with(&plain, s, &marker);
         }
+        plain
     };
     Ok((text, handle))
 }
@@ -1134,7 +1215,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                     (true, actor)
                 }
             };
-            let mut checked: BTreeMap<(String, String), bool> = BTreeMap::new();
+            let mut checked: BTreeMap<(String, String, String), bool> = BTreeMap::new();
             let mut kept = Vec::with_capacity(tools.len());
             for dt in tools {
                 let contract = match dt.external_version.as_deref() {
@@ -1158,7 +1239,11 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                 if !two_phase_enabled {
                     continue;
                 }
-                let conn_key = (contract.connection_id.clone(), contract.account_id.clone());
+                let conn_key = (
+                    contract.connection_id.clone(),
+                    contract.account_id.clone(),
+                    contract.action.clone(),
+                );
                 if let Some(&allowed) = checked.get(&conn_key) {
                     if allowed {
                         kept.push(dt.tool);
@@ -1344,7 +1429,11 @@ impl ApprovedAdapter for ExternalMcpAdapter {
 
                 match call_result {
                     Ok(success) => {
-                        match sanitize_tool_success(&success, contract.handle_field.as_deref()) {
+                        match sanitize_tool_success(
+                            &success,
+                            contract.handle_field.as_deref(),
+                            credential.bearer_token(),
+                        ) {
                             Ok((text, handle)) => return StepResult::ToolSuccess { text, handle },
                             Err(_) => {
                                 if !is_read {
@@ -1568,6 +1657,17 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             }
         })
     }
+
+    fn reconcile_operation<'a>(
+        &'a self,
+        run: &'a ActiveRun,
+        operation: &'a UnresolvedOperation,
+        step: StepContext,
+    ) -> Pin<Box<dyn Future<Output = Option<OwnedObservation>> + Send + 'a>> {
+        Box::pin(async move {
+            ExternalMcpAdapter::reconcile_operation(self, run, operation, step).await
+        })
+    }
 }
 
 fn idempotency_wire_fields<'a>(
@@ -1625,7 +1725,8 @@ mod tests {
             })),
             meta: None,
         };
-        let (text, handle) = sanitize_tool_success(&structured_escaped, Some("handle")).unwrap();
+        let (text, handle) =
+            sanitize_tool_success(&structured_escaped, Some("handle"), None).unwrap();
         assert_eq!(handle.as_deref(), Some(escaped_handle));
         assert!(!text.contains(escaped_handle));
         assert!(!text.contains("quote"));
@@ -1648,7 +1749,7 @@ mod tests {
             meta: None,
         };
         let (short_text, short_handle) =
-            sanitize_tool_success(&structured_short, Some("handle")).unwrap();
+            sanitize_tool_success(&structured_short, Some("handle"), None).unwrap();
         assert_eq!(short_handle.as_deref(), Some("1"));
         let parsed_short: Value = serde_json::from_str(&short_text).expect("valid JSON");
         assert!(parsed_short.get("handle").is_none());
@@ -1670,7 +1771,7 @@ mod tests {
             structured: Some(json!({"handle": "1"})),
             meta: None,
         };
-        let (ctext, chandle) = sanitize_tool_success(&json_content, Some("handle")).unwrap();
+        let (ctext, chandle) = sanitize_tool_success(&json_content, Some("handle"), None).unwrap();
         assert_eq!(chandle.as_deref(), Some("1"));
         let parsed_c: Value = serde_json::from_str(&ctext).expect("valid JSON");
         assert!(parsed_c.get("handle").is_none());
@@ -1684,7 +1785,7 @@ mod tests {
             structured: Some(json!({"handle": escaped_handle})),
             meta: None,
         };
-        let (ptext, phandle) = sanitize_tool_success(&plain_content, Some("handle")).unwrap();
+        let (ptext, phandle) = sanitize_tool_success(&plain_content, Some("handle"), None).unwrap();
         assert_eq!(phandle.as_deref(), Some(escaped_handle));
         assert_eq!(ptext, "done [REDACTED] end");
 
@@ -1700,7 +1801,7 @@ mod tests {
             })),
             meta: None,
         };
-        let (ktext, khandle) = sanitize_tool_success(&key_collision, Some("handle")).unwrap();
+        let (ktext, khandle) = sanitize_tool_success(&key_collision, Some("handle"), None).unwrap();
         assert_eq!(khandle.as_deref(), Some("h-key"));
         assert!(!ktext.contains("h-key"));
         let parsed_k: Value = serde_json::from_str(&ktext).expect("valid JSON");
@@ -1720,7 +1821,7 @@ mod tests {
             })),
             meta: None,
         };
-        let (dtext, dhandle) = sanitize_tool_success(&digit_two, Some("handle")).unwrap();
+        let (dtext, dhandle) = sanitize_tool_success(&digit_two, Some("handle"), None).unwrap();
         assert_eq!(dhandle.as_deref(), Some("2"));
         let parsed_d: Value = serde_json::from_str(&dtext).expect("valid JSON");
         assert_eq!(parsed_d["[REDACTED]"], 1);
@@ -1737,7 +1838,7 @@ mod tests {
             })),
             meta: None,
         };
-        let (htext, hhandle) = sanitize_tool_success(&hash_handle, Some("handle")).unwrap();
+        let (htext, hhandle) = sanitize_tool_success(&hash_handle, Some("handle"), None).unwrap();
         assert_eq!(hhandle.as_deref(), Some("#"));
         assert!(!htext.contains('#'));
         let parsed_h: Value = serde_json::from_str(&htext).expect("valid JSON");
@@ -1752,7 +1853,7 @@ mod tests {
             meta: None,
         };
         let (stext, shandle) =
-            sanitize_tool_success(&top_level_json_string, Some("handle")).unwrap();
+            sanitize_tool_success(&top_level_json_string, Some("handle"), None).unwrap();
         assert_eq!(shandle.as_deref(), Some(escaped_handle));
         assert!(!stext.contains("quote"));
         assert!(!stext.contains(escaped_handle));
@@ -1772,7 +1873,8 @@ mod tests {
             structured: Some(json!({"handle": escaped_handle})),
             meta: None,
         };
-        let (mb_text, mb_handle) = sanitize_tool_success(&multi_block, Some("handle")).unwrap();
+        let (mb_text, mb_handle) =
+            sanitize_tool_success(&multi_block, Some("handle"), None).unwrap();
         assert_eq!(mb_handle.as_deref(), Some(escaped_handle));
         assert!(!mb_text.contains("quote"));
         assert!(!mb_text.contains(escaped_handle));
@@ -1802,7 +1904,7 @@ mod tests {
                 })),
                 meta: None,
             };
-            let (t_out, t_h) = sanitize_tool_success(&tricky, Some("handle")).unwrap();
+            let (t_out, t_h) = sanitize_tool_success(&tricky, Some("handle"), None).unwrap();
             assert_eq!(t_h.as_deref(), Some(tricky_handle));
             assert!(
                 !t_out.contains(tricky_handle),
@@ -1833,7 +1935,8 @@ mod tests {
             structured: Some(json!({"handle": "1"})),
             meta: None,
         };
-        let (dp_out, dp_h) = sanitize_tool_success(&deep_and_primitives, Some("handle")).unwrap();
+        let (dp_out, dp_h) =
+            sanitize_tool_success(&deep_and_primitives, Some("handle"), None).unwrap();
         assert_eq!(dp_h.as_deref(), Some("1"));
         assert!(!dp_out.contains("quote"));
         assert!(!dp_out.contains("slash"));
@@ -1856,7 +1959,7 @@ mod tests {
             structured: Some(json!({"handle": "t"})),
             meta: None,
         };
-        let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle")).unwrap();
+        let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle"), None).unwrap();
         assert_eq!(bh_out, "true\nfalse\nnull");
 
         // Exact numeric handle echo in a standalone block is redacted, while form-feed (`\x0c`)
@@ -1871,7 +1974,8 @@ mod tests {
             structured: Some(json!({"handle": "18446744073709551617"})),
             meta: None,
         };
-        let (ene_out, ene_h) = sanitize_tool_success(&exact_numeric_echo, Some("handle")).unwrap();
+        let (ene_out, ene_h) =
+            sanitize_tool_success(&exact_numeric_echo, Some("handle"), None).unwrap();
         assert_eq!(ene_h.as_deref(), Some("18446744073709551617"));
         assert!(!ene_out.contains("18446744073709551617"));
         assert_eq!(
@@ -1885,7 +1989,8 @@ mod tests {
             structured: Some(json!({"handle": "1"})),
             meta: None,
         };
-        let (ff_out, ff_h) = sanitize_tool_success(&form_feed_padded, Some("handle")).unwrap();
+        let (ff_out, ff_h) =
+            sanitize_tool_success(&form_feed_padded, Some("handle"), None).unwrap();
         assert_eq!(ff_h.as_deref(), Some("1"));
         assert!(!ff_out.contains('1'));
         assert_eq!(
@@ -1948,7 +2053,7 @@ mod tests {
             structured: Some(Value::Object(many_keys)),
             meta: None,
         };
-        let (m_out, m_h) = sanitize_tool_success(&many, Some("handle")).unwrap();
+        let (m_out, m_h) = sanitize_tool_success(&many, Some("handle"), None).unwrap();
         assert_eq!(m_h.as_deref(), Some("hk"));
         assert!(!m_out.contains("hk"));
         let m_parsed: Value = serde_json::from_str(&m_out).expect("valid JSON");
@@ -1969,11 +2074,13 @@ mod tests {
             meta: None,
         };
         assert!(matches!(
-            extract_downstream_handle(&absent, Some("handle")),
+            extract_downstream_handle(&absent, Some("handle"), None),
             ExtractedHandle::Absent
         ));
         assert_eq!(
-            sanitize_tool_success(&absent, Some("handle")).unwrap().1,
+            sanitize_tool_success(&absent, Some("handle"), None)
+                .unwrap()
+                .1,
             None
         );
 
@@ -1984,7 +2091,7 @@ mod tests {
             meta: None,
         };
         assert!(matches!(
-            extract_downstream_handle(&valid, Some("handle")),
+            extract_downstream_handle(&valid, Some("handle"), None),
             ExtractedHandle::Valid(ref s) if s == "op_123-abc"
         ));
 
@@ -2007,16 +2114,60 @@ mod tests {
             };
             assert!(
                 matches!(
-                    extract_downstream_handle(&malformed, Some("handle")),
+                    extract_downstream_handle(&malformed, Some("handle"), None),
                     ExtractedHandle::Malformed
                 ),
                 "expected Malformed for {bad}"
             );
             assert_eq!(
-                sanitize_tool_success(&malformed, Some("handle")),
+                sanitize_tool_success(&malformed, Some("handle"), None),
                 Err(ToolFault::TerminalRefusal),
                 "expected TerminalRefusal for {bad}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_tool_success_redacts_reflected_bearer_and_rejects_secret_in_handle() {
+        let secret = "CANARY-BEARER-REFLECTED-999";
+        let echoed_text = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![
+                format!("upstream saw Bearer {secret} twice {secret}"),
+                json!({"echo": format!("tok={secret}"), "secret_key": secret}).to_string(),
+            ],
+            structured: Some(json!({"handle": "op-clean-1", "echo": secret})),
+            meta: None,
+        };
+        let (out, handle) =
+            sanitize_tool_success(&echoed_text, Some("handle"), Some(secret)).unwrap();
+        assert_eq!(handle.as_deref(), Some("op-clean-1"));
+        assert!(!out.contains(secret), "bearer leaked: {out}");
+        assert!(out.contains("[REDACTED_CREDENTIAL]"), "{out}");
+
+        let echoed_structured = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(json!({"result": format!("Bearer {secret}")})),
+            meta: None,
+        };
+        let (s_out, _) = sanitize_tool_success(&echoed_structured, None, Some(secret)).unwrap();
+        assert!(!s_out.contains(secret), "{s_out}");
+        assert!(s_out.contains("[REDACTED_CREDENTIAL]"), "{s_out}");
+
+        let poisoned_handle = ToolCallSuccess {
+            text: "ok".into(),
+            content_blocks: vec!["ok".into()],
+            structured: Some(json!({"handle": format!("h-{secret}")})),
+            meta: None,
+        };
+        assert!(matches!(
+            extract_downstream_handle(&poisoned_handle, Some("handle"), Some(secret)),
+            ExtractedHandle::Malformed
+        ));
+        assert_eq!(
+            sanitize_tool_success(&poisoned_handle, Some("handle"), Some(secret)),
+            Err(ToolFault::TerminalRefusal)
+        );
     }
 }

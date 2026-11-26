@@ -588,7 +588,7 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
-    let (app, issuance) = match app(&config, &pool, artifacts.clone(), vault_keys) {
+    let (app, issuance) = match app(&config, &pool, artifacts.clone(), vault_keys.clone()) {
         Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");
@@ -615,16 +615,13 @@ pub async fn run(role: Role) -> u8 {
     let worker = config.worker.map(|settings| WorkerRuntime {
         settings,
         executor: settings.policy.zip(inference).map(|(policy, inference)| {
-            let executor = worker::turns::TurnExecutor::new(
+            build_worker_turn_executor(
                 pool.clone(),
-                inference.catalog,
+                inference,
                 policy.leases,
-                inference.routes,
-            );
-            Arc::new(match &artifacts {
-                Some(store) => executor.with_artifacts(store.clone()),
-                None => executor,
-            })
+                artifacts.clone(),
+                vault_keys.clone(),
+            )
         }),
         store: artifacts,
     });
@@ -653,6 +650,54 @@ pub async fn run(role: Role) -> u8 {
     // Bounded: a stalled stderr or collector loses the final lines or spans, not the exit.
     telemetry.stop(flush).await;
     code
+}
+
+/// Build the packaged worker's [`worker::turns::TurnExecutor`] from validated
+/// `OPENMETTLE_WORKER_INFERENCE_CONFIG`, optional `ARTIFACTS_DIR`, and optional
+/// `VAULT_KEYS_CONFIG` (ADRs 0039, 0043, 0045).
+///
+/// When `inference.external_mcp` is present, attaches [`mcp::external::ExternalMcpAdapter`] with
+/// [`vault::VaultDestinationAuthorizer`] and:
+/// - [`vault::VaultCredentialProvider`] (plus optional provider-bound
+///   [`vault::VaultRefreshRegistry`]) when `vault_keys` is mounted; or
+/// - fail-closed [`mcp::external::GatedCredentialProvider`] when `vault_keys` is absent.
+pub fn build_worker_turn_executor(
+    pool: PgPool,
+    inference: worker::config::InferenceConfig,
+    leases: authz::leases::LeaseSettings,
+    artifacts: Option<artifact_fs::Store>,
+    vault_keys: Option<Arc<vault::VaultKeyRing>>,
+) -> Arc<worker::turns::TurnExecutor<worker::config::GatewayRoutes>> {
+    let mut executor =
+        worker::turns::TurnExecutor::new(pool.clone(), inference.catalog, leases, inference.routes);
+    if let Some(store) = &artifacts {
+        executor = executor.with_artifacts(store.clone());
+    }
+    if let Some(ext) = inference.external_mcp {
+        let credentials: Arc<dyn mcp::external::McpCredentialProvider> = match vault_keys {
+            Some(keys) => Arc::new(vault::VaultCredentialProvider::new(
+                pool.clone(),
+                keys,
+                ext.refresh_registry
+                    .map(|r| r as Arc<dyn vault::RefreshClient>),
+                vault::VaultConfig::default(),
+            )),
+            None => Arc::new(mcp::external::GatedCredentialProvider),
+        };
+        let mut adapter = mcp::external::ExternalMcpAdapter::new(
+            pool,
+            leases,
+            ext.registry,
+            ext.transports,
+            credentials,
+            Arc::new(vault::VaultDestinationAuthorizer::new()),
+        );
+        if let Some(store) = artifacts {
+            adapter = adapter.with_artifacts(store);
+        }
+        executor = executor.with_effects(Arc::new(Arc::new(adapter).approved_effects()));
+    }
+    Arc::new(executor)
 }
 
 /// Splits `SHUTDOWN_TIMEOUT_MS` so the whole stop fits it: the final telemetry flush gets a

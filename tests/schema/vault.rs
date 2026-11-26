@@ -21,35 +21,50 @@ use super::authz_runs::{personal_of, seeded_session};
 use super::authz_store::{Account, FUTURE, PROVIDER, account, ctx, make_admin, providers};
 use super::*;
 use openmettle_core::{
+    artifact_fs,
     authz::{
         CapabilityGate, Grantee, ProjectRole,
-        approvals::EffectClass,
-        leases::{self, LeaseSettings},
+        approvals::{
+            self, EffectClass, IntentResult, ReplayEffect, record_fenced_intent,
+            start_write_attempt,
+        },
+        branches::{
+            self, Conversation, Operation, Part, UserInput,
+            snapshot::{Intent as TurnIntent, Snapshots},
+        },
+        leases::{self, LeaseSettings, Settle},
         projects::{self, ProjectSettingsInput},
         runs::{self as run_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
         store,
     },
+    build_worker_turn_executor,
     mcp::{
-        contract::{ExternalRegistry, ExternalToolContract},
+        contract::{ExternalRegistry, ExternalToolContract, ReconcileSpec},
         external::{
             CredentialOutcome, CredentialRequest, DestinationAuthorizer, ExternalCall,
             ExternalMcpAdapter, McpCredentialProvider, ReconcileTarget,
         },
     },
+    model_config::{ConfigSnapshot, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection},
     provider_http::{
         Trust,
         mcp::{McpTimeouts, McpTransport},
     },
+    restore::{self, GateLockRequest},
     runs::{RunInput, WriteTransaction},
     vault::{
         self, AuthorizeConnectionInput, CreateConnectionInput, HttpsRefreshClient, RefreshClient,
         RefreshOutcome, RefreshRequest, RefreshTimeouts, RefreshedCredential, SecretText,
         VaultConfig, VaultCredentialProvider, VaultDestinationAuthorizer, VaultKeyRing,
+        VaultRefreshRegistry,
     },
-    worker::{ActiveRun, StepContext, StepResult, StepTasks, Stop},
+    worker::{
+        ActiveRun, ApprovedAdapter, Executor, StepContext, StepResult, StepTasks, Stop,
+        config as worker_config,
+    },
 };
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{Executor as SqlxExecutor, PgPool, postgres::PgPoolOptions};
 use std::{
     collections::BTreeMap,
     fs,
@@ -426,10 +441,16 @@ impl SyntheticTlsServer {
         format!("https://{}:{}{path}", self.host, self.port)
     }
 
-    fn refresh_client(&self) -> Arc<HttpsRefreshClient> {
+    fn refresh_client(
+        &self,
+        provider_kind: &str,
+        allowed_origins: &[&str],
+    ) -> Arc<HttpsRefreshClient> {
         let range = self.private_cidr();
         Arc::new(
             HttpsRefreshClient::new(
+                provider_kind,
+                allowed_origins,
                 &self.url("/oauth/token"),
                 Trust::Bundle(&self.ca_pem),
                 &[&range],
@@ -624,7 +645,8 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     let ring = Arc::new(VaultKeyRing::new("k1".into(), vec![("k1".into(), k1)]).unwrap());
     let provider =
         VaultCredentialProvider::new(worker_pool.clone(), ring, None, VaultConfig::default());
-    let authorizer = VaultDestinationAuthorizer::new(worker_pool.clone());
+    let authorizer = VaultDestinationAuthorizer::new();
+    let mut worker_conn = connect(&db.0, WORKER).await;
 
     // Non-owner Bob and account_admin Carol are concealed (404).
     for (label, who) in [
@@ -667,18 +689,19 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     // Valid authorization stores encrypted credentials and returns non-secret metadata only.
     let access_canary = "CANARY-ACCESS-SECRET-ALPHA";
     let refresh_canary = "CANARY-REFRESH-SECRET-BETA";
+    let auth_ok_body = json!({
+        "access_token": access_canary,
+        "refresh_token": refresh_canary,
+        "granted_scopes": ["issues.read"],
+        "expires_at": "2030-01-01T00:00:00.000000Z",
+        "reason": "store synthetic credentials"
+    });
     let (st, authorized_json) = api.call(
         As::Browser(&alice_s),
         "POST",
         &format!("/v1/connections/{conn_id}/authorize"),
         Some("auth-ok-1"),
-        Some(&json!({
-            "access_token": access_canary,
-            "refresh_token": refresh_canary,
-            "granted_scopes": ["issues.read"],
-            "expires_at": "2030-01-01T00:00:00.000000Z",
-            "reason": "store synthetic credentials"
-        })),
+        Some(&auth_ok_body),
     );
     assert_eq!(st, 200, "{authorized_json}");
     let auth_view = consumer::decode_connection(&authorized_json).unwrap();
@@ -688,6 +711,111 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     assert_eq!(auth_view.granted_scopes, vec!["issues.read"]);
     assert!(!authorized_json.to_string().contains(access_canary));
     assert!(!authorized_json.to_string().contains(refresh_canary));
+
+    // P2 #11: Exact Idempotency-Key replay succeeds (200); reusing key with different tokens -> 409!
+    let (st, replay_auth) = api.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{conn_id}/authorize"),
+        Some("auth-ok-1"),
+        Some(&auth_ok_body),
+    );
+    assert_eq!(st, 200, "{replay_auth}");
+    assert_eq!(
+        consumer::decode_connection(&replay_auth)
+            .unwrap()
+            .generation,
+        1
+    );
+    for (label, mutated) in [
+        (
+            "different access_token",
+            json!({
+                "access_token": "CANARY-DIFFERENT-ACCESS",
+                "refresh_token": refresh_canary,
+                "granted_scopes": ["issues.read"],
+                "expires_at": "2030-01-01T00:00:00.000000Z",
+                "reason": "store synthetic credentials"
+            }),
+        ),
+        (
+            "different refresh_token",
+            json!({
+                "access_token": access_canary,
+                "refresh_token": "CANARY-DIFFERENT-REFRESH",
+                "granted_scopes": ["issues.read"],
+                "expires_at": "2030-01-01T00:00:00.000000Z",
+                "reason": "store synthetic credentials"
+            }),
+        ),
+    ] {
+        let (st, conflict) = api.call(
+            As::Browser(&alice_s),
+            "POST",
+            &format!("/v1/connections/{conn_id}/authorize"),
+            Some("auth-ok-1"),
+            Some(&mutated),
+        );
+        assert_eq!(st, 409, "{label}: {conflict}");
+        assert_eq!(conflict["code"], "idempotency_conflict", "{label}");
+    }
+
+    // P2 #14 & P2 #15: 64 distinct 128-byte scopes fit within 4,096-byte audit details,
+    // 4,097-byte access token is refused (400), and 4,096-byte access token succeeds (200).
+    let max_scopes: Vec<String> = (0..64)
+        .map(|i| format!("s{i:02}-{}", "a".repeat(124)))
+        .collect();
+    assert!(max_scopes.iter().all(|s| s.len() == 128));
+    let (st, max_conn_json) = api.call(
+        As::Browser(&alice_s),
+        "POST",
+        "/v1/connections",
+        Some("conn-64-scopes"),
+        Some(&json!({
+            "provider_kind": "github",
+            "account_id": "acct-64-scopes",
+            "origin": "https://api.example.test",
+            "allowed_scopes": max_scopes,
+        })),
+    );
+    assert_eq!(st, 201, "{max_conn_json}");
+    let max_conn_id = consumer::decode_connection(&max_conn_json)
+        .unwrap()
+        .connection_id;
+    let (st, too_long_err) = api.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{max_conn_id}/authorize"),
+        Some("auth-4097"),
+        Some(&json!({
+            "access_token": "x".repeat(4097),
+            "granted_scopes": max_scopes,
+        })),
+    );
+    assert_eq!(st, 400, "{too_long_err}");
+    assert_eq!(too_long_err["code"], "validation");
+    let (st, ok_4096) = api.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{max_conn_id}/authorize"),
+        Some("auth-64-scopes-4096"),
+        Some(&json!({
+            "access_token": "x".repeat(4096),
+            "granted_scopes": max_scopes,
+        })),
+    );
+    assert_eq!(st, 200, "{ok_4096}");
+    let max_audit_bytes: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(octet_length(details::text)), 0)::bigint
+           FROM openmettle.authorization_audit",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(
+        max_audit_bytes <= 4096,
+        "audit details exceeded 4096 bytes: {max_audit_bytes}"
+    );
 
     // Verify ZERO plaintext secret substrings anywhere in PostgreSQL tables or debug logs.
     let conn_dump: String = sqlx::query_scalar(
@@ -800,23 +928,27 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
             .await;
         match resolved {
             CredentialOutcome::Ready(cred) => assert_eq!(cred.bearer_token(), Some(access_canary)),
-            CredentialOutcome::Unavailable => panic!("expected Ready for shared user {label}"),
+            other => panic!("expected Ready for shared user {label}, got {other:?}"),
         }
         assert!(
             authorizer
-                .authorize_reconcile(ReconcileTarget {
-                    scope_id: &alice_scope,
-                    run_id: "00000000-0000-4000-8000-000000000001",
-                    actor_user_id: &acct.user,
-                    actor_approval_id: Some(&acct.approval),
-                    connection_id: &conn_id,
-                    account_id: "acct-alice",
-                    tool_id: "gh.issue",
-                    tool_version: "1",
-                    destination: &dest,
-                    capability: "lookup",
-                    expected_origin: Some("https://api.example.test"),
-                })
+                .authorize_reconcile(
+                    &mut worker_conn,
+                    ReconcileTarget {
+                        scope_id: &alice_scope,
+                        run_id: "00000000-0000-4000-8000-000000000001",
+                        actor_user_id: &acct.user,
+                        actor_approval_id: Some(&acct.approval),
+                        connection_id: &conn_id,
+                        account_id: "acct-alice",
+                        tool_id: "gh.issue",
+                        tool_version: "1",
+                        destination: &dest,
+                        capability: "lookup",
+                        lookup_scope: "issues.read",
+                        expected_origin: Some("https://api.example.test"),
+                    }
+                )
                 .await,
             "expected authorize_reconcile=true for {label}"
         );
@@ -855,19 +987,23 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     ));
     assert!(
         !authorizer
-            .authorize_reconcile(ReconcileTarget {
-                scope_id: &alice_scope,
-                run_id: "00000000-0000-4000-8000-000000000001",
-                actor_user_id: &bob.user,
-                actor_approval_id: Some(&bob.approval),
-                connection_id: &conn_id,
-                account_id: "acct-alice",
-                tool_id: "gh.issue",
-                tool_version: "1",
-                destination: &dest,
-                capability: "lookup",
-                expected_origin: Some("https://api.example.test"),
-            })
+            .authorize_reconcile(
+                &mut worker_conn,
+                ReconcileTarget {
+                    scope_id: &alice_scope,
+                    run_id: "00000000-0000-4000-8000-000000000001",
+                    actor_user_id: &bob.user,
+                    actor_approval_id: Some(&bob.approval),
+                    connection_id: &conn_id,
+                    account_id: "acct-alice",
+                    tool_id: "gh.issue",
+                    tool_version: "1",
+                    destination: &dest,
+                    capability: "lookup",
+                    lookup_scope: "issues.read",
+                    expected_origin: Some("https://api.example.test"),
+                }
+            )
             .await
     );
 
@@ -985,8 +1121,13 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     );
     assert_eq!(st, 200);
 
-    // Before explicit share, project Editor Bob and account_admin Carol are concealed (404) & denied execution.
-    for who in [As::Native(&bob_s), As::Browser(&admin_s)] {
+    // P2 #13: Before explicit share, project Editor Bob, Viewer, and account_admin Carol are
+    // concealed (`404 not_found`) across BOTH GET and every management mutation!
+    for who in [
+        As::Native(&bob_s),
+        As::Native(&viewer_s),
+        As::Browser(&admin_s),
+    ] {
         let (st, _) = api.call(
             who,
             "GET",
@@ -995,6 +1136,37 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
             None,
         );
         assert_eq!(st, 404);
+    }
+    for (method, suffix, key, body) in [
+        (
+            "POST",
+            "/authorize",
+            "bob-unshared-auth",
+            Some(json!({"access_token": "CANARY-UNSHARED", "granted_scopes": ["issues.read"]})),
+        ),
+        ("POST", "/disconnect", "bob-unshared-disc", None),
+        (
+            "PUT",
+            "/shares",
+            "bob-unshared-share",
+            Some(json!({"grantee": {"kind": "project"}, "access": "use"})),
+        ),
+        (
+            "POST",
+            "/shares/revoke",
+            "bob-unshared-revoke",
+            Some(json!({"grantee": {"kind": "project"}})),
+        ),
+    ] {
+        let (st, err) = api.call(
+            As::Native(&bob_s),
+            method,
+            &format!("/v1/connections/{pconn_id}{suffix}"),
+            Some(key),
+            body.as_ref(),
+        );
+        assert_eq!(st, 404, "unshared Editor {method} {suffix}: {err}");
+        assert_eq!(err["code"], "not_found");
     }
     assert!(matches!(
         provider
@@ -1011,7 +1183,8 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
         CredentialOutcome::Unavailable
     ));
 
-    // Whole-project share grants Editor Bob execution, allows Viewer metadata read, STILL denies Viewer execution!
+    // Whole-project share grants Editor Bob execution, allows Viewer metadata read, STILL denies
+    // Viewer execution, and returns `403 policy` (not 404) when visible non-owners attempt management!
     let (st, _) = api.call(
         As::Browser(&alice_s),
         "PUT",
@@ -1020,6 +1193,37 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
         Some(&json!({"grantee": {"kind": "project"}, "access": "use"})),
     );
     assert_eq!(st, 200);
+    for (method, suffix, key, body) in [
+        (
+            "POST",
+            "/authorize",
+            "bob-shared-auth",
+            Some(json!({"access_token": "CANARY-SHARED", "granted_scopes": ["issues.read"]})),
+        ),
+        ("POST", "/disconnect", "bob-shared-disc", None),
+        (
+            "PUT",
+            "/shares",
+            "bob-shared-share",
+            Some(json!({"grantee": {"kind": "user", "grantee_id": bob.user}, "access": "use"})),
+        ),
+        (
+            "POST",
+            "/shares/revoke",
+            "bob-shared-revoke",
+            Some(json!({"grantee": {"kind": "project"}})),
+        ),
+    ] {
+        let (st, err) = api.call(
+            As::Native(&bob_s),
+            method,
+            &format!("/v1/connections/{pconn_id}{suffix}"),
+            Some(key),
+            body.as_ref(),
+        );
+        assert_eq!(st, 403, "shared Editor {method} {suffix}: {err}");
+        assert_eq!(err["code"], "policy");
+    }
     assert!(matches!(
         provider
             .resolve(CredentialRequest {
@@ -1126,16 +1330,18 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     assert_eq!(st, 404);
 
     // Closed restore_reconciliation_gate fails closed on API mutations (503) and worker resolve.
-    let (origin_us, lifecycle_origin_us, lifecycle_baseline_digest, head_seq, head_digest): (
-        i64,
-        i64,
-        String,
-        i64,
-        String,
-    ) = sqlx::query_as(
+    let (
+        origin_us,
+        lifecycle_origin_us,
+        lifecycle_baseline_digest,
+        connection_origin_us,
+        head_seq,
+        head_digest,
+    ): (i64, i64, String, i64, i64, String) = sqlx::query_as(
         "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
                 (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
                 encode(lifecycle_baseline_digest, 'hex'),
+                (extract(epoch FROM connection_coverage_started_at) * 1000000)::bigint,
                 journal_seq,
                 encode(chain_digest, 'hex')
            FROM openmettle.deletion_journal_head WHERE id",
@@ -1144,13 +1350,14 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     .await
     .unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4, decode($5, 'hex'))",
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4, decode($5, 'hex'), $6)",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lifecycle_origin_us)
     .bind(&lifecycle_baseline_digest)
+    .bind(connection_origin_us)
     .execute(&mut owner)
     .await
     .unwrap();
@@ -1267,8 +1474,71 @@ async fn vault_versioned_encryption_aad_tamper_and_admin_rotation() {
     assert!(!missing_out.status.success());
     assert!(stderr(&missing_out).contains("stored key version missing"));
 
-    // Rotate online in batch-size 1 with both k1 and k2 present.
+    // P2 #7: Hold an active worker refresh lease on conn_ids[0] during `vault rotate`:
+    // rotate must defer conn_ids[0], rotate conn_ids[1], preserve the in-flight claim,
+    // exit non-zero, and NOT consume `rot-to-k2` so retrying after lease release completes cleanly!
     let cfg_k1_k2 = write_keyring_files(&dir, "k1-k2", "k2", &[("k1", k1), ("k2", k2)]);
+    let active_claim: String = sqlx::query_scalar(
+        "UPDATE openmettle.external_connections
+            SET refresh_claim_token = gen_random_uuid(),
+                refresh_lease_until = clock_timestamp() + interval '5 minutes'
+          WHERE id = $1::uuid
+         RETURNING refresh_claim_token::text",
+    )
+    .bind(&conn_ids[0])
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let deferred_out = admin_cli(
+        &db.url(OWNER),
+        &[
+            "vault",
+            "rotate",
+            "--vault-keys",
+            &cfg_k1_k2,
+            "--operator-id",
+            op_id,
+            "--request-key",
+            "rot-to-k2",
+            "--reason",
+            "rotate to k2",
+            "--batch-size",
+            "1",
+        ],
+    );
+    assert!(
+        !deferred_out.status.success(),
+        "rotate with deferred active refresh must exit non-zero"
+    );
+    let deferred_stdout = String::from_utf8_lossy(&deferred_out.stdout);
+    assert!(
+        deferred_stdout.contains(
+            "applied vault.rotated target_key_id=k2 rotated=1 skipped=1 deferred_active_refresh=1"
+        ),
+        "{deferred_stdout}"
+    );
+    let (still_key, still_gen, still_claim): (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT encryption_key_id, credential_generation, refresh_claim_token::text
+           FROM openmettle.external_connections WHERE id = $1::uuid",
+    )
+    .bind(&conn_ids[0])
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(still_key, "k1");
+    assert_eq!(still_gen, 1);
+    assert_eq!(still_claim.as_deref(), Some(active_claim.as_str()));
+
+    // Clear the active refresh lease and retry with the EXACT SAME `--request-key rot-to-k2`.
+    sqlx::query(
+        "UPDATE openmettle.external_connections
+            SET refresh_claim_token = NULL, refresh_lease_until = NULL
+          WHERE id = $1::uuid",
+    )
+    .bind(&conn_ids[0])
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let rot_out = admin_cli(
         &db.url(OWNER),
         &[
@@ -1289,7 +1559,9 @@ async fn vault_versioned_encryption_aad_tamper_and_admin_rotation() {
     assert!(rot_out.status.success(), "{}", stderr(&rot_out));
     let rot_stdout = String::from_utf8_lossy(&rot_out.stdout);
     assert!(
-        rot_stdout.contains("applied vault.rotated target_key_id=k2 rotated=2 skipped=0"),
+        rot_stdout.contains(
+            "applied vault.rotated target_key_id=k2 rotated=1 skipped=0 deferred_active_refresh=0"
+        ),
         "{rot_stdout}"
     );
 
@@ -1339,7 +1611,7 @@ async fn vault_versioned_encryption_aad_tamper_and_admin_rotation() {
                     Some(format!("CANARY-ROT-ACCESS-{i}").as_str())
                 );
             }
-            CredentialOutcome::Unavailable => panic!("expected k2 decryption for conn {i}"),
+            other => panic!("expected k2 decryption for conn {i}, got {other:?}"),
         }
     }
 
@@ -1421,7 +1693,7 @@ async fn vault_versioned_encryption_aad_tamper_and_admin_rotation() {
         .await
     {
         CredentialOutcome::Ready(c) => assert_eq!(c.bearer_token(), Some("CANARY-RECOVERED-K3")),
-        CredentialOutcome::Unavailable => panic!("expected recovery under k3"),
+        other => panic!("expected recovery under k3, got {other:?}"),
     }
 }
 
@@ -1462,15 +1734,17 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
     let alice_scope = personal_of(&db, &alice).await;
     let mut api_conn = connect(&db.0, API).await;
     let ring = Arc::new(VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x44u8; 32])]).unwrap());
     let worker_pool = make_pool(&db, WORKER).await;
 
-    // (a) Single-flight concurrent refresh over synthetic rcgen TLS server: 8 callers -> 1 HTTP call!
+    // (a) P1 #1: Provider-bound VaultRefreshRegistry routing an MCP origin to a SEPARATE trusted
+    // OAuth AS origin over synthetic rcgen TLS: 8 concurrent callers -> 1 HTTP call!
     let mode = Arc::new(Mutex::new("ok"));
     let mode_for_srv = mode.clone();
-    let tls_srv = SyntheticTlsServer::start(move |_head, body| {
+    let oauth_as_srv = SyntheticTlsServer::start(move |_head, body| {
         assert!(body.contains("grant_type=refresh_token"), "{body}");
         let m = *mode_for_srv.lock().unwrap();
         match m {
@@ -1483,13 +1757,20 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
                     "expires_in": 3600
                 }),
             ),
-            "widen" => http_json(
+            // P1 #4: Widen within allowed_scopes (`issues.write` is allowed on the connection,
+            // NOT in prior `granted_scopes = ["issues.read"]`)!
+            "widen_within_allowed" => http_json(
                 200,
                 &json!({
-                    "access_token": "CANARY-WIDENED-UPSTREAM",
-                    "scope": "issues.read issues.admin",
+                    "access_token": "CANARY-WIDENED-WITHIN-ALLOWED",
+                    "scope": "issues.read issues.write",
                     "expires_in": 3600
                 }),
+            ),
+            "400_proxy" => b"HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: 22\r\nconnection: close\r\n\r\nBad Request from proxy".to_vec(),
+            "400_oauth" => http_json(
+                400,
+                &json!({"error": "invalid_grant", "error_description": "revoked"}),
             ),
             "401" => http_json(
                 401,
@@ -1501,6 +1782,15 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     })
     .await;
 
+    // Distinct MCP resource server origin (different port/host from oauth_as_srv.origin()!).
+    let mcp_origin = "https://mcp-resource.example.test";
+    assert_ne!(mcp_origin, oauth_as_srv.origin());
+    let mut refresh_registry = VaultRefreshRegistry::new();
+    refresh_registry
+        .register(oauth_as_srv.refresh_client("github", &[mcp_origin]))
+        .unwrap();
+    let refresh_registry = Arc::new(refresh_registry);
+
     let conn_id = vault::create_connection(
         &mut api_conn,
         &ctx(&alice, "sf-create"),
@@ -1508,7 +1798,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
             scope_id: &alice_scope,
             provider_kind: "github",
             account_id: "acct-sf",
-            origin: &tls_srv.origin(),
+            origin: mcp_origin,
             allowed_scopes: &["issues.read".into(), "issues.write".into()],
         },
     )
@@ -1534,7 +1824,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     let provider = Arc::new(VaultCredentialProvider::new(
         worker_pool.clone(),
         ring.clone(),
-        Some(tls_srv.refresh_client()),
+        Some(refresh_registry.clone()),
         VaultConfig {
             refresh_skew: Duration::from_secs(60),
             refresh_lease: Duration::from_secs(10),
@@ -1553,7 +1843,6 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
         let sc = alice_scope.clone();
         let uid = alice.user.clone();
         let aid = alice.approval.clone();
-        let orig = tls_srv.origin();
         tasks.push(tokio::spawn(async move {
             b.wait().await;
             p.resolve(CredentialRequest {
@@ -1562,7 +1851,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
                 scope_id: &sc,
                 actor_user_id: &uid,
                 actor_approval_id: Some(&aid),
-                expected_origin: Some(&orig),
+                expected_origin: Some(mcp_origin),
                 required_scope: Some("issues.read"),
             })
             .await
@@ -1573,11 +1862,11 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
             CredentialOutcome::Ready(cred) => {
                 assert_eq!(cred.bearer_token(), Some("CANARY-REFRESHED-ACCESS-1"));
             }
-            CredentialOutcome::Unavailable => panic!("expected refreshed credential"),
+            other => panic!("expected refreshed credential, got {other:?}"),
         }
     }
     assert_eq!(
-        tls_srv.requests.load(Ordering::SeqCst),
+        oauth_as_srv.requests.load(Ordering::SeqCst),
         1,
         "single-flight refresh must issue exactly ONE upstream HTTPS request"
     );
@@ -1591,42 +1880,233 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     .unwrap();
     assert_eq!(refreshed_audit, 1);
 
-    // (b) Transient 503 releases refresh lease and preserves refresh secret!
+    // P1 #1: Mismatched provider_kind (`gitlab`) or unconfigured origin returns Transient with
+    // ZERO HTTP calls to oauth_as_srv and preserves stored credentials!
+    let reqs_before_mismatch = oauth_as_srv.requests.load(Ordering::SeqCst);
+    for (idx, (prov_kind, orig)) in [
+        ("gitlab", mcp_origin),
+        ("github", "https://other-mcp.example.test"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mismatch_id = vault::create_connection(
+            &mut api_conn,
+            &ctx(&alice, &format!("mis-c-{idx}")),
+            &CreateConnectionInput {
+                scope_id: &alice_scope,
+                provider_kind: prov_kind,
+                account_id: &format!("acct-mis-{idx}"),
+                origin: orig,
+                allowed_scopes: &["issues.read".into()],
+            },
+        )
+        .await
+        .unwrap()
+        .target_id()
+        .to_owned();
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice, &format!("mis-a-{idx}")),
+            &ring,
+            &mismatch_id,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-MIS-ACCESS",
+                refresh_token: Some("CANARY-MIS-REFRESH"),
+                granted_scopes: &["issues.read".into()],
+                expires_at: Some("2020-01-01T00:00:00.000000Z"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            provider
+                .resolve(CredentialRequest {
+                    connection_id: &mismatch_id,
+                    account_id: &format!("acct-mis-{idx}"),
+                    scope_id: &alice_scope,
+                    actor_user_id: &alice.user,
+                    actor_approval_id: Some(&alice.approval),
+                    expected_origin: Some(orig),
+                    required_scope: Some("issues.read"),
+                })
+                .await,
+            CredentialOutcome::Transient
+        ));
+        let (st, has_ref): (String, bool) = sqlx::query_as(
+            "SELECT state, has_refresh FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&mismatch_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((st.as_str(), has_ref), ("authorized", true));
+    }
+    assert_eq!(
+        oauth_as_srv.requests.load(Ordering::SeqCst),
+        reqs_before_mismatch,
+        "unmatched provider/origin must send zero requests to oauth_as_srv"
+    );
+
+    // (b) P2 #8: Transient 503, non-OAuth 400, and unconfigured refresher (`None`) all return
+    // `CredentialOutcome::Transient` and preserve `state = 'authorized'` & `refresh_ciphertext`!
     sqlx::query("UPDATE openmettle.external_connections SET expires_at = now() - interval '10 seconds' WHERE id = $1::uuid")
         .bind(&conn_id)
         .execute(&mut owner)
         .await
         .unwrap();
-    *mode.lock().unwrap() = "503";
+    for transient_mode in ["503", "400_proxy"] {
+        *mode.lock().unwrap() = transient_mode;
+        assert!(
+            matches!(
+                provider
+                    .resolve(CredentialRequest {
+                        connection_id: &conn_id,
+                        account_id: "acct-sf",
+                        scope_id: &alice_scope,
+                        actor_user_id: &alice.user,
+                        actor_approval_id: Some(&alice.approval),
+                        expected_origin: Some(mcp_origin),
+                        required_scope: Some("issues.read"),
+                    })
+                    .await,
+                CredentialOutcome::Transient
+            ),
+            "expected Transient for {transient_mode}"
+        );
+        let (state, has_refresh, claim_null): (String, bool, bool) = sqlx::query_as(
+            "SELECT state, has_refresh, refresh_claim_token IS NULL
+               FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), has_refresh, claim_null),
+            ("authorized", true, true),
+            "{transient_mode} must preserve valid credentials"
+        );
+    }
+    let no_refresher_provider = VaultCredentialProvider::new(
+        worker_pool.clone(),
+        ring.clone(),
+        None,
+        VaultConfig::default(),
+    );
     assert!(matches!(
-        provider
+        no_refresher_provider
             .resolve(CredentialRequest {
                 connection_id: &conn_id,
                 account_id: "acct-sf",
                 scope_id: &alice_scope,
                 actor_user_id: &alice.user,
                 actor_approval_id: Some(&alice.approval),
-                expected_origin: Some(&tls_srv.origin()),
+                expected_origin: Some(mcp_origin),
                 required_scope: Some("issues.read"),
             })
             .await,
-        CredentialOutcome::Unavailable
+        CredentialOutcome::Transient
     ));
-    let (state, has_refresh, claim_null): (String, bool, bool) = sqlx::query_as(
-        "SELECT state, has_refresh, refresh_claim_token IS NULL
-           FROM openmettle.external_connections WHERE id = $1::uuid",
+    let (st_no_ref, hr_no_ref): (String, bool) = sqlx::query_as(
+        "SELECT state, has_refresh FROM openmettle.external_connections WHERE id = $1::uuid",
     )
     .bind(&conn_id)
     .fetch_one(&mut owner)
     .await
     .unwrap();
+    assert_eq!((st_no_ref.as_str(), hr_no_ref), ("authorized", true));
+
+    // P1 #2: Post-FOR UPDATE authority recheck when Bob's share is revoked while refresh waits
+    // on the connection row lock -> 0 HTTP requests sent to oauth_as_srv!
+    vault::share_connection(
+        &mut api_conn,
+        &ctx(&alice, "sf-share-bob"),
+        &conn_id,
+        &Grantee::User(bob.user.clone()),
+    )
+    .await
+    .unwrap();
+    let reqs_before_lock_race = oauth_as_srv.requests.load(Ordering::SeqCst);
+    *mode.lock().unwrap() = "ok";
+    {
+        let mut blocker = connect(&db.0, OWNER).await;
+        let mut lock_tx = blocker.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM openmettle.external_connections WHERE id = $1::uuid FOR UPDATE")
+            .bind(&conn_id)
+            .fetch_one(&mut *lock_tx)
+            .await
+            .unwrap();
+        let p_bob = provider.clone();
+        let cid_bob = conn_id.clone();
+        let sc_bob = alice_scope.clone();
+        let uid_bob = bob.user.clone();
+        let aid_bob = bob.approval.clone();
+        let bob_task = tokio::spawn(async move {
+            p_bob
+                .resolve(CredentialRequest {
+                    connection_id: &cid_bob,
+                    account_id: "acct-sf",
+                    scope_id: &sc_bob,
+                    actor_user_id: &uid_bob,
+                    actor_approval_id: Some(&aid_bob),
+                    expected_origin: Some(mcp_origin),
+                    required_scope: Some("issues.read"),
+                })
+                .await
+        });
+        // Wait briefly so bob_task passes the REPEATABLE READ snapshot and blocks on Phase 1 FOR UPDATE.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Revoke Bob's share inside the same transaction holding the row lock and commit.
+        sqlx::query(
+            "UPDATE openmettle.external_connection_shares
+                SET active = false, revision = revision + 1, updated_at = clock_timestamp()
+              WHERE connection_id = $1::uuid AND grantee_user_id = $2::uuid AND active",
+        )
+        .bind(&conn_id)
+        .bind(&bob.user)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.external_connections
+                SET share_revision = share_revision + 1,
+                    revocation_generation = revocation_generation + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&conn_id)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+        lock_tx.commit().await.unwrap();
+        assert!(matches!(
+            bob_task.await.unwrap(),
+            CredentialOutcome::Unavailable
+        ));
+    }
     assert_eq!(
-        (state.as_str(), has_refresh, claim_null),
-        ("authorized", true, true)
+        oauth_as_srv.requests.load(Ordering::SeqCst),
+        reqs_before_lock_race,
+        "revoked caller blocked on FOR UPDATE must never dispatch an upstream refresh"
     );
 
-    // (c) Upstream scope widening transitions to reauth_required & wipes secrets!
-    *mode.lock().unwrap() = "widen";
+    // (c) P1 #4: Direct worker SQL UPDATE attempting to widen granted_scopes within allowed_scopes
+    // fails with SQLSTATE 23514, AND upstream refresh widening within allowed_scopes transitions
+    // the connection to `reauth_required` & wipes secrets!
+    {
+        let mut worker_conn = connect(&db.0, WORKER).await;
+        expect_state(
+            &mut worker_conn,
+            &format!(
+                "UPDATE openmettle.external_connections
+                    SET granted_scopes = ARRAY['issues.read', 'issues.write']
+                  WHERE id = '{conn_id}'::uuid"
+            ),
+            "23514",
+        )
+        .await;
+    }
+    *mode.lock().unwrap() = "widen_within_allowed";
     assert!(matches!(
         provider
             .resolve(CredentialRequest {
@@ -1635,7 +2115,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
                 scope_id: &alice_scope,
                 actor_user_id: &alice.user,
                 actor_approval_id: Some(&alice.approval),
-                expected_origin: Some(&tls_srv.origin()),
+                expected_origin: Some(mcp_origin),
                 required_scope: Some("issues.read"),
             })
             .await,
@@ -1654,43 +2134,46 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
         ("reauth_required", true, true)
     );
 
-    // (d) Re-authorize from reauth_required -> test 401 refusal -> reauth_required again!
-    vault::authorize_connection(
-        &mut api_conn,
-        &ctx(&alice, "reauth-1"),
-        &ring,
-        &conn_id,
-        &AuthorizeConnectionInput {
-            access_token: "CANARY-REAUTHED",
-            refresh_token: Some("CANARY-REAUTHED-REF"),
-            granted_scopes: &["issues.read".into()],
-            expires_at: Some("2020-01-01T00:00:00.000000Z"),
-        },
-    )
-    .await
-    .unwrap();
-    *mode.lock().unwrap() = "401";
-    assert!(matches!(
-        provider
-            .resolve(CredentialRequest {
-                connection_id: &conn_id,
-                account_id: "acct-sf",
-                scope_id: &alice_scope,
-                actor_user_id: &alice.user,
-                actor_approval_id: Some(&alice.approval),
-                expected_origin: Some(&tls_srv.origin()),
-                required_scope: Some("issues.read"),
-            })
-            .await,
-        CredentialOutcome::Unavailable
-    ));
-    let state_after_401: String =
-        sqlx::query_scalar("SELECT state FROM openmettle.external_connections WHERE id = $1::uuid")
-            .bind(&conn_id)
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-    assert_eq!(state_after_401, "reauth_required");
+    // (d) Re-authorize -> permanent OAuth 400 (`invalid_grant`) AND 401 wipe to `reauth_required`!
+    for (idx, refused_mode) in ["400_oauth", "401"].into_iter().enumerate() {
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice, &format!("reauth-{idx}")),
+            &ring,
+            &conn_id,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-REAUTHED",
+                refresh_token: Some("CANARY-REAUTHED-REF"),
+                granted_scopes: &["issues.read".into()],
+                expires_at: Some("2020-01-01T00:00:00.000000Z"),
+            },
+        )
+        .await
+        .unwrap();
+        *mode.lock().unwrap() = refused_mode;
+        assert!(matches!(
+            provider
+                .resolve(CredentialRequest {
+                    connection_id: &conn_id,
+                    account_id: "acct-sf",
+                    scope_id: &alice_scope,
+                    actor_user_id: &alice.user,
+                    actor_approval_id: Some(&alice.approval),
+                    expected_origin: Some(mcp_origin),
+                    required_scope: Some("issues.read"),
+                })
+                .await,
+            CredentialOutcome::Unavailable
+        ));
+        let st_after: String = sqlx::query_scalar(
+            "SELECT state FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(st_after, "reauth_required", "{refused_mode}");
+    }
 
     // (e) Concurrent disconnect wins over an in-flight refresh!
     vault::authorize_connection(
@@ -1724,7 +2207,6 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     let sc_clone = alice_scope.clone();
     let uid_clone = alice.user.clone();
     let aid_clone = alice.approval.clone();
-    let orig_clone = tls_srv.origin();
     let refresh_task = tokio::spawn(async move {
         racing_provider
             .resolve(CredentialRequest {
@@ -1733,7 +2215,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
                 scope_id: &sc_clone,
                 actor_user_id: &uid_clone,
                 actor_approval_id: Some(&aid_clone),
-                expected_origin: Some(&orig_clone),
+                expected_origin: Some(mcp_origin),
                 required_scope: Some("issues.read"),
             })
             .await
@@ -1832,33 +2314,101 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
     let act = admin_cli(&db.url(OWNER), &["runtime", "activate-two-phase-intents"]);
     assert!(act.status.success(), "{}", stderr(&act));
 
-    // Synthetic rcgen TLS MCP server returning tools/list + tools/call.
-    let mcp_srv = SyntheticTlsServer::start(|_head, body| {
+    // Synthetic rcgen TLS MCP server returning tools/list + tools/call (including reflected-bearer
+    // inline, spilled >20 KiB, and poisoned-handle scenarios plus read-only reconcile lookup).
+    let mcp_mode = Arc::new(Mutex::new("ok"));
+    let mcp_mode_srv = mcp_mode.clone();
+    let mcp_srv = SyntheticTlsServer::start(move |head, body| {
         let req: Value = serde_json::from_str(body).unwrap_or(Value::Null);
         let id = req["id"].as_str().unwrap_or("1");
         let method = req["method"].as_str().unwrap_or("");
+        let bearer = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("authorization")
+                    .then(|| v.trim().strip_prefix("Bearer ").map(str::to_owned))?
+            })
+            .unwrap_or_default();
         if method == "tools/list" {
+            let repo_schema = json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["repo"],
+                "properties": {
+                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                }
+            });
             http_json(
                 200,
                 &json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "tools": [{
-                            "name": "list_issues",
-                            "inputSchema": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["repo"],
-                                "properties": {
-                                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
-                                }
-                            }
-                        }]
+                        "tools": [
+                            {"name": "list_issues", "inputSchema": repo_schema},
+                            {"name": "echo_bearer", "inputSchema": repo_schema},
+                            {"name": "create_issue", "inputSchema": repo_schema}
+                        ]
                     }
                 }),
             )
         } else {
+            let tool_name = req["params"]["name"].as_str().unwrap_or("");
+            if tool_name == "lookup_issue" {
+                return http_json(
+                    200,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": "{\"status\":\"succeeded\"}"}],
+                            "structuredContent": {"status": "succeeded"}
+                        }
+                    }),
+                );
+            }
+            if tool_name == "echo_bearer" {
+                let mode = *mcp_mode_srv.lock().unwrap();
+                return match mode {
+                    "echo_inline" => http_json(
+                        200,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": format!("reflected={bearer}")}],
+                                "structuredContent": {"echo": bearer}
+                            }
+                        }),
+                    ),
+                    "echo_spill" => {
+                        let big = format!("prefix-{bearer}-{}", "z".repeat(20 * 1024));
+                        http_json(
+                            200,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{"type": "text", "text": big}]
+                                }
+                            }),
+                        )
+                    }
+                    "echo_handle" => http_json(
+                        200,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{"type": "text", "text": "ok"}],
+                                "structuredContent": {"op_handle": format!("h-{bearer}")}
+                            }
+                        }),
+                    ),
+                    _ => unreachable!(),
+                };
+            }
             http_json(
                 200,
                 &json!({
@@ -1882,14 +2432,20 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
             provider_kind: "github",
             account_id: "acct-mcp",
             origin: &mcp_srv.origin(),
-            allowed_scopes: &["issues.read".into(), "issues.write".into()],
+            allowed_scopes: &[
+                "issues.read".into(),
+                "issues.write".into(),
+                "status.read".into(),
+            ],
         },
     )
     .await
     .unwrap()
     .target_id()
     .to_owned();
-    let mcp_access = "CANARY-MCP-BEARER-ONLY";
+    // P2 #15: Exercise exact 4,096-byte boundary access token end-to-end over MCP tools/list & tools/call!
+    let mcp_access = format!("CANARY-MCP-4K-{}", "t".repeat(4096 - 14));
+    assert_eq!(mcp_access.len(), 4096);
     let mcp_refresh = "CANARY-MCP-REFRESH-NEVER-SENT";
     vault::authorize_connection(
         &mut api_conn,
@@ -1897,7 +2453,7 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         &ring,
         &conn_id,
         &AuthorizeConnectionInput {
-            access_token: mcp_access,
+            access_token: &mcp_access,
             refresh_token: Some(mcp_refresh),
             granted_scopes: &["issues.read".into()],
             expires_at: None,
@@ -1993,9 +2549,9 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
     .expect("claimed run");
 
     let mut reg = ExternalRegistry::new();
-    let make_tool = |tool_id: &str, action: &str| ExternalToolContract {
+    let make_tool = |tool_id: &str, remote_name: &str, action: &str| ExternalToolContract {
         tool_id: tool_id.into(),
-        remote_name: "list_issues".into(),
+        remote_name: remote_name.into(),
         version: "1".into(),
         description: "Synthetic MCP tool".into(),
         input_schema: json!({
@@ -2026,27 +2582,58 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         reconcile: None,
         call_timeout: Duration::from_secs(10),
     };
-    reg.register(make_tool("gh.list_issues", "issues.read"))
+    reg.register(make_tool("gh.list_issues", "list_issues", "issues.read"))
         .unwrap();
-    reg.register(make_tool("gh.write_issue", "issues.write"))
-        .unwrap();
+    let mut write_tool = make_tool("gh.write_issue", "create_issue", "issues.write");
+    write_tool.class = EffectClass::EligibleWrite;
+    write_tool.authoritative_lookup = true;
+    write_tool.reconcile = Some(ReconcileSpec {
+        lookup_tool: "lookup_issue".into(),
+        lookup_scope: "status.read".into(),
+        handle_argument: None,
+        deterministic_key_argument: Some("key".into()),
+        status_field: "status".into(),
+    });
+    reg.register(write_tool).unwrap();
+    let mut echo_tool = make_tool("gh.echo", "echo_bearer", "issues.read");
+    echo_tool.handle_field = Some("op_handle".into());
+    reg.register(echo_tool).unwrap();
+    let reg = Arc::new(reg);
+
+    // Prepare real artifact store and storage quota limits for P1 #3 spilled-output redaction.
+    let art_dir = auth_config_support::Dir::new();
+    let art_root = PathBuf::from(art_dir.path("artifacts"));
+    fs::create_dir_all(&art_root).unwrap();
+    let art_store = artifact_fs::Store::open(&art_root).unwrap();
+    let api_pool = make_pool(&db, API).await;
+    art_store.initialize_api(&api_pool).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_instance
+            SET personal_limit_bytes = 4000000, instance_budget_bytes = 4000000",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
 
     let worker_pool = make_pool(&db, WORKER).await;
     let mut transports = BTreeMap::new();
     transports.insert(conn_id.clone(), mcp_srv.mcp_transport());
-    let adapter = Arc::new(ExternalMcpAdapter::new(
-        worker_pool.clone(),
-        leases,
-        Arc::new(reg),
-        transports,
-        Arc::new(VaultCredentialProvider::new(
+    let adapter = Arc::new(
+        ExternalMcpAdapter::new(
             worker_pool.clone(),
-            ring.clone(),
-            None,
-            VaultConfig::default(),
-        )),
-        Arc::new(VaultDestinationAuthorizer::new(worker_pool)),
-    ));
+            leases,
+            reg.clone(),
+            transports.clone(),
+            Arc::new(VaultCredentialProvider::new(
+                worker_pool.clone(),
+                ring.clone(),
+                None,
+                VaultConfig::default(),
+            )),
+            Arc::new(VaultDestinationAuthorizer::new()),
+        )
+        .with_artifacts(art_store),
+    );
 
     let (_stop_tx, stop_rx) = watch::channel(None::<Stop>);
     let step = StepContext {
@@ -2060,7 +2647,25 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         execution_deadline: step.deadline,
     };
 
-    // Allowed action (`issues.read`) succeeds and injects ONLY access bearer token.
+    // P2 #12: `filter_turn_tools` caches by `(connection_id, account_id, action)`, so mixed
+    // granted (`issues.read`) and ungranted (`issues.write`) tools keep ONLY `gh.list_issues`
+    // regardless of declaration order!
+    let d_read = reg.get("gh.list_issues", "1").unwrap().declared_tool();
+    let d_write = reg.get("gh.write_issue", "1").unwrap().declared_tool();
+    for (order, list) in [
+        ("read_first", vec![d_read.clone(), d_write.clone()]),
+        ("write_first", vec![d_write, d_read]),
+    ] {
+        let filtered = adapter
+            .filter_turn_tools(&active, list, &step)
+            .await
+            .ok()
+            .expect("filter_turn_tools succeeded");
+        let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["gh.list_issues"], "order={order}");
+    }
+
+    // Allowed action (`issues.read`) succeeds and injects ONLY the 4,096-byte access bearer token.
     let res = adapter
         .call(
             &active,
@@ -2084,9 +2689,101 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         assert!(
             head.contains(&format!("authorization: Bearer {mcp_access}"))
                 || head.contains(&format!("Authorization: Bearer {mcp_access}")),
-            "missing expected bearer token in request head: {head}"
+            "missing expected 4096-byte bearer token in request head"
         );
         assert!(!head.contains(mcp_refresh) && !body.contains(mcp_refresh));
+    }
+
+    // P1 #3: Reflected bearer credential redaction (inline, >20 KiB spilled artifact, poisoned handle).
+    *mcp_mode.lock().unwrap() = "echo_inline";
+    match adapter
+        .call(
+            &active,
+            step.clone(),
+            ExternalCall {
+                key: "call-echo-inline",
+                tool: "gh.echo",
+                version: "1",
+                raw_args: br#"{"repo":"openmettle-core"}"#,
+                approval: None,
+            },
+        )
+        .await
+    {
+        StepResult::ToolOutput(env) => {
+            assert!(env.contains("[REDACTED_CREDENTIAL]"), "{env}");
+            assert!(
+                !env.contains(&mcp_access),
+                "inline observation leaked bearer"
+            );
+        }
+        _ => panic!("expected redacted inline ToolOutput"),
+    }
+    *mcp_mode.lock().unwrap() = "echo_spill";
+    match adapter
+        .call(
+            &active,
+            step.clone(),
+            ExternalCall {
+                key: "call-echo-spill",
+                tool: "gh.echo",
+                version: "1",
+                raw_args: br#"{"repo":"openmettle-core"}"#,
+                approval: None,
+            },
+        )
+        .await
+    {
+        StepResult::ToolOutput(env) => {
+            let env_val: Value = serde_json::from_str(&env).unwrap();
+            assert_eq!(
+                env_val["storage"], "spilled",
+                "expected spilled artifact: {env}"
+            );
+            assert!(env_val["provenance"]["artifact_id"].is_string(), "{env}");
+            assert!(!env.contains(&mcp_access), "spill envelope leaked bearer");
+        }
+        _ => panic!("expected redacted spilled ToolOutput"),
+    }
+    // Check EVERY file on disk under art_root/revisions contains zero bytes of mcp_access and has marker!
+    let mut found_redacted_spill = false;
+    for entry in fs::read_dir(art_root.join("revisions")).unwrap() {
+        let bytes = fs::read(entry.unwrap().path()).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(&mcp_access),
+            "spilled artifact leaked bearer"
+        );
+        if text.contains("[REDACTED_CREDENTIAL]") {
+            found_redacted_spill = true;
+        }
+    }
+    assert!(
+        found_redacted_spill,
+        "expected redacted spilled artifact on disk"
+    );
+
+    // Poisoned handle_field containing bearer secret -> terminal_refusal & zero leaked bytes!
+    *mcp_mode.lock().unwrap() = "echo_handle";
+    match adapter
+        .call(
+            &active,
+            step.clone(),
+            ExternalCall {
+                key: "call-echo-handle",
+                tool: "gh.echo",
+                version: "1",
+                raw_args: br#"{"repo":"openmettle-core"}"#,
+                approval: None,
+            },
+        )
+        .await
+    {
+        StepResult::ToolOutput(env) => {
+            assert!(env.contains("terminal_refusal"), "{env}");
+            assert!(!env.contains(&mcp_access), "refusal leaked bearer");
+        }
+        _ => panic!("expected terminal_refusal on poisoned handle"),
     }
 
     // Ungranted action (`issues.write` is allowed on connection but NOT in granted_scopes) is refused with 0 HTTP calls!
@@ -2110,7 +2807,207 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
     }
     assert_eq!(mcp_srv.requests.load(Ordering::SeqCst), reqs_before);
 
+    // P2 #9 & P2 #10: `reconcile_operation` on a `max_connections(1)` pool enforces
+    // `ReconcileSpec.lookup_scope` (`status.read`, distinct from write `action = issues.write`)
+    // without pool exhaustion deadlock!
+    {
+        // Grant `runs.use_yolo` to Alice and admit + claim a dedicated YOLO run so we create a
+        // real two-phase write intent (`record_fenced_intent` -> `start_write_attempt` ->
+        // `Settle::Stopped` -> `ExecState::Reconciling`).
+        sqlx::query(
+            "INSERT INTO openmettle.user_capability_grants AS g
+                 (user_id, capability, granted, updated_by_user_id)
+             VALUES ($1::uuid, 'runs.use_yolo', true, $1::uuid)
+             ON CONFLICT (user_id, capability) DO UPDATE
+                SET granted = true, revision = g.revision + 1",
+        )
+        .bind(&alice.user)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        let yolo_cfg = json!({"execution_mode": "yolo"}).to_string();
+        let mut tx_y = WriteTransaction::begin(&mut api_conn).await.unwrap();
+        let admitted_y = run_queue::admit_run_with_mode(
+            &mut tx_y,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &alice_scope,
+                    actor: &alice.user,
+                    conversation: &conv,
+                    branch: &branch,
+                    message: &msg,
+                    key: "mcp-yolo-reconcile-run",
+                    format: "openmettle.synthetic-run",
+                    version: 1,
+                    input: b"{}",
+                    config: yolo_cfg.as_bytes(),
+                },
+                actor_approval_id: &alice.approval,
+                now_ms: effect_session.context().observed_ms(),
+                capabilities: &[],
+                requested_rounds: Some(5),
+                cost_qualified: None,
+            },
+            &limits,
+            &effect_session,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(admitted_y, Admission::Admitted { .. }));
+        tx_y.commit().await.unwrap();
+        let mut w_conn = connect(&db.0, WORKER).await;
+        let rec_claim = run_queue::claim_next(
+            &mut w_conn,
+            &ClaimLimits {
+                executing_per_actor: 4,
+                executing_per_scope: 4,
+            },
+            &leases,
+        )
+        .await
+        .unwrap()
+        .expect("claimed yolo reconcile run");
+
+        // Authorize with ONLY `issues.write` (missing `status.read`) first.
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice, "mcp-a-write-only"),
+            &ring,
+            &conn_id,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-RECONCILE-BEARER",
+                refresh_token: None,
+                granted_scopes: &["issues.write".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let proposal = reg
+            .get("gh.write_issue", "1")
+            .unwrap()
+            .proposal("reconcile-key-1", br#"{"repo":"openmettle-core"}"#)
+            .unwrap();
+        let IntentResult::Applied(tx1) = record_fenced_intent(
+            &mut w_conn,
+            &rec_claim.lease(),
+            &proposal,
+            None,
+            reg.as_ref(),
+            &leases,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected Tx1 for reconcile write");
+        };
+        assert!(matches!(
+            start_write_attempt(
+                &mut w_conn,
+                &rec_claim.lease(),
+                &tx1.operation_id,
+                &proposal,
+                &leases,
+                reg.as_ref(),
+            )
+            .await
+            .unwrap(),
+            ReplayEffect::Ready(_)
+        ));
+        assert_eq!(
+            leases::settle(&mut w_conn, &rec_claim.lease(), &leases, Settle::Stopped)
+                .await
+                .unwrap(),
+            leases::Settled::Reconciling { unresolved: 1 }
+        );
+        let capability: String =
+            sqlx::query_scalar("SELECT capability FROM openmettle.operations WHERE id = $1::uuid")
+                .bind(&tx1.operation_id)
+                .fetch_one(&mut owner)
+                .await
+                .unwrap();
+        let unres = leases::UnresolvedOperation {
+            id: tx1.operation_id,
+            logical_key: proposal.logical_key.clone(),
+            target: proposal.destination().to_owned(),
+            capability,
+            outcome: "intent".into(),
+            revision: 0,
+            downstream_handle: None,
+            dispatched_attempts: Some(1),
+        };
+        let rec_active = ActiveRun {
+            claim: rec_claim,
+            state: leases::ExecState::Reconciling,
+            execution_deadline: step.deadline,
+        };
+        let single_conn_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_with(role_options(&db.0, WORKER))
+            .await
+            .unwrap();
+        let single_adapter = ExternalMcpAdapter::new(
+            single_conn_pool.clone(),
+            leases,
+            reg.clone(),
+            transports,
+            Arc::new(VaultCredentialProvider::new(
+                single_conn_pool,
+                ring.clone(),
+                None,
+                VaultConfig::default(),
+            )),
+            Arc::new(VaultDestinationAuthorizer::new()),
+        );
+        let reqs_pre_rec = mcp_srv.requests.load(Ordering::SeqCst);
+        let denied_rec = single_adapter
+            .reconcile_operation(&rec_active, &unres, step.clone())
+            .await;
+        assert!(
+            denied_rec.is_none(),
+            "missing lookup_scope must deny reconciliation"
+        );
+        assert_eq!(mcp_srv.requests.load(Ordering::SeqCst), reqs_pre_rec);
+
+        // Now grant `status.read` alongside `issues.write`: single-connection pool reconciles cleanly!
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice, "mcp-a-write-and-status"),
+            &ring,
+            &conn_id,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-RECONCILE-BEARER",
+                refresh_token: None,
+                granted_scopes: &["issues.write".into(), "status.read".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ok_rec = single_adapter
+            .reconcile_operation(&rec_active, &unres, step.clone())
+            .await
+            .expect("reconcile_operation must succeed on max_connections(1) pool when lookup_scope is granted");
+        assert_eq!(ok_rec.outcome, "succeeded");
+        // Restore issues.read grant for disconnect test below.
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice, "mcp-a-restore-read"),
+            &ring,
+            &conn_id,
+            &AuthorizeConnectionInput {
+                access_token: &mcp_access,
+                refresh_token: Some(mcp_refresh),
+                granted_scopes: &["issues.read".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     // Disconnect evicts catalog cache and immediately blocks the next call with 0 HTTP calls!
+    let reqs_before_disc = mcp_srv.requests.load(Ordering::SeqCst);
     vault::disconnect_connection(&mut api_conn, &ctx(&alice, "mcp-disc"), &conn_id)
         .await
         .unwrap();
@@ -2131,7 +3028,7 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         StepResult::ToolOutput(env) => assert!(env.contains("terminal_refusal"), "{env}"),
         _ => panic!("expected terminal_refusal after disconnect"),
     }
-    assert_eq!(mcp_srv.requests.load(Ordering::SeqCst), reqs_before);
+    assert_eq!(mcp_srv.requests.load(Ordering::SeqCst), reqs_before_disc);
 
     // Verify zero plaintext secret substrings in operations or run_events.
     let ops_dump: String = sqlx::query_scalar(
@@ -2146,7 +3043,7 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    for needle in [mcp_access, mcp_refresh] {
+    for needle in [mcp_access.as_str(), mcp_refresh, "CANARY-RECONCILE-BEARER"] {
         assert!(!ops_dump.contains(needle));
         assert!(!ev_dump.contains(needle));
     }
@@ -2179,5 +3076,780 @@ async fn vault_external_mcp_adapter_end_to_end_and_role_boundaries() {
         ] {
             expect_state(&mut c, sql, "42501").await;
         }
+    }
+}
+
+// ============================================================================================
+// 5. P1 #5: Packaged worker startup wiring (`worker::config::load` + `build_worker_turn_executor`)
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and TEST_GATEWAY_HOST"]
+async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
+    let db = TestDb::migrated().await;
+    super::run_admission::seed_token_budget(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_scope = personal_of(&db, &alice).await;
+    let mut api_conn = connect(&db.0, API).await;
+
+    let act = admin_cli(&db.url(OWNER), &["runtime", "activate-two-phase-intents"]);
+    assert!(act.status.success(), "{}", stderr(&act));
+
+    // Synthetic TLS MCP server expecting the vaulted bearer token.
+    let mcp_srv = SyntheticTlsServer::start(|_head, body| {
+        let req: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let id = req["id"].as_str().unwrap_or("1");
+        let method = req["method"].as_str().unwrap_or("");
+        if method == "tools/list" {
+            http_json(
+                200,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "list_issues",
+                            "inputSchema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["repo"],
+                                "properties": {
+                                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                                }
+                            }
+                        }]
+                    }
+                }),
+            )
+        } else {
+            http_json(
+                200,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": "packaged-worker-mcp-ok"}]
+                    }
+                }),
+            )
+        }
+    })
+    .await;
+
+    // Synthetic TLS metered gateway returning a tool call on round 1 and final answer on round 2.
+    let gw_round = Arc::new(AtomicUsize::new(0));
+    let gw_round_srv = gw_round.clone();
+    let gw_seen_mcp_result = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gw_seen_srv = gw_seen_mcp_result.clone();
+    let gw_srv = SyntheticTlsServer::start(move |_head, body| {
+        let r = gw_round_srv.fetch_add(1, Ordering::SeqCst);
+        if r == 0 {
+            http_json(
+                200,
+                &json!({
+                    "id": "chatcmpl-w1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_pkg_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "gh_list_issues",
+                                    "arguments": "{\"repo\":\"openmettle-core\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 6}
+                }),
+            )
+        } else {
+            if body.contains("packaged-worker-mcp-ok") {
+                gw_seen_srv.store(true, Ordering::SeqCst);
+            }
+            http_json(
+                200,
+                &json!({
+                    "id": "chatcmpl-w2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Packaged worker turn completed."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 6}
+                }),
+            )
+        }
+    })
+    .await;
+
+    let ring = Arc::new(VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x88u8; 32])]).unwrap());
+    let conn_id = vault::create_connection(
+        &mut api_conn,
+        &ctx(&alice, "pkg-c1"),
+        &CreateConnectionInput {
+            scope_id: &alice_scope,
+            provider_kind: "github",
+            account_id: "acct-pkg",
+            origin: &mcp_srv.origin(),
+            allowed_scopes: &["issues.read".into()],
+        },
+    )
+    .await
+    .unwrap()
+    .target_id()
+    .to_owned();
+    let bearer_secret = "CANARY-PACKAGED-WORKER-BEARER";
+    vault::authorize_connection(
+        &mut api_conn,
+        &ctx(&alice, "pkg-a1"),
+        &ring,
+        &conn_id,
+        &AuthorizeConnectionInput {
+            access_token: bearer_secret,
+            refresh_token: None,
+            granted_scopes: &["issues.read".into()],
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Write a real OPENMETTLE_WORKER_INFERENCE_CONFIG file referencing gw_srv + mcp_srv!
+    let dir = auth_config_support::Dir::new();
+    let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
+    let catalog_val: Value = serde_json::from_slice(catalog_bytes).unwrap();
+    let mut inf_doc = auth_config_support::inference_document(
+        &dir,
+        &catalog_val,
+        &gw_srv.ca_pem,
+        &format!("{}:{}", gw_srv.host, gw_srv.port),
+    );
+    let gw_cidr = gw_srv.private_cidr();
+    let mcp_cidr = mcp_srv.private_cidr();
+    let mcp_ca = dir.write("mcp-ca.pem", &mcp_srv.ca_pem);
+    for model_key in ["a", "b"] {
+        inf_doc["routes"][model_key]["private_cidrs"] = json!([gw_cidr]);
+        inf_doc["routes"][model_key]["functions"] = json!("flat");
+    }
+    inf_doc["external_mcp"] = json!({
+        "connections": {
+            &conn_id: {
+                "endpoint": mcp_srv.url("/mcp"),
+                "trust": { "roots": "bundle", "bundle_path": mcp_ca },
+                "private_cidrs": [mcp_cidr],
+                "setup_timeout_milliseconds": 5000,
+                "idle_read_timeout_milliseconds": 5000,
+                "call_timeout_milliseconds": 10000
+            }
+        },
+        "tools": [{
+            "tool_id": "gh_list_issues",
+            "remote_name": "list_issues",
+            "version": "1",
+            "description": "List repository issues",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["repo"],
+                "properties": {
+                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                }
+            },
+            "connection_id": &conn_id,
+            "account_id": "acct-pkg",
+            "action": "issues.read",
+            "resource_field": "repo",
+            "fixed_resource": "default",
+            "class": "read",
+            "capability": "tool.github",
+            "gate": "on_by_default",
+            "tool_policy": "mcp.v1",
+            "destination_policy": "synth.v1",
+            "endpoint_id": "gh-mcp",
+            "endpoint_version": "1",
+            "authoritative_lookup": false,
+            "semantic_errors_are_side_effect_free": true,
+            "call_timeout_milliseconds": 10000
+        }]
+    });
+    let inf_path = dir.write("worker-inference.json", inf_doc.to_string().as_bytes());
+    let loaded = worker_config::load(std::path::Path::new(&inf_path)).unwrap();
+    let catalog = loaded.catalog.clone();
+
+    // Admit a real conversation turn run on model "a".
+    let conv_outcome =
+        branches::create_conversation(&mut api_conn, &ctx(&alice, "pkg-conv"), &alice_scope)
+            .await
+            .unwrap();
+    let conv = match conv_outcome {
+        store::WriteOutcome::Applied { target_id }
+        | store::WriteOutcome::Replayed { target_id } => target_id,
+    };
+    let msg_id = "00000000-0000-4000-8000-000000004559";
+    let chat = Conversation {
+        scope: &alice_scope,
+        id: &conv.conversation_id,
+    };
+    let parts = [Part::Text("list open issues".into())];
+    let turn_op = Operation::Append(UserInput {
+        id: msg_id,
+        parts: &parts,
+    });
+    let selection: Selection = serde_json::from_value(
+        json!({"model": "a", "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let snapshot = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("a").unwrap().cost_bound,
+    };
+    let turn_intent = TurnIntent {
+        source_branch_id: &conv.branch_id,
+        expected_head_message_id: None,
+        operation: turn_op,
+        selection: &selection,
+        requested_rounds: Some(3),
+    };
+    let sess_token = seeded_session(&db, &alice, 10, None).await;
+    let sess_policy =
+        openmettle_core::sessions::Policy::new(Duration::from_secs(60), 10, Duration::from_secs(3))
+            .unwrap();
+    let effect_session =
+        approvals::EffectSession::validate(&mut api_conn, &sess_token, &sess_policy, None)
+            .await
+            .unwrap();
+    let actor_principal = super::authz_store::principal(&db, &alice).await;
+    let mut tx = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    branches::prepare_turn(
+        &mut tx,
+        &ctx(&alice, "pkg-msg"),
+        chat,
+        &conv.branch_id,
+        None,
+        turn_op,
+    )
+    .await
+    .unwrap();
+    let history = branches::history(
+        tx.connection().unwrap(),
+        &actor_principal,
+        chat,
+        &conv.branch_id,
+        effect_session.context().observed_ms(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pins = Snapshots::encode(&turn_intent, &history, &catalog, &snapshot).unwrap();
+    let limits = AdmissionLimits {
+        live_per_actor: 4,
+        live_per_scope: 4,
+        queued_in_instance: 16,
+        queue_timeout: Duration::from_secs(600),
+        round_cap: 10,
+    };
+    let admitted = run_queue::admit_run_with_mode(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &conv.conversation_id,
+                branch: &conv.branch_id,
+                message: msg_id,
+                key: "pkg-turn-run-1",
+                format: SNAPSHOT_FORMAT,
+                version: SNAPSHOT_VERSION,
+                input: &pins.input,
+                config: &pins.config,
+            },
+            actor_approval_id: &alice.approval,
+            now_ms: effect_session.context().observed_ms(),
+            capabilities: &[],
+            requested_rounds: Some(3),
+            cost_qualified: None,
+        },
+        &limits,
+        &effect_session,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(admitted, Admission::Admitted { .. }));
+    tx.commit().await.unwrap();
+
+    let leases = LeaseSettings {
+        lease: Duration::from_secs(30),
+        execution_timeout: Duration::from_secs(120),
+    };
+    let mut worker_conn = connect(&db.0, WORKER).await;
+    let claimed = run_queue::claim_next(
+        &mut worker_conn,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 4,
+        },
+        &leases,
+    )
+    .await
+    .unwrap()
+    .expect("claimed packaged-worker run");
+
+    let worker_pool = make_pool(&db, WORKER).await;
+    let executor =
+        build_worker_turn_executor(worker_pool.clone(), loaded, leases, None, Some(ring));
+    let (_stop_tx, stop_rx) = watch::channel(None::<Stop>);
+    let step = StepContext {
+        stop: stop_rx,
+        deadline: Instant::now() + Duration::from_secs(20),
+        tasks: StepTasks::default().handle(),
+    };
+    let active = ActiveRun {
+        claim: claimed,
+        state: leases::ExecState::Running,
+        execution_deadline: step.deadline,
+    };
+    let result = executor.step(&active, step).await;
+    assert!(
+        matches!(result, StepResult::Answer(_)),
+        "expected TurnExecutor Answer through packaged worker wiring"
+    );
+    assert!(
+        gw_seen_mcp_result.load(Ordering::SeqCst),
+        "model round 2 must observe external MCP tool output"
+    );
+    let mcp_captured = mcp_srv.captured.lock().unwrap().clone();
+    assert!(!mcp_captured.is_empty());
+    assert!(
+        mcp_captured
+            .iter()
+            .any(|(head, _)| head.contains(&format!("Bearer {bearer_secret}"))),
+        "packaged worker must inject vaulted bearer token into outbound MCP requests"
+    );
+
+    // Without VAULT_KEYS_CONFIG (`vault_keys = None`), packaged worker wiring stays fail-closed
+    // (`GatedCredentialProvider`): filter_turn_tools omits the tool and 0 MCP calls occur!
+    let reqs_before_gated = mcp_srv.requests.load(Ordering::SeqCst);
+    let conv_2 = match branches::create_conversation(
+        &mut api_conn,
+        &ctx(&alice, "pkg-conv-2"),
+        &alice_scope,
+    )
+    .await
+    .unwrap()
+    {
+        store::WriteOutcome::Applied { target_id }
+        | store::WriteOutcome::Replayed { target_id } => target_id,
+    };
+    let chat_2 = Conversation {
+        scope: &alice_scope,
+        id: &conv_2.conversation_id,
+    };
+    let msg_id_2 = "00000000-0000-4000-8000-000000004560";
+    let parts_2 = [Part::Text("second run without vault keys".into())];
+    let turn_op_2 = Operation::Append(UserInput {
+        id: msg_id_2,
+        parts: &parts_2,
+    });
+    let turn_intent_2 = TurnIntent {
+        source_branch_id: &conv_2.branch_id,
+        expected_head_message_id: None,
+        operation: turn_op_2,
+        selection: &selection,
+        requested_rounds: Some(2),
+    };
+    let mut tx2 = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    branches::prepare_turn(
+        &mut tx2,
+        &ctx(&alice, "pkg-msg-2"),
+        chat_2,
+        &conv_2.branch_id,
+        None,
+        turn_op_2,
+    )
+    .await
+    .unwrap();
+    let history_2 = branches::history(
+        tx2.connection().unwrap(),
+        &actor_principal,
+        chat_2,
+        &conv_2.branch_id,
+        effect_session.context().observed_ms(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pins_2 = Snapshots::encode(&turn_intent_2, &history_2, &catalog, &snapshot).unwrap();
+    let admitted_2 = run_queue::admit_run_with_mode(
+        &mut tx2,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &conv_2.conversation_id,
+                branch: &conv_2.branch_id,
+                message: msg_id_2,
+                key: "pkg-turn-run-2",
+                format: SNAPSHOT_FORMAT,
+                version: SNAPSHOT_VERSION,
+                input: &pins_2.input,
+                config: &pins_2.config,
+            },
+            actor_approval_id: &alice.approval,
+            now_ms: effect_session.context().observed_ms(),
+            capabilities: &[],
+            requested_rounds: Some(2),
+            cost_qualified: None,
+        },
+        &limits,
+        &effect_session,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(admitted_2, Admission::Admitted { .. }));
+    tx2.commit().await.unwrap();
+    let claimed_2 = run_queue::claim_next(
+        &mut worker_conn,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 4,
+        },
+        &leases,
+    )
+    .await
+    .unwrap()
+    .expect("claimed gated run");
+    let loaded_gated = worker_config::load(std::path::Path::new(&inf_path)).unwrap();
+    let gated_exec = build_worker_turn_executor(worker_pool, loaded_gated, leases, None, None);
+    let (_stop_tx2, stop_rx2) = watch::channel(None::<Stop>);
+    let step2 = StepContext {
+        stop: stop_rx2,
+        deadline: Instant::now() + Duration::from_secs(20),
+        tasks: StepTasks::default().handle(),
+    };
+    let active2 = ActiveRun {
+        claim: claimed_2,
+        state: leases::ExecState::Running,
+        execution_deadline: step2.deadline,
+    };
+    let gated_result = gated_exec.step(&active2, step2).await;
+    assert!(
+        matches!(gated_result, StepResult::Answer(_)),
+        "gated worker run should settle without invoking unconfigured external MCP tool"
+    );
+    assert_eq!(
+        mcp_srv.requests.load(Ordering::SeqCst),
+        reqs_before_gated,
+        "worker without VAULT_KEYS_CONFIG must send 0 HTTP requests to MCP server"
+    );
+    let gw_last_body = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+    assert!(
+        !gw_last_body.contains("gh_list_issues"),
+        "gated worker must omit external MCP tool declaration when VAULT_KEYS_CONFIG is absent: {gw_last_body}"
+    );
+}
+
+// ============================================================================================
+// 6. P1 #6: Deletion-journal replay & coverage-gap connection reconciliation across restore
+// ============================================================================================
+
+async fn backup_db(db: &TestDb) -> TestDb {
+    let copy = TestDb::with_options(false, &format!("TEMPLATE {}", db.0)).await;
+    let roles = "openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway";
+    for sql in [
+        format!("REVOKE ALL ON DATABASE {} FROM PUBLIC", copy.0),
+        format!("GRANT CONNECT ON DATABASE {} TO {roles}", copy.0),
+    ] {
+        SqlxExecutor::execute(&mut copy.admin().await, AssertSqlSafe(sql))
+            .await
+            .unwrap();
+    }
+    copy
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn vault_restore_journal_replay_and_coverage_gap_reconciliation() {
+    let db = TestDb::migrated().await;
+    let (conn_disc, conn_rot, conn_shared, bob_user) = {
+        let mut owner = connect(&db.0, OWNER).await;
+        providers(&mut owner).await;
+        let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+        let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+        let alice_scope = personal_of(&db, &alice).await;
+        let mut api_conn = connect(&db.0, API).await;
+        let ring = VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x5au8; 32])]).unwrap();
+
+        let make_auth = |suffix: &str| {
+            let scope = alice_scope.clone();
+            let acct = format!("acct-rst-{suffix}");
+            (scope, acct)
+        };
+        let mut ids = Vec::new();
+        for suffix in ["disc", "rot", "shared"] {
+            let (scope, acct) = make_auth(suffix);
+            let id = vault::create_connection(
+                &mut api_conn,
+                &ctx(&alice, &format!("rst-c-{suffix}")),
+                &CreateConnectionInput {
+                    scope_id: &scope,
+                    provider_kind: "github",
+                    account_id: &acct,
+                    origin: "https://api.example.test",
+                    allowed_scopes: &["issues.read".into()],
+                },
+            )
+            .await
+            .unwrap()
+            .target_id()
+            .to_owned();
+            vault::authorize_connection(
+                &mut api_conn,
+                &ctx(&alice, &format!("rst-a-{suffix}")),
+                &ring,
+                &id,
+                &AuthorizeConnectionInput {
+                    access_token: &format!("CANARY-PREBACKUP-{suffix}"),
+                    refresh_token: Some(&format!("CANARY-PREBACKUP-REF-{suffix}")),
+                    granted_scopes: &["issues.read".into()],
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        vault::share_connection(
+            &mut api_conn,
+            &ctx(&alice, "rst-share-bob"),
+            &ids[2],
+            &Grantee::User(bob.user.clone()),
+        )
+        .await
+        .unwrap();
+        // Drop all connections to `db` before `CREATE DATABASE ... TEMPLATE`.
+        drop(api_conn);
+        drop(owner);
+        (ids[0].clone(), ids[1].clone(), ids[2].clone(), bob.user)
+    };
+
+    // Simulate two restored copies of the pre-revocation backup taken at T0.
+    let restored_replay = backup_db(&db).await;
+    let restored_gap = backup_db(&db).await;
+
+    // On LIVE after backup T0: disconnect conn_disc, supersede conn_rot, revoke Bob's share on conn_shared!
+    let export_text = {
+        let mut owner = connect(&db.0, OWNER).await;
+        let alice_user: String = sqlx::query_scalar(
+            "SELECT owner_user_id::text FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_disc)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let alice_approval: String = sqlx::query_scalar(
+            "SELECT a.id::text FROM openmettle.local_identity_approvals a
+               JOIN openmettle.user_identities i ON i.id = a.identity_id
+              WHERE i.user_id = $1::uuid LIMIT 1",
+        )
+        .bind(&alice_user)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let alice_acct = Account {
+            user: alice_user,
+            approval: alice_approval,
+        };
+        let mut api_conn = connect(&db.0, API).await;
+        let ring = VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x5au8; 32])]).unwrap();
+
+        vault::disconnect_connection(&mut api_conn, &ctx(&alice_acct, "post-disc"), &conn_disc)
+            .await
+            .unwrap();
+        vault::authorize_connection(
+            &mut api_conn,
+            &ctx(&alice_acct, "post-supersede"),
+            &ring,
+            &conn_rot,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-POSTBACKUP-ROTATED",
+                refresh_token: Some("CANARY-POSTBACKUP-ROTATED-REF"),
+                granted_scopes: &["issues.read".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        vault::revoke_connection_share(
+            &mut api_conn,
+            &ctx(&alice_acct, "post-revoke-bob"),
+            &conn_shared,
+            &Grantee::User(bob_user.clone()),
+        )
+        .await
+        .unwrap();
+
+        let live_pool = make_pool(&db, OWNER).await;
+        restore::export(&live_pool).await.unwrap()
+    };
+    let parsed_export = restore::Export::parse(&export_text).unwrap();
+    assert!(parsed_export.connection_origin_us.is_some());
+    assert!(export_text.contains("external_connection.disconnected"));
+    assert!(export_text.contains("external_connection.credential_superseded"));
+    assert!(export_text.contains("external_connection.share_revoked"));
+
+    // (a) Complete journal replay onto `restored_replay`: enforces all 3 post-backup events!
+    {
+        let pool = make_pool(&restored_replay, OWNER).await;
+        restore::lock_gate_with_connection_origin(
+            &pool,
+            &GateLockRequest {
+                origin_us: parsed_export.origin_us,
+                lifecycle_origin_us: parsed_export.lifecycle_origin_us,
+                lifecycle_baseline_digest: parsed_export.lifecycle_baseline_digest.as_deref(),
+                required_seq: parsed_export.seq,
+                required_digest: &parsed_export.digest,
+                coverage_complete: true,
+                replace_restore_run: None,
+                new_restore: true,
+            },
+            parsed_export.connection_origin_us,
+        )
+        .await
+        .unwrap();
+        let applied = restore::apply(&pool, &parsed_export).await.unwrap();
+        assert!(
+            applied >= 3,
+            "expected >=3 replayed connection events, got {applied}"
+        );
+        restore::finish(&pool, None, &parsed_export).await.unwrap();
+
+        let mut owner = connect(&restored_replay.0, OWNER).await;
+        assert!(restore::gate_open(&mut owner).await.unwrap());
+        let (disc_st, disc_ct_null): (String, bool) = sqlx::query_as(
+            "SELECT state, access_ciphertext IS NULL AND refresh_ciphertext IS NULL
+               FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_disc)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((disc_st.as_str(), disc_ct_null), ("disconnected", true));
+
+        let (rot_st, rot_ct_null): (String, bool) = sqlx::query_as(
+            "SELECT state, access_ciphertext IS NULL AND refresh_ciphertext IS NULL
+               FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_rot)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((rot_st.as_str(), rot_ct_null), ("reauth_required", true));
+
+        let (shared_st, bob_active): (String, bool) = sqlx::query_as(
+            "SELECT c.state,
+                    EXISTS(SELECT 1 FROM openmettle.external_connection_shares s
+                            WHERE s.connection_id = c.id AND s.grantee_user_id = $2::uuid AND s.active)
+               FROM openmettle.external_connections c WHERE c.id = $1::uuid",
+        )
+        .bind(&conn_shared)
+        .bind(&bob_user)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((shared_st.as_str(), bob_active), ("authorized", false));
+    }
+
+    // (b) Incomplete journal / coverage gap onto `restored_gap`:
+    // Direct gate open refuses (`OMR04`) while authorized connections/shares survive;
+    // `openmettle-admin restore accept-coverage-gap` wipes ALL authorized connections to
+    // `reauth_required` and deactivates ALL active shares so nothing revives across the gap!
+    {
+        let pool = make_pool(&restored_gap, OWNER).await;
+        let pre_export_text = restore::export(&pool).await.unwrap();
+        let pre_export = restore::Export::parse(&pre_export_text).unwrap();
+        let locked = restore::lock_gate_with_connection_origin(
+            &pool,
+            &GateLockRequest {
+                origin_us: pre_export.origin_us,
+                lifecycle_origin_us: pre_export.lifecycle_origin_us,
+                lifecycle_baseline_digest: pre_export.lifecycle_baseline_digest.as_deref(),
+                required_seq: pre_export.seq,
+                required_digest: &pre_export.digest,
+                coverage_complete: false,
+                replace_restore_run: None,
+                new_restore: true,
+            },
+            pre_export.connection_origin_us,
+        )
+        .await
+        .unwrap();
+
+        // Direct finish without accept-coverage-gap must fail with OMR04!
+        restore::apply(&pool, &pre_export).await.unwrap();
+        let premature = restore::finish(&pool, None, &pre_export).await;
+        assert!(
+            matches!(
+                premature,
+                Err(restore::Error::Database(sqlx::Error::Database(ref d)))
+                    if d.code().as_deref() == Some("OMR04")
+            ),
+            "expected OMR04 without accept-coverage-gap, got {premature:?}"
+        );
+
+        let gap_out = admin_cli(
+            &restored_gap.url(OWNER),
+            &[
+                "restore",
+                "accept-coverage-gap",
+                "--restore-run",
+                &locked.restore_run_id,
+                "--operator-id",
+                "00000000-0000-4000-8000-000000000902",
+                "--request-key",
+                "vault-gap-1",
+                "--reason",
+                "synthetic coverage gap test",
+            ],
+        );
+        assert!(gap_out.status.success(), "{}", stderr(&gap_out));
+
+        restore::finish(&pool, None, &pre_export).await.unwrap();
+
+        let mut owner = connect(&restored_gap.0, OWNER).await;
+        let (still_auth, still_active_shares, gate_open): (i64, i64, bool) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.external_connections WHERE state = 'authorized'),
+                    (SELECT count(*) FROM openmettle.external_connection_shares WHERE active),
+                    (SELECT open FROM openmettle.restore_reconciliation_gate WHERE id)",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            still_auth, 0,
+            "all authorized connections must be wiped to reauth_required"
+        );
+        assert_eq!(
+            still_active_shares, 0,
+            "all active shares must be deactivated"
+        );
+        assert!(gate_open, "gate must open after accept-coverage-gap");
     }
 }
