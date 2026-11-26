@@ -2271,11 +2271,12 @@ async fn declare_lost_refuses_unapplied_lifecycle_baseline_when_journal_seq_matc
     assert_eq!(storage_account(&restored_db, &c.scope).await, (0, 0, 0));
 }
 
-/// Review #3 P2 #1 regression: on a closed restore gate with `head.journal_seq >
-/// required_journal_seq`, an exact `--request-key` retry MUST verify
-/// `restore_verify_lost_journal_tail` in both CLI preflight (before opening/unlinking leftover
-/// files) and inside `storage_declare_payload_lost` under `deletion_journal_head FOR SHARE`,
-/// failing closed (`OMR03`) when the tail is not bound to the current `restore_run_id`.
+/// Review #3 P2 #1 & Review #4 P2 #2 regression: on a closed restore gate with `head.journal_seq
+/// > required_journal_seq`, both an exact `--request-key` retry of `storage declare-lost` (CLI
+/// preflight and `storage_declare_payload_lost` under `deletion_journal_head FOR SHARE`) and
+/// `storage rebind` (before unlinking `lost_cleanups`) MUST verify
+/// `restore_verify_lost_journal_tail`, failing closed without unlinking leftover files or losing
+/// the held adoption barrier when the tail is tampered or bound to a different `restore_run_id`.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatched_restore_run_without_unlinking()
@@ -2322,6 +2323,7 @@ async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatc
     .unwrap();
     let (ok, _, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
     assert!(!ok);
+    let held_barrier = barrier_of(&f.db).await.unwrap();
     let (ok, out, err) = declare_lost_cli(
         &f.db,
         OWNER,
@@ -2333,7 +2335,7 @@ async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatc
     );
     assert!(ok, "{out}{err}");
 
-    // Place a leftover file on disk to prove a failed exact retry never unlinks anything.
+    // Place a leftover file on disk to prove a failed exact retry or rebind never unlinks anything.
     let leftover = copy.join("revisions").join(&target.reservation);
     fs::write(&leftover, b"leftover-before-retry").unwrap();
 
@@ -2378,9 +2380,32 @@ async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatc
     .await;
     assert_eq!(sqlstate(sql_res), "OMR03");
 
+    // `storage rebind` also verifies the closed-gate lost journal tail under lock before unlinking
+    // `lost_cleanups`, refusing while preserving both the leftover file and the held barrier.
+    let (ok, _, err) = cli(
+        &f.db,
+        &[
+            "storage",
+            "rebind",
+            copy.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("closed restore gate journal tail verification failed"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&leftover).unwrap(), b"leftover-before-retry");
+    assert_eq!(
+        barrier_of(&f.db).await.as_deref(),
+        Some(held_barrier.as_str())
+    );
+
     // 3. Restore `run_1`, then corrupt `deletion_journal_head.chain_digest` so the post-replay
-    //    tail digest no longer matches the head; both CLI retry and direct SQL must refuse OMR03
-    //    without unlinking `leftover`.
+    //    tail digest no longer matches the head; CLI retry, direct SQL, and `storage rebind` must
+    //    all refuse without unlinking `leftover` or losing `held_barrier`.
     sqlx::query(
         "UPDATE openmettle.restore_reconciliation_gate
             SET restore_run_id = $1::uuid
@@ -2425,6 +2450,27 @@ async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatc
     .execute(&mut connect(&f.db.0, OWNER).await)
     .await;
     assert_eq!(sqlstate(sql_res), "OMR03");
+
+    let (ok, _, err) = cli(
+        &f.db,
+        &[
+            "storage",
+            "rebind",
+            copy.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("closed restore gate journal tail verification failed"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&leftover).unwrap(), b"leftover-before-retry");
+    assert_eq!(
+        barrier_of(&f.db).await.as_deref(),
+        Some(held_barrier.as_str())
+    );
 }
 
 /// Review #3 P2 #2 regression: on a closed restore gate with `required_lifecycle_origin_us IS NOT

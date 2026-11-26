@@ -13,7 +13,7 @@ use super::{
 use rustix::{fs as at, io::Errno};
 use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, TryLockError},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -863,6 +863,24 @@ async fn scan_and_apply(
     sqlx::query("SELECT id FROM openmettle.artifact_revisions ORDER BY id FOR UPDATE")
         .execute(&mut *tx)
         .await?;
+    let gate = if !scan.lost_cleanups.is_empty() {
+        Some(
+            sqlx::query(
+                "SELECT open,
+                        (NOT open AND volume_claim_token IS NOT NULL AND volume_lease_until > clock_timestamp()) AS volume_active,
+                        required_journal_seq,
+                        required_chain_digest,
+                        restore_run_id::text AS restore_run_id
+                   FROM openmettle.restore_reconciliation_gate
+                  WHERE id
+                    FOR SHARE",
+            )
+            .fetch_one(&mut *tx)
+            .await?,
+        )
+    } else {
+        None
+    };
     // A later run that replaced this barrier fences this one out here.
     let own: Option<bool> = sqlx::query_scalar(
         "SELECT adoption_run_id=$1::uuid FROM openmettle.storage_volume_control WHERE id FOR UPDATE",
@@ -877,6 +895,67 @@ async fn scan_and_apply(
     let locked = sqlx::query(INVENTORY).fetch_all(&mut *tx).await?;
     if !locked.iter().map(identity).eq(rows.iter().map(identity)) {
         return Err(Failure("ledger changed during rebind"));
+    }
+    if let Some(gate) = gate
+        && !gate.try_get::<bool, _>("open")?
+    {
+        if gate.try_get::<bool, _>("volume_active")? {
+            return Err(Failure("restore volume phase is active"));
+        }
+        // Preserve canonical lock order before locking deletion_journal_head FOR SHARE when this
+        // transaction will also update storage_accounts and storage_instance for journal purges.
+        if !scan.journal_purges.is_empty() {
+            let scope_ids: BTreeSet<&str> = scan
+                .journal_purges
+                .iter()
+                .map(|jp| jp.scope_id.as_str())
+                .collect();
+            for scope_id in scope_ids {
+                sqlx::query(
+                    "SELECT FROM openmettle.storage_accounts WHERE scope_id = $1::uuid FOR UPDATE",
+                )
+                .bind(scope_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query("SELECT FROM openmettle.storage_instance WHERE id FOR UPDATE")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let (head_seq, head_digest): (i64, Vec<u8>) = sqlx::query_as(
+            "SELECT journal_seq, chain_digest FROM openmettle.deletion_journal_head WHERE id FOR SHARE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let req_seq = gate
+            .try_get::<Option<i64>, _>("required_journal_seq")?
+            .ok_or(Failure(
+                "closed restore gate is missing required journal state",
+            ))?;
+        let req_digest = gate
+            .try_get::<Option<Vec<u8>>, _>("required_chain_digest")?
+            .ok_or(Failure(
+                "closed restore gate is missing required journal state",
+            ))?;
+        let restore_run_id =
+            gate.try_get::<Option<String>, _>("restore_run_id")?
+                .ok_or(Failure(
+                    "closed restore gate is missing required journal state",
+                ))?;
+        if head_seq < req_seq || (head_seq == req_seq && head_digest != req_digest) {
+            return Err(Failure(
+                "closed restore gate deletion journal has not caught up",
+            ));
+        }
+        if head_seq > req_seq {
+            sqlx::query("SELECT openmettle.restore_verify_lost_journal_tail($1, $2, $3::uuid)")
+                .bind(req_seq)
+                .bind(&req_digest)
+                .bind(&restore_run_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| Failure("closed restore gate journal tail verification failed"))?;
+        }
     }
     // Before the first write: every file is still the one inspected, and every file whose
     // inode is about to be recorded is durable.
@@ -1008,8 +1087,9 @@ async fn scan_and_apply(
             .or_insert(0) += jp.size_bytes;
         instance_retained_decrement += jp.size_bytes;
     }
-    // Canonical lock order: storage_reservations -> artifact_revisions -> storage_volume_control
-    // -> storage_accounts (ascending scope_id) -> storage_instance.
+    // Canonical lock order: storage_reservations -> artifact_revisions ->
+    // restore_reconciliation_gate -> storage_volume_control -> storage_accounts (ascending
+    // scope_id) -> storage_instance -> deletion_journal_head.
     for (scope_id, bytes) in scope_retained_decrements {
         let updated = sqlx::query(
             "UPDATE openmettle.storage_accounts

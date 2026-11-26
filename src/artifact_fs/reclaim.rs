@@ -1278,10 +1278,9 @@ pub async fn cleanup_lost_on_restore(
                 AND r.state = 'lost'
                 AND ($1::uuid IS NULL OR s.id > $1::uuid)
               ORDER BY s.id ASC
-              LIMIT $2",
+              LIMIT 100",
         )
         .bind(&cursor)
-        .bind(MAX_BATCH)
         .fetch_all(pool)
         .await?;
         if batch.is_empty() {
@@ -1289,6 +1288,7 @@ pub async fn cleanup_lost_on_restore(
         }
         for (res_id, scope_id, rev_id, has_ino) in batch {
             cursor = Some(res_id.clone());
+            renew_volume_phase(pool, restore_run_id, claim_token).await?;
             let names = super::rebind::reservation_names(&res_id);
             let entries = super::rebind::stat_reservation(v, &names)
                 .map_err(|_| Error::Io)?

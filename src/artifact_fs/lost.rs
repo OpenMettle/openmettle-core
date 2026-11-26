@@ -8,7 +8,7 @@
 //! locks, and any file with a foreign hard link outside this reservation's four names.
 use super::{
     FS_TX_IDLE_TIMEOUT, TX_FENCE_BUDGET,
-    adoption::{self, COMMIT_UNKNOWN, Failure, READ_FAILED, RevisionDigests},
+    adoption::{self, COMMIT_UNKNOWN, Failure, RevisionDigests},
     rebind::{
         self, CHANGED, Entry, Ledger, Names, OwnedNames, Plan, has_foreign_hard_link,
         lock_reservation_files, reservation_names, stat_reservation, unlink_reservation_files,
@@ -112,6 +112,23 @@ fn check_fence(deadline: Instant) -> Result<(), Failure> {
     Ok(())
 }
 
+fn handle_candidate_digest(
+    ledger: &Ledger<'_>,
+    names: &Names,
+    result: Result<(), Failure>,
+) -> Result<(), Failure> {
+    match result {
+        Ok(()) => Err(match rebind::classify(ledger, names) {
+            Ok(Plan::Content(_)) => Failure("payload verifies intact; run storage rebind instead"),
+            _ => Failure(
+                "payload verifies intact; resolve layout mismatch or run storage rebind instead",
+            ),
+        }),
+        Err(Failure("size_or_digest_mismatch")) => Ok(()),
+        Err(other) => Err(other),
+    }
+}
+
 /// Checks whether ANY file under the reservation's names verifies intact against `(size_bytes,
 /// content_digest)` (independently of anchor or layout mismatches) or is an already-truncated
 /// `purging` layout accepted by `storage rebind`. Returns `Err(...)` to refuse `declare-lost`, or
@@ -147,20 +164,11 @@ fn check_unrecoverable_and_no_foreign_links(
         if let Some((_, file)) = locked.iter_mut().find(|(file_ino, _)| *file_ino == e.ino) {
             file.seek(SeekFrom::Start(0))?;
             let mut digests = RevisionDigests::default();
-            match digests.verify(reservation_id, file, size_bytes, content_digest) {
-                Ok(()) => {
-                    return Err(match rebind::classify(ledger, &names) {
-                        Ok(Plan::Content(_)) => {
-                            Failure("payload verifies intact; run storage rebind instead")
-                        }
-                        _ => Failure(
-                            "payload verifies intact; resolve layout mismatch or run storage rebind instead",
-                        ),
-                    });
-                }
-                Err(Failure("size_or_digest_mismatch" | READ_FAILED)) => {}
-                Err(other) => return Err(other),
-            }
+            handle_candidate_digest(
+                ledger,
+                &names,
+                digests.verify(reservation_id, file, size_bytes, content_digest),
+            )?;
         }
     }
     if matches!(rebind::classify(ledger, &names), Ok(Plan::Empty { .. }))
@@ -869,5 +877,89 @@ mod tests {
             assert!(anchor_path.exists());
             std::fs::remove_file(&anchor_path).unwrap();
         }
+    }
+
+    #[test]
+    fn read_failure_aborts_declare_lost_while_interrupted_retries_and_refuses_intact_payload() {
+        use super::super::adoption::{READ_FAILED, sha256_reader};
+        use std::collections::VecDeque;
+        use std::io::{self, Read};
+
+        struct ScriptedReader {
+            steps: VecDeque<io::Result<Vec<u8>>>,
+        }
+        impl Read for ScriptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.steps.pop_front() {
+                    None => Ok(0),
+                    Some(Ok(chunk)) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        Ok(n)
+                    }
+                    Some(Err(err)) => Err(err),
+                }
+            }
+        }
+
+        let payload = b"intact-under-eintr";
+        let expected = Sha256::digest(payload).to_vec();
+        let ledger = Ledger {
+            state: "settled",
+            reclaim: "none",
+            revision: Some("active"),
+            purge: Some("none"),
+        };
+        let names = Names {
+            staging: None,
+            reclaim: None,
+            revision: Some(Entry {
+                ino: 42,
+                len: payload.len() as u64,
+                links: 1,
+            }),
+            purge: None,
+        };
+
+        // 1. Transient EINTR retries cleanly, matches expected digest, and refuses declare-lost.
+        let interrupted_reader = ScriptedReader {
+            steps: VecDeque::from([
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"intact-".to_vec()),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"under-eintr".to_vec()),
+            ]),
+        };
+        let verify_ok = sha256_reader(interrupted_reader).and_then(|digest| {
+            if digest.as_slice() == expected.as_slice() {
+                Ok(())
+            } else {
+                Err(Failure("size_or_digest_mismatch"))
+            }
+        });
+        assert_eq!(
+            handle_candidate_digest(&ledger, &names, verify_ok)
+                .unwrap_err()
+                .0,
+            "payload verifies intact; run storage rebind instead"
+        );
+
+        // 2. Non-Interrupted I/O failure produces READ_FAILED and aborts declare-lost fail-closed.
+        let eio_reader = ScriptedReader {
+            steps: VecDeque::from([
+                Ok(b"intact-".to_vec()),
+                Err(io::Error::other("injected eio")),
+            ]),
+        };
+        let verify_eio = sha256_reader(eio_reader).map(|_| ());
+        assert_eq!(
+            handle_candidate_digest(&ledger, &names, verify_eio)
+                .unwrap_err()
+                .0,
+            READ_FAILED
+        );
+
+        // 3. Confirmed digest mismatch still allows declare-lost to proceed.
+        handle_candidate_digest(&ledger, &names, Err(Failure("size_or_digest_mismatch"))).unwrap();
     }
 }
