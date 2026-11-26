@@ -23,14 +23,52 @@
 -- storage_reservations -> restore_reconciliation_gate (FOR SHARE) -> storage_volume_control ->
 -- storage_accounts -> storage_instance -> retention_policy -> deletion_journal_head.
 -- restore_gate_lock, restore_verify_export, restore_verify_checkpoints, restore_claim_volume_phase,
--- restore_renew_volume_phase, restore_release_volume_phase, restore_gate_open and
--- restore_accept_coverage_gap lock the gate row first and touch no storage or dispatch lock row.
+-- restore_renew_volume_phase, restore_release_volume_phase and restore_accept_coverage_gap lock
+-- the gate row first and touch no storage or dispatch lock row; restore_gate_open locks the gate
+-- row FOR UPDATE and then storage_volume_control FOR SHARE (in canonical order) before
+-- deletion_journal_head FOR SHARE.
 --
 -- Upgrade from 40: the gate starts open (a live database is not a restore), deletion_journal_head
 -- records coverage_started_at from migration 28's installed_on timestamp when _sqlx_migrations is
 -- present (matching backups taken at schema >= 28 and rejecting schema <= 27 backups migrated
 -- during restore with OMR04), and the deletion journal hash chain continues unchanged. See
 -- docs/operator/storage-adoption-and-quota-upgrade.md.
+
+-- Acquire ACCESS EXCLUSIVE on every pre-existing table modified by migration 41 in one atomic
+-- bounded NOWAIT retry loop at the top of the transaction so concurrent 0040 writers (such as
+-- confirm_purge locking artifact_revisions -> deletion_journal_head) cannot deadlock with DDL.
+DO $$
+DECLARE
+    v_timeout interval;
+    v_deadline timestamptz;
+BEGIN
+    SELECT coalesce(nullif(setting::bigint, 0), 15000) * interval '1 millisecond'
+      INTO v_timeout
+      FROM pg_catalog.pg_settings
+     WHERE name = 'lock_timeout';
+    v_timeout := coalesce(v_timeout, interval '15 seconds');
+    v_deadline := pg_catalog.clock_timestamp() + v_timeout;
+
+    LOOP
+        BEGIN
+            LOCK TABLE openmettle.artifact_revisions,
+                       openmettle.authorization_audit,
+                       openmettle.retention_policy,
+                       openmettle.deletion_journal,
+                       openmettle.deletion_journal_head
+                IN ACCESS EXCLUSIVE MODE NOWAIT;
+            EXIT;
+        EXCEPTION
+            WHEN lock_not_available THEN
+                IF pg_catalog.clock_timestamp() >= v_deadline THEN
+                    RAISE EXCEPTION 'canceling statement due to lock timeout'
+                        USING ERRCODE = '55P03';
+                END IF;
+                PERFORM pg_catalog.pg_sleep(0.02);
+        END;
+    END LOOP;
+END
+$$;
 
 ALTER TABLE openmettle.deletion_journal_head
     ADD COLUMN coverage_started_at timestamptz;
@@ -89,72 +127,45 @@ CREATE TABLE openmettle.restore_reconciliation_gate (
 INSERT INTO openmettle.restore_reconciliation_gate (id) VALUES (true);
 GRANT SELECT ON openmettle.restore_reconciliation_gate TO openmettle_worker;
 
--- Widen authorization_audit CHECK constraints additively under a bounded NOWAIT retry loop
--- so audited break-glass coverage-gap acceptance writes an operator-only audit row.
-DO $$
-DECLARE
-    v_timeout interval;
-    v_deadline timestamptz;
-BEGIN
-    SELECT coalesce(nullif(setting::bigint, 0), 15000) * interval '1 millisecond'
-      INTO v_timeout
-      FROM pg_catalog.pg_settings
-     WHERE name = 'lock_timeout';
-    v_timeout := coalesce(v_timeout, interval '15 seconds');
-    v_deadline := pg_catalog.clock_timestamp() + v_timeout;
-
-    LOOP
-        BEGIN
-            LOCK TABLE openmettle.authorization_audit IN ACCESS EXCLUSIVE MODE NOWAIT;
-            EXIT;
-        EXCEPTION
-            WHEN lock_not_available THEN
-                IF pg_catalog.clock_timestamp() >= v_deadline THEN
-                    RAISE EXCEPTION 'canceling statement due to lock timeout'
-                        USING ERRCODE = '55P03';
-                END IF;
-                PERFORM pg_catalog.pg_sleep(0.02);
-        END;
-    END LOOP;
-
-    ALTER TABLE openmettle.authorization_audit
-        DROP CONSTRAINT authorization_audit_action_check,
-        ADD CONSTRAINT authorization_audit_action_check CHECK (action IN (
-            'account_admin.grant', 'account_admin.revoke',
-            'user.disable', 'user.enable',
-            'local_group.create', 'local_group.rename', 'local_group.disable', 'local_group.enable',
-            'local_group.member_add', 'local_group.member_remove',
-            'project.create', 'project.settings_update', 'project.archive', 'project.restore',
-            'project.delete', 'project.member_grant', 'project.member_revoke',
-            'resource.share', 'resource.unshare',
-            'capability.platform_deny', 'capability.platform_allow',
-            'capability.user_deny', 'capability.user_allow',
-            'capability.user_grant', 'capability.user_revoke',
-            'conversation.create', 'branch.create', 'quota.override.set', 'quota.override.revoke',
-            'retention.policy_update',
-            'family_policy.set', 'family_policy.clear',
-            'family_policy.model_study_allow', 'family_policy.model_study_revoke',
-            'family_policy.model_disable', 'family_policy.model_enable',
-            'restore.accept_coverage_gap')),
-        DROP CONSTRAINT authorization_audit_target_kind_check,
-        ADD CONSTRAINT authorization_audit_target_kind_check CHECK (target_kind IN (
-            'user', 'project', 'conversation', 'artifact', 'local_group', 'capability',
-            'scope', 'branch', 'quota_scope', 'retention_policy',
-            'family_policy', 'oidc_group', 'restore_gate')),
-        ADD CONSTRAINT authorization_audit_restore_gate_check CHECK (
-            (action = 'restore.accept_coverage_gap') = (target_kind = 'restore_gate')
-            AND (
-                action <> 'restore.accept_coverage_gap'
-                OR (
-                    actor_kind = 'operator'
-                    AND actor_user_id IS NULL
-                    AND operator_id IS NOT NULL
-                    AND target_id = 'instance'
-                )
+-- Widen authorization_audit CHECK constraints additively (ACCESS EXCLUSIVE is already held from
+-- the top-of-migration atomic NOWAIT lock) so audited break-glass coverage-gap acceptance writes
+-- an operator-only audit row.
+ALTER TABLE openmettle.authorization_audit
+    DROP CONSTRAINT authorization_audit_action_check,
+    ADD CONSTRAINT authorization_audit_action_check CHECK (action IN (
+        'account_admin.grant', 'account_admin.revoke',
+        'user.disable', 'user.enable',
+        'local_group.create', 'local_group.rename', 'local_group.disable', 'local_group.enable',
+        'local_group.member_add', 'local_group.member_remove',
+        'project.create', 'project.settings_update', 'project.archive', 'project.restore',
+        'project.delete', 'project.member_grant', 'project.member_revoke',
+        'resource.share', 'resource.unshare',
+        'capability.platform_deny', 'capability.platform_allow',
+        'capability.user_deny', 'capability.user_allow',
+        'capability.user_grant', 'capability.user_revoke',
+        'conversation.create', 'branch.create', 'quota.override.set', 'quota.override.revoke',
+        'retention.policy_update',
+        'family_policy.set', 'family_policy.clear',
+        'family_policy.model_study_allow', 'family_policy.model_study_revoke',
+        'family_policy.model_disable', 'family_policy.model_enable',
+        'restore.accept_coverage_gap')),
+    DROP CONSTRAINT authorization_audit_target_kind_check,
+    ADD CONSTRAINT authorization_audit_target_kind_check CHECK (target_kind IN (
+        'user', 'project', 'conversation', 'artifact', 'local_group', 'capability',
+        'scope', 'branch', 'quota_scope', 'retention_policy',
+        'family_policy', 'oidc_group', 'restore_gate')),
+    ADD CONSTRAINT authorization_audit_restore_gate_check CHECK (
+        (action = 'restore.accept_coverage_gap') = (target_kind = 'restore_gate')
+        AND (
+            action <> 'restore.accept_coverage_gap'
+            OR (
+                actor_kind = 'operator'
+                AND actor_user_id IS NULL
+                AND operator_id IS NOT NULL
+                AND target_id = 'instance'
             )
-        );
-END
-$$;
+        )
+    );
 
 -- Worker helper: locks the singleton restore gate row FOR SHARE inside a claim/reclaim transaction
 -- without granting openmettle_worker UPDATE on restore_reconciliation_gate. Returns true only when
@@ -280,6 +291,7 @@ DECLARE
     v_stored_digest bytea;
     v_digest_hex text;
     v_req_hex text;
+    v_effective_required_seq bigint;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'restore gate changes require READ COMMITTED' USING ERRCODE = '25000';
@@ -328,6 +340,15 @@ BEGIN
             RAISE EXCEPTION 'required watermark digest does not match stored journal at %',
                 p_required_seq USING ERRCODE = 'OMR03';
         END IF;
+    END IF;
+    IF g.open OR p_new_restore THEN
+        v_effective_required_seq := head.journal_seq;
+    ELSE
+        v_effective_required_seq := greatest(head.journal_seq, g.required_journal_seq);
+    END IF;
+    IF p_coverage_complete AND p_required_seq < v_effective_required_seq THEN
+        RAISE EXCEPTION 'cannot assert complete export coverage for watermark % below target sequence %',
+            p_required_seq, v_effective_required_seq USING ERRCODE = 'OMR04';
     END IF;
 
     v_digest_hex := encode(p_required_digest, 'hex');
@@ -750,21 +771,26 @@ REVOKE ALL ON FUNCTION openmettle.deletion_journal_replay(bigint, bigint, text, 
     bigint, bytea, bigint, bytea) FROM PUBLIC;
 
 -- Owner only: opens a closed gate when the caller holds the active restore volume-phase lease
--- (OMR02), coverage_complete is true (OMR04), origin and head match both export and locked
--- requirement plus all pinned checkpoints (OMR04 / OMR03), and every revision named in
--- deletion_journal is purged (OMR05). Clears restore_run_id, required_origin_us, checkpoints, and
+-- (OMR02), the storage volume control pin matches p_expected_volume_id with no active
+-- adoption/rebind barrier (OMQ03, locked FOR SHARE in canonical order after the gate),
+-- coverage_complete is true (OMR04), origin and head match both export and locked requirement plus
+-- all pinned checkpoints (OMR04 / OMR03), and every revision named in deletion_journal is purged
+-- (OMR05). Clears restore_run_id, required_origin_us, checkpoints, and
 -- volume_claim_token/volume_lease_until on open. Requires READ COMMITTED.
 CREATE FUNCTION openmettle.restore_gate_open(
     p_restore_run_id uuid,
     p_claim_token uuid,
     p_origin_us bigint,
     p_export_seq bigint,
-    p_export_digest bytea)
+    p_export_digest bytea,
+    p_expected_volume_id uuid)
 RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
     head openmettle.deletion_journal_head%ROWTYPE;
     v_origin_us bigint;
+    v_volume_id uuid;
+    v_adoption_run_id uuid;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'restore gate changes require READ COMMITTED' USING ERRCODE = '25000';
@@ -783,6 +809,15 @@ BEGIN
        OR g.volume_lease_until IS NULL
        OR g.volume_lease_until <= clock_timestamp() THEN
         RAISE EXCEPTION 'restore volume phase lease lost or mismatched' USING ERRCODE = 'OMR02';
+    END IF;
+    SELECT volume_id, adoption_run_id
+      INTO STRICT v_volume_id, v_adoption_run_id
+      FROM openmettle.storage_volume_control
+     WHERE id
+       FOR SHARE;
+    IF v_adoption_run_id IS NOT NULL OR v_volume_id IS DISTINCT FROM p_expected_volume_id THEN
+        RAISE EXCEPTION 'storage volume pin changed or adoption/rebind in progress'
+            USING ERRCODE = 'OMQ03';
     END IF;
     IF NOT g.coverage_complete THEN
         RAISE EXCEPTION 'unexported purge window after last export; inspect or run restore accept-coverage-gap'
@@ -819,7 +854,7 @@ BEGIN
      WHERE id;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid) FROM PUBLIC;
 
 -- Owner only: audited break-glass acceptance of an unexported purge window after the last
 -- surviving journal export (for example catastrophic primary loss without a post-quiesce export).

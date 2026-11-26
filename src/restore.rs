@@ -521,31 +521,94 @@ async fn finish_claimed(
             });
         }
     }
-    let drift = match artifact_fs::verify_accounting_drift(pool, store).await {
-        Ok(drift) => drift,
-        Err(err) => {
-            return Err(if store.is_some_and(Store::awaits_rebind) {
-                Error::RebindRequired
-            } else {
-                err.into()
-            });
+    // Hold `storage_volume_control FOR SHARE` continuously on Connection 1 across drift
+    // verification and until AFTER `restore_gate_open` commits on Connection 2, serializing with
+    // any concurrent `storage rebind` / `storage adopt` / auto-pin.
+    let mut tx_pin = read_committed(pool).await?;
+    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+        .execute(&mut *tx_pin)
+        .await?;
+    let (vol, adopting_now, has_rows): (Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT volume_id::text, adoption_run_id IS NOT NULL,
+                EXISTS (SELECT FROM openmettle.storage_reservations)
+                OR EXISTS (SELECT FROM openmettle.artifact_revisions)
+           FROM openmettle.storage_volume_control
+          WHERE id
+            FOR SHARE",
+    )
+    .fetch_one(&mut *tx_pin)
+    .await?;
+    let expected_volume_id: Option<String> = if let Some(store) = store {
+        if adopting_now {
+            sqlx::query("SELECT openmettle.storage_lock_pinned_volume()")
+                .execute(&mut *tx_pin)
+                .await?;
+            return Err(Error::Storage(artifact_fs::Error::Io));
         }
+        let pin = match store.prepare_pin_on(&mut tx_pin).await {
+            Ok(Some(pin)) => pin,
+            Ok(None) => return Err(Error::Storage(artifact_fs::Error::Io)),
+            Err(err) => {
+                return Err(if store.awaits_rebind() {
+                    Error::RebindRequired
+                } else {
+                    err.into()
+                });
+            }
+        };
+        if vol.as_deref() != Some(pin.as_str()) {
+            return Err(Error::Storage(artifact_fs::Error::Io));
+        }
+        let drift = match artifact_fs::verify_volume_with_lease(
+            &mut tx_pin,
+            pool,
+            store,
+            &pin,
+            restore_run_id,
+            claim_token,
+        )
+        .await
+        {
+            Ok(drift) => drift,
+            Err(err) => {
+                return Err(if store.awaits_rebind() {
+                    Error::RebindRequired
+                } else {
+                    err.into()
+                });
+            }
+        };
+        if !drift.healthy() || drift.unsettled_payloads != 0 {
+            return Err(Error::Drift);
+        }
+        Some(pin)
+    } else {
+        if vol.is_some() || adopting_now {
+            return Err(Error::ArtifactRootRequired);
+        }
+        if has_rows {
+            return Err(Error::Storage(artifact_fs::Error::Io));
+        }
+        let drift = artifact_fs::verify_ledgers_on(&mut tx_pin).await?;
+        if !drift.healthy() {
+            return Err(Error::Drift);
+        }
+        None
     };
-    if !drift.healthy() || drift.unsettled_payloads != 0 {
-        return Err(Error::Drift);
-    }
-    let mut tx = read_committed(pool).await?;
+    let mut open_tx = read_committed(pool).await?;
     sqlx::query(
-        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'))",
+        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid)",
     )
     .bind(restore_run_id)
     .bind(claim_token)
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
-    .execute(&mut *tx)
+    .bind(expected_volume_id.as_deref())
+    .execute(&mut *open_tx)
     .await?;
-    tx.commit().await?;
+    open_tx.commit().await?;
+    tx_pin.commit().await?;
     Ok(())
 }
 

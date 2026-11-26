@@ -1,7 +1,29 @@
 //! A claim fences stale workers. A durable hard link pins the payload inode until the SQL
 //! credit commits. Detached anchors are retried independently of normal expiry scans.
 use super::*;
-use std::fs::File;
+use std::{fs::File, time::Instant};
+
+/// Transaction-local idle timeout for transactions that span synchronous filesystem I/O so a
+/// strict session default cannot drop the PostgreSQL fencing locks early.
+const FS_TX_IDLE_TIMEOUT: &str = "SET LOCAL idle_in_transaction_session_timeout = '300s'";
+/// Monotonic deadline strictly shorter than `FS_TX_IDLE_TIMEOUT` (and the 300 s restore
+/// volume-phase lease): if synchronous filesystem I/O stalls past this window, abort before any
+/// subsequent destructive filesystem call so no mutation runs after the DB fence expires.
+const FS_FENCE_WINDOW: Duration = Duration::from_secs(240);
+
+async fn set_fs_tx_idle_timeout(tx: &mut WriteTransaction<'_>) -> Result<(), Error> {
+    sqlx::query(FS_TX_IDLE_TIMEOUT)
+        .execute(tx.connection()?)
+        .await?;
+    Ok(())
+}
+
+fn check_fence(deadline: Instant) -> Result<(), Error> {
+    if Instant::now() >= deadline {
+        return Err(Error::Io);
+    }
+    Ok(())
+}
 
 pub(super) async fn lock_pin(tx: &mut WriteTransaction<'_>, expected: &str) -> Result<(), Error> {
     let pin: String = sqlx::query_scalar("SELECT openmettle.storage_lock_pinned_volume()::text")
@@ -289,7 +311,7 @@ async fn assert_volume_phase(
     Ok(())
 }
 
-async fn renew_volume_phase(
+pub(super) async fn renew_volume_phase(
     pool: &PgPool,
     restore_run_id: &str,
     claim_token: &str,
@@ -316,6 +338,7 @@ async fn detach(
     phase: Option<(&str, &str)>,
 ) -> Result<(), Error> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    set_fs_tx_idle_timeout(&mut tx).await?;
     let (check, clear) = if purge {
         ("SELECT FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr ON sr.scope_id=r.scope_id
           AND sr.id=r.reservation_id WHERE r.id=$1::uuid AND r.state='purged' AND r.purge_stage='anchor_pending_unlink'
@@ -339,6 +362,7 @@ async fn detach(
         assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
     }
     lock_pin(&mut tx, pin).await?;
+    let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
     let v = &store.volume;
     v.verify(pin)?;
     let (dir, name) = if purge {
@@ -348,6 +372,7 @@ async fn detach(
     };
     if v.inode(dir, &name)?.is_some() {
         let _guard = lock_file(v, dir, &name, ino, true)?;
+        check_fence(fence_deadline)?;
         v.unlink(dir, &name, ino)?;
     }
     at::fsync(dir)?;
@@ -382,6 +407,8 @@ async fn purge_one(
     }
     if let Some((restore_run_id, claim_token)) = phase {
         assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
+    } else if !crate::restore::lock_open_gate(tx.connection()?).await? {
+        return Ok(false);
     }
     lock_pin(&mut tx, pin).await?;
     tx.commit().await?;
@@ -401,7 +428,11 @@ async fn purge_one(
         return Err(Error::Io);
     };
     let f = lock_file(v, &v.revisions, src, ino, false)?;
+    // Hold artifact_revisions FOR UPDATE -> restore_reconciliation_gate FOR SHARE ->
+    // storage_volume_control FOR SHARE continuously across Stage A filesystem mutations for both
+    // live `purge_due` and restore `purge_journaled`.
     let mut stage_a = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    set_fs_tx_idle_timeout(&mut stage_a).await?;
     let live=sqlx::query("SELECT FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr
         ON sr.id=r.reservation_id AND sr.scope_id=r.scope_id WHERE r.id=$1::uuid AND r.state='purging'
         AND NOT sr.adoption_unverified AND sr.payload_ino=$2::text::numeric FOR UPDATE OF r")
@@ -411,23 +442,17 @@ async fn purge_one(
     }
     if let Some((restore_run_id, claim_token)) = phase {
         assert_volume_phase(&mut stage_a, restore_run_id, claim_token).await?;
+    } else if !crate::restore::lock_open_gate(stage_a.connection()?).await? {
+        return Ok(false);
     }
     lock_pin(&mut stage_a, pin).await?;
-    let stage_a = if phase.is_none() {
-        stage_a.commit().await?;
-        None
-    } else {
-        Some(stage_a)
-    };
+    let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
     v.verify(pin)?;
     v.matches(&f, &v.revisions, src, ino)?;
     let a_now = v.inode(&v.revisions, &name)?;
     let r_now = v.inode(&v.revisions, reservation)?;
     let s_now = v.inode(&v.staging, reservation)?;
-    if a_now.is_some_and(|other| other != ino)
-        || r_now.is_some_and(|other| other != ino)
-        || s_now.is_some_and(|other| other != ino)
-    {
+    if a_now.is_some_and(|other| other != ino) || r_now.is_some_and(|other| other != ino) {
         return Err(Error::Io);
     }
     let own = u64::from(a_now == Some(ino))
@@ -436,20 +461,22 @@ async fn purge_one(
     if f.metadata()?.nlink() != own {
         return Err(Error::Io);
     }
+    check_fence(fence_deadline)?;
     f.set_len(0)?;
     f.sync_all()?;
+    check_fence(fence_deadline)?;
     anchor(v, &v.revisions, src, &v.revisions, &name, ino)?;
     if r_now == Some(ino) {
+        check_fence(fence_deadline)?;
         v.unlink(&v.revisions, reservation, ino)?;
     }
     if s_now == Some(ino) {
+        check_fence(fence_deadline)?;
         v.unlink(&v.staging, reservation, ino)?;
     }
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;
-    if let Some(stage_a) = stage_a {
-        stage_a.commit().await?;
-    }
+    stage_a.commit().await?;
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     if let Some((restore_run_id, claim_token)) = phase {
         sqlx::query(
@@ -481,7 +508,10 @@ async fn sweep_anchors(
     limit: i64,
     purge: bool,
     phase: Option<(&str, &str)>,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
+    if let Some((restore_run_id, claim_token)) = phase {
+        renew_volume_phase(pool, restore_run_id, claim_token).await?;
+    }
     let (from, ts, id, res) = if purge {
         ("openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr ON sr.scope_id=r.scope_id AND sr.id=r.reservation_id
           WHERE r.state='purged' AND r.purge_stage='anchor_pending_unlink' AND NOT sr.adoption_unverified AND sr.payload_ino IS NOT NULL",
@@ -499,7 +529,7 @@ async fn sweep_anchors(
         .await?;
     }
     let Some(upper) = pass.upper.clone() else {
-        return Ok(());
+        return Ok(true);
     };
     let page = sqlx::query_as::<_, (String, String, String, String)>(sqlx::AssertSqlSafe(format!(
         "SELECT {ts}::text,{id}::text,{res}::text,sr.payload_ino::text FROM {from}
@@ -516,6 +546,9 @@ async fn sweep_anchors(
     let short = page.len() < limit as usize;
     let mut error = None;
     for (ts, id, res, ino) in page {
+        if let Some((restore_run_id, claim_token)) = phase {
+            renew_volume_phase(pool, restore_run_id, claim_token).await?;
+        }
         if let Err(e) = detach(
             pool,
             store,
@@ -532,10 +565,11 @@ async fn sweep_anchors(
         }
         pass.after = Some((ts, id));
     }
-    if short || pass.after == pass.upper {
+    let finished = short || pass.after == pass.upper;
+    if finished {
         *pass = AnchorPass::default();
     }
-    error.map_or(Ok(()), Err)
+    error.map_or(Ok(finished), Err)
 }
 
 pub async fn reconcile_expired(
@@ -549,7 +583,9 @@ pub async fn reconcile_expired(
     let Some(pin) = store.prepare(pool, false).await? else {
         return staging.map(|()| 0);
     };
-    let anchors = sweep_anchors(pool, store, &pin, limit, false, None).await;
+    let anchors = sweep_anchors(pool, store, &pin, limit, false, None)
+        .await
+        .map(|_| ());
     let age = i64::try_from(older_than.as_millis()).map_err(|_| Error::Io)?;
     let mut count = 0;
     let mut failure = None;
@@ -661,7 +697,9 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
     let Some(pin) = store.prepare(pool, false).await? else {
         return Ok(0);
     };
-    let anchors = sweep_anchors(pool, store, &pin, limit, true, None).await;
+    let anchors = sweep_anchors(pool, store, &pin, limit, true, None)
+        .await
+        .map(|_| ());
     let mut pass = store.purge_pass.lock().await;
     const DUE: &str = "FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr
         ON sr.scope_id=r.scope_id AND sr.id=r.reservation_id
@@ -723,34 +761,50 @@ pub async fn purge_journaled(
     let Some(pin) = store.prepare(pool, false).await? else {
         return Err(Error::Io);
     };
-    renew_volume_phase(pool, restore_run_id, claim_token).await?;
-    let page = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
-           FROM openmettle.deletion_journal j
-           JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
-           JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
-          WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL ORDER BY j.journal_seq",
-    )
-    .fetch_all(pool)
-    .await?;
     let pin = pin.as_str();
     let phase = Some((restore_run_id, claim_token));
-    let count = sweep_items(page, |(id, scope, res, ino)| async move {
-        purge_one(
-            pool,
-            store,
-            pin,
-            &scope,
-            &id,
-            &res,
-            ino.parse().map_err(|_| Error::Io)?,
-            phase,
+    let mut count = 0usize;
+    let mut after_seq: i64 = 0;
+    loop {
+        renew_volume_phase(pool, restore_run_id, claim_token).await?;
+        let page = sqlx::query_as::<_, (i64, String, String, String, String)>(
+            "SELECT j.journal_seq, r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
+               FROM openmettle.deletion_journal j
+               JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
+               JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
+              WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL AND j.journal_seq > $1
+              ORDER BY j.journal_seq
+              LIMIT 100",
         )
-        .await
-    })
-    .await?;
-    renew_volume_phase(pool, restore_run_id, claim_token).await?;
-    sweep_anchors(pool, store, pin, MAX_BATCH, true, phase).await?;
+        .bind(after_seq)
+        .fetch_all(pool)
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+        if let Some((seq, ..)) = page.last() {
+            after_seq = *seq;
+        }
+        count += sweep_items(page, |(_, id, scope, res, ino)| async move {
+            purge_one(
+                pool,
+                store,
+                pin,
+                &scope,
+                &id,
+                &res,
+                ino.parse().map_err(|_| Error::Io)?,
+                phase,
+            )
+            .await
+        })
+        .await?;
+    }
+    loop {
+        if sweep_anchors(pool, store, pin, 100, true, phase).await? {
+            break;
+        }
+    }
     Ok(count)
 }
 
@@ -781,6 +835,7 @@ pub async fn scrub_unsettled_on_restore(
     let mut scrubbed = 0usize;
     let mut cursor: Option<String> = None;
     loop {
+        renew_volume_phase(pool, restore_run_id, claim_token).await?;
         let page = sqlx::query_as::<_, (String, bool, String, Option<String>, bool)>(
             "SELECT id::text, adoption_unverified, reclaim_state, payload_ino::text, publish_pending
                FROM openmettle.storage_reservations
@@ -876,6 +931,7 @@ pub async fn scrub_unsettled_on_restore(
                     // mutation and durability sync so no concurrent rebind/adopt/gate-open can
                     // race with truncation or unlinking.
                     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+                    set_fs_tx_idle_timeout(&mut tx).await?;
                     let eligible = sqlx::query(
                         "SELECT FROM openmettle.storage_reservations
                           WHERE id = $1::uuid AND state = 'reserved'
@@ -893,6 +949,7 @@ pub async fn scrub_unsettled_on_restore(
                     }
                     assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
                     lock_pin(&mut tx, &pin).await?;
+                    let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
 
                     v.verify(&pin)?;
                     v.matches(&file, dir, src, ino)?;
@@ -900,11 +957,13 @@ pub async fn scrub_unsettled_on_restore(
                         "none" => {
                             let mut mutated = false;
                             if meta.len() != 0 {
+                                check_fence(fence_deadline)?;
                                 file.set_len(0)?;
                                 mutated = true;
                             }
                             file.sync_all()?;
                             if s_now.is_none() {
+                                check_fence(fence_deadline)?;
                                 at::linkat(
                                     &v.revisions,
                                     id.as_str(),
@@ -917,12 +976,16 @@ pub async fn scrub_unsettled_on_restore(
                                 }
                                 mutated = true;
                             }
+                            // Unconditionally sync `staging` strictly BEFORE unlinking
+                            // `revisions/<id>` (even on retries where `staging/<id>` already
+                            // existed) so the surviving staged entry is durable first.
+                            at::fsync(&v.staging)?;
                             if r_now.is_some() {
+                                check_fence(fence_deadline)?;
                                 v.unlink(&v.revisions, &id, ino)?;
                                 mutated = true;
                             }
                             at::fsync(&v.revisions)?;
-                            at::fsync(&v.staging)?;
                             if publish_pending || mutated {
                                 let updated = sqlx::query(
                                     "UPDATE openmettle.storage_reservations
@@ -944,14 +1007,18 @@ pub async fn scrub_unsettled_on_restore(
                         }
                         "claiming" => {
                             if meta.len() != 0 {
+                                check_fence(fence_deadline)?;
                                 file.set_len(0)?;
                             }
                             file.sync_all()?;
+                            check_fence(fence_deadline)?;
                             anchor(v, dir, src, &v.staging, &reclaim_name, ino)?;
                             if r_now.is_some() {
+                                check_fence(fence_deadline)?;
                                 v.unlink(&v.revisions, &id, ino)?;
                             }
                             if s_now.is_some() {
+                                check_fence(fence_deadline)?;
                                 v.unlink(&v.staging, &id, ino)?;
                             }
                             at::fsync(&v.revisions)?;
@@ -1019,6 +1086,7 @@ pub async fn scrub_unsettled_on_restore(
             }
         }
     }
+    renew_volume_phase(pool, restore_run_id, claim_token).await?;
     v.verify(&pin)?;
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;

@@ -194,7 +194,14 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(w.steps.try_recv().is_err());
     sqlx::query(
-        "SELECT openmettle.restore_gate_open(c.restore_run_id, c.volume_claim_token, $1, 0, decode(repeat('00', 32), 'hex'))
+        "SELECT openmettle.restore_gate_open(
+                    c.restore_run_id,
+                    c.volume_claim_token,
+                    $1,
+                    0,
+                    decode(repeat('00', 32), 'hex'),
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                )
            FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex')) AS c",
     )
     .bind(origin_us)

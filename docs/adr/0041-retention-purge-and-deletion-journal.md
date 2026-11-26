@@ -241,7 +241,9 @@ PR2b (migration 41, 26 November 2026) settles the restore barrier contract on to
   `(required_journal_seq, required_chain_digest)` and accumulates every pinned `(seq, digest)`
   checkpoint in `checkpoints` (verifying against stored rows when `required_seq <= head`, else
   `OMR03`), and defaults `coverage_complete = false` unless `--export-complete` asserts a
-  post-quiesce export. Re-locking an already-closed gate requires `--replace-restore-run` matching
+  post-quiesce export at or above the effective target sequence (`OMR04` if `--export-complete` is
+  supplied for a sequence below `head.journal_seq` or an already-higher locked `required_journal_seq`).
+  Re-locking an already-closed gate requires `--replace-restore-run` matching
   the current `restore_run_id` and no active volume-phase lease (`OMR02`); passing `--new-restore`
   starts a fresh restore over a closed-gate backup without inheriting `coverage_complete = true`.
 - **While closed.** Trigger `artifact_revisions_restore_gate` (`BEFORE UPDATE OF state`) refuses
@@ -270,8 +272,9 @@ PR2b (migration 41, 26 November 2026) settles the restore barrier contract on to
   the active `(restore_run_id, volume_claim_token)` lease when `coverage_complete = true` (`OMR04`
   otherwise, cleared only by an audited `'operator'` `restore.accept_coverage_gap` entry bound to
   `restore_run_id` via `openmettle-admin restore accept-coverage-gap`).
-- **Durability and limits.** `openmettle-admin journal export FILE` creates the file exclusively and
-  `fsync`s both the file and its parent directory before printing the `watermark` line. The export
+- **Durability and limits.** `openmettle-admin journal export FILE` creates the file exclusively
+  with `0600` permissions on Unix and `fsync`s both the file and its parent directory before
+  printing the `watermark` line. The export
   is checksummed, not signed (signing belongs to V1-30). Only confirmed purges are journaled;
   PR3's removal routes must journal deadline commitments, and revocations/tombstones follow their
   owning increments.

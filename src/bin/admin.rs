@@ -233,7 +233,14 @@ async fn journal(
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            fs::File::create_new(path)
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(path)
                 .and_then(|mut f| {
                     std::io::Write::write_all(&mut f, text.as_bytes())?;
                     f.sync_all()?;

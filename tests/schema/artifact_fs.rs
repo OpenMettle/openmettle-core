@@ -1103,7 +1103,14 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
     assert_eq!(f.files("revisions"), [s.reservation.as_str()]);
     assert_eq!(account(&f.db, &f.c.scope).await, (0, 5, 0));
     sqlx::query(
-        "SELECT openmettle.restore_gate_open(c.restore_run_id, c.volume_claim_token, $1, 0, decode(repeat('00', 32), 'hex'))
+        "SELECT openmettle.restore_gate_open(
+                    c.restore_run_id,
+                    c.volume_claim_token,
+                    $1,
+                    0,
+                    decode(repeat('00', 32), 'hex'),
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                )
            FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex')) AS c",
     )
     .bind(origin_us)

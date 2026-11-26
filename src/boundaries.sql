@@ -313,7 +313,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.restore_assert_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
         ('openmettle.restore_release_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid)',false,ARRAY[]::text[]),
         ('openmettle.restore_accept_coverage_gap(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 41
 ),
 gateway_functions (signature,definer,roles) AS (

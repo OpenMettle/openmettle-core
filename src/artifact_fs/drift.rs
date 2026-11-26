@@ -131,6 +131,10 @@ async fn ledgers(c: &mut PgConnection) -> Result<Drift, Error> {
     })
 }
 
+pub(crate) async fn verify_ledgers_on(c: &mut PgConnection) -> Result<Drift, Error> {
+    ledgers(c).await
+}
+
 pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Result<Drift, Error> {
     let Some(store) = store else {
         let mut c = pool.acquire().await?;
@@ -151,6 +155,39 @@ pub(super) async fn verify_volume(
     v: &Volume,
     pin: &str,
 ) -> Result<Drift, Error> {
+    verify_volume_inner(c, v, pin, None).await
+}
+
+/// Restore-phase volume and ledger drift verification on a connection holding
+/// `storage_volume_control FOR SHARE`, renewing the restore volume-phase lease on `pool` every
+/// page (100 reservations) and every 100 directory entries so large healthy volumes never outlive
+/// the lease.
+pub(crate) async fn verify_volume_with_lease(
+    c: &mut PgConnection,
+    pool: &PgPool,
+    store: &Store,
+    pin: &str,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<Drift, Error> {
+    verify_volume_inner(
+        c,
+        &store.volume,
+        pin,
+        Some((pool, restore_run_id, claim_token)),
+    )
+    .await
+}
+
+async fn verify_volume_inner(
+    c: &mut PgConnection,
+    v: &Volume,
+    pin: &str,
+    lease: Option<(&PgPool, &str, &str)>,
+) -> Result<Drift, Error> {
+    if let Some((pool, run_id, token)) = lease {
+        reclaim::renew_volume_phase(pool, run_id, token).await?;
+    }
     let mut report = ledgers(c).await?;
     let by_id = sqlx::AssertSqlSafe(format!("{INVENTORY} WHERE s.id=$1::uuid"));
     let paged = sqlx::AssertSqlSafe(format!(
@@ -158,6 +195,9 @@ pub(super) async fn verify_volume(
     ));
     let mut cursor: Option<String> = None;
     loop {
+        if let Some((pool, run_id, token)) = lease {
+            reclaim::renew_volume_phase(pool, run_id, token).await?;
+        }
         let page = sqlx::query(sqlx::AssertSqlSafe(paged.0.as_str()))
             .bind(&cursor)
             .fetch_all(&mut *c)
@@ -192,8 +232,15 @@ pub(super) async fn verify_volume(
             }
         }
     }
+    let mut scanned_entries = 0usize;
     for (dir, anchor) in [(&v.revisions, ".purge."), (&v.staging, ".reclaim.")] {
         for entry in Dir::read_from(dir)? {
+            scanned_entries += 1;
+            if scanned_entries.is_multiple_of(100)
+                && let Some((pool, run_id, token)) = lease
+            {
+                reclaim::renew_volume_phase(pool, run_id, token).await?;
+            }
             let entry = entry?;
             let Ok(name) = entry.file_name().to_str() else {
                 report.files += 1;
@@ -217,6 +264,9 @@ pub(super) async fn verify_volume(
                 report.files += 1;
             }
         }
+    }
+    if let Some((pool, run_id, token)) = lease {
+        reclaim::renew_volume_phase(pool, run_id, token).await?;
     }
     v.verify(pin)?;
     Ok(report)

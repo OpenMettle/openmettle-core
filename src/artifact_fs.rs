@@ -3,6 +3,7 @@
 pub mod adoption;
 mod drift;
 pub use drift::{Drift, verify_accounting_drift};
+pub(crate) use drift::{verify_ledgers_on, verify_volume_with_lease};
 pub mod rebind;
 mod reclaim;
 mod spill;
@@ -231,6 +232,12 @@ impl Store {
             return Ok(Some(id));
         }
         Ok(None)
+    }
+    pub(crate) async fn prepare_pin_on(
+        &self,
+        c: &mut PgConnection,
+    ) -> Result<Option<String>, Error> {
+        self.prepare_on(c, false).await
     }
     async fn stage(&self, reservation: &str) -> Result<Staged, Error> {
         self.create_stage(reservation, false)
