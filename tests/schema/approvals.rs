@@ -375,18 +375,39 @@ async fn human_park_decision_resume_and_committed_intent_recovery() {
         tasks: StepTasks::default().handle(),
     };
     let mut sends = 0;
-    let StartPermit::Ready { request: bytes, .. } = committed.start(&step) else {
+    let ReplayEffect::Ready(dispatched) =
+        start_write_attempt(&mut w, &resumed.lease(), &op, &p, &LEASES, &policy)
+            .await
+            .unwrap()
+    else {
+        panic!("expected transaction 2 permit")
+    };
+    let StartPermit::Ready { request: bytes, .. } = dispatched.start(&step) else {
         panic!("expected ready")
     };
     sends += 1;
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["authorization"]["basis"], "human");
     assert_eq!(body["endpoint"]["endpoint_key"]["key"], "effect-key");
+    // Mismatched explicit approval_id conflicts; approval = None replays the stored human approval.
     assert!(
+        record_fenced_intent(
+            &mut w,
+            &resumed.lease(),
+            &p,
+            Some("00000000-0000-4000-8000-000000000099"),
+            &policy,
+            &LEASES,
+        )
+        .await
+        .is_err()
+    );
+    assert!(matches!(
         record_fenced_intent(&mut w, &resumed.lease(), &p, None, &policy, &LEASES)
             .await
-            .is_err()
-    );
+            .unwrap(),
+        IntentResult::Replayed(id) if id == op
+    ));
     leases::release_lease(&mut w, &resumed.lease())
         .await
         .unwrap();
@@ -560,8 +581,20 @@ async fn explicit_mode_replay_and_per_effect_policy() {
     let IntentResult::Applied(committed) = result else {
         panic!("expected automatic authorization")
     };
-    // Crash before send. Dropping the commit reply cannot mint another start permit.
-    drop(committed);
+    // Transaction 2 marks attempt 1 before send. Dropping the permit afterward cannot mint another.
+    let ReplayEffect::Ready(dispatched) = start_write_attempt(
+        &mut w,
+        &r.lease(),
+        &committed.operation_id,
+        &p,
+        &LEASES,
+        &policy,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected transaction 2 write permit")
+    };
+    drop(dispatched);
     assert!(matches!(
         record_fenced_intent(&mut w, &r.lease(), &p, None, &policy, &LEASES)
             .await
@@ -634,6 +667,13 @@ async fn expired_endpoint_key_and_mismatched_ledger_evidence_cannot_start_a_writ
         panic!("expected new intent")
     };
     let op = intent.operation_id.clone();
+    let ReplayEffect::Ready(intent) =
+        start_write_attempt(&mut w, &r.lease(), &op, &p, &LEASES, &policy)
+            .await
+            .unwrap()
+    else {
+        panic!("expected transaction 2 write permit")
+    };
     let (_, stop) = tokio::sync::watch::channel(None);
     let step = StepContext {
         stop,
@@ -1900,6 +1940,7 @@ async fn worker_sends_the_committed_approval_once_and_releases_invalidated_claim
         }
         async fn reconcile(
             &self,
+            _: &ActiveRun,
             _: &leases::UnresolvedOperation,
             _: StepContext,
         ) -> Option<OwnedObservation> {
@@ -2436,3 +2477,6 @@ async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
 
 #[path = "mcp.rs"]
 mod mcp_core;
+
+#[path = "mcp_pr3.rs"]
+mod mcp_pr3;

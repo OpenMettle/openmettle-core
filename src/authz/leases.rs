@@ -311,11 +311,17 @@ pub enum Settled {
 
 macro_rules! unresolved {
     () => {
+        "(outcome = 'outcome_unknown' OR (outcome = 'intent' AND coalesce(dispatched_attempts, 1) > 0)) AND capability IN ('idempotent', 'lookup', 'non_repeatable')"
+    };
+}
+
+macro_rules! any_open_write {
+    () => {
         "outcome IN ('intent', 'outcome_unknown') AND capability IN ('idempotent', 'lookup', 'non_repeatable')"
     };
 }
 
-pub(super) use unresolved;
+pub(super) use any_open_write;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnresolvedOperation {
@@ -326,6 +332,7 @@ pub struct UnresolvedOperation {
     pub outcome: String,
     pub revision: i64,
     pub downstream_handle: Option<String>,
+    pub dispatched_attempts: Option<i32>,
 }
 
 fn validate_limit(limit: u32) -> Result<(), StoreError> {
@@ -354,7 +361,7 @@ pub(crate) async fn unresolved_after(
     fenced(c, lease, Fence::Hold, async |tx, _| {
         let rows = sqlx::query(concat!(
             "SELECT id::text, logical_key, target, capability, outcome,
-                revision, downstream_handle FROM openmettle.operations
+                revision, downstream_handle, dispatched_attempts FROM openmettle.operations
                 WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
             unresolved!(),
             " AND ($4::uuid IS NULL OR id > $4::uuid) ORDER BY openmettle.operations.id LIMIT $3"
@@ -375,6 +382,7 @@ pub(crate) async fn unresolved_after(
                     outcome: row.try_get("outcome")?,
                     revision: row.try_get("revision")?,
                     downstream_handle: row.try_get("downstream_handle")?,
+                    dispatched_attempts: row.try_get("dispatched_attempts")?,
                 })
             })
             .collect()
@@ -507,6 +515,8 @@ pub async fn settle(
 const SETTLEMENT_INPUTS: &str = concat!(
     "SELECT (SELECT count(*) FROM openmettle.operations WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
     unresolved!(),
+    "), EXISTS(SELECT 1 FROM openmettle.operations WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
+    any_open_write!(),
     "), execution_expires_at > clock_timestamp() + $3::bigint * interval '1 millisecond'
          FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid"
 );
@@ -522,7 +532,7 @@ pub(crate) async fn handoff(
         if held.state == ExecState::Reconciling {
             return release_locked(c, lease).await;
         }
-        let (pending, time_to_reclaim) = settlement_inputs(c, lease, settings).await?;
+        let (pending, _, time_to_reclaim) = settlement_inputs(c, lease, settings).await?;
         if held.cancel.is_some() || pending > 0 || !time_to_reclaim {
             let settled =
                 settle_locked(c, lease, held.state, held.cancel, settings, Settle::Stopped).await?;
@@ -543,7 +553,13 @@ pub(super) async fn settle_locked(
     settings: &LeaseSettings,
     input: Settle,
 ) -> Result<Settled, StoreError> {
-    let (n, time) = settlement_inputs(c, lease, settings).await?;
+    let (n, has_open_write, time) = settlement_inputs(c, lease, settings).await?;
+    if input == Settle::Succeeded && has_open_write {
+        if state == ExecState::Reconciling {
+            return Err(StoreError::InvalidInput("settle"));
+        }
+        return Err(StoreError::Conflict("unresolved operation"));
+    }
     let resolution = decide(state, cancel, input, n, time)?;
     finish_resolution(c, lease, resolution).await
 }
@@ -552,14 +568,14 @@ async fn settlement_inputs(
     c: &mut PgConnection,
     lease: &Lease<'_>,
     settings: &LeaseSettings,
-) -> Result<(u32, bool), StoreError> {
-    let (n, time): (i64, bool) = sqlx::query_as(SETTLEMENT_INPUTS)
+) -> Result<(u32, bool, bool), StoreError> {
+    let (n, has_open_write, time): (i64, bool, bool) = sqlx::query_as(SETTLEMENT_INPUTS)
         .bind(lease.scope_id)
         .bind(lease.run_id)
         .bind(settings.lease.as_millis() as i64)
         .fetch_one(&mut *c)
         .await?;
-    Ok((operation_count(n)?, time))
+    Ok((operation_count(n)?, has_open_write, time))
 }
 
 /// Publish and settle under one run lock. A conflict rolls back all graph writes before
@@ -573,8 +589,12 @@ pub async fn settle_answer(
     settings.validate()?;
     let result = fenced(c, lease, Fence::Hold, async |tx, held| {
         let c = tx.connection()?;
-        let (unresolved, time) = settlement_inputs(c, lease, settings).await?;
-        if held.state != ExecState::Running || held.cancel.is_some() || unresolved != 0 {
+        let (unresolved, has_open_write, time) = settlement_inputs(c, lease, settings).await?;
+        if held.state != ExecState::Running || held.cancel.is_some() || has_open_write {
+            if held.state == ExecState::Running && held.cancel.is_none() && unresolved == 0 && time
+            {
+                return Err(StoreError::Conflict("unresolved operation"));
+            }
             let disposition = decide(held.state, held.cancel, Settle::Stopped, unresolved, time)?;
             return finish_resolution(c, lease, disposition).await;
         }
@@ -606,11 +626,65 @@ pub async fn settle_answer(
     }
 }
 
+async fn close_unsent_writes(
+    c: &mut PgConnection,
+    scope: &str,
+    run: &str,
+) -> Result<(), StoreError> {
+    let ops: Vec<String> = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.operations
+          WHERE scope_id = $1::uuid AND run_id = $2::uuid
+            AND outcome = 'intent'
+            AND dispatched_attempts = 0
+            AND capability IN ('idempotent', 'lookup', 'non_repeatable')
+            AND revision = 0
+          ORDER BY id FOR UPDATE",
+    )
+    .bind(scope)
+    .bind(run)
+    .fetch_all(&mut *c)
+    .await?;
+    for op in ops {
+        durable::record_observation_locked(
+            c,
+            &durable::Observation {
+                scope,
+                run,
+                operation: &op,
+                key: &format!("unsent-write:{op}"),
+                expected_revision: 0,
+                outcome: "failed",
+                handle: None,
+                evidence: Payload {
+                    format: "openmettle.unsent-write",
+                    version: 1,
+                    bytes: br#"{"reason":"unsent_write_intent"}"#,
+                },
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            durable::Error::Conflict | durable::Error::StaleRevision => {
+                StoreError::Conflict("unsent write observation")
+            }
+            durable::Error::Invalid => StoreError::InvalidInput("unsent write observation"),
+            other => other.into(),
+        })?;
+    }
+    Ok(())
+}
+
 async fn finish_resolution(
     c: &mut PgConnection,
     lease: &Lease<'_>,
     resolution: Resolution,
 ) -> Result<Settled, StoreError> {
+    if !matches!(
+        resolution,
+        Resolution::Reconciling(_) | Resolution::Succeeded
+    ) {
+        close_unsent_writes(c, lease.scope_id, lease.run_id).await?;
+    }
     sqlx::query("UPDATE openmettle.runs SET state = $3, wait_reason = NULL WHERE scope_id = $1::uuid AND id = $2::uuid")
         .bind(lease.scope_id)
         .bind(lease.run_id)
@@ -700,7 +774,7 @@ pub async fn reclaim_next(
 }
 
 const LOCK_EXPIRED: &str = concat!(
-    "SELECT id::text FROM openmettle.runs WHERE ",
+    "SELECT scope_id::text, id::text FROM openmettle.runs WHERE ",
     lapsed!(),
     " AND (execution_expires_at IS NULL OR execution_expires_at <= clock_timestamp())
        ORDER BY openmettle.runs.id LIMIT $1 FOR NO KEY UPDATE SKIP LOCKED"
@@ -729,13 +803,17 @@ const SETTLE_EXPIRED: &str = concat!(
 pub async fn settle_expired(c: &mut PgConnection, limit: u32) -> Result<Vec<String>, StoreError> {
     validate_limit(limit)?;
     transaction(c, async |c| {
-        let ids: Vec<String> = sqlx::query_scalar(LOCK_EXPIRED)
+        let locked: Vec<(String, String)> = sqlx::query_as(LOCK_EXPIRED)
             .bind(i64::from(limit))
             .fetch_all(&mut *c)
             .await?;
-        if ids.is_empty() {
-            return Ok(ids);
+        if locked.is_empty() {
+            return Ok(Vec::new());
         }
+        for (scope_id, run_id) in &locked {
+            close_unsent_writes(c, scope_id, run_id).await?;
+        }
+        let ids: Vec<String> = locked.into_iter().map(|(_, id)| id).collect();
         let rows = sqlx::query(SETTLE_EXPIRED)
             .bind(&ids)
             .fetch_all(&mut *c)

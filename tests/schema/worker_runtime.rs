@@ -48,6 +48,7 @@ impl Executor for Adapter {
 
     async fn reconcile(
         &self,
+        _: &ActiveRun,
         op: &UnresolvedOperation,
         cx: StepContext,
     ) -> Option<OwnedObservation> {

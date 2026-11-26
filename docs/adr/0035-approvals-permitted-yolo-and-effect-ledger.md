@@ -270,6 +270,20 @@ crash before send, lost response or stale claim goes to ledger inspection. Neith
 identical approval receipt nor finding the same UUID is a send instruction. Release the DB
 connection before adapter I/O.
 
+> **Amendment (25 November 2026, [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md) V1-14 PR3):**
+> When durable two-phase effect intents (`openmettle.runtime_feature_gates.two_phase_effect_intents_enabled = true`)
+> are active, Transaction 1 commits `outcome = 'intent'` with non-null `dispatched_attempts = 0` and
+> Transaction 2 commits `dispatched_attempts = 1` strictly before the first outbound byte leaves the process.
+> Under this invariant, `approvals::record_fenced_intent` may issue a write send permit on an existing
+> `openmettle.operations` row **strictly** when `o.outcome = 'intent' AND o.dispatched_attempts = 0`
+> (`IS NOT NULL AND = 0`) after re-verifying live `EffectPolicy`, `{AUTH}`, bound session/approval evidence,
+> and `effective_expires_us`. Rows with `dispatched_attempts IS NULL`, `dispatched_attempts >= 1`, or
+> `outcome <> 'intent'` still never receive a write send permit. `leases::unresolved!()` excludes proven-unsent
+> `dispatched_attempts = 0` writes from reconciliation and handoff blocking while `Settle::Succeeded`
+> (`leases::settle_locked`, `leases::settle_answer`, and `openmettle.resolve_terminal_write_intents()`) and
+> `approvals::park` (`BLOCKS_PARK`) continue rejecting any write row with `outcome IN ('intent', 'outcome_unknown')`,
+> explicitly including `dispatched_attempts = 0`.
+
 Record observations under `Fence::Hold` with `record_observation`, the expected revision,
 a stable append key and the original handle once known. A proven success or failure gives
 `succeeded` or `failed` with evidence. Timeout, disconnect or ambiguous cancellation gives

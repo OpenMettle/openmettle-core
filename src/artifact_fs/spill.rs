@@ -120,6 +120,7 @@ async fn try_publish(
     cx: &SpillContext<'_>,
     store: &Store,
     output: &Output<'_>,
+    handle: Option<&str>,
 ) -> Result<String, SpillError> {
     let mut stop = cx.step.stop.clone();
     let deadline = cx.step.deadline;
@@ -127,7 +128,7 @@ async fn try_publish(
         biased;
         _=stop.wait_for(Option::is_some)=>Err(SpillError::Stopped),
         _=tokio::time::sleep_until(deadline)=>Err(SpillError::Stopped),
-        result=publish(cx,store,output)=>result,
+        result=publish(cx,store,output,handle)=>result,
     }
 }
 
@@ -135,6 +136,7 @@ async fn publish(
     cx: &SpillContext<'_>,
     store: &Store,
     output: &Output<'_>,
+    handle: Option<&str>,
 ) -> Result<String, SpillError> {
     let permit = PERMITS
         .get_or_init(|| Arc::new(Semaphore::new(1)))
@@ -295,7 +297,7 @@ async fn publish(
         )
         .await?;
         let encoded = output.preview(cx.proposal, cx.operation, Ok((&artifact, &revision)));
-        mcp::observe(tx, &cx.lease, cx.operation, true, &encoded).await?;
+        mcp::observe_with_handle(tx, &cx.lease, cx.operation, true, handle, &encoded).await?;
         let check = stage.clone();
         let pin = pin.clone();
         let verified = timeout(
@@ -357,6 +359,17 @@ pub async fn publish_bytes(
     cx: &SpillContext<'_>,
     store: Option<&Store>,
     text: &str,
+    settings: &leases::LeaseSettings,
+    policy: &impl crate::authz::approvals::EffectPolicy,
+) -> crate::worker::StepResult {
+    publish_bytes_with_handle(cx, store, text, None, settings, policy).await
+}
+
+pub(crate) async fn publish_bytes_with_handle(
+    cx: &SpillContext<'_>,
+    store: Option<&Store>,
+    text: &str,
+    handle: Option<&str>,
     settings: &leases::LeaseSettings,
     policy: &impl crate::authz::approvals::EffectPolicy,
 ) -> crate::worker::StepResult {
@@ -422,7 +435,7 @@ pub async fn publish_bytes(
             }
             Ok(ReplayEffect::Pending) => match store {
                 None => Some("store_unconfigured"),
-                Some(store) => match try_publish(cx, store, &output).await {
+                Some(store) => match try_publish(cx, store, &output, handle).await {
                     Ok(_) => None,
                     Err(SpillError::LeaseLost) => return StepResult::LeaseLost,
                     Err(error) => Some(error.code()),
@@ -444,7 +457,16 @@ pub async fn publish_bytes(
                 .acquire()
                 .await
                 .map_err(crate::authz::store::StoreError::from)?;
-            mcp::observe_known(&mut c, &cx.lease, cx.step, cx.operation, true, &s).await
+            mcp::observe_known_with_handle(
+                &mut c,
+                &cx.lease,
+                cx.step,
+                cx.operation,
+                true,
+                handle,
+                &s,
+            )
+            .await
         };
         match timeout(Duration::from_secs(2), write).await {
             Ok(Ok(())) => {}

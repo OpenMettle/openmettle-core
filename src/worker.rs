@@ -120,6 +120,11 @@ pub enum StepResult {
     Answer(turns::FinalAnswer),
     /// A known scoped tool outcome awaiting bounded observation and optional publication.
     ToolResponse(Result<String, crate::mcp::ToolFault>),
+    /// A known scoped tool success carrying an optional redacted downstream handle.
+    ToolSuccess {
+        text: String,
+        handle: Option<String>,
+    },
     /// Model-visible output of an observed, reviewed tool operation.
     ToolOutput(String),
     /// A fenced authority check already invalidated the run.
@@ -160,13 +165,96 @@ pub trait Executor: Send + Sync + 'static {
     }
     fn reconcile(
         &self,
+        run: &ActiveRun,
         operation: &UnresolvedOperation,
         cx: StepContext,
     ) -> impl Future<Output = Option<OwnedObservation>> + Send;
 }
 
+/// Outcome of [`ApprovedAdapter::preflight`] before Transaction 1 commits any operation row.
+#[derive(Debug)]
+pub enum PreflightError {
+    /// Non-retryable policy, schema, credential-unavailable, catalog-drift, or terminal refusal.
+    Refused,
+    /// Temporary upstream, network, or timeout outage; caller should hand off or retry rather
+    /// than terminally failing a run or its proven-unsent write.
+    Transient,
+    /// Database or lease-layer error.
+    Store(StoreError),
+}
+
+/// Server-owned tool declaration paired with its pinned external MCP contract version, if any.
+#[derive(Clone)]
+pub struct DeclaredTool {
+    pub tool: crate::provider_http::inference::Tool,
+    pub external_version: Option<String>,
+}
+
+impl DeclaredTool {
+    pub fn internal(tool: crate::provider_http::inference::Tool) -> Self {
+        Self {
+            tool,
+            external_version: None,
+        }
+    }
+
+    pub fn external(
+        tool: crate::provider_http::inference::Tool,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool,
+            external_version: Some(version.into()),
+        }
+    }
+}
+
 /// A reviewed adapter receives only committed bytes. It records observations with a Hold fence.
 pub trait ApprovedAdapter: Send + Sync {
+    /// Pre-intent server-side gate run strictly before `record_fenced_intent` commits any
+    /// `openmettle.operations` row (rollout gates, verified upstream `tools/list` catalog, and
+    /// credential availability). Defaults to `Ok(())`.
+    fn preflight<'a>(
+        &'a self,
+        _run: &'a ActiveRun,
+        _proposal: &'a Proposal,
+        _step: &'a StepContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), PreflightError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Verify that a model tool `call` maps faithfully to `proposal` under the advertised
+    /// `expected_external_version` (allowing deterministic schema-default expansion on external
+    /// MCP contracts while rejecting version switches and route-injected fields).
+    fn verify_turn_call_proposal(
+        &self,
+        call: &crate::provider_http::inference::Call,
+        proposal: &Proposal,
+        expected_external_version: Option<&str>,
+    ) -> bool {
+        expected_external_version.is_none()
+            && proposal.tool == call.name
+            && proposal.arguments() == &call.arguments
+    }
+
+    /// Filter model-facing tool declarations before starting a turn round (e.g. verifying
+    /// external MCP `tools/list` catalogs before offering those tools to the model).
+    /// Defaults to returning the inner `Tool` declarations unchanged.
+    fn filter_turn_tools<'a>(
+        &'a self,
+        _run: &'a ActiveRun,
+        tools: Vec<DeclaredTool>,
+        _step: &'a StepContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<Vec<crate::provider_http::inference::Tool>, StepResult>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(tools.into_iter().map(|t| t.tool).collect()) })
+    }
+
     fn send<'a>(
         &'a self,
         run: &'a ActiveRun,
@@ -187,6 +275,10 @@ impl EffectPolicy for Option<&ApprovedEffects> {
             Some(effects) => effects.policy.review(scope, run, p),
             None => Ok(None),
         }
+    }
+
+    fn requires_two_phase_writes(&self) -> bool {
+        self.is_some_and(|effects| effects.policy.requires_two_phase_writes())
     }
 }
 
@@ -495,7 +587,7 @@ async fn reconcile<E: Executor>(
             if let Some(why) = context.stopped() {
                 return Ok(WorkEnd::Stop(why));
             }
-            if let Some(o) = executor.reconcile(op, context.step()).await {
+            if let Some(o) = executor.reconcile(run, op, context.step()).await {
                 let mut c = connection(pool).await?;
                 if context.stopped() == Some(Stop::LeaseLost) {
                     return Ok(WorkEnd::Stop(Stop::LeaseLost));
@@ -573,7 +665,19 @@ async fn execute<E: Executor>(
             return Ok(WorkEnd::Stop(why));
         }
         let pending =
-            approvals::pending_effect(&mut *connection(pool).await?, &run.claim.lease()).await?;
+            match approvals::pending_effect(&mut *connection(pool).await?, &run.claim.lease())
+                .await?
+            {
+                Some((id, proposal)) => Some((Some(id), proposal)),
+                None if adapters.approved.is_some() => approvals::pending_automatic_write(
+                    &mut *connection(pool).await?,
+                    &run.claim.lease(),
+                )
+                .await?
+                .filter(|proposal| adapters.executor.can_resume_approved(proposal))
+                .map(|proposal| (None, proposal)),
+                None => None,
+            };
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
@@ -581,11 +685,29 @@ async fn execute<E: Executor>(
             if !adapters.executor.can_resume_approved(&proposal) {
                 return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
             }
+            if let Some(effects) = adapters.approved {
+                let preflight_step = context.step();
+                let preflight = effects
+                    .adapter
+                    .preflight(run, &proposal, &preflight_step)
+                    .await;
+                if let Some(why) = context.stopped() {
+                    return Ok(WorkEnd::Stop(why));
+                }
+                match preflight {
+                    Ok(()) => {}
+                    Err(PreflightError::Transient) => return Ok(WorkEnd::Handoff),
+                    Err(PreflightError::Refused) => {
+                        return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+                    }
+                    Err(PreflightError::Store(err)) => return Err(err.into()),
+                }
+            }
             let intent = approvals::record_fenced_intent(
                 &mut *connection(pool).await?,
                 &run.claim.lease(),
                 &proposal,
-                Some(&id),
+                id.as_deref(),
                 &adapters.approved,
                 settings,
             )
@@ -619,7 +741,9 @@ async fn execute<E: Executor>(
             StepResult::Handoff => return Ok(WorkEnd::Handoff),
             StepResult::LeaseLost => return Ok(WorkEnd::Stop(Stop::LeaseLost)),
             StepResult::Answer(answer) => return Ok(WorkEnd::Answer(answer)),
-            StepResult::ToolOutput(_) | StepResult::ToolResponse(_) => {
+            StepResult::ToolOutput(_)
+            | StepResult::ToolResponse(_)
+            | StepResult::ToolSuccess { .. } => {
                 return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
             }
             StepResult::Continue => continue,
@@ -804,11 +928,18 @@ impl EffectDispatch<'_> {
         let Ok(mut c) = pool.acquire().await else {
             return StepResult::LeaseLost;
         };
-        let class:Result<String,_>=sqlx::query_scalar("SELECT capability FROM openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid")
-        .bind(lease.scope_id).bind(lease.run_id).bind(&op).fetch_one(&mut *c).await;
-        let permit = match class.as_deref() {
+        let op_row: Result<(String, Option<i32>), _> = sqlx::query_as(
+            "SELECT capability, dispatched_attempts FROM openmettle.operations
+              WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid",
+        )
+        .bind(lease.scope_id)
+        .bind(lease.run_id)
+        .bind(&op)
+        .fetch_one(&mut *c)
+        .await;
+        let permit = match op_row {
             Err(_) => return StepResult::LeaseLost,
-            Ok("repeatable_read") => {
+            Ok((cap, _)) if cap == "repeatable_read" => {
                 if let Some(why) = *step.stop.borrow() {
                     return stopped_step(why);
                 }
@@ -818,15 +949,29 @@ impl EffectDispatch<'_> {
                 approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
                     .await
             }
-            Ok(_) => match fresh {
-                Some(i) => Ok(ReplayEffect::Ready(i)),
-                None => {
-                    approvals::recheck_replay_effect_authority(
-                        &mut c, &lease, &op, proposal, settings, &policy,
-                    )
-                    .await
+            // Only legacy single-phase rows (`dispatched_attempts IS NULL`, created while
+            // `two_phase_effect_intents_enabled = false`) may bypass Transaction 2.
+            Ok((_, None)) if fresh.is_some() => Ok(ReplayEffect::Ready(fresh.unwrap())),
+            // Any unproven-sent two-phase write (`dispatched_attempts = 0`, whether freshly
+            // inserted or reclaimed via `IntentResult::Replayed`), and any two-phase write with a
+            // fresh first-phase permit (even if a same-claim peer already advanced attempts >= 1),
+            // MUST go through Transaction 2 (`start_write_attempt`).
+            Ok((_, Some(attempts))) if attempts == 0 || fresh.is_some() => {
+                if let Some(why) = *step.stop.borrow() {
+                    return stopped_step(why);
                 }
-            },
+                if Instant::now() >= step.deadline {
+                    return StepResult::Handoff;
+                }
+                approvals::start_write_attempt(&mut c, &lease, &op, proposal, settings, &policy)
+                    .await
+            }
+            Ok(_) => {
+                approvals::recheck_replay_effect_authority(
+                    &mut c, &lease, &op, proposal, settings, &policy,
+                )
+                .await
+            }
         };
         let bytes = match start_permit(
             &mut c,
@@ -853,6 +998,46 @@ impl EffectDispatch<'_> {
             Err(_) => return StepResult::Handoff,
         };
         let output = match result {
+            StepResult::ToolSuccess { text, handle } if proposal.tool != crate::mcp::READ_RANGE => {
+                let cx = artifact_fs::SpillContext {
+                    pool,
+                    lease,
+                    proposal,
+                    operation: &op,
+                    step: &step,
+                };
+                return artifact_fs::publish_bytes_with_handle(
+                    &cx,
+                    artifacts,
+                    &text,
+                    handle.as_deref(),
+                    settings,
+                    &policy,
+                )
+                .await;
+            }
+            StepResult::ToolSuccess { text, handle } => {
+                if *step.stop.borrow() == Some(Stop::LeaseLost) {
+                    return StepResult::LeaseLost;
+                }
+                let Ok(mut c) = pool.acquire().await else {
+                    return StepResult::LeaseLost;
+                };
+                if let Err(e) = crate::mcp::observe_known_with_handle(
+                    &mut c,
+                    &lease,
+                    &step,
+                    &op,
+                    true,
+                    handle.as_deref(),
+                    &text,
+                )
+                .await
+                {
+                    return turns::lease_step(e);
+                }
+                text
+            }
             StepResult::ToolResponse(Ok(text)) if proposal.tool != crate::mcp::READ_RANGE => {
                 let cx = artifact_fs::SpillContext {
                     pool,
@@ -958,7 +1143,8 @@ pub(crate) async fn start_permit(
                 });
             }
             Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
-            Ok(ReplayEffect::Handoff) => return Err(StepResult::Handoff),
+            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => return Err(StepResult::Handoff),
+            Ok(ReplayEffect::Exhausted) => return Err(StepResult::Stopped),
             Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
             Err(e) => return Err(turns::lease_step(e)),
         }

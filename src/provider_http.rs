@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 
 pub mod gateway;
 pub mod inference;
+pub mod mcp;
 pub(crate) mod transport;
 use transport::{Endpoint, Limits, Lookup, Range, Route, endpoint, private_range};
 // Names the existing provider tests reach through `use super::*`.

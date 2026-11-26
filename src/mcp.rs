@@ -1,4 +1,6 @@
 //! Reviewed server-owned tools for the restricted stateless MCP 2026-07-28 profile.
+pub mod contract;
+pub mod external;
 mod range;
 pub(crate) mod result;
 
@@ -175,6 +177,17 @@ pub(crate) async fn observe(
     succeeded: bool,
     evidence: &str,
 ) -> Result<(), runs::Error> {
+    observe_with_handle(tx, lease, op, succeeded, None, evidence).await
+}
+
+pub(crate) async fn observe_with_handle(
+    tx: &mut WriteTransaction<'_>,
+    lease: &Lease<'_>,
+    op: &str,
+    succeeded: bool,
+    handle: Option<&str>,
+    evidence: &str,
+) -> Result<(), runs::Error> {
     if evidence.len() > INLINE_BYTES {
         return Err(runs::Error::Invalid);
     }
@@ -187,7 +200,7 @@ pub(crate) async fn observe(
             key: &format!("tool-result:{op}"),
             expected_revision: 0,
             outcome: if succeeded { "succeeded" } else { "failed" },
-            handle: None,
+            handle,
             evidence: Payload {
                 format: RESULT_FORMAT,
                 version: 1,
@@ -210,6 +223,18 @@ pub(crate) async fn observe_known(
     success: bool,
     output: &str,
 ) -> Result<(), leases::LeaseError> {
+    observe_known_with_handle(c, lease, step, operation, success, None, output).await
+}
+
+pub(crate) async fn observe_known_with_handle(
+    c: &mut sqlx::PgConnection,
+    lease: &Lease<'_>,
+    step: &StepContext,
+    operation: &str,
+    success: bool,
+    handle: Option<&str>,
+    output: &str,
+) -> Result<(), leases::LeaseError> {
     let check = || {
         if *step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
             Err(runs::Error::Conflict)
@@ -220,7 +245,7 @@ pub(crate) async fn observe_known(
     let record = async |c: &mut sqlx::PgConnection, fence| {
         leases::with_lease(c, lease, fence, async |tx, _| {
             check()?;
-            observe(tx, lease, operation, success, output).await?;
+            observe_with_handle(tx, lease, operation, success, handle, output).await?;
             check()
         })
         .await
@@ -237,6 +262,62 @@ pub(crate) async fn observe_known(
         Err(leases::LeaseError::StaleClaim)
     } else {
         result
+    }
+}
+
+/// Commit `outcome = "outcome_unknown"` under `Fence::Hold` for any write whose remote outcome
+/// is uncertain, returning `StepResult::Stopped` (or `StepResult::LeaseLost` if the claim is gone).
+pub(crate) async fn observe_unknown(
+    pool: &PgPool,
+    lease: &Lease<'_>,
+    step: &StepContext,
+    operation: &str,
+) -> StepResult {
+    if *step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
+        return StepResult::LeaseLost;
+    }
+    let Ok(mut c) = pool.acquire().await else {
+        return StepResult::LeaseLost;
+    };
+    let res = leases::with_lease(&mut c, lease, leases::Fence::Hold, async |tx, _| {
+        if *step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
+            return Err(runs::Error::Conflict);
+        }
+        runs::record_observation(
+            tx,
+            &Observation {
+                scope: lease.scope_id,
+                run: lease.run_id,
+                operation,
+                key: &format!("tool-unknown:{operation}"),
+                expected_revision: 0,
+                outcome: "outcome_unknown",
+                handle: None,
+                evidence: Payload {
+                    format: "openmettle.unresolved-write",
+                    version: 1,
+                    bytes: br#"{"reason":"uncertain_remote_outcome"}"#,
+                },
+            },
+        )
+        .await?;
+        if *step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
+            return Err(runs::Error::Conflict);
+        }
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(()) => StepResult::Stopped,
+        Err(
+            leases::LeaseError::StaleClaim
+            | leases::LeaseError::Expired
+            | leases::LeaseError::Terminal { .. },
+        ) => StepResult::LeaseLost,
+        Err(_) if *step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) => {
+            StepResult::LeaseLost
+        }
+        Err(_) => StepResult::Stopped,
     }
 }
 
@@ -393,6 +474,11 @@ impl ScopedAdapter {
             let Ok(mut c) = self.pool.acquire().await else {
                 return StepResult::LeaseLost;
             };
+            match approvals::two_phase_effect_intents_enabled(&mut c).await {
+                Ok(true) => {}
+                Ok(false) => return refused(),
+                Err(_) => return StepResult::LeaseLost,
+            }
             match approvals::record_fenced_intent(
                 &mut c,
                 &run.claim.lease(),

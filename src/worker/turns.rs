@@ -69,6 +69,14 @@ pub trait TurnRoutes: Send + Sync + 'static {
     fn tools(&self, _claim: &ClaimedRun) -> Vec<Tool> {
         vec![]
     }
+    /// Server-owned declarations carrying pinned external contract versions when applicable.
+    /// External MCP routes should override this via `ExternalToolContract::declared_tool`.
+    fn declared_tools(&self, claim: &ClaimedRun) -> Vec<DeclaredTool> {
+        self.tools(claim)
+            .into_iter()
+            .map(DeclaredTool::internal)
+            .collect()
+    }
     /// A profile-qualified upper bound for the complete prompt with server tools and their
     /// results. The admission estimate covers the original conversation without these items.
     fn tool_prompt_bound(&self, _model: &Effective, _request: &Request) -> Option<u64> {
@@ -87,6 +95,104 @@ pub struct TurnExecutor<R> {
     routes: R,
     artifacts: Option<artifact_fs::Store>,
     effects: Option<Arc<ApprovedEffects>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AdvertisedDeclaration {
+    Unoffered,
+    Internal,
+    External { version: String },
+}
+
+impl AdvertisedDeclaration {
+    fn from_external_version(ext: Option<String>) -> Self {
+        match ext {
+            None => Self::Internal,
+            Some(version) => Self::External { version },
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SavedCallGroup {
+    Valid {
+        round: i64,
+        continuation_rounds: Vec<i64>,
+        parts: Vec<String>,
+        reasoning: Option<Box<SavedReasoning>>,
+        calls: Vec<SavedCall>,
+    },
+    Rejected {
+        round: i64,
+        continuation_rounds: Vec<i64>,
+        errors: Vec<inference::ToolError>,
+    },
+}
+
+impl SavedCallGroup {
+    fn is_valid_shape(&self, expected_round: i64) -> bool {
+        let rounds_ok = |rounds: &[i64]| {
+            !rounds.is_empty()
+                && rounds.last() == Some(&expected_round)
+                && rounds.iter().all(|&r| r >= 1 && r <= expected_round)
+                && rounds.windows(2).all(|w| w[0] < w[1])
+        };
+        match self {
+            Self::Valid {
+                round,
+                continuation_rounds,
+                calls,
+                ..
+            } => *round == expected_round && !calls.is_empty() && rounds_ok(continuation_rounds),
+            Self::Rejected {
+                round,
+                continuation_rounds,
+                errors,
+            } => *round == expected_round && !errors.is_empty() && rounds_ok(continuation_rounds),
+        }
+    }
+
+    fn continuation_rounds(&self) -> &[i64] {
+        match self {
+            Self::Valid {
+                continuation_rounds,
+                ..
+            }
+            | Self::Rejected {
+                continuation_rounds,
+                ..
+            } => continuation_rounds,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedHandoff {
+    continuation_rounds: Vec<i64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedReasoning {
+    source: crate::model_config::ReplaySource,
+    blocks: Vec<Value>,
+    storage_bytes: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedCall {
+    id: String,
+    name: String,
+    arguments: Value,
+    advertised: AdvertisedDeclaration,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedCallResult {
+    call_id: String,
+    operation_id: Option<String>,
+    output: String,
 }
 
 pub struct FinalAnswer {
@@ -266,43 +372,226 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
     }
 
+    async fn persist_turn_calls(
+        &self,
+        run: &ActiveRun,
+        round: i64,
+        saved: &SavedCallGroup,
+    ) -> Result<(), StepResult> {
+        let bytes = serde_json::to_vec(saved).map_err(|_| FAILED)?;
+        if bytes.len() > 65_536 {
+            return Err(FAILED);
+        }
+        let mut c = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StepResult::LeaseLost)?;
+        leases::with_lease(&mut c, &run.claim.lease(), Fence::Step, async |tx, _| {
+            crate::runs::append_event(
+                tx,
+                &run.claim.scope_id,
+                &run.claim.run_id,
+                &format!("turn-calls:{round}"),
+                Payload {
+                    format: "openmettle.turn-calls",
+                    version: 1,
+                    bytes: &bytes,
+                },
+            )
+            .await?;
+            Ok(())
+        })
+        .await
+        .map_err(lease_step)
+    }
+
+    async fn persist_turn_handoff(
+        &self,
+        run: &ActiveRun,
+        round: i64,
+        continuation_rounds: &[i64],
+    ) -> Result<(), StepResult> {
+        let bytes = serde_json::to_vec(&SavedHandoff {
+            continuation_rounds: continuation_rounds.to_vec(),
+        })
+        .map_err(|_| FAILED)?;
+        if bytes.len() > 65_536 {
+            return Err(FAILED);
+        }
+        let mut c = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StepResult::LeaseLost)?;
+        leases::with_lease(&mut c, &run.claim.lease(), Fence::Step, async |tx, _| {
+            crate::runs::append_event(
+                tx,
+                &run.claim.scope_id,
+                &run.claim.run_id,
+                &format!("turn-handoff:{round}"),
+                Payload {
+                    format: "openmettle.turn-handoff",
+                    version: 1,
+                    bytes: &bytes,
+                },
+            )
+            .await?;
+            Ok(())
+        })
+        .await
+        .map_err(lease_step)
+    }
+
+    async fn persist_turn_result(
+        &self,
+        run: &ActiveRun,
+        round: i64,
+        idx: usize,
+        call_id: &str,
+        operation_id: Option<&str>,
+        output: &str,
+    ) -> Result<(), StepResult> {
+        let bytes = serde_json::to_vec(&SavedCallResult {
+            call_id: call_id.to_owned(),
+            operation_id: operation_id.map(str::to_owned),
+            output: output.to_owned(),
+        })
+        .map_err(|_| FAILED)?;
+        if bytes.len() > 65_536 {
+            return Err(FAILED);
+        }
+        let mut c = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StepResult::LeaseLost)?;
+        leases::with_lease(&mut c, &run.claim.lease(), Fence::Step, async |tx, _| {
+            crate::runs::append_event(
+                tx,
+                &run.claim.scope_id,
+                &run.claim.run_id,
+                &format!("turn-result:{round}:{idx}"),
+                Payload {
+                    format: "openmettle.turn-result",
+                    version: 1,
+                    bytes: &bytes,
+                },
+            )
+            .await?;
+            Ok(())
+        })
+        .await
+        .map_err(lease_step)
+    }
+
+    fn declared_tool_map(
+        raw: &[DeclaredTool],
+    ) -> Result<std::collections::BTreeMap<String, AdvertisedDeclaration>, StepResult> {
+        let mut map = std::collections::BTreeMap::new();
+        for dt in raw {
+            let decl = AdvertisedDeclaration::from_external_version(dt.external_version.clone());
+            if map.insert(dt.tool.name.clone(), decl).is_some() {
+                return Err(FAILED);
+            }
+        }
+        Ok(map)
+    }
+
+    fn proposal_matches_declaration(
+        &self,
+        claim: &ClaimedRun,
+        effects: &ApprovedEffects,
+        call: &Call,
+        proposal: &Proposal,
+        decl: &AdvertisedDeclaration,
+    ) -> bool {
+        if proposal.tool != call.name {
+            return false;
+        }
+        match decl {
+            AdvertisedDeclaration::Unoffered => false,
+            AdvertisedDeclaration::Internal => {
+                if proposal.tool == crate::mcp::READ_RANGE {
+                    let Ok(expected) = crate::mcp::Registry.proposal(
+                        &claim.scope_id,
+                        &proposal.logical_key,
+                        &call.name,
+                        &proposal.version,
+                        call.arguments.to_string().as_bytes(),
+                    ) else {
+                        return false;
+                    };
+                    expected.arguments() == proposal.arguments()
+                        && expected.destination() == proposal.destination()
+                } else {
+                    effects
+                        .adapter
+                        .verify_turn_call_proposal(call, proposal, None)
+                }
+            }
+            AdvertisedDeclaration::External { version } => {
+                proposal.version == *version
+                    && effects.adapter.verify_turn_call_proposal(
+                        call,
+                        proposal,
+                        Some(version.as_str()),
+                    )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn tool(
         &self,
         run: &ActiveRun,
         cx: &StepContext,
         config: &ConfigSnapshot,
         call: &Call,
+        advertised: &AdvertisedDeclaration,
         prior_effects: &mut Vec<(String, Proposal)>,
-    ) -> Result<String, StepResult> {
+        is_open_zero: bool,
+    ) -> Result<(String, Option<String>), StepResult> {
         let effects = self.effects.as_deref().ok_or(FAILED)?;
         if let Some(why) = *cx.stop.borrow() {
             return Err(stopped_step(why));
         }
         self.authority(&run.claim, config).await?;
-        let refused = || crate::mcp::ToolFault::TerminalRefusal.envelope();
-        let Some(proposal) = self.routes.proposal(&run.claim, call) else {
-            return Ok(refused());
-        };
-        if proposal.tool != call.name {
-            return Ok(refused());
-        }
-        if proposal.tool == crate::mcp::READ_RANGE {
-            let Ok(expected) = crate::mcp::Registry.proposal(
-                &run.claim.scope_id,
-                &proposal.logical_key,
-                &call.name,
-                &proposal.version,
-                call.arguments.to_string().as_bytes(),
-            ) else {
-                return Ok(refused());
-            };
-            if expected.arguments() != proposal.arguments()
-                || expected.destination() != proposal.destination()
-            {
-                return Ok(refused());
+        let refused = || {
+            if is_open_zero {
+                Err(FAILED)
+            } else {
+                Ok((crate::mcp::ToolFault::TerminalRefusal.envelope(), None))
             }
-        } else if proposal.arguments() != &call.arguments {
-            return Ok(refused());
+        };
+        if matches!(advertised, AdvertisedDeclaration::Unoffered) {
+            return refused();
+        }
+        let Some(proposal) = self.routes.proposal(&run.claim, call) else {
+            return refused();
+        };
+        if !self.proposal_matches_declaration(&run.claim, effects, call, &proposal, advertised) {
+            return refused();
+        }
+        let step = StepContext {
+            deadline: run.execution_deadline,
+            ..cx.clone()
+        };
+        let preflight = effects.adapter.preflight(run, &proposal, &step).await;
+        if let Some(why) = *cx.stop.borrow() {
+            return Err(stopped_step(why));
+        }
+        match preflight {
+            Ok(()) => {}
+            Err(PreflightError::Transient) => {
+                return if is_open_zero {
+                    Err(StepResult::Handoff)
+                } else {
+                    Ok((crate::mcp::ToolFault::Transient.envelope(), None))
+                };
+            }
+            Err(PreflightError::Refused) => return refused(),
+            Err(PreflightError::Store(_)) => return Err(StepResult::LeaseLost),
         }
         let intent = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
@@ -321,14 +610,10 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             {
                 Ok(intent) => intent,
                 Err(LeaseError::Store(StoreError::Denied(_) | StoreError::InvalidInput(_))) => {
-                    return Ok(refused());
+                    return refused();
                 }
                 Err(e) => return Err(lease_step(e)),
             }
-        };
-        let step = StepContext {
-            deadline: run.execution_deadline,
-            ..cx.clone()
         };
         let id = match &intent {
             IntentResult::Applied(i) => Some(i.operation_id.clone()),
@@ -345,10 +630,10 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         .await
         {
             StepResult::ToolOutput(output) => {
-                if let Some(id) = id {
-                    prior_effects.push((id, proposal));
+                if let Some(op_id) = &id {
+                    prior_effects.push((op_id.clone(), proposal));
                 }
-                Ok(output)
+                Ok((output, id))
             }
             stopped @ (StepResult::Stopped
             | StepResult::Handoff
@@ -399,7 +684,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             tools,
             stream: route.stream,
         };
-        if request.tools.is_some() {
+        if request.tools.is_some() || !continuation.is_empty() {
             let bound = self
                 .routes
                 .tool_prompt_bound(&config.effective, &request)
@@ -428,13 +713,459 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .map_err(|_| FAILED)?
         };
         let mut continuation = Vec::new();
+        let mut continuation_rounds: Vec<i64> = Vec::new();
         let mut prior_effects: Vec<(String, Proposal)> = Vec::new();
-        let mut tools = self
-            .effects
-            .as_ref()
-            .map(|_| self.routes.tools(&run.claim))
-            .filter(|t| !t.is_empty());
+        let mut last_completed_round: i64 = 0;
+        // Discover either (a) an open, proven-unsent automatic (`approval_id IS NULL`,
+        // `dispatched_attempts = 0`) write intent left by a prior claim that handed off before
+        // Transaction 2, or (b) an explicit fenced `turn-handoff:{used}` checkpoint written when
+        // pre-round tool verification transiently handed off after a completed round.
+        if let Some(effects) = self.effects.as_deref() {
+            if let Some(why) = *cx.stop.borrow() {
+                return Err(stopped_step(why));
+            }
+            let has_pending_auto = {
+                let mut c = self
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(|_| StepResult::LeaseLost)?;
+                approvals::pending_automatic_write(&mut c, &run.claim.lease())
+                    .await
+                    .map_err(|_| StepResult::LeaseLost)?
+                    .is_some()
+            };
+            let has_turn_handoff = if has_pending_auto {
+                false
+            } else {
+                let mut c = self
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(|_| StepResult::LeaseLost)?;
+                leases::with_lease(&mut c, &run.claim.lease(), Fence::Step, async |tx, _| {
+                    let conn = tx.connection()?;
+                    let used: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM openmettle.run_events
+                          WHERE scope_id=$1::uuid AND run_id=$2::uuid AND format='openmettle.model-round'",
+                    )
+                    .bind(&run.claim.scope_id)
+                    .bind(&run.claim.run_id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    if used <= 0 {
+                        return Ok(false);
+                    }
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM openmettle.run_events
+                              WHERE scope_id=$1::uuid AND run_id=$2::uuid
+                                AND append_key=$3
+                                AND format='openmettle.turn-handoff'
+                         )",
+                    )
+                    .bind(&run.claim.scope_id)
+                    .bind(&run.claim.run_id)
+                    .bind(format!("turn-handoff:{used}"))
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    Ok(exists)
+                })
+                .await
+                .map_err(lease_step)?
+            };
+            if has_pending_auto || has_turn_handoff {
+                let route_declared =
+                    Self::declared_tool_map(&self.routes.declared_tools(&run.claim))?;
+                let (used, expected_rounds, saved_rounds, saved_results, ops_by_key) = {
+                    let mut c = self
+                        .pool
+                        .acquire()
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?;
+                    leases::with_lease(&mut c, &run.claim.lease(), Fence::Step, async |tx, _| {
+                        let conn = tx.connection()?;
+                        let used: i64 = sqlx::query_scalar(
+                            "SELECT count(*) FROM openmettle.run_events
+                              WHERE scope_id=$1::uuid AND run_id=$2::uuid AND format='openmettle.model-round'",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                        if used <= 0 {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        let transcript_rows: Vec<(String, i64, String, Vec<u8>)> = sqlx::query_as(
+                            "SELECT format, format_version::bigint, append_key, payload
+                               FROM openmettle.run_events
+                              WHERE scope_id=$1::uuid AND run_id=$2::uuid
+                                AND format IN (
+                                    'openmettle.turn-handoff',
+                                    'openmettle.turn-calls',
+                                    'openmettle.turn-result'
+                                )",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                        let mut handoff_rows: std::collections::BTreeMap<i64, SavedHandoff> =
+                            std::collections::BTreeMap::new();
+                        let mut saved_rounds: std::collections::BTreeMap<i64, SavedCallGroup> =
+                            std::collections::BTreeMap::new();
+                        let mut raw_results: Vec<(String, Vec<u8>)> = Vec::new();
+                        for (format, format_version, append_key, bytes) in transcript_rows {
+                            if format_version != 1 {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                            match format.as_str() {
+                                "openmettle.turn-handoff" => {
+                                    let Some(r_str) = append_key.strip_prefix("turn-handoff:")
+                                    else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    let Ok(r) = r_str.parse::<i64>() else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    if r < 1 || r > used || r.to_string() != r_str {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    let ho: SavedHandoff = serde_json::from_slice(&bytes)
+                                        .map_err(|_| crate::runs::Error::Conflict)?;
+                                    if ho.continuation_rounds.is_empty()
+                                        || ho.continuation_rounds.last() != Some(&r)
+                                    {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    if handoff_rows.insert(r, ho).is_some() {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                }
+                                "openmettle.turn-calls" => {
+                                    let Some(round_str) = append_key.strip_prefix("turn-calls:")
+                                    else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    let Ok(r) = round_str.parse::<i64>() else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    if r < 1 || r > used || r.to_string() != round_str {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    let saved: SavedCallGroup = serde_json::from_slice(&bytes)
+                                        .map_err(|_| crate::runs::Error::Conflict)?;
+                                    if !saved.is_valid_shape(r) {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    if saved_rounds.insert(r, saved).is_some() {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                }
+                                "openmettle.turn-result" => {
+                                    raw_results.push((append_key, bytes));
+                                }
+                                _ => return Err(crate::runs::Error::Conflict),
+                            }
+                        }
+                        if has_turn_handoff && !handoff_rows.contains_key(&used) {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        let Some(last_group) = saved_rounds.get(&used) else {
+                            return Err(crate::runs::Error::Conflict);
+                        };
+                        let expected_rounds = last_group.continuation_rounds().to_vec();
+                        for (&hr, ho) in &handoff_rows {
+                            if saved_rounds.get(&hr).map(SavedCallGroup::continuation_rounds)
+                                != Some(ho.continuation_rounds.as_slice())
+                            {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                        }
+                        if expected_rounds.is_empty()
+                            || expected_rounds.last() != Some(&used)
+                            || !expected_rounds.iter().all(|&r| r >= 1 && r <= used)
+                            || !expected_rounds.windows(2).all(|w| w[0] < w[1])
+                            || !saved_rounds.keys().copied().eq(expected_rounds.iter().copied())
+                        {
+                            return Err(crate::runs::Error::Conflict);
+                        }
+                        for (idx, &r) in expected_rounds.iter().enumerate() {
+                            if saved_rounds[&r].continuation_rounds() != &expected_rounds[..=idx] {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                        }
+                        let mut saved_results: std::collections::BTreeMap<
+                            (i64, usize),
+                            SavedCallResult,
+                        > = std::collections::BTreeMap::new();
+                        for (append_key, bytes) in raw_results {
+                            let Some(rest) = append_key.strip_prefix("turn-result:") else {
+                                return Err(crate::runs::Error::Conflict);
+                            };
+                            let Some((r_str, idx_str)) = rest.split_once(':') else {
+                                return Err(crate::runs::Error::Conflict);
+                            };
+                            let (Ok(r), Ok(idx)) = (r_str.parse::<i64>(), idx_str.parse::<usize>())
+                            else {
+                                return Err(crate::runs::Error::Conflict);
+                            };
+                            if r.to_string() != r_str || idx.to_string() != idx_str {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                            let Some(SavedCallGroup::Valid { calls, .. }) = saved_rounds.get(&r)
+                            else {
+                                return Err(crate::runs::Error::Conflict);
+                            };
+                            if idx >= calls.len() {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                            let res: SavedCallResult = serde_json::from_slice(&bytes)
+                                .map_err(|_| crate::runs::Error::Conflict)?;
+                            if res.call_id != calls[idx].id {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                            if saved_results.insert((r, idx), res).is_some() {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                        }
+                        let op_rows: Vec<(String, String, bool)> = sqlx::query_as(
+                            "SELECT id::text, logical_key,
+                                    coalesce(
+                                        outcome = 'intent'
+                                            AND dispatched_attempts = 0
+                                            AND approval_id IS NULL,
+                                        false
+                                    )
+                               FROM openmettle.operations
+                              WHERE scope_id=$1::uuid AND run_id=$2::uuid",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                        let mut ops_by_key: std::collections::BTreeMap<String, (String, bool)> =
+                            std::collections::BTreeMap::new();
+                        for (id, logical_key, is_open_zero) in op_rows {
+                            ops_by_key.insert(logical_key, (id, is_open_zero));
+                        }
+                        Ok((
+                            used,
+                            expected_rounds,
+                            saved_rounds,
+                            saved_results,
+                            ops_by_key,
+                        ))
+                    })
+                    .await
+                    .map_err(lease_step)?
+                };
+                let any_open_zero = ops_by_key.values().any(|(_, open)| *open);
+                if has_pending_auto != any_open_zero {
+                    return Err(FAILED);
+                }
+                let mut saved_keys = std::collections::BTreeSet::new();
+                for saved in saved_rounds.values() {
+                    if let SavedCallGroup::Valid { calls, .. } = saved {
+                        for sc in calls {
+                            let call = Call {
+                                id: sc.id.clone(),
+                                name: sc.name.clone(),
+                                arguments: sc.arguments.clone(),
+                            };
+                            if let Some(p) = self.routes.proposal(&run.claim, &call)
+                                && self.proposal_matches_declaration(
+                                    &run.claim,
+                                    effects,
+                                    &call,
+                                    &p,
+                                    &sc.advertised,
+                                )
+                            {
+                                saved_keys.insert(p.logical_key);
+                            }
+                        }
+                    }
+                }
+                if ops_by_key.keys().any(|k| !saved_keys.contains(k)) {
+                    return Err(FAILED);
+                }
+                let mut saved_rounds = saved_rounds;
+                for &r in &expected_rounds {
+                    match saved_rounds.remove(&r).ok_or(FAILED)? {
+                        SavedCallGroup::Rejected { errors, .. } => {
+                            if saved_results.keys().any(|(rr, _)| *rr == r) {
+                                return Err(FAILED);
+                            }
+                            continuation.push(History::RejectedGroup(errors));
+                        }
+                        SavedCallGroup::Valid {
+                            parts,
+                            reasoning,
+                            calls: saved_calls,
+                            ..
+                        } => {
+                            let call_decls: Vec<(Call, AdvertisedDeclaration)> = saved_calls
+                                .into_iter()
+                                .map(|c| {
+                                    (
+                                        Call {
+                                            id: c.id,
+                                            name: c.name,
+                                            arguments: c.arguments,
+                                        },
+                                        c.advertised,
+                                    )
+                                })
+                                .collect();
+                            let must_be_saved = r < used || !has_pending_auto;
+                            let mut results = Vec::with_capacity(call_decls.len());
+                            for (idx, (call, saved_decl)) in call_decls.iter().enumerate() {
+                                let proposal = self.routes.proposal(&run.claim, call);
+                                let op_entry = proposal
+                                    .as_ref()
+                                    .and_then(|p| ops_by_key.get(&p.logical_key));
+                                let is_open_zero = op_entry.is_some_and(|(_, open)| *open);
+                                if let Some(saved_res) = saved_results.get(&(r, idx)) {
+                                    if saved_res.call_id != call.id || is_open_zero {
+                                        return Err(FAILED);
+                                    }
+                                    match (&saved_res.operation_id, op_entry, proposal) {
+                                        (Some(op_id), Some((db_id, false)), Some(prop))
+                                            if op_id == db_id
+                                                && self.proposal_matches_declaration(
+                                                    &run.claim, effects, call, &prop, saved_decl,
+                                                ) =>
+                                        {
+                                            prior_effects.push((op_id.clone(), prop));
+                                        }
+                                        (None, None, _) => {}
+                                        _ => return Err(FAILED),
+                                    }
+                                    results.push((call.id.clone(), saved_res.output.clone()));
+                                } else if must_be_saved {
+                                    return Err(FAILED);
+                                } else {
+                                    if saved_results
+                                        .range((r, idx + 1)..=(r, usize::MAX))
+                                        .next()
+                                        .is_some()
+                                    {
+                                        return Err(FAILED);
+                                    }
+                                    let effective_decl =
+                                        if route_declared.get(&call.name) == Some(saved_decl) {
+                                            saved_decl
+                                        } else {
+                                            &AdvertisedDeclaration::Unoffered
+                                        };
+                                    let (output, op_id) = self
+                                        .tool(
+                                            run,
+                                            &cx,
+                                            &config,
+                                            call,
+                                            effective_decl,
+                                            &mut prior_effects,
+                                            is_open_zero,
+                                        )
+                                        .await?;
+                                    self.persist_turn_result(
+                                        run,
+                                        r,
+                                        idx,
+                                        &call.id,
+                                        op_id.as_deref(),
+                                        &output,
+                                    )
+                                    .await?;
+                                    results.push((call.id.clone(), output));
+                                }
+                            }
+                            let calls: Vec<Call> = call_decls.into_iter().map(|(c, _)| c).collect();
+                            let reasoning = reasoning.map(|rr| inference::Reasoning {
+                                source: Box::new(rr.source),
+                                blocks: rr.blocks,
+                                storage_bytes: rr.storage_bytes,
+                            });
+                            continuation.push(History::Assistant {
+                                parts,
+                                reasoning,
+                                calls,
+                            });
+                            continuation.extend(
+                                results
+                                    .into_iter()
+                                    .map(|(id, output)| History::ToolResult { id, output }),
+                            );
+                        }
+                    }
+                }
+                let still_pending = {
+                    let mut c = self
+                        .pool
+                        .acquire()
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?;
+                    approvals::pending_automatic_write(&mut c, &run.claim.lease())
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)?
+                        .is_some()
+                };
+                if still_pending {
+                    return Err(FAILED);
+                }
+                continuation_rounds = expected_rounds;
+                last_completed_round = used;
+            }
+        }
         loop {
+            let (tools, offered_declarations) = if let Some(effects) = self.effects.as_deref() {
+                let raw = self.routes.declared_tools(&run.claim);
+                let raw_map = Self::declared_tool_map(&raw)?;
+                if raw.is_empty() {
+                    (None, std::collections::BTreeMap::new())
+                } else {
+                    let filter_step = StepContext {
+                        deadline: run.execution_deadline,
+                        ..cx.clone()
+                    };
+                    let filtered = tokio::select! {
+                        biased;
+                        _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
+                        filtered = effects.adapter.filter_turn_tools(run, raw, &filter_step) => {
+                            filtered
+                        }
+                    };
+                    let kept = match filtered {
+                        Ok(kept) => kept,
+                        Err(StepResult::Handoff) => {
+                            if !continuation.is_empty() && last_completed_round > 0 {
+                                self.persist_turn_handoff(
+                                    run,
+                                    last_completed_round,
+                                    &continuation_rounds,
+                                )
+                                .await?;
+                            }
+                            return Err(StepResult::Handoff);
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    let mut offered = std::collections::BTreeMap::new();
+                    for t in &kept {
+                        let Some(decl) = raw_map.get(&t.name) else {
+                            return Err(FAILED);
+                        };
+                        if offered.insert(t.name.clone(), decl.clone()).is_some() {
+                            return Err(FAILED);
+                        }
+                    }
+                    ((!kept.is_empty()).then_some(kept), offered)
+                }
+            } else {
+                (None, std::collections::BTreeMap::new())
+            };
             let (route, request, round, actor) = tokio::select! {
                 biased;
                 _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
@@ -614,7 +1345,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     .await
                     .map_err(inference::Error::step_result)?
             };
-            tools = request.tools;
             let [answer]: [_; 1] = turn.answers.try_into().map_err(|_| FAILED)?;
             match answer.calls {
                 CallGroup::Valid(calls) if calls.is_empty() => {
@@ -645,14 +1375,74 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     return Err(StepResult::Failed(FailReason::RoundLimit));
                 }
                 CallGroup::InvalidArguments(errors) => {
-                    continuation.push(History::RejectedGroup(errors))
+                    if self.effects.is_some() {
+                        let mut next_rounds = continuation_rounds.clone();
+                        next_rounds.push(round);
+                        self.persist_turn_calls(
+                            run,
+                            round,
+                            &SavedCallGroup::Rejected {
+                                round,
+                                continuation_rounds: next_rounds.clone(),
+                                errors: errors.clone(),
+                            },
+                        )
+                        .await?;
+                        continuation_rounds = next_rounds;
+                    }
+                    continuation.push(History::RejectedGroup(errors));
+                    last_completed_round = round;
                 }
                 CallGroup::Valid(calls) => {
+                    if self.effects.is_some() {
+                        let mut next_rounds = continuation_rounds.clone();
+                        next_rounds.push(round);
+                        let saved = SavedCallGroup::Valid {
+                            round,
+                            continuation_rounds: next_rounds.clone(),
+                            parts: answer.parts.clone(),
+                            reasoning: answer.reasoning.as_ref().map(|r| {
+                                Box::new(SavedReasoning {
+                                    source: (*r.source).clone(),
+                                    blocks: r.blocks.clone(),
+                                    storage_bytes: r.storage_bytes,
+                                })
+                            }),
+                            calls: calls
+                                .iter()
+                                .map(|c| SavedCall {
+                                    id: c.id.clone(),
+                                    name: c.name.clone(),
+                                    arguments: c.arguments.clone(),
+                                    advertised: offered_declarations
+                                        .get(&c.name)
+                                        .cloned()
+                                        .unwrap_or(AdvertisedDeclaration::Unoffered),
+                                })
+                                .collect(),
+                        };
+                        self.persist_turn_calls(run, round, &saved).await?;
+                        continuation_rounds = next_rounds;
+                    }
                     let mut results = Vec::with_capacity(calls.len());
-                    for call in &calls {
-                        let output = self
-                            .tool(run, &cx, &config, call, &mut prior_effects)
+                    for (idx, call) in calls.iter().enumerate() {
+                        let adv = offered_declarations
+                            .get(&call.name)
+                            .unwrap_or(&AdvertisedDeclaration::Unoffered);
+                        let (output, op_id) = self
+                            .tool(run, &cx, &config, call, adv, &mut prior_effects, false)
                             .await?;
+                        if self.effects.is_some() {
+                            self.persist_turn_result(
+                                run,
+                                round,
+                                idx,
+                                &call.id,
+                                op_id.as_deref(),
+                                &output,
+                            )
+                            .await?;
+                        }
                         results.push((call.id.clone(), output));
                     }
                     continuation.push(History::Assistant {
@@ -665,6 +1455,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             .into_iter()
                             .map(|(id, output)| History::ToolResult { id, output }),
                     );
+                    last_completed_round = round;
                 }
             }
         }
@@ -685,7 +1476,12 @@ impl<R: TurnRoutes> Executor for TurnExecutor<R> {
         false
     }
 
-    async fn reconcile(&self, _: &UnresolvedOperation, _: StepContext) -> Option<OwnedObservation> {
+    async fn reconcile(
+        &self,
+        _: &ActiveRun,
+        _: &UnresolvedOperation,
+        _: StepContext,
+    ) -> Option<OwnedObservation> {
         // No authoritative downstream lookup was supplied. Never repeat an uncertain effect.
         None
     }
