@@ -10,6 +10,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 const SENTINEL: &str = ".openmettle-volume-id";
@@ -150,6 +151,29 @@ impl Volume {
         let name = name.as_ref();
         if self.inode(dir, name)? != Some(ino) {
             return Err(invalid());
+        }
+        at::unlinkat(dir, name, AtFlags::empty())?;
+        Ok(())
+    }
+    /// Verifies that `name` still resolves to `ino` and rechecks `deadline` strictly AFTER that
+    /// `statat` probe and immediately BEFORE `unlinkat`, so a stalled `statat` cannot let an
+    /// unlink run after the caller's PostgreSQL fencing window expired.
+    pub fn unlink_before(
+        &self,
+        dir: &File,
+        name: impl AsRef<OsStr>,
+        ino: u64,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let name = name.as_ref();
+        if self.inode(dir, name)? != Some(ino) {
+            return Err(invalid());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "filesystem fence window expired",
+            ));
         }
         at::unlinkat(dir, name, AtFlags::empty())?;
         Ok(())

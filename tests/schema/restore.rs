@@ -2378,9 +2378,11 @@ async fn drift_verification_renews_volume_phase_lease_across_large_volume() {
         .await
         .unwrap();
 
-    // Part B: Instrument `volume_lease_until` updates on the disposable test DB to confirm
-    // `verify_volume_with_lease` inside `restore::finish` renews the lease across >100
-    // reservations (multiple pages) and >100 directory entries before opening the gate.
+    // Part B: Instrument `volume_lease_until` updates on the disposable test DB and exercise an
+    // ACTUAL lease-window crossing during storage-enabled `verify_volume_on`: hold an
+    // `ACCESS EXCLUSIVE` lock on `storage_accounts` so `ledgers(&mut tx_pin)` blocks on Conn 1
+    // while `with_volume_phase_heartbeat` renews on Conn 2 every 60 ms across a shortened 250 ms
+    // lease window (~450 ms total hold).
     let mut adm = restored.admin().await;
     sqlx::raw_sql(
         "CREATE TABLE public._lease_renew_log (id serial PRIMARY KEY);
@@ -2402,21 +2404,138 @@ async fn drift_verification_renews_volume_phase_lease_across_large_volume() {
     .await
     .unwrap();
 
-    restore::finish(&owner, Some(&f.store), &export)
+    let mut blocker = connect(&restored.0, OWNER).await;
+    let blocker_pid = pid(&mut blocker).await;
+    let mut blocker_tx = blocker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.storage_accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker_tx)
         .await
         .unwrap();
+
+    let finishing = tokio::spawn({
+        let owner = owner.clone();
+        let store = f.store.clone();
+        let export = export.clone();
+        async move {
+            restore::finish_with_heartbeat(&owner, Some(&store), &export, Duration::from_millis(60))
+                .await
+        }
+    });
+    wait_for_blocked_peer(&restored, blocker_pid).await;
+
+    // Shorten the active lease to +250 ms AFTER the upfront renewal has already run and Conn 1
+    // is blocked inside `ledgers(&mut tx_pin)`.
+    sqlx::query(
+        "UPDATE openmettle.restore_reconciliation_gate
+            SET volume_lease_until = clock_timestamp() + interval '250 milliseconds'
+          WHERE id",
+    )
+    .execute(&mut adm)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    let still_extended: bool = sqlx::query_scalar(
+        "SELECT volume_lease_until > clock_timestamp() + interval '200 seconds'
+           FROM openmettle.restore_reconciliation_gate WHERE id",
+    )
+    .fetch_one(&mut adm)
+    .await
+    .unwrap();
+    assert!(
+        still_extended,
+        "mid-verification heartbeat must extend volume_lease_until while ledgers query is blocked"
+    );
+    let mut rival = connect(&restored.0, OWNER).await;
+    let rival_claim = sqlx::query(
+        "SELECT * FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'))",
+    )
+    .bind(export.origin_us)
+    .bind(export.seq)
+    .bind(&export.digest)
+    .execute(&mut rival)
+    .await;
+    assert_eq!(sqlstate(rival_claim), "OMR02");
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    blocker_tx.commit().await.unwrap();
+    finishing.await.unwrap().unwrap();
     assert!(gate(&restored).await.0);
+
     let renewals: i64 = sqlx::query_scalar("SELECT count(*) FROM public._lease_renew_log")
         .fetch_one(&mut adm)
         .await
         .unwrap();
-    // purge_journaled (1 page + 1 anchor sweep = 2) + scrub_unsettled (3: start, 1 empty page, end)
-    // + verify_volume_with_lease (>= 6: start, 3 pages over 115+ rows, >=1 dir-entry batch of 100,
-    // end) => >= 11 renewals.
     assert!(
         renewals >= 10,
-        "expected >= 10 lease renewals across large-volume drift verification, got {renewals}"
+        "expected >= 10 lease renewals across heartbeat-driven verification, got {renewals}"
     );
+
+    // Part C: Exercise an ACTUAL lease-window crossing on the storage-disabled (`store = None`,
+    // `verify_ledgers_on`) path too.
+    let disabled_db = TestDb::migrated().await;
+    let disabled_owner = pool(&disabled_db, OWNER).await;
+    let disabled_export = Export::parse(&restore::export(&disabled_owner).await.unwrap()).unwrap();
+    restore::lock(
+        &disabled_owner,
+        disabled_export.origin_us,
+        0,
+        GENESIS,
+        true,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut dis_blocker = connect(&disabled_db.0, OWNER).await;
+    let dis_blocker_pid = pid(&mut dis_blocker).await;
+    let mut dis_blocker_tx = dis_blocker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.storage_accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *dis_blocker_tx)
+        .await
+        .unwrap();
+
+    let dis_finishing = tokio::spawn({
+        let owner = disabled_owner.clone();
+        let export = disabled_export.clone();
+        async move {
+            restore::finish_with_heartbeat(&owner, None, &export, Duration::from_millis(60)).await
+        }
+    });
+    wait_for_blocked_peer(&disabled_db, dis_blocker_pid).await;
+
+    let mut dis_adm = disabled_db.admin().await;
+    sqlx::query(
+        "UPDATE openmettle.restore_reconciliation_gate
+            SET volume_lease_until = clock_timestamp() + interval '250 milliseconds'
+          WHERE id",
+    )
+    .execute(&mut dis_adm)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(320)).await;
+    let dis_extended: bool = sqlx::query_scalar(
+        "SELECT volume_lease_until > clock_timestamp() + interval '200 seconds'
+           FROM openmettle.restore_reconciliation_gate WHERE id",
+    )
+    .fetch_one(&mut dis_adm)
+    .await
+    .unwrap();
+    assert!(
+        dis_extended,
+        "storage-disabled heartbeat must extend volume_lease_until while verify_ledgers_on blocks"
+    );
+    let mut dis_rival = connect(&disabled_db.0, OWNER).await;
+    let dis_rival_claim = sqlx::query(
+        "SELECT * FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'))",
+    )
+    .bind(disabled_export.origin_us)
+    .execute(&mut dis_rival)
+    .await;
+    assert_eq!(sqlstate(dis_rival_claim), "OMR02");
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    dis_blocker_tx.commit().await.unwrap();
+    dis_finishing.await.unwrap().unwrap();
+    assert!(gate(&disabled_db).await.0);
 }
 
 /// Review #2 P1 #4 regression: `restore_gate_open` verifies `storage_volume_control.volume_id`
@@ -2496,8 +2615,9 @@ async fn restore_gate_open_checks_volume_pin_and_serializes_with_rebind() {
 
     // 4. Three-connection serialization check: Conn 1 (`tx_pin`) holds `storage_volume_control
     //    FOR SHARE`, Conn 3 (concurrent `storage rebind` / `adopt`) blocks on `FOR UPDATE`, and
-    //    Conn 2 (`open_tx`) commits `restore_gate_open` cleanly WITHOUT deadlocking while Conn 3
-    //    remains blocked until `tx_pin` commits.
+    //    Conn 2 (`open_tx`) executes `restore_gate_open` cleanly WITHOUT deadlocking. Committing
+    //    `tx_pin` FIRST keeps `rebind` blocked on `open_tx`'s share lock and keeps the gate closed
+    //    until `open_tx` commits SECOND.
     let mut conn1 = connect(&f.db.0, OWNER).await;
     let pid1 = pid(&mut conn1).await;
     let mut tx_pin = conn1.begin().await.unwrap();
@@ -2531,17 +2651,66 @@ async fn restore_gate_open_checks_volume_pin_and_serializes_with_rebind() {
     .execute(&mut *open_tx)
     .await
     .unwrap();
-    open_tx.commit().await.unwrap();
-    assert!(gate(&f.db).await.0);
+    tx_pin.commit().await.unwrap();
+    assert!(!gate(&f.db).await.0);
     assert!(
         !rebind.is_finished(),
-        "rebind must remain blocked while tx_pin holds FOR SHARE"
+        "rebind must remain blocked on open_tx's share lock after tx_pin commits"
     );
-    tx_pin.commit().await.unwrap();
+    open_tx.commit().await.unwrap();
+    assert!(gate(&f.db).await.0);
     tokio::time::timeout(Duration::from_secs(5), rebind)
         .await
-        .expect("rebind should unblock once tx_pin commits")
+        .expect("rebind should unblock once open_tx commits")
         .unwrap();
+
+    // 4b. Review #3 P1 #4 regression: if `tx_pin`'s PostgreSQL backend is terminated after
+    //     verification and before `tx_pin.commit()`, committing `tx_pin` FIRST fails, `open_tx`
+    //     rolls back on drop, and `restore_reconciliation_gate.open` remains `false`.
+    restore::lock(&owner, origin, 0, GENESIS, true, None, true)
+        .await
+        .unwrap();
+    let (run_id2, token2): (String, String) = sqlx::query_as(
+        "SELECT restore_run_id::text, volume_claim_token::text
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'))",
+    )
+    .bind(origin)
+    .fetch_one(&owner)
+    .await
+    .unwrap();
+    let mut dead_conn = connect(&f.db.0, OWNER).await;
+    let dead_pid = pid(&mut dead_conn).await;
+    let mut dead_tx_pin = dead_conn.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.storage_volume_control WHERE id FOR SHARE")
+        .execute(&mut *dead_tx_pin)
+        .await
+        .unwrap();
+    let mut open_tx_aborted = owner.begin().await.unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, 0, decode(repeat('00', 32), 'hex'), $4::uuid)",
+    )
+    .bind(&run_id2)
+    .bind(&token2)
+    .bind(origin)
+    .bind(&true_vol)
+    .execute(&mut *open_tx_aborted)
+    .await
+    .unwrap();
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(dead_pid)
+        .fetch_one(&mut f.db.admin().await)
+        .await
+        .unwrap();
+    assert!(terminated);
+    assert!(
+        dead_tx_pin.commit().await.is_err(),
+        "terminated tx_pin backend must fail commit"
+    );
+    drop(open_tx_aborted);
+    assert!(
+        !gate(&f.db).await.0,
+        "rolling back open_tx after tx_pin commit failure must leave gate closed"
+    );
 
     // 5. Storage-disabled deployment (`store = None`) opens cleanly with `p_expected_volume_id = NULL`.
     let disabled_db = TestDb::migrated().await;
@@ -2648,6 +2817,110 @@ async fn live_purge_stage_a_holds_restore_gate_share_lock_and_stops_when_closed(
     );
     assert_eq!(state(&f.db, &p.revision).await.0, "purged");
     assert!(!payload_path.exists());
+
+    // Review #3 P2 #5 regression: live `detach` for a `state = 'purged',
+    // purge_stage = 'anchor_pending_unlink'` revision also calls `restore_gate_lock_open()`
+    // before `lock_pin`, leaving `.purge.<reservation>` intact while the gate is closed and
+    // serializing with `restore_gate_lock` while open.
+    let pa = f.payload("anchor-gated", b"anchor-payload").await;
+    step(&f.db.0, &f.c.scope, &pa.revision, Step::Retain)
+        .await
+        .unwrap();
+    sleep_past_grace().await;
+    for s in [Step::Claim, Step::Confirm] {
+        step(&f.db.0, &f.c.scope, &pa.revision, s).await.unwrap();
+    }
+    let pa_rev_path = f.root.join("revisions").join(&pa.reservation);
+    let pa_anchor_path = f
+        .root
+        .join("revisions")
+        .join(format!(".purge.{}", pa.reservation));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&pa_rev_path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    fs::rename(&pa_rev_path, &pa_anchor_path).unwrap();
+    let purge_stage = async |rev: &str| -> String {
+        sqlx::query_scalar(
+            "SELECT purge_stage FROM openmettle.artifact_revisions WHERE id = $1::uuid",
+        )
+        .bind(rev)
+        .fetch_one(&mut f.db.admin().await)
+        .await
+        .unwrap()
+    };
+    assert_eq!(purge_stage(&pa.revision).await, "anchor_pending_unlink");
+
+    let (head_seq, head_digest): (i64, String) = sqlx::query_as(
+        "SELECT journal_seq, encode(chain_digest, 'hex') FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&owner)
+    .await
+    .unwrap();
+    restore::lock(&owner, origin, head_seq, &head_digest, true, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &f.store, 10).await.unwrap(),
+        0
+    );
+    assert!(
+        pa_anchor_path.exists(),
+        "live detach must not unlink .purge.<res> while restore gate is closed"
+    );
+    assert_eq!(purge_stage(&pa.revision).await, "anchor_pending_unlink");
+
+    // Reopen the gate, pause live `detach` on `storage_volume_control FOR SHARE` right after it
+    // acquires `restore_gate_lock_open()` (`FOR SHARE`), and verify `restore_gate_lock` blocks on
+    // the live `detach` transaction until `detach` finishes and commits.
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open(
+                    c.restore_run_id,
+                    c.volume_claim_token,
+                    $1,
+                    $2,
+                    decode($3, 'hex'),
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                )
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex')) c",
+    )
+    .bind(origin)
+    .bind(head_seq)
+    .bind(&head_digest)
+    .execute(&owner)
+    .await
+    .unwrap();
+
+    let mut vol_conn = connect(&f.db.0, OWNER).await;
+    let vol_holder = pid(&mut vol_conn).await;
+    let mut vol_tx = vol_conn.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.storage_volume_control WHERE id FOR UPDATE")
+        .execute(&mut *vol_tx)
+        .await
+        .unwrap();
+
+    let detaching = tokio::spawn({
+        let worker = worker.clone();
+        let store = f.store.clone();
+        async move { artifact_fs::purge_due(&worker, &store, 10).await }
+    });
+    let detach_pid = waiter_on(&f.db, vol_holder).await;
+
+    let relocking = tokio::spawn({
+        let owner = owner.clone();
+        let head_digest = head_digest.clone();
+        async move { restore::lock(&owner, origin, head_seq, &head_digest, true, None, true).await }
+    });
+    wait_for_blocked_peer(&f.db, detach_pid).await;
+
+    vol_tx.rollback().await.unwrap();
+    assert_eq!(detaching.await.unwrap().unwrap(), 0);
+    relocking.await.unwrap().unwrap();
+    assert!(!pa_anchor_path.exists());
+    assert_eq!(purge_stage(&pa.revision).await, "none");
+    assert!(!gate(&f.db).await.0);
 }
 
 /// Review #2 P2 #6 regression: an unrelated file (distinct inode) at `staging/<reservation_id>`

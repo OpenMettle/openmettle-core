@@ -3,7 +3,7 @@
 pub mod adoption;
 mod drift;
 pub use drift::{Drift, verify_accounting_drift};
-pub(crate) use drift::{verify_ledgers_on, verify_volume_with_lease};
+pub(crate) use drift::{verify_ledgers_on, verify_volume_on};
 pub mod rebind;
 mod reclaim;
 mod spill;

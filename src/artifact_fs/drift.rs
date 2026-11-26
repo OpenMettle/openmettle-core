@@ -1,6 +1,7 @@
 //! Read-only verification of the SQL ledgers and their current directory entries.
 use super::*;
 use rustix::fs::Dir;
+use std::time::Instant;
 
 #[derive(Debug, Default)]
 pub struct Drift {
@@ -159,35 +160,25 @@ pub(super) async fn verify_volume(
 }
 
 /// Restore-phase volume and ledger drift verification on a connection holding
-/// `storage_volume_control FOR SHARE`, renewing the restore volume-phase lease on `pool` every
-/// page (100 reservations) and every 100 directory entries so large healthy volumes never outlive
-/// the lease.
-pub(crate) async fn verify_volume_with_lease(
+/// `storage_volume_control FOR SHARE`. Yields cooperatively whenever synchronous per-row or
+/// directory-entry checks run for `yield_interval` so a concurrent lease-renewal heartbeat on a
+/// second connection can extend the restore volume-phase lease on time.
+pub(crate) async fn verify_volume_on(
     c: &mut PgConnection,
-    pool: &PgPool,
     store: &Store,
     pin: &str,
-    restore_run_id: &str,
-    claim_token: &str,
+    yield_interval: Duration,
 ) -> Result<Drift, Error> {
-    verify_volume_inner(
-        c,
-        &store.volume,
-        pin,
-        Some((pool, restore_run_id, claim_token)),
-    )
-    .await
+    verify_volume_inner(c, &store.volume, pin, Some(yield_interval)).await
 }
 
 async fn verify_volume_inner(
     c: &mut PgConnection,
     v: &Volume,
     pin: &str,
-    lease: Option<(&PgPool, &str, &str)>,
+    yield_interval: Option<Duration>,
 ) -> Result<Drift, Error> {
-    if let Some((pool, run_id, token)) = lease {
-        reclaim::renew_volume_phase(pool, run_id, token).await?;
-    }
+    let mut last_yield = Instant::now();
     let mut report = ledgers(c).await?;
     let by_id = sqlx::AssertSqlSafe(format!("{INVENTORY} WHERE s.id=$1::uuid"));
     let paged = sqlx::AssertSqlSafe(format!(
@@ -195,9 +186,6 @@ async fn verify_volume_inner(
     ));
     let mut cursor: Option<String> = None;
     loop {
-        if let Some((pool, run_id, token)) = lease {
-            reclaim::renew_volume_phase(pool, run_id, token).await?;
-        }
         let page = sqlx::query(sqlx::AssertSqlSafe(paged.0.as_str()))
             .bind(&cursor)
             .fetch_all(&mut *c)
@@ -206,6 +194,12 @@ async fn verify_volume_inner(
             break;
         }
         for row in page {
+            if let Some(interval) = yield_interval
+                && last_yield.elapsed() >= interval
+            {
+                last_yield = Instant::now();
+                tokio::task::yield_now().await;
+            }
             let id: String = row.get("id");
             cursor = Some(id.clone());
             if row.get::<bool, _>("adoption_unverified") {
@@ -232,14 +226,13 @@ async fn verify_volume_inner(
             }
         }
     }
-    let mut scanned_entries = 0usize;
     for (dir, anchor) in [(&v.revisions, ".purge."), (&v.staging, ".reclaim.")] {
         for entry in Dir::read_from(dir)? {
-            scanned_entries += 1;
-            if scanned_entries.is_multiple_of(100)
-                && let Some((pool, run_id, token)) = lease
+            if let Some(interval) = yield_interval
+                && last_yield.elapsed() >= interval
             {
-                reclaim::renew_volume_phase(pool, run_id, token).await?;
+                last_yield = Instant::now();
+                tokio::task::yield_now().await;
             }
             let entry = entry?;
             let Ok(name) = entry.file_name().to_str() else {
@@ -264,9 +257,6 @@ async fn verify_volume_inner(
                 report.files += 1;
             }
         }
-    }
-    if let Some((pool, run_id, token)) = lease {
-        reclaim::renew_volume_phase(pool, run_id, token).await?;
     }
     v.verify(pin)?;
     Ok(report)

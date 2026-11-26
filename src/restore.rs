@@ -25,10 +25,12 @@ use crate::{
     runs::{self, digest},
 };
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
-use std::fmt::Write;
+use std::{fmt::Write, future::Future, time::Duration};
 
 const HEADER: &str = "openmettle.deletion_journal.export/1";
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// Heartbeat renewal period during drift verification (well inside the 300 s volume-phase lease).
+const VOLUME_PHASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Strict 64-character lowercase hexadecimal SHA-256 digest check.
 pub fn is_valid_digest(s: &str) -> bool {
@@ -471,6 +473,20 @@ async fn claim_volume_phase(pool: &PgPool, export: &Export) -> Result<(String, S
     Ok(lease)
 }
 
+async fn renew_volume_phase(
+    pool: &PgPool,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = read_committed(pool).await?;
+    sqlx::query("SELECT openmettle.restore_renew_volume_phase($1::uuid, $2::uuid)")
+        .bind(restore_run_id)
+        .bind(claim_token)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
 async fn release_volume_phase(
     pool: &PgPool,
     restore_run_id: &str,
@@ -485,6 +501,40 @@ async fn release_volume_phase(
     tx.commit().await
 }
 
+/// Runs `fut` (which must use only Connection 1 and filesystem I/O, never `pool`) while renewing
+/// the restore volume-phase lease on `pool` (Connection 2) up front, on every elapsed
+/// `renew_interval` tick, and once on completion. Because `fut` never borrows from `pool`, a
+/// 2-connection pool never contends with itself even while long SQL queries run on Connection 1.
+async fn with_volume_phase_heartbeat<T, F>(
+    pool: &PgPool,
+    restore_run_id: &str,
+    claim_token: &str,
+    renew_interval: Duration,
+    fut: F,
+) -> Result<T, Error>
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    renew_volume_phase(pool, restore_run_id, claim_token).await?;
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + renew_interval, renew_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            _ = ticker.tick() => {
+                renew_volume_phase(pool, restore_run_id, claim_token).await?;
+            }
+            res = &mut fut => {
+                let out = res?;
+                renew_volume_phase(pool, restore_run_id, claim_token).await?;
+                return Ok(out);
+            }
+        }
+    }
+}
+
 async fn finish_claimed(
     pool: &PgPool,
     store: Option<&Store>,
@@ -492,6 +542,7 @@ async fn finish_claimed(
     adopting: bool,
     restore_run_id: &str,
     claim_token: &str,
+    renew_interval: Duration,
 ) -> Result<(), Error> {
     if let Some(store) = store {
         if store.awaits_rebind() {
@@ -522,8 +573,11 @@ async fn finish_claimed(
         }
     }
     // Hold `storage_volume_control FOR SHARE` continuously on Connection 1 across drift
-    // verification and until AFTER `restore_gate_open` commits on Connection 2, serializing with
-    // any concurrent `storage rebind` / `storage adopt` / auto-pin.
+    // verification and until Connection 2 (`open_tx`) has executed `restore_gate_open` (which
+    // itself locks `restore_reconciliation_gate FOR UPDATE` and `storage_volume_control FOR
+    // SHARE`). Commit `tx_pin` BEFORE committing `open_tx` so if `tx_pin`'s backend died after
+    // verification (releasing its share lock early), `tx_pin.commit()` fails and `open_tx` rolls
+    // back leaving the restore gate closed.
     let mut tx_pin = read_committed(pool).await?;
     sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
         .execute(&mut *tx_pin)
@@ -538,6 +592,7 @@ async fn finish_claimed(
     )
     .fetch_one(&mut *tx_pin)
     .await?;
+    let yield_interval = (renew_interval / 2).max(Duration::from_millis(1));
     let expected_volume_id: Option<String> = if let Some(store) = store {
         if adopting_now {
             sqlx::query("SELECT openmettle.storage_lock_pinned_volume()")
@@ -559,25 +614,19 @@ async fn finish_claimed(
         if vol.as_deref() != Some(pin.as_str()) {
             return Err(Error::Storage(artifact_fs::Error::Io));
         }
-        let drift = match artifact_fs::verify_volume_with_lease(
-            &mut tx_pin,
-            pool,
-            store,
-            &pin,
-            restore_run_id,
-            claim_token,
-        )
-        .await
-        {
-            Ok(drift) => drift,
-            Err(err) => {
-                return Err(if store.awaits_rebind() {
-                    Error::RebindRequired
-                } else {
-                    err.into()
-                });
-            }
-        };
+        let drift =
+            with_volume_phase_heartbeat(pool, restore_run_id, claim_token, renew_interval, async {
+                artifact_fs::verify_volume_on(&mut tx_pin, store, &pin, yield_interval)
+                    .await
+                    .map_err(|err| {
+                        if store.awaits_rebind() {
+                            Error::RebindRequired
+                        } else {
+                            err.into()
+                        }
+                    })
+            })
+            .await?;
         if !drift.healthy() || drift.unsettled_payloads != 0 {
             return Err(Error::Drift);
         }
@@ -589,7 +638,13 @@ async fn finish_claimed(
         if has_rows {
             return Err(Error::Storage(artifact_fs::Error::Io));
         }
-        let drift = artifact_fs::verify_ledgers_on(&mut tx_pin).await?;
+        let drift =
+            with_volume_phase_heartbeat(pool, restore_run_id, claim_token, renew_interval, async {
+                artifact_fs::verify_ledgers_on(&mut tx_pin)
+                    .await
+                    .map_err(Error::from)
+            })
+            .await?;
         if !drift.healthy() {
             return Err(Error::Drift);
         }
@@ -607,8 +662,8 @@ async fn finish_claimed(
     .bind(expected_volume_id.as_deref())
     .execute(&mut *open_tx)
     .await?;
-    open_tx.commit().await?;
     tx_pin.commit().await?;
+    open_tx.commit().await?;
     Ok(())
 }
 
@@ -616,10 +671,23 @@ async fn finish_claimed(
 /// committed: refuses concurrent volume phases (`OMR02`), unrebound copied volumes
 /// (`RebindRequired`), and active adoption/rebind barriers (`OMQ03`), purges resurrected payloads
 /// of replayed revisions, scrubs unsettled uploads that cannot survive a restore, verifies the
-/// volume and ledgers with zero unsettled payloads, and opens the gate if migration 41's checks
-/// pass. On any clean error after claiming the lease, releases the caller's own lease before
-/// returning so operator repair and retry proceed immediately.
+/// volume and ledgers with zero unsettled payloads while renewing the lease on a heartbeat, and
+/// opens the gate if migration 41's checks pass. On any clean error after claiming the lease,
+/// releases the caller's own lease before returning so operator repair and retry proceed
+/// immediately.
 pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Result<(), Error> {
+    finish_with_heartbeat(pool, store, export, VOLUME_PHASE_HEARTBEAT_INTERVAL).await
+}
+
+/// [`finish`] with an explicit lease-renewal heartbeat interval for deterministic lease-crossing
+/// tests.
+#[doc(hidden)]
+pub async fn finish_with_heartbeat(
+    pool: &PgPool,
+    store: Option<&Store>,
+    export: &Export,
+    renew_interval: Duration,
+) -> Result<(), Error> {
     let (pinned, adopting): (bool, bool) = sqlx::query_as(
         "SELECT volume_id IS NOT NULL, adoption_run_id IS NOT NULL
            FROM openmettle.storage_volume_control WHERE id",
@@ -630,7 +698,16 @@ pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Re
         return Err(Error::ArtifactRootRequired);
     }
     let (restore_run_id, claim_token) = claim_volume_phase(pool, export).await?;
-    let result = finish_claimed(pool, store, export, adopting, &restore_run_id, &claim_token).await;
+    let result = finish_claimed(
+        pool,
+        store,
+        export,
+        adopting,
+        &restore_run_id,
+        &claim_token,
+        renew_interval,
+    )
+    .await;
     if result.is_err() {
         let _ = release_volume_phase(pool, &restore_run_id, &claim_token).await;
     }

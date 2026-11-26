@@ -51,7 +51,11 @@ fn anchor(
     dir: &File,
     anchor: &str,
     ino: u64,
+    deadline: Option<Instant>,
 ) -> Result<(), Error> {
+    if let Some(deadline) = deadline {
+        check_fence(deadline)?;
+    }
     match at::linkat(source, name, dir, anchor, AtFlags::empty()) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
@@ -178,7 +182,7 @@ pub(super) async fn release(
             };
             file.set_len(0)?;
             file.sync_all()?;
-            anchor(v, dir, src, &v.staging, &name, ino)?;
+            anchor(v, dir, src, &v.staging, &name, ino, None)?;
             if r.is_some() {
                 v.unlink(&v.revisions, id, ino)?;
             }
@@ -206,7 +210,7 @@ pub(super) async fn release(
         renew(pool, &pin, id, &token, ino, true, false).await?;
         v.verify(&pin)?;
         v.matches(&file, &v.staging, id, ino)?;
-        anchor(v, &v.staging, id, &v.staging, &name, ino)?;
+        anchor(v, &v.staging, id, &v.staging, &name, ino, None)?;
         v.unlink(&v.staging, id, ino)?;
         claim_ino = Some(ino);
         locked = Some(file);
@@ -311,7 +315,7 @@ async fn assert_volume_phase(
     Ok(())
 }
 
-pub(super) async fn renew_volume_phase(
+async fn renew_volume_phase(
     pool: &PgPool,
     restore_run_id: &str,
     claim_token: &str,
@@ -360,9 +364,12 @@ async fn detach(
     }
     if let Some((restore_run_id, claim_token)) = phase {
         assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
+    } else if purge && !crate::restore::lock_open_gate(tx.connection()?).await? {
+        return Ok(());
     }
-    lock_pin(&mut tx, pin).await?;
     let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+    lock_pin(&mut tx, pin).await?;
+    check_fence(fence_deadline)?;
     let v = &store.volume;
     v.verify(pin)?;
     let (dir, name) = if purge {
@@ -372,8 +379,7 @@ async fn detach(
     };
     if v.inode(dir, &name)?.is_some() {
         let _guard = lock_file(v, dir, &name, ino, true)?;
-        check_fence(fence_deadline)?;
-        v.unlink(dir, &name, ino)?;
+        v.unlink_before(dir, &name, ino, fence_deadline)?;
     }
     at::fsync(dir)?;
     sqlx::query(clear)
@@ -445,8 +451,9 @@ async fn purge_one(
     } else if !crate::restore::lock_open_gate(stage_a.connection()?).await? {
         return Ok(false);
     }
-    lock_pin(&mut stage_a, pin).await?;
     let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+    lock_pin(&mut stage_a, pin).await?;
+    check_fence(fence_deadline)?;
     v.verify(pin)?;
     v.matches(&f, &v.revisions, src, ino)?;
     let a_now = v.inode(&v.revisions, &name)?;
@@ -464,15 +471,20 @@ async fn purge_one(
     check_fence(fence_deadline)?;
     f.set_len(0)?;
     f.sync_all()?;
-    check_fence(fence_deadline)?;
-    anchor(v, &v.revisions, src, &v.revisions, &name, ino)?;
+    anchor(
+        v,
+        &v.revisions,
+        src,
+        &v.revisions,
+        &name,
+        ino,
+        Some(fence_deadline),
+    )?;
     if r_now == Some(ino) {
-        check_fence(fence_deadline)?;
-        v.unlink(&v.revisions, reservation, ino)?;
+        v.unlink_before(&v.revisions, reservation, ino, fence_deadline)?;
     }
     if s_now == Some(ino) {
-        check_fence(fence_deadline)?;
-        v.unlink(&v.staging, reservation, ino)?;
+        v.unlink_before(&v.staging, reservation, ino, fence_deadline)?;
     }
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;
@@ -948,8 +960,9 @@ pub async fn scrub_unsettled_on_restore(
                         return Err(Error::Io);
                     }
                     assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
-                    lock_pin(&mut tx, &pin).await?;
                     let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+                    lock_pin(&mut tx, &pin).await?;
+                    check_fence(fence_deadline)?;
 
                     v.verify(&pin)?;
                     v.matches(&file, dir, src, ino)?;
@@ -981,8 +994,7 @@ pub async fn scrub_unsettled_on_restore(
                             // existed) so the surviving staged entry is durable first.
                             at::fsync(&v.staging)?;
                             if r_now.is_some() {
-                                check_fence(fence_deadline)?;
-                                v.unlink(&v.revisions, &id, ino)?;
+                                v.unlink_before(&v.revisions, &id, ino, fence_deadline)?;
                                 mutated = true;
                             }
                             at::fsync(&v.revisions)?;
@@ -1011,15 +1023,20 @@ pub async fn scrub_unsettled_on_restore(
                                 file.set_len(0)?;
                             }
                             file.sync_all()?;
-                            check_fence(fence_deadline)?;
-                            anchor(v, dir, src, &v.staging, &reclaim_name, ino)?;
+                            anchor(
+                                v,
+                                dir,
+                                src,
+                                &v.staging,
+                                &reclaim_name,
+                                ino,
+                                Some(fence_deadline),
+                            )?;
                             if r_now.is_some() {
-                                check_fence(fence_deadline)?;
-                                v.unlink(&v.revisions, &id, ino)?;
+                                v.unlink_before(&v.revisions, &id, ino, fence_deadline)?;
                             }
                             if s_now.is_some() {
-                                check_fence(fence_deadline)?;
-                                v.unlink(&v.staging, &id, ino)?;
+                                v.unlink_before(&v.staging, &id, ino, fence_deadline)?;
                             }
                             at::fsync(&v.revisions)?;
                             at::fsync(&v.staging)?;
