@@ -246,6 +246,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "declare lost artifact payload",
         sql: include_str!("../migrations/0044_declare_lost_artifact_payload.sql"),
     },
+    Source {
+        version: 45,
+        description: "maintenance backup coordination",
+        sql: include_str!("../migrations/0045_maintenance_backup_coordination.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

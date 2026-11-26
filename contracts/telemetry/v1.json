@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 476,
-    "max_prometheus_series_per_process": 1204,
+    "max_data_point_streams": 480,
+    "max_prometheus_series_per_process": 1208,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -375,10 +375,20 @@
           "timeout"
         ]
       }
+    },
+    {
+      "name": "openmettle.backup.runs",
+      "prometheus_name": "openmettle_backup_runs_total",
+      "kind": "counter",
+      "unit": "{run}",
+      "semantics": "coordinated_backup_outcomes_and_rpo_overdue_observations",
+      "max_series": 4,
+      "labels": {
+        "outcome": ["succeeded", "failed", "incomplete", "overdue"]
+      }
     }
   ],
   "reserved_signals": [
-    {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"},
-    {"name": "openmettle.backup.runs", "owner_ticket": "V1-30", "status": "planned"}
+    {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"}
   ]
 }

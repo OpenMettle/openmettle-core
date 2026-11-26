@@ -509,6 +509,7 @@ const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
 const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000","lifecycle_baseline_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
 const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_lifecycle_origin_us":null,"snapshot_lifecycle_baseline_digest":null,"required_lifecycle_origin_us":null,"required_lifecycle_baseline_digest":null,"replayed_lifecycle_baseline_digest":null,"snapshot_connection_origin_us":null,"required_connection_origin_us":null,"connection_gap_reconciled":false,"gate_generation":1,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
+const BACKUP_MAINTENANCE_GATE_SEED: &str = r#"{"id":true,"maintenance_active":false,"backup_run_id":null,"entered_at":null,"entered_by_operator_id":null,"reason":null,"quiesced_at":null,"rpo_target_seconds":86400,"rpo_tracking_armed_at":null,"last_overdue_observed_at":null}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -1286,6 +1287,18 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "external_connection_shares",
         seed_row: None,
     },
+    AdditiveTable {
+        since: 45,
+        dropped_in: None,
+        table: "backup_runs",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 45,
+        dropped_in: None,
+        table: "backup_maintenance_gate",
+        seed_row: Some(BACKUP_MAINTENANCE_GATE_SEED),
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1473,6 +1486,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "3d6e5c6d44cb3ee77cbcf26dc77e4ca5d460bfc658a17d5c48307b067fcdd6d6",
         "82f67b5f5f67e12ccf95aab4b82777412c2262c860e45bb76194db2459fb164e",
         "9bdbe2c9c78885ec7b507df84aee23160194f3bb842aef0ebf3ac2612c8cf19a",
+        "dcde0891dc1ebd378771bed001780078d53a35beaf2ad2ee6f0d2dbafacd9987",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1619,7 +1633,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 48);
+    assert_eq!(after_14.len(), 50);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1685,6 +1699,11 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("retention_upgrade_baseline", None),
             ("external_connections", None),
             ("external_connection_shares", None),
+            ("backup_runs", None),
+            (
+                "backup_maintenance_gate",
+                Some(BACKUP_MAINTENANCE_GATE_SEED)
+            ),
         ]
     );
 
@@ -3326,3 +3345,6 @@ mod family_policy;
 
 #[path = "schema/vault.rs"]
 mod vault;
+
+#[path = "schema/backup.rs"]
+mod backup;

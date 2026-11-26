@@ -1499,6 +1499,7 @@ pub async fn cancel_run(
     uuid(run_id, "run_id")?;
     transaction(c, async |c| {
         crate::restore::require_open_gate(c).await?;
+        crate::backup::require_open_maintenance(c).await?;
         let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(LOCK_RUN)
             .bind(scope_id)
             .bind(run_id)
@@ -1765,9 +1766,11 @@ pub async fn claim_next(
         sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
             .execute(&mut *c)
             .await?;
-        // ADR 0041: lock the restore reconciliation gate FOR SHARE inside the claim transaction so
-        // no run can be claimed once a restore closes the gate, even after waiting above.
-        if !crate::restore::lock_open_gate(&mut *c).await? {
+        // ADR 0041 & ADR 0046: lock the restore gate and maintenance gate FOR SHARE inside the
+        // claim transaction so no run is claimed once restore or maintenance closes admission.
+        if !crate::restore::lock_open_gate(&mut *c).await?
+            || !crate::backup::lock_open_maintenance(&mut *c).await?
+        {
             return Ok(None);
         }
         let has_quota_rules: bool = if has_quota_schema(c).await? {

@@ -70,3 +70,16 @@ groups:
         annotations:
           summary: "OpenMettle storage or quota accounting drift detected"
           description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+
+      - alert: OpenMettleBackupFailedOrOverdue
+        expr: |
+          sum by (outcome) (increase(openmettle_backup_runs_total{outcome=~"failed|incomplete|overdue"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: openmettle-worker
+          component: backup
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle coordinated backup failed, incomplete, or overdue"
+          description: "Coordinated maintenance-window backup capture reported a failed or incomplete run, or exceeded its configured RPO target."

@@ -11,6 +11,7 @@ pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
 pub mod authz;
+pub mod backup;
 pub mod browser_auth;
 pub mod capabilities;
 pub mod capacity;

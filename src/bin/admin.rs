@@ -8,10 +8,19 @@ use openmettle_core::{
         gateway::family,
         store::{StoreError, WriteOutcome},
     },
+    backup::{
+        self, CaptureOptions, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_LEASE_SECONDS, GraphitiMode,
+        archive::GfsPolicy, crypto::BackupKeyRing,
+    },
     restore, vault,
 };
 use sqlx::{Connection, PgConnection, PgPool};
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 const REBIND_FIRST: &str = "the artifact volume was restored by file copy and is not rebound; run `openmettle-admin storage rebind` first";
 
@@ -505,6 +514,9 @@ async fn run() -> Result<(), &'static str> {
     if command.0.as_deref() == Some("vault") {
         return vault_command(command.1.as_deref(), &args.collect::<Vec<_>>()).await;
     }
+    if command.0.as_deref() == Some("backup") {
+        return backup_command(command.1.as_deref(), &args.collect::<Vec<_>>()).await;
+    }
     if command.0.as_deref() == Some("family") {
         let mut family_args = Vec::new();
         if let Some(sub) = command.1 {
@@ -621,7 +633,7 @@ async fn run() -> Result<(), &'static str> {
         || (command.1.as_deref() != Some("adopt") && !rebinding && !declaring_lost)
     {
         return Err(
-            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID] | storage declare-lost ROOT --revision UUID --operator-id UUID --request-key KEY --reason REASON | vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]",
+            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID] | storage declare-lost ROOT --revision UUID --operator-id UUID --request-key KEY --reason REASON | vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N] | backup status | backup enter-maintenance ... | backup release-maintenance ... | backup arm-rpo ... | backup capture ... | backup verify ... | backup unpack ... | backup prune ...",
         );
     }
     let root = args.next().ok_or("missing artifact directory")?;
@@ -1004,10 +1016,687 @@ async fn vault_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stati
     }
 }
 
+struct BackupAuditArgs {
+    operator_id: String,
+    request_key: String,
+    reason: String,
+    abort_active_run: bool,
+    rpo_seconds: Option<i32>,
+}
+
+fn parse_backup_audit_args(
+    args: &[String],
+    allow_abort: bool,
+    allow_rpo: bool,
+    usage: &'static str,
+) -> Result<BackupAuditArgs, &'static str> {
+    let mut operator_id = None;
+    let mut request_key = None;
+    let mut reason = None;
+    let mut abort_active_run = false;
+    let mut rpo_seconds = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--operator-id" => {
+                if operator_id.is_some() {
+                    return Err("duplicate --operator-id");
+                }
+                i += 1;
+                operator_id = Some(args.get(i).ok_or("missing --operator-id value")?.clone());
+            }
+            "--request-key" => {
+                if request_key.is_some() {
+                    return Err("duplicate --request-key");
+                }
+                i += 1;
+                request_key = Some(args.get(i).ok_or("missing --request-key value")?.clone());
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err("duplicate --reason");
+                }
+                i += 1;
+                reason = Some(args.get(i).ok_or("missing --reason value")?.clone());
+            }
+            "--abort-active-run" if allow_abort => {
+                if abort_active_run {
+                    return Err("duplicate --abort-active-run");
+                }
+                abort_active_run = true;
+            }
+            "--rpo-seconds" if allow_rpo => {
+                if rpo_seconds.is_some() {
+                    return Err("duplicate --rpo-seconds");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --rpo-seconds value")?;
+                let parsed: i32 = raw.parse().map_err(|_| "invalid --rpo-seconds")?;
+                if !(3600..=604_800).contains(&parsed) {
+                    return Err("invalid --rpo-seconds");
+                }
+                rpo_seconds = Some(parsed);
+            }
+            _ => return Err("unknown backup option"),
+        }
+        i += 1;
+    }
+    Ok(BackupAuditArgs {
+        operator_id: operator_id.ok_or(usage)?,
+        request_key: request_key.ok_or(usage)?,
+        reason: reason.ok_or(usage)?,
+        abort_active_run,
+        rpo_seconds,
+    })
+}
+
+struct BackupCaptureArgs {
+    destination_root: PathBuf,
+    destination_domain: String,
+    backup_keys_config: Option<PathBuf>,
+    artifact_root: Option<PathBuf>,
+    operator_id: String,
+    request_key: String,
+    reason: String,
+    drain_timeout_secs: u64,
+    require_separate_device: bool,
+    graphiti_mode: GraphitiMode,
+    config_files: Vec<(String, PathBuf)>,
+    keep_daily: usize,
+    keep_weekly: usize,
+    keep_monthly: usize,
+    no_prune: bool,
+    release_on_success: bool,
+}
+
+fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'static str> {
+    let usage = "usage: openmettle-admin backup capture --destination-root PATH --destination-domain DOMAIN [--backup-keys-config PATH] [--artifact-root PATH] --operator-id UUID --request-key KEY --reason REASON [--drain-timeout-secs N] [--require-separate-device] [--graphiti-mode not-provisioned|offline-dump] [--neo4j-dump PATH] [--config-file NAME=PATH]... [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--no-prune] [--release-on-success]";
+    let defaults = GfsPolicy::default();
+    let mut destination_root = None;
+    let mut destination_domain = None;
+    let mut backup_keys_config = None;
+    let mut artifact_root = None;
+    let mut operator_id = None;
+    let mut request_key = None;
+    let mut reason = None;
+    let mut drain_timeout_secs = None;
+    let mut require_separate_device = false;
+    let mut graphiti_mode_raw: Option<String> = None;
+    let mut neo4j_dump: Option<PathBuf> = None;
+    let mut config_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut keep_daily = None;
+    let mut keep_weekly = None;
+    let mut keep_monthly = None;
+    let mut no_prune = false;
+    let mut release_on_success = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--destination-root" => {
+                if destination_root.is_some() {
+                    return Err("duplicate --destination-root");
+                }
+                i += 1;
+                destination_root = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --destination-root value")?,
+                ));
+            }
+            "--destination-domain" => {
+                if destination_domain.is_some() {
+                    return Err("duplicate --destination-domain");
+                }
+                i += 1;
+                destination_domain = Some(
+                    args.get(i)
+                        .ok_or("missing --destination-domain value")?
+                        .clone(),
+                );
+            }
+            "--backup-keys-config" => {
+                if backup_keys_config.is_some() {
+                    return Err("duplicate --backup-keys-config");
+                }
+                i += 1;
+                backup_keys_config = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --backup-keys-config value")?,
+                ));
+            }
+            "--artifact-root" => {
+                if artifact_root.is_some() {
+                    return Err("duplicate --artifact-root");
+                }
+                i += 1;
+                artifact_root = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --artifact-root value")?,
+                ));
+            }
+            "--operator-id" => {
+                if operator_id.is_some() {
+                    return Err("duplicate --operator-id");
+                }
+                i += 1;
+                operator_id = Some(args.get(i).ok_or("missing --operator-id value")?.clone());
+            }
+            "--request-key" => {
+                if request_key.is_some() {
+                    return Err("duplicate --request-key");
+                }
+                i += 1;
+                request_key = Some(args.get(i).ok_or("missing --request-key value")?.clone());
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err("duplicate --reason");
+                }
+                i += 1;
+                reason = Some(args.get(i).ok_or("missing --reason value")?.clone());
+            }
+            "--drain-timeout-secs" => {
+                if drain_timeout_secs.is_some() {
+                    return Err("duplicate --drain-timeout-secs");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --drain-timeout-secs value")?;
+                let secs: u64 = raw.parse().map_err(|_| "invalid --drain-timeout-secs")?;
+                if secs == 0 || secs > 86_400 {
+                    return Err("invalid --drain-timeout-secs");
+                }
+                drain_timeout_secs = Some(secs);
+            }
+            "--require-separate-device" => {
+                if require_separate_device {
+                    return Err("duplicate --require-separate-device");
+                }
+                require_separate_device = true;
+            }
+            "--graphiti-mode" => {
+                if graphiti_mode_raw.is_some() {
+                    return Err("duplicate --graphiti-mode");
+                }
+                i += 1;
+                graphiti_mode_raw =
+                    Some(args.get(i).ok_or("missing --graphiti-mode value")?.clone());
+            }
+            "--neo4j-dump" => {
+                if neo4j_dump.is_some() {
+                    return Err("duplicate --neo4j-dump");
+                }
+                i += 1;
+                neo4j_dump = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --neo4j-dump value")?,
+                ));
+            }
+            "--config-file" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --config-file value")?;
+                let (name, path) = raw
+                    .split_once('=')
+                    .ok_or("--config-file must be formatted as NAME=PATH")?;
+                if name.is_empty() || path.is_empty() {
+                    return Err("--config-file must be formatted as NAME=PATH");
+                }
+                config_files.push((name.to_owned(), PathBuf::from(path)));
+            }
+            "--keep-daily" => {
+                if keep_daily.is_some() {
+                    return Err("duplicate --keep-daily");
+                }
+                i += 1;
+                keep_daily = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-daily value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-daily")?,
+                );
+            }
+            "--keep-weekly" => {
+                if keep_weekly.is_some() {
+                    return Err("duplicate --keep-weekly");
+                }
+                i += 1;
+                keep_weekly = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-weekly value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-weekly")?,
+                );
+            }
+            "--keep-monthly" => {
+                if keep_monthly.is_some() {
+                    return Err("duplicate --keep-monthly");
+                }
+                i += 1;
+                keep_monthly = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-monthly value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-monthly")?,
+                );
+            }
+            "--no-prune" => {
+                if no_prune {
+                    return Err("duplicate --no-prune");
+                }
+                no_prune = true;
+            }
+            "--release-on-success" => {
+                if release_on_success {
+                    return Err("duplicate --release-on-success");
+                }
+                release_on_success = true;
+            }
+            _ => return Err("unknown backup capture option"),
+        }
+        i += 1;
+    }
+
+    let graphiti_mode = match graphiti_mode_raw.as_deref().unwrap_or("not-provisioned") {
+        "not-provisioned" => {
+            if neo4j_dump.is_some() {
+                return Err("--neo4j-dump requires --graphiti-mode offline-dump");
+            }
+            GraphitiMode::NotProvisioned
+        }
+        "offline-dump" => {
+            let path =
+                neo4j_dump.ok_or("--graphiti-mode offline-dump requires --neo4j-dump PATH")?;
+            GraphitiMode::OfflineDump(path)
+        }
+        _ => return Err("--graphiti-mode must be not-provisioned or offline-dump"),
+    };
+
+    Ok(BackupCaptureArgs {
+        destination_root: destination_root.ok_or(usage)?,
+        destination_domain: destination_domain.ok_or(usage)?,
+        backup_keys_config,
+        artifact_root,
+        operator_id: operator_id.ok_or(usage)?,
+        request_key: request_key.ok_or(usage)?,
+        reason: reason.ok_or(usage)?,
+        drain_timeout_secs: drain_timeout_secs.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS),
+        require_separate_device,
+        graphiti_mode,
+        config_files,
+        keep_daily: keep_daily.unwrap_or(defaults.keep_daily),
+        keep_weekly: keep_weekly.unwrap_or(defaults.keep_weekly),
+        keep_monthly: keep_monthly.unwrap_or(defaults.keep_monthly),
+        no_prune,
+        release_on_success,
+    })
+}
+
+struct BackupVerifyUnpackArgs {
+    backup_dir: PathBuf,
+    output_dir: Option<PathBuf>,
+    backup_keys_config: Option<PathBuf>,
+}
+
+fn parse_backup_verify_unpack_args(
+    args: &[String],
+    require_output_dir: bool,
+) -> Result<BackupVerifyUnpackArgs, &'static str> {
+    let usage = if require_output_dir {
+        "usage: openmettle-admin backup unpack --backup-dir PATH --output-dir PATH [--backup-keys-config PATH]"
+    } else {
+        "usage: openmettle-admin backup verify --backup-dir PATH [--backup-keys-config PATH]"
+    };
+    let mut backup_dir = None;
+    let mut output_dir = None;
+    let mut backup_keys_config = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--backup-dir" => {
+                if backup_dir.is_some() {
+                    return Err("duplicate --backup-dir");
+                }
+                i += 1;
+                backup_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --backup-dir value")?,
+                ));
+            }
+            "--output-dir" if require_output_dir => {
+                if output_dir.is_some() {
+                    return Err("duplicate --output-dir");
+                }
+                i += 1;
+                output_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --output-dir value")?,
+                ));
+            }
+            "--backup-keys-config" => {
+                if backup_keys_config.is_some() {
+                    return Err("duplicate --backup-keys-config");
+                }
+                i += 1;
+                backup_keys_config = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --backup-keys-config value")?,
+                ));
+            }
+            _ => return Err("unknown backup option"),
+        }
+        i += 1;
+    }
+    Ok(BackupVerifyUnpackArgs {
+        backup_dir: backup_dir.ok_or(usage)?,
+        output_dir: if require_output_dir {
+            Some(output_dir.ok_or(usage)?)
+        } else {
+            None
+        },
+        backup_keys_config,
+    })
+}
+
+struct BackupPruneArgs {
+    destination_root: PathBuf,
+    policy: GfsPolicy,
+    dry_run: bool,
+}
+
+fn parse_backup_prune_args(args: &[String]) -> Result<BackupPruneArgs, &'static str> {
+    let usage = "usage: openmettle-admin backup prune --destination-root PATH [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--dry-run]";
+    let defaults = GfsPolicy::default();
+    let mut destination_root = None;
+    let mut keep_daily = None;
+    let mut keep_weekly = None;
+    let mut keep_monthly = None;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--destination-root" => {
+                if destination_root.is_some() {
+                    return Err("duplicate --destination-root");
+                }
+                i += 1;
+                destination_root = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --destination-root value")?,
+                ));
+            }
+            "--keep-daily" => {
+                if keep_daily.is_some() {
+                    return Err("duplicate --keep-daily");
+                }
+                i += 1;
+                keep_daily = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-daily value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-daily")?,
+                );
+            }
+            "--keep-weekly" => {
+                if keep_weekly.is_some() {
+                    return Err("duplicate --keep-weekly");
+                }
+                i += 1;
+                keep_weekly = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-weekly value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-weekly")?,
+                );
+            }
+            "--keep-monthly" => {
+                if keep_monthly.is_some() {
+                    return Err("duplicate --keep-monthly");
+                }
+                i += 1;
+                keep_monthly = Some(
+                    args.get(i)
+                        .ok_or("missing --keep-monthly value")?
+                        .parse()
+                        .map_err(|_| "invalid --keep-monthly")?,
+                );
+            }
+            "--dry-run" => {
+                if dry_run {
+                    return Err("duplicate --dry-run");
+                }
+                dry_run = true;
+            }
+            _ => return Err("unknown backup prune option"),
+        }
+        i += 1;
+    }
+    let policy = GfsPolicy {
+        keep_daily: keep_daily.unwrap_or(defaults.keep_daily),
+        keep_weekly: keep_weekly.unwrap_or(defaults.keep_weekly),
+        keep_monthly: keep_monthly.unwrap_or(defaults.keep_monthly),
+    };
+    policy
+        .validate()
+        .map_err(|_| "invalid GFS retention policy")?;
+    Ok(BackupPruneArgs {
+        destination_root: destination_root.ok_or(usage)?,
+        policy,
+        dry_run,
+    })
+}
+
+fn load_backup_keyring(explicit: Option<&Path>) -> Result<BackupKeyRing, &'static str> {
+    let path = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(env::var("OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG").map_err(
+            |_| "--backup-keys-config or OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG is required",
+        )?),
+    };
+    BackupKeyRing::load_from_config(&path).map_err(|err| {
+        eprintln!("backup keys: {err}");
+        "backup keyring configuration invalid"
+    })
+}
+
+fn report_backup_error(step: &'static str) -> impl FnOnce(backup::BackupError) -> &'static str {
+    move |err| {
+        eprintln!("{step}: {err}");
+        match step {
+            "backup status" => "backup status failed",
+            "backup enter-maintenance" => "backup enter-maintenance failed",
+            "backup release-maintenance" => "backup release-maintenance failed",
+            "backup arm-rpo" => "backup arm-rpo failed",
+            "backup capture" => "backup capture failed",
+            "backup verify" => "backup verification failed",
+            "backup unpack" => "backup unpack failed",
+            _ => "backup prune failed",
+        }
+    }
+}
+
+async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'static str> {
+    match sub {
+        Some("status") => {
+            if !args.is_empty() {
+                return Err("usage: openmettle-admin backup status");
+            }
+            let st = backup::status(&pool(1).await?)
+                .await
+                .map_err(report_backup_error("backup status"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&st).map_err(|_| "backup status encode failed")?
+            );
+            Ok(())
+        }
+        Some("enter-maintenance") => {
+            let parsed = parse_backup_audit_args(
+                args,
+                false,
+                false,
+                "usage: openmettle-admin backup enter-maintenance --operator-id UUID --request-key KEY --reason REASON",
+            )?;
+            let (entered, entered_at) = backup::enter_maintenance(
+                &pool(1).await?,
+                &parsed.operator_id,
+                &parsed.request_key,
+                &parsed.reason,
+            )
+            .await
+            .map_err(report_backup_error("backup enter-maintenance"))?;
+            println!(
+                "{} backup.maintenance_entered entered_at={}",
+                if entered { "applied" } else { "replayed" },
+                entered_at.as_deref().unwrap_or("none")
+            );
+            Ok(())
+        }
+        Some("release-maintenance") => {
+            let parsed = parse_backup_audit_args(
+                args,
+                true,
+                false,
+                "usage: openmettle-admin backup release-maintenance --operator-id UUID --request-key KEY --reason REASON [--abort-active-run]",
+            )?;
+            let (released, aborted) = backup::release_maintenance(
+                &pool(1).await?,
+                &parsed.operator_id,
+                &parsed.request_key,
+                &parsed.reason,
+                parsed.abort_active_run,
+            )
+            .await
+            .map_err(report_backup_error("backup release-maintenance"))?;
+            println!(
+                "{} backup.maintenance_released aborted_run_id={}",
+                if released { "applied" } else { "replayed" },
+                aborted.as_deref().unwrap_or("none")
+            );
+            Ok(())
+        }
+        Some("arm-rpo") => {
+            let parsed = parse_backup_audit_args(
+                args,
+                false,
+                true,
+                "usage: openmettle-admin backup arm-rpo --operator-id UUID --request-key KEY --reason REASON [--rpo-seconds 86400]",
+            )?;
+            let rpo_seconds = parsed.rpo_seconds.unwrap_or(86_400);
+            let (target, armed_at) = backup::arm_rpo(
+                &pool(1).await?,
+                &parsed.operator_id,
+                &parsed.request_key,
+                &parsed.reason,
+                rpo_seconds,
+            )
+            .await
+            .map_err(report_backup_error("backup arm-rpo"))?;
+            println!("applied backup.rpo_armed rpo_target_seconds={target} armed_at={armed_at}");
+            Ok(())
+        }
+        Some("capture") => {
+            let parsed = parse_backup_capture_args(args)?;
+            let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
+            let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+                .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+            let db = pool(2).await?;
+            let prune_policy = if parsed.no_prune {
+                None
+            } else {
+                Some(GfsPolicy {
+                    keep_daily: parsed.keep_daily,
+                    keep_weekly: parsed.keep_weekly,
+                    keep_monthly: parsed.keep_monthly,
+                })
+            };
+            let report = backup::capture(
+                &db,
+                &keyring,
+                &CaptureOptions {
+                    database_url: url,
+                    destination_root: parsed.destination_root,
+                    destination_domain: parsed.destination_domain,
+                    artifact_root: parsed.artifact_root,
+                    operator_id: parsed.operator_id,
+                    request_key: parsed.request_key,
+                    reason: parsed.reason,
+                    drain_timeout: Duration::from_secs(parsed.drain_timeout_secs),
+                    lease_seconds: DEFAULT_LEASE_SECONDS,
+                    require_separate_device: parsed.require_separate_device,
+                    graphiti_mode: parsed.graphiti_mode,
+                    config_files: parsed.config_files,
+                    prune_policy,
+                    release_on_success: parsed.release_on_success,
+                    allow_local_test_paths: false,
+                },
+            )
+            .await
+            .map_err(report_backup_error("backup capture"))?;
+            println!(
+                "backup.capture_succeeded run_id={} dir={} key_id={} bundle_digest={} journal_seq={} pruned={} maintenance_released={}",
+                report.backup_run_id,
+                report.backup_dir.display(),
+                report.encryption_key_id,
+                report.bundle_digest,
+                report.journal_seq,
+                report.pruned.as_ref().map_or(0, |p| p.pruned.len()),
+                report.released_maintenance
+            );
+            Ok(())
+        }
+        Some("verify") => {
+            let parsed = parse_backup_verify_unpack_args(args, false)?;
+            let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
+            let manifest = backup::verify_backup(&parsed.backup_dir, &keyring)
+                .map_err(report_backup_error("backup verify"))?;
+            println!(
+                "backup.verified run_id={} schema={} key_id={} components={} journal_seq={} artifact_revisions={}",
+                manifest.backup_run_id,
+                manifest.schema_version,
+                manifest.encryption_key_id,
+                manifest.components.len(),
+                manifest.deletion_journal.journal_seq,
+                manifest.artifact_volume.revision_count
+            );
+            Ok(())
+        }
+        Some("unpack") => {
+            let parsed = parse_backup_verify_unpack_args(args, true)?;
+            let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
+            let report = backup::unpack_backup(
+                &parsed.backup_dir,
+                parsed.output_dir.as_deref().unwrap(),
+                &keyring,
+            )
+            .map_err(report_backup_error("backup unpack"))?;
+            println!(
+                "backup.unpacked run_id={} output={} artifact_revisions={} config_files={} neo4j_dump={}",
+                report.manifest.backup_run_id,
+                report.output_dir.display(),
+                report.artifact_summary.revision_count,
+                report.config_files_written,
+                report.has_neo4j_dump
+            );
+            Ok(())
+        }
+        Some("prune") => {
+            let parsed = parse_backup_prune_args(args)?;
+            let report = backup::prune(&parsed.destination_root, parsed.policy, parsed.dry_run)
+                .map_err(report_backup_error("backup prune"))?;
+            println!(
+                "backup.pruned dry_run={} kept={} pruned={}",
+                parsed.dry_run,
+                report.kept.len(),
+                report.pruned.len()
+            );
+            Ok(())
+        }
+        _ => Err(
+            "usage: openmettle-admin backup status | enter-maintenance ... | release-maintenance ... | arm-rpo ... | capture ... | verify ... | unpack ... | prune ...",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_declare_lost_args, parse_restore_lock_args, parse_restore_replay_args};
+    use super::{
+        GraphitiMode, parse_backup_audit_args, parse_backup_capture_args, parse_backup_prune_args,
+        parse_backup_verify_unpack_args, parse_declare_lost_args, parse_restore_lock_args,
+        parse_restore_replay_args,
+    };
     use openmettle_core::restore::GENESIS;
+    use std::path::PathBuf;
 
     fn vecs(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
@@ -1128,5 +1817,194 @@ mod tests {
             parse_restore_replay_args(&vecs(&["--unknown", "export.txt"])).err(),
             Some("unknown restore replay option")
         );
+    }
+
+    #[test]
+    fn backup_capture_parses_options_and_enforces_graphiti_and_config_rules() {
+        let parsed = parse_backup_capture_args(&vecs(&[
+            "--destination-root",
+            "/mnt/offhost-backups/openmettle",
+            "--destination-domain",
+            "nas-primary-rack2",
+            "--backup-keys-config",
+            "/etc/openmettle/backup-keys.json",
+            "--artifact-root",
+            "/var/lib/openmettle/artifacts",
+            "--operator-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--request-key",
+            "nightly-2026-11-26",
+            "--reason",
+            "scheduled nightly backup",
+            "--drain-timeout-secs",
+            "180",
+            "--require-separate-device",
+            "--graphiti-mode",
+            "offline-dump",
+            "--neo4j-dump",
+            "/var/backups/neo4j/graphiti.dump",
+            "--config-file",
+            "catalog.json=/etc/openmettle/catalog.json",
+            "--config-file",
+            "inference.json=/etc/openmettle/inference.json",
+            "--keep-daily",
+            "7",
+            "--keep-weekly",
+            "4",
+            "--keep-monthly",
+            "3",
+            "--release-on-success",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.destination_root,
+            PathBuf::from("/mnt/offhost-backups/openmettle")
+        );
+        assert_eq!(parsed.destination_domain, "nas-primary-rack2");
+        assert_eq!(parsed.drain_timeout_secs, 180);
+        assert!(parsed.require_separate_device);
+        assert_eq!(
+            parsed.graphiti_mode,
+            GraphitiMode::OfflineDump(PathBuf::from("/var/backups/neo4j/graphiti.dump"))
+        );
+        assert_eq!(parsed.config_files.len(), 2);
+        assert!(parsed.release_on_success);
+        assert!(!parsed.no_prune);
+
+        // offline-dump without --neo4j-dump is refused.
+        assert_eq!(
+            parse_backup_capture_args(&vecs(&[
+                "--destination-root",
+                "/mnt/backups",
+                "--destination-domain",
+                "offhost",
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "k1",
+                "--reason",
+                "r1",
+                "--graphiti-mode",
+                "offline-dump",
+            ]))
+            .err(),
+            Some("--graphiti-mode offline-dump requires --neo4j-dump PATH")
+        );
+
+        // --neo4j-dump without offline-dump is refused.
+        assert_eq!(
+            parse_backup_capture_args(&vecs(&[
+                "--destination-root",
+                "/mnt/backups",
+                "--destination-domain",
+                "offhost",
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "k1",
+                "--reason",
+                "r1",
+                "--neo4j-dump",
+                "/var/backups/neo4j.dump",
+            ]))
+            .err(),
+            Some("--neo4j-dump requires --graphiti-mode offline-dump")
+        );
+
+        // Malformed --config-file is refused.
+        assert_eq!(
+            parse_backup_capture_args(&vecs(&[
+                "--destination-root",
+                "/mnt/backups",
+                "--destination-domain",
+                "offhost",
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "k1",
+                "--reason",
+                "r1",
+                "--config-file",
+                "missing-equals",
+            ]))
+            .err(),
+            Some("--config-file must be formatted as NAME=PATH")
+        );
+    }
+
+    #[test]
+    fn backup_audit_verify_unpack_and_prune_parsers_validate_flags() {
+        let rel = parse_backup_audit_args(
+            &vecs(&[
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "rel-1",
+                "--reason",
+                "recover stuck maintenance",
+                "--abort-active-run",
+            ]),
+            true,
+            false,
+            "usage",
+        )
+        .unwrap();
+        assert!(rel.abort_active_run);
+
+        let rpo = parse_backup_audit_args(
+            &vecs(&[
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "arm-1",
+                "--reason",
+                "arm nightly 24h RPO",
+                "--rpo-seconds",
+                "86400",
+            ]),
+            false,
+            true,
+            "usage",
+        )
+        .unwrap();
+        assert_eq!(rpo.rpo_seconds, Some(86_400));
+
+        assert_eq!(
+            parse_backup_audit_args(&vecs(&["--rpo-seconds", "60"]), false, true, "usage").err(),
+            Some("invalid --rpo-seconds")
+        );
+
+        let verify = parse_backup_verify_unpack_args(
+            &vecs(&["--backup-dir", "/mnt/backups/backup-1"]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(verify.backup_dir, PathBuf::from("/mnt/backups/backup-1"));
+        assert!(verify.output_dir.is_none());
+
+        assert!(
+            parse_backup_verify_unpack_args(
+                &vecs(&["--backup-dir", "/mnt/backups/backup-1"]),
+                true,
+            )
+            .is_err()
+        );
+
+        let prune = parse_backup_prune_args(&vecs(&[
+            "--destination-root",
+            "/mnt/backups",
+            "--keep-daily",
+            "7",
+            "--keep-weekly",
+            "4",
+            "--keep-monthly",
+            "3",
+            "--dry-run",
+        ]))
+        .unwrap();
+        assert!(prune.dry_run);
+        assert_eq!(prune.policy.keep_daily, 7);
+        assert_eq!(prune.policy.keep_weekly, 4);
+        assert_eq!(prune.policy.keep_monthly, 3);
     }
 }

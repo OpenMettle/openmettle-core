@@ -1223,7 +1223,7 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
             .iter()
             .map(|row| {
                 let mut value: serde_json::Value = serde_json::from_str(row).unwrap();
-                if entry.table == "quota_defaults" {
+                if entry.table == "quota_defaults" || entry.table == "backup_maintenance_gate" {
                     assert!(
                         value
                             .as_object_mut()

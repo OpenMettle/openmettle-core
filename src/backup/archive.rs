@@ -1,0 +1,1052 @@
+//! Generic PVC POSIX artifact archive (`OMART01`), destination/config hygiene, and GFS
+//! retention pruning (`7 daily, 4 weekly, 3 monthly` default) for ADR 0046.
+
+use super::crypto::{KeyRingPaths, file_dev_ino};
+use crate::runs;
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use rustix::fs::{self as at, AtFlags, FileType, Mode, OFlags};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt, fs,
+    io::{self, Read, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
+
+pub const ARTIFACT_ARCHIVE_MAGIC: &[u8; 8] = b"OMART01\0";
+const ENTRY_FILE: u8 = 0x01;
+const ENTRY_END: u8 = 0x00;
+const VOLUME_SENTINEL: &str = ".openmettle-volume-id";
+const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
+const COPY_BUF_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub enum ArchiveError {
+    Invalid(&'static str),
+    Integrity(&'static str),
+    Io(io::Error),
+}
+
+impl fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(msg) => f.write_str(msg),
+            Self::Integrity(msg) => f.write_str(msg),
+            Self::Io(_) => f.write_str("backup archive filesystem I/O error"),
+        }
+    }
+}
+
+impl std::error::Error for ArchiveError {}
+
+impl From<io::Error> for ArchiveError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<rustix::io::Errno> for ArchiveError {
+    fn from(e: rustix::io::Errno) -> Self {
+        Self::Io(e.into())
+    }
+}
+
+/// Settled artifact revision row expected on disk during quiesced backup capture.
+#[derive(Clone, Debug)]
+pub struct SettledArtifactRecord {
+    pub revision_id: String,
+    pub reservation_id: String,
+    pub state: String,
+    pub size_bytes: i64,
+    pub content_digest: [u8; 32],
+    pub payload_ino: Option<u64>,
+}
+
+/// Summary of an archived `OMART01` generic PVC artifact stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactArchiveSummary {
+    pub volume_id: Option<String>,
+    pub revision_count: u64,
+    pub payload_bytes: u64,
+}
+
+/// Open a directory descriptor without following symlinks and with `O_CLOEXEC`.
+fn open_dir_nofollow(
+    parent: impl std::os::fd::AsFd,
+    path: &Path,
+) -> Result<fs::File, ArchiveError> {
+    let fd = at::openat(
+        parent,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok(fs::File::from(fd))
+}
+
+fn read_volume_sentinel(
+    dir: &fs::File,
+    expected_dev: u64,
+    expected_role: &str,
+) -> Result<String, ArchiveError> {
+    let fd = at::openat(
+        dir,
+        VOLUME_SENTINEL,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ArchiveError::Integrity("artifact volume sentinel missing or unreadable"))?;
+    let f = fs::File::from(fd);
+    let m = f.metadata()?;
+    if !m.is_file() || m.dev() != expected_dev || (m.mode() & 0o777) != 0o600 || m.len() > 64 {
+        return Err(ArchiveError::Integrity("artifact volume sentinel invalid"));
+    }
+    let mut text = String::new();
+    f.take(64).read_to_string(&mut text)?;
+    let id = text
+        .strip_suffix(&format!(":{expected_role}\n"))
+        .ok_or(ArchiveError::Integrity(
+            "artifact volume sentinel malformed",
+        ))?;
+    runs::uuid(id).map_err(|_| ArchiveError::Integrity("artifact volume sentinel invalid UUID"))?;
+    Ok(id.to_owned())
+}
+
+/// Stream every settled artifact payload from `artifact_root` (generic POSIX PVC file copy,
+/// zero CSI snapshot assumptions) into `writer` in deterministic `OMART01` format, verifying
+/// `.openmettle-volume-id`, `O_NOFOLLOW`, single hard link (`nlink == 1`), `payload_ino`, exact
+/// `size_bytes`, and live SHA-256 `content_digest` against PostgreSQL metadata.
+pub fn write_artifact_archive(
+    artifact_root: Option<&Path>,
+    pinned_volume_id: Option<&str>,
+    records: &[SettledArtifactRecord],
+    writer: &mut dyn Write,
+) -> Result<ArtifactArchiveSummary, ArchiveError> {
+    writer.write_all(ARTIFACT_ARCHIVE_MAGIC)?;
+
+    let Some(root_path) = artifact_root else {
+        if pinned_volume_id.is_some() || !records.is_empty() {
+            return Err(ArchiveError::Invalid(
+                "--artifact-root is required when the artifact storage volume is pinned",
+            ));
+        }
+        writer.write_all(&[0u8])?; // has_volume_id = false
+        writer.write_all(&[ENTRY_END])?;
+        writer.flush()?;
+        return Ok(ArtifactArchiveSummary {
+            volume_id: None,
+            revision_count: 0,
+            payload_bytes: 0,
+        });
+    };
+
+    if !root_path.is_absolute() {
+        return Err(ArchiveError::Invalid("artifact root must be absolute"));
+    }
+    let root_dir = open_dir_nofollow(at::CWD, root_path)?;
+    let root_dev = root_dir.metadata()?.dev();
+    let staging_dir = open_dir_nofollow(&root_dir, Path::new("staging"))?;
+    let revisions_dir = open_dir_nofollow(&root_dir, Path::new("revisions"))?;
+    if staging_dir.metadata()?.dev() != root_dev || revisions_dir.metadata()?.dev() != root_dev {
+        return Err(ArchiveError::Integrity(
+            "artifact subdirectories reside on another device",
+        ));
+    }
+
+    let volume_id = match pinned_volume_id {
+        Some(expected) => {
+            for (dir, role) in [
+                (&root_dir, "root"),
+                (&staging_dir, "staging"),
+                (&revisions_dir, "revisions"),
+            ] {
+                if read_volume_sentinel(dir, root_dev, role)? != expected {
+                    return Err(ArchiveError::Integrity(
+                        "artifact volume sentinel does not match PostgreSQL volume pin",
+                    ));
+                }
+            }
+            Some(expected.to_owned())
+        }
+        None => None,
+    };
+
+    // Ensure staging contains no live unsettled payload files after drain.
+    for entry in at::Dir::read_from(&staging_dir)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| ArchiveError::Integrity("non-UTF-8 entry in staging directory"))?;
+        if matches!(name, "." | ".." | VOLUME_SENTINEL) {
+            continue;
+        }
+        return Err(ArchiveError::Integrity(
+            "unexpected file remains in artifact staging directory after drain",
+        ));
+    }
+
+    // Write volume_id header.
+    match &volume_id {
+        Some(vid) => {
+            writer.write_all(&[1u8])?;
+            write_u16_str(writer, vid)?;
+        }
+        None => writer.write_all(&[0u8])?,
+    }
+
+    let mut expected_names = BTreeSet::new();
+    let mut sorted: Vec<&SettledArtifactRecord> = records.iter().collect();
+    sorted.sort_by(|a, b| a.reservation_id.cmp(&b.reservation_id));
+
+    let mut buf = vec![0u8; COPY_BUF_BYTES];
+    let mut total_bytes: u64 = 0;
+
+    for rec in &sorted {
+        if rec.size_bytes < 0 {
+            return Err(ArchiveError::Integrity("negative artifact revision size"));
+        }
+        runs::uuid(&rec.reservation_id)
+            .map_err(|_| ArchiveError::Integrity("invalid reservation UUID"))?;
+        runs::uuid(&rec.revision_id)
+            .map_err(|_| ArchiveError::Integrity("invalid revision UUID"))?;
+        expected_names.insert(rec.reservation_id.as_str());
+
+        let stat = at::statat(
+            &revisions_dir,
+            rec.reservation_id.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| ArchiveError::Integrity("settled artifact payload missing on disk"))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(ArchiveError::Integrity(
+                "settled artifact entry is not a regular file",
+            ));
+        }
+        let fd = at::openat(
+            &revisions_dir,
+            rec.reservation_id.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| ArchiveError::Integrity("settled artifact payload unreadable"))?;
+        let mut file = fs::File::from(fd);
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.dev() != root_dev || meta.ino() != stat.st_ino {
+            return Err(ArchiveError::Integrity(
+                "artifact payload identity mismatch",
+            ));
+        }
+        if meta.nlink() != 1 {
+            return Err(ArchiveError::Integrity(
+                "artifact payload has foreign or extra hard links",
+            ));
+        }
+        if let Some(bound_ino) = rec.payload_ino
+            && meta.ino() != bound_ino
+        {
+            return Err(ArchiveError::Integrity(
+                "artifact payload inode does not match PostgreSQL ledger",
+            ));
+        }
+        let expected_size = rec.size_bytes as u64;
+        if meta.len() != expected_size {
+            return Err(ArchiveError::Integrity(
+                "artifact payload size does not match PostgreSQL ledger",
+            ));
+        }
+
+        writer.write_all(&[ENTRY_FILE])?;
+        write_u16_str(writer, &rec.reservation_id)?;
+        write_u16_str(writer, &rec.revision_id)?;
+        write_u16_str(writer, &rec.state)?;
+        writer.write_all(&rec.content_digest)?;
+        writer.write_all(&expected_size.to_be_bytes())?;
+
+        let mut hasher = Sha256::new();
+        let mut copied: u64 = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            writer.write_all(&buf[..n])?;
+            copied = copied
+                .checked_add(n as u64)
+                .ok_or(ArchiveError::Integrity("artifact byte count overflow"))?;
+        }
+        let computed: [u8; 32] = hasher.finalize().into();
+        if copied != expected_size || computed != rec.content_digest {
+            return Err(ArchiveError::Integrity(
+                "artifact payload SHA-256 or byte count failed verification during backup capture",
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(copied)
+            .ok_or(ArchiveError::Integrity("total artifact bytes overflow"))?;
+    }
+
+    // Verify no stray files exist in `revisions/`.
+    for entry in at::Dir::read_from(&revisions_dir)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| ArchiveError::Integrity("non-UTF-8 entry in revisions directory"))?;
+        if matches!(name, "." | ".." | VOLUME_SENTINEL) {
+            continue;
+        }
+        if !expected_names.contains(name) {
+            return Err(ArchiveError::Integrity(
+                "unexpected unmanaged file in artifact revisions directory",
+            ));
+        }
+    }
+
+    writer.write_all(&[ENTRY_END])?;
+    writer.flush()?;
+    Ok(ArtifactArchiveSummary {
+        volume_id,
+        revision_count: sorted.len() as u64,
+        payload_bytes: total_bytes,
+    })
+}
+
+/// Unpack a decrypted `OMART01` stream into `artifacts_dir` (`0700` dirs, `0600` files),
+/// recreating `.openmettle-volume-id` sentinels and every verified `revisions/<reservation_id>`
+/// file so `openmettle-admin storage rebind` and `restore replay` can consume it directly.
+pub fn unpack_artifact_archive(
+    reader: &mut dyn Read,
+    artifacts_dir: &Path,
+) -> Result<ArtifactArchiveSummary, ArchiveError> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != ARTIFACT_ARCHIVE_MAGIC {
+        return Err(ArchiveError::Integrity(
+            "invalid OMART01 artifact archive magic",
+        ));
+    }
+
+    let mut has_vol = [0u8; 1];
+    reader.read_exact(&mut has_vol)?;
+    let volume_id = match has_vol[0] {
+        0 => None,
+        1 => {
+            let vid = read_u16_str(reader, 64)?;
+            runs::uuid(&vid)
+                .map_err(|_| ArchiveError::Integrity("invalid volume UUID in archive"))?;
+            Some(vid)
+        }
+        _ => return Err(ArchiveError::Integrity("invalid OMART01 volume flag")),
+    };
+
+    create_dir_0700(artifacts_dir)?;
+    let staging_dir = artifacts_dir.join("staging");
+    let revisions_dir = artifacts_dir.join("revisions");
+    create_dir_0700(&staging_dir)?;
+    create_dir_0700(&revisions_dir)?;
+
+    if let Some(vid) = &volume_id {
+        for (dir, role) in [
+            (artifacts_dir, "root"),
+            (staging_dir.as_path(), "staging"),
+            (revisions_dir.as_path(), "revisions"),
+        ] {
+            write_file_0600(
+                &dir.join(VOLUME_SENTINEL),
+                format!("{vid}:{role}\n").as_bytes(),
+            )?;
+        }
+    }
+
+    let mut seen_names = BTreeSet::new();
+    let mut buf = vec![0u8; COPY_BUF_BYTES];
+    let mut revision_count: u64 = 0;
+    let mut payload_bytes: u64 = 0;
+
+    loop {
+        let mut kind = [0u8; 1];
+        reader.read_exact(&mut kind)?;
+        match kind[0] {
+            ENTRY_END => {
+                let mut trailing = [0u8; 1];
+                if reader.read(&mut trailing)? != 0 {
+                    return Err(ArchiveError::Integrity(
+                        "unexpected trailing bytes in OMART01 archive",
+                    ));
+                }
+                break;
+            }
+            ENTRY_FILE => {
+                let reservation_id = read_u16_str(reader, 64)?;
+                let revision_id = read_u16_str(reader, 64)?;
+                let state = read_u16_str(reader, 32)?;
+                runs::uuid(&reservation_id)
+                    .map_err(|_| ArchiveError::Integrity("invalid reservation UUID in archive"))?;
+                runs::uuid(&revision_id)
+                    .map_err(|_| ArchiveError::Integrity("invalid revision UUID in archive"))?;
+                if !matches!(state.as_str(), "active" | "retained" | "purging") {
+                    return Err(ArchiveError::Integrity("invalid revision state in archive"));
+                }
+                if !seen_names.insert(reservation_id.clone()) {
+                    return Err(ArchiveError::Integrity(
+                        "duplicate reservation entry in OMART01 archive",
+                    ));
+                }
+                let mut expected_sha = [0u8; 32];
+                reader.read_exact(&mut expected_sha)?;
+                let mut size_buf = [0u8; 8];
+                reader.read_exact(&mut size_buf)?;
+                let size_bytes = u64::from_be_bytes(size_buf);
+
+                let dest_path = revisions_dir.join(&reservation_id);
+                let mut out = open_new_file_0600(&dest_path)?;
+                let mut hasher = Sha256::new();
+                let mut remaining = size_bytes;
+                while remaining > 0 {
+                    let want = (remaining as usize).min(buf.len());
+                    reader.read_exact(&mut buf[..want])?;
+                    hasher.update(&buf[..want]);
+                    out.write_all(&buf[..want])?;
+                    remaining -= want as u64;
+                }
+                out.sync_all()?;
+                let computed: [u8; 32] = hasher.finalize().into();
+                if computed != expected_sha {
+                    return Err(ArchiveError::Integrity(
+                        "unpacked artifact payload failed SHA-256 verification",
+                    ));
+                }
+                revision_count += 1;
+                payload_bytes = payload_bytes
+                    .checked_add(size_bytes)
+                    .ok_or(ArchiveError::Integrity("unpacked artifact byte overflow"))?;
+            }
+            _ => return Err(ArchiveError::Integrity("unknown OMART01 entry tag")),
+        }
+    }
+
+    fsync_dir(&revisions_dir)?;
+    fsync_dir(&staging_dir)?;
+    fsync_dir(artifacts_dir)?;
+
+    Ok(ArtifactArchiveSummary {
+        volume_id,
+        revision_count,
+        payload_bytes,
+    })
+}
+
+fn write_u16_str(writer: &mut dyn Write, s: &str) -> Result<(), ArchiveError> {
+    let len =
+        u16::try_from(s.len()).map_err(|_| ArchiveError::Invalid("archive field too long"))?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+fn read_u16_str(reader: &mut dyn Read, max_len: usize) -> Result<String, ArchiveError> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact(&mut len_buf)?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > max_len {
+        return Err(ArchiveError::Integrity("invalid archive string length"));
+    }
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| ArchiveError::Integrity("non-UTF-8 archive field"))
+}
+
+pub(crate) fn create_dir_0700(path: &Path) -> Result<(), ArchiveError> {
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub(crate) fn open_new_file_0600(path: &Path) -> Result<fs::File, ArchiveError> {
+    let parent = path
+        .parent()
+        .ok_or(ArchiveError::Invalid("file path missing parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(ArchiveError::Invalid("file path missing file name"))?;
+    let dir = open_dir_nofollow(at::CWD, parent)?;
+    let fd = at::openat(
+        &dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    Ok(fs::File::from(fd))
+}
+
+pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), ArchiveError> {
+    let mut f = open_new_file_0600(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn fsync_dir(path: &Path) -> Result<(), ArchiveError> {
+    let dir = open_dir_nofollow(at::CWD, path)?;
+    at::fsync(&dir)?;
+    Ok(())
+}
+
+// --- destination & non-secret config-file hygiene ---------------------------------------------
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+fn is_inside_git_workspace(path: &Path) -> bool {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        cur = dir.parent();
+    }
+    false
+}
+
+fn is_temp_location(canon: &Path) -> bool {
+    let mut forbidden = vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var/tmp"),
+        PathBuf::from("/private/var/tmp"),
+    ];
+    if let Ok(tmpdir) = std::env::var("TMPDIR")
+        && !tmpdir.is_empty()
+    {
+        forbidden.push(PathBuf::from(&tmpdir));
+        if let Ok(c) = fs::canonicalize(&tmpdir) {
+            forbidden.push(c);
+        }
+    }
+    forbidden.into_iter().any(|t| {
+        let tc = fs::canonicalize(&t).unwrap_or(t);
+        canon == tc || canon.starts_with(&tc)
+    })
+}
+
+/// Validate destination root isolation (off-workstation mount hygiene, distinct from
+/// `ARTIFACTS_DIR` and key directories, optional separate mount device check).
+pub fn validate_destination_root(
+    dest_root: &Path,
+    artifact_root: Option<&Path>,
+    keyring_paths: &KeyRingPaths,
+    require_separate_device: bool,
+    allow_local_test_paths: bool,
+) -> Result<PathBuf, ArchiveError> {
+    if !dest_root.is_absolute() {
+        return Err(ArchiveError::Invalid("--destination-root must be absolute"));
+    }
+    let sym = fs::symlink_metadata(dest_root)
+        .map_err(|_| ArchiveError::Invalid("--destination-root does not exist"))?;
+    if sym.file_type().is_symlink() || !sym.is_dir() {
+        return Err(ArchiveError::Invalid(
+            "--destination-root must be an existing non-symlink directory",
+        ));
+    }
+    let dest_canon = fs::canonicalize(dest_root)
+        .map_err(|_| ArchiveError::Invalid("--destination-root could not be canonicalized"))?;
+    let dest_meta = fs::metadata(&dest_canon)?;
+
+    if !allow_local_test_paths {
+        if is_temp_location(&dest_canon) {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must not lie under TMPDIR, /tmp, or /var/tmp",
+            ));
+        }
+        if is_inside_git_workspace(&dest_canon) {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must not lie inside a git workspace",
+            ));
+        }
+    }
+
+    if let Some(art) = artifact_root {
+        let art_canon = fs::canonicalize(art)
+            .map_err(|_| ArchiveError::Invalid("--artifact-root could not be canonicalized"))?;
+        let art_meta = fs::metadata(&art_canon)?;
+        if paths_overlap(&dest_canon, &art_canon)
+            || (dest_meta.dev(), dest_meta.ino()) == (art_meta.dev(), art_meta.ino())
+        {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must be distinct from --artifact-root",
+            ));
+        }
+        if require_separate_device && dest_meta.dev() == art_meta.dev() {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must reside on a separate storage device from --artifact-root",
+            ));
+        }
+    }
+
+    // Refuse overlap with backup keyring config or key files.
+    for key_path in keyring_paths
+        .config_path
+        .iter()
+        .chain(keyring_paths.key_files.iter())
+    {
+        if let Ok(kc) = fs::canonicalize(key_path)
+            && let Some(kdir) = kc.parent()
+            && paths_overlap(&dest_canon, kdir)
+        {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must not overlap backup key custody directory",
+            ));
+        }
+    }
+
+    Ok(dest_canon)
+}
+
+/// Validated non-secret config entry bundled into `config.json.enc`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundledConfigFile {
+    pub name: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub content_utf8: String,
+}
+
+fn valid_config_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn contains_forbidden_secret_material(text: &str) -> bool {
+    if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
+        return true;
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text)
+        && json_looks_like_secret_material(&val)
+    {
+        return true;
+    }
+    false
+}
+
+fn json_looks_like_secret_material(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Object(map) => {
+            // Refuse vault/backup keyring manifests or raw key/token fields.
+            if map.contains_key("active_key_id") && map.contains_key("keys") {
+                return true;
+            }
+            for (k, v) in map {
+                let lower = k.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "master_key"
+                        | "backup_key"
+                        | "vault_key"
+                        | "private_key"
+                        | "secret_key"
+                        | "access_token"
+                        | "refresh_token"
+                        | "client_secret"
+                        | "database_password"
+                        | "password"
+                ) {
+                    return true;
+                }
+                if json_looks_like_secret_material(v) {
+                    return true;
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_looks_like_secret_material),
+        _ => false,
+    }
+}
+
+/// Load and validate non-secret `--config-file NAME=PATH` entries, refusing backup/vault key
+/// files, private keys, and JSON objects holding vault/backup key material.
+pub fn load_non_secret_config_files(
+    specs: &[(String, PathBuf)],
+    keyring_paths: &KeyRingPaths,
+) -> Result<Vec<BundledConfigFile>, ArchiveError> {
+    let mut vault_inodes = BTreeSet::new();
+    for var in [
+        "OPENMETTLE_API_VAULT_KEYS_CONFIG",
+        "OPENMETTLE_WORKER_VAULT_KEYS_CONFIG",
+        "OPENMETTLE_ADMIN_VAULT_KEYS_CONFIG",
+        "VAULT_KEYS_CONFIG",
+    ] {
+        if let Ok(raw) = std::env::var(var)
+            && !raw.is_empty()
+        {
+            let p = Path::new(&raw);
+            if let Some(ino) = file_dev_ino(p) {
+                vault_inodes.insert(ino);
+            }
+            if let Ok(bytes) = fs::read(p)
+                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(keys) = val.get("keys").and_then(serde_json::Value::as_array)
+            {
+                for item in keys {
+                    if let Some(file) = item.get("file").and_then(serde_json::Value::as_str)
+                        && let Some(ino) = file_dev_ino(Path::new(file))
+                    {
+                        vault_inodes.insert(ino);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen_names = BTreeSet::new();
+    let mut out = Vec::with_capacity(specs.len());
+    for (name, path) in specs {
+        if !valid_config_name(name) || !seen_names.insert(name.as_str()) {
+            return Err(ArchiveError::Invalid(
+                "invalid or duplicate --config-file name",
+            ));
+        }
+        if !path.is_absolute() {
+            return Err(ArchiveError::Invalid("--config-file path must be absolute"));
+        }
+        let meta = fs::metadata(path)
+            .map_err(|_| ArchiveError::Invalid("--config-file path unreadable"))?;
+        if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES as u64 {
+            return Err(ArchiveError::Invalid(
+                "--config-file must be a regular file <= 1 MiB",
+            ));
+        }
+        let dev_ino = (meta.dev(), meta.ino());
+        if keyring_paths.protected_inodes.contains(&dev_ino) || vault_inodes.contains(&dev_ino) {
+            return Err(ArchiveError::Invalid(
+                "--config-file refuses vault or backup key files",
+            ));
+        }
+        let perm = meta.permissions().mode() & 0o777;
+        let bytes = fs::read(path)?;
+        if bytes.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(ArchiveError::Invalid("--config-file exceeds 1 MiB"));
+        }
+        // Refuse 32-byte raw binary key files or owner-only binary key files.
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ArchiveError::Invalid("--config-file must be UTF-8 non-secret configuration")
+        })?;
+        if contains_forbidden_secret_material(&text) {
+            return Err(ArchiveError::Invalid(
+                "--config-file appears to contain secret or key material",
+            ));
+        }
+        if matches!(perm, 0o400 | 0o600) && text.len() == 32 && !text.contains('\n') {
+            return Err(ArchiveError::Invalid(
+                "--config-file refuses 32-byte owner-only key-like files",
+            ));
+        }
+        let sha256 = crate::authz::projects::hex(&Sha256::digest(text.as_bytes()));
+        out.push(BundledConfigFile {
+            name: name.clone(),
+            sha256,
+            size_bytes: text.len() as u64,
+            content_utf8: text,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+// --- Unencrypted non-secret routing header (`backup-meta.json`) & GFS retention ---------------
+
+/// Unencrypted non-secret routing header stored beside encrypted `.enc` files so `backup prune`
+/// and `backup status` never require decrypting archives.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackupMeta {
+    pub format: String,
+    pub backup_run_id: String,
+    pub completed_at: String,
+    pub destination_domain: String,
+    pub encryption_key_id: String,
+    pub manifest_ciphertext_sha256: String,
+    pub bundle_digest: String,
+    pub state: String,
+}
+
+/// Grandfather-Father-Son retention counts (`7 daily, 4 weekly, 3 monthly` default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GfsPolicy {
+    pub keep_daily: usize,
+    pub keep_weekly: usize,
+    pub keep_monthly: usize,
+}
+
+impl Default for GfsPolicy {
+    fn default() -> Self {
+        Self {
+            keep_daily: 7,
+            keep_weekly: 4,
+            keep_monthly: 3,
+        }
+    }
+}
+
+impl GfsPolicy {
+    pub fn validate(self) -> Result<(), ArchiveError> {
+        if self.keep_daily == 0 || self.keep_weekly == 0 || self.keep_monthly == 0 {
+            return Err(ArchiveError::Invalid(
+                "GFS retention counts must each be at least 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupSetCandidate {
+    pub dir_name: String,
+    pub backup_run_id: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneReport {
+    pub kept: Vec<String>,
+    pub pruned: Vec<String>,
+}
+
+/// Deterministic GFS selector over verified complete backup sets.
+/// Always keeps the newest set unconditionally, plus the newest set from each of the most
+/// recent `keep_daily` distinct UTC dates, `keep_weekly` distinct ISO weeks, and `keep_monthly`
+/// distinct calendar months.
+pub fn select_gfs_retention(
+    candidates: &[BackupSetCandidate],
+    policy: GfsPolicy,
+) -> Result<(BTreeSet<String>, Vec<String>), ArchiveError> {
+    policy.validate()?;
+    let mut sorted: Vec<&BackupSetCandidate> = candidates.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.completed_at
+            .cmp(&a.completed_at)
+            .then_with(|| b.backup_run_id.cmp(&a.backup_run_id))
+            .then_with(|| b.dir_name.cmp(&a.dir_name))
+    });
+
+    let mut kept = BTreeSet::new();
+    let mut daily: BTreeMap<NaiveDate, &str> = BTreeMap::new();
+    let mut weekly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
+    let mut monthly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
+
+    for (idx, c) in sorted.iter().enumerate() {
+        if idx == 0 {
+            kept.insert(c.dir_name.clone());
+        }
+        let date = c.completed_at.date_naive();
+        if daily.len() < policy.keep_daily && !daily.contains_key(&date) {
+            daily.insert(date, &c.dir_name);
+            kept.insert(c.dir_name.clone());
+        }
+        let iso = date.iso_week();
+        let wk = (iso.year(), iso.week());
+        if weekly.len() < policy.keep_weekly && !weekly.contains_key(&wk) {
+            weekly.insert(wk, &c.dir_name);
+            kept.insert(c.dir_name.clone());
+        }
+        let mo = (date.year(), date.month());
+        if monthly.len() < policy.keep_monthly && !monthly.contains_key(&mo) {
+            monthly.insert(mo, &c.dir_name);
+            kept.insert(c.dir_name.clone());
+        }
+    }
+
+    let pruned: Vec<String> = sorted
+        .iter()
+        .filter(|c| !kept.contains(&c.dir_name))
+        .map(|c| c.dir_name.clone())
+        .collect();
+    Ok((kept, pruned))
+}
+
+/// Scan `dest_root` for verified complete `backup-*` sets (`backup-meta.json` with
+/// `state == "complete"`), compute GFS retention, and remove expired sets unless `dry_run`.
+pub fn prune_destination(
+    dest_root: &Path,
+    policy: GfsPolicy,
+    dry_run: bool,
+) -> Result<PruneReport, ArchiveError> {
+    policy.validate()?;
+    if !dest_root.is_absolute() || !dest_root.is_dir() {
+        return Err(ArchiveError::Invalid(
+            "--destination-root must be an existing absolute directory",
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(dest_root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("backup-") {
+            continue;
+        }
+        let meta_path = entry.path().join("backup-meta.json");
+        let Ok(meta_bytes) = fs::read(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice::<BackupMeta>(&meta_bytes) else {
+            continue;
+        };
+        if meta.state != "complete" || runs::uuid(&meta.backup_run_id).is_err() {
+            continue;
+        }
+        if !name.ends_with(&format!("-{}", meta.backup_run_id)) {
+            continue;
+        }
+        let Ok(completed_at) = DateTime::parse_from_rfc3339(&meta.completed_at) else {
+            continue;
+        };
+        candidates.push(BackupSetCandidate {
+            dir_name: name,
+            backup_run_id: meta.backup_run_id,
+            completed_at: completed_at.with_timezone(&Utc),
+        });
+    }
+
+    let (kept_set, pruned) = select_gfs_retention(&candidates, policy)?;
+    if !dry_run {
+        for dir_name in &pruned {
+            let target = dest_root.join(dir_name);
+            fs::remove_dir_all(&target)?;
+        }
+        if !pruned.is_empty() {
+            fsync_dir(dest_root)?;
+        }
+    }
+
+    let mut kept: Vec<String> = kept_set.into_iter().collect();
+    kept.sort();
+    Ok(PruneReport { kept, pruned })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cand(name: &str, y: i32, m: u32, d: u32, h: u32) -> BackupSetCandidate {
+        BackupSetCandidate {
+            dir_name: name.to_owned(),
+            backup_run_id: format!(
+                "00000000-0000-4000-8000-{:012}",
+                y as u64 * 10000 + m as u64 * 100 + d as u64 + h as u64 * 1000000
+            ),
+            completed_at: Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn gfs_retention_keeps_7_daily_4_weekly_3_monthly_and_newest_always() {
+        // Build 120 consecutive daily backups from 2026-08-01 through 2026-11-28.
+        let start = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let mut all = Vec::new();
+        for offset in 0..120 {
+            let date = start + chrono::Duration::days(offset);
+            all.push(cand(
+                &format!("backup-{}", date.format("%Y%m%d")),
+                date.year(),
+                date.month(),
+                date.day(),
+                2,
+            ));
+        }
+        // Add a second backup on the latest day; only the newer one occupies the daily slot.
+        let latest = start + chrono::Duration::days(119);
+        all.push(cand(
+            &format!("backup-{}-later", latest.format("%Y%m%d")),
+            latest.year(),
+            latest.month(),
+            latest.day(),
+            14,
+        ));
+
+        let (kept, pruned) = select_gfs_retention(&all, GfsPolicy::default()).unwrap();
+        assert!(kept.contains(&format!("backup-{}-later", latest.format("%Y%m%d"))));
+        assert!(!kept.contains(&format!("backup-{}", latest.format("%Y%m%d"))));
+        // 7 distinct daily dates, 4 distinct ISO weeks (some overlapping), 3 distinct months
+        // (Nov, Oct, Sep -> 2 extra beyond weekly): total kept must be strictly bounded and > 7.
+        assert!(kept.len() >= 10 && kept.len() <= 14, "kept={kept:?}");
+        assert_eq!(kept.len() + pruned.len(), all.len());
+        // Verify newest of September (2026-09-30) and October (2026-10-31) are retained.
+        assert!(kept.contains("backup-20261031"), "kept={kept:?}");
+        assert!(kept.contains("backup-20260930"), "kept={kept:?}");
+        // August (4th month back) must be pruned.
+        assert!(!kept.contains("backup-20260831"), "kept={kept:?}");
+    }
+
+    #[test]
+    fn destination_validation_rejects_tmp_and_git_workspace_when_strict() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            validate_destination_root(&cwd, None, &KeyRingPaths::default(), false, false).is_err()
+        );
+        let tmp = std::env::temp_dir();
+        assert!(
+            validate_destination_root(&tmp, None, &KeyRingPaths::default(), false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn config_loader_refuses_secret_json_and_private_keys() {
+        let dir = std::env::temp_dir().join(format!("om-backup-cfg-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("catalog.json");
+        fs::write(&good, r#"{"version":1,"models":["example"]}"#).unwrap();
+        let loaded = load_non_secret_config_files(
+            &[("catalog.json".into(), good.clone())],
+            &KeyRingPaths::default(),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+
+        let bad_ring = dir.join("keys.json");
+        fs::write(
+            &bad_ring,
+            r#"{"version":1,"active_key_id":"k1","keys":[{"id":"k1","file":"/etc/k"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            load_non_secret_config_files(
+                &[("keys.json".into(), bad_ring)],
+                &KeyRingPaths::default()
+            )
+            .is_err()
+        );
+
+        let bad_pem = dir.join("priv.txt");
+        fs::write(
+            &bad_pem,
+            "-----BEGIN EC PRIVATE KEY-----\nfake\n-----END EC PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        assert!(
+            load_non_secret_config_files(&[("priv.txt".into(), bad_pem)], &KeyRingPaths::default())
+                .is_err()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

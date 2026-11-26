@@ -1,6 +1,6 @@
 # Decision records
 
-## Index (0001–0045)
+## Index (0001–0046)
 
 | ADR | Title | Date |
 | --- | --- | --- |
@@ -49,6 +49,7 @@
 | [0043](docs/adr/0043-packaged-worker-inference-configuration.md) | Packaged worker inference configuration | 23 November 2026 |
 | [0044](docs/adr/0044-own-inference-proxy-and-binding-free-dispatch.md) | OpenMettle's own inference proxy and binding-free dispatch (supersedes ADRs 0037 and 0038 in part) | 23 November 2026 |
 | [0045](docs/adr/0045-credential-vault-and-external-connection-lifecycle.md) | Credential vault and external connection lifecycle | 26 November 2026 |
+| [0046](docs/adr/0046-maintenance-window-coordinated-backup-capture.md) | Maintenance-window coordinated backup capture | 26 November 2026 |
 
 ## 0001 — Repository bootstrap (16 November 2026)
 

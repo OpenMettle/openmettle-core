@@ -426,9 +426,12 @@ pub(crate) async fn maintenance(
             if !spills || !uploads {
                 sweep_failed(Sweep::Uploads);
             }
-            // ADR 0041: no purge sweep until a restore's journal replay opens the gate.
+            // ADR 0041 & ADR 0046: no purge sweep while restore gate is closed or maintenance is active.
             let open = timeout(Duration::from_secs(15), async {
-                crate::restore::gate_open(&mut *pool.acquire().await?).await
+                let mut conn = pool.acquire().await?;
+                let restore_open = crate::restore::gate_open(&mut conn).await?;
+                let maint_active = crate::backup::maintenance_active(&mut conn).await?;
+                Ok::<bool, sqlx::Error>(restore_open && !maint_active)
             })
             .await;
             let purged = match open {
@@ -440,6 +443,8 @@ pub(crate) async fn maintenance(
                 sweep_failed(Sweep::Retention);
             }
         }
+        // ADR 0046 / ADR 0028: observe completed/failed/expired backup runs and RPO overdue state.
+        let _ = sweep(crate::backup::observe_telemetry(pool)).await;
     }
 }
 
@@ -448,8 +453,10 @@ async fn claim(
     policy: RunPolicy,
 ) -> Result<Option<(ActiveRun, Instant, bool)>, StoreError> {
     let mut c = connection(pool).await?;
-    // ADR 0041: no run is claimed or reclaimed until a restore's journal replay opens the gate.
-    if !crate::restore::gate_open(&mut c).await? {
+    // ADR 0041 & ADR 0046: no run is claimed or reclaimed while restore is pending or maintenance is active.
+    if !crate::restore::gate_open(&mut c).await?
+        || crate::backup::maintenance_active(&mut c).await?
+    {
         return Ok(None);
     }
     let sent = Instant::now();

@@ -563,6 +563,34 @@ impl QuotaDriftOutcome {
     }
 }
 
+/// Closed outcome set for coordinated maintenance-window backups and RPO checks (ADR 0046).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupRunOutcome {
+    Succeeded,
+    Failed,
+    Incomplete,
+    Overdue,
+}
+
+impl BackupRunOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Succeeded,
+        Self::Failed,
+        Self::Incomplete,
+        Self::Overdue,
+    ];
+    pub const NAMES: &'static [&'static str] = &["succeeded", "failed", "incomplete", "overdue"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Instrument kind recorded in telemetry contract v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -859,6 +887,18 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.backup.runs",
+        prometheus_name: "openmettle_backup_runs_total",
+        kind: InstrumentKind::Counter,
+        unit: "{run}",
+        description: "Coordinated maintenance-window backup capture outcomes and RPO overdue observations.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: BackupRunOutcome::NAMES,
+        }],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -894,6 +934,7 @@ const CAPACITY_GRANT_SLOTS: usize = CapacityOperation::NAMES.len() * CapacityOut
 const CAPACITY_STALE_SLOTS: usize = CapacityStaleSurface::NAMES.len();
 const CAPACITY_WAIT_SLOTS: usize = CapacityWaitOutcome::NAMES.len();
 const QUOTA_DRIFT_SLOTS: usize = QuotaDriftOutcome::NAMES.len();
+const BACKUP_RUN_SLOTS: usize = BackupRunOutcome::NAMES.len();
 
 struct HistogramSlot {
     buckets: [AtomicU64; BUCKET_SLOTS],
@@ -953,6 +994,7 @@ pub struct Metrics {
     capacity_stale_observations: [AtomicU64; CAPACITY_STALE_SLOTS],
     capacity_wait_duration: [HistogramSlot; CAPACITY_WAIT_SLOTS],
     quota_drift: [AtomicU64; QUOTA_DRIFT_SLOTS],
+    backup_runs: [AtomicU64; BACKUP_RUN_SLOTS],
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -995,6 +1037,7 @@ impl Metrics {
             capacity_stale_observations: std::array::from_fn(|_| AtomicU64::new(0)),
             capacity_wait_duration: std::array::from_fn(|_| HistogramSlot::new()),
             quota_drift: std::array::from_fn(|_| AtomicU64::new(0)),
+            backup_runs: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -1082,6 +1125,16 @@ impl Metrics {
         if count > 0 {
             self.quota_drift[outcome.index()].fetch_add(count, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_backup_run(&self, outcome: BackupRunOutcome, count: u64) {
+        if count > 0 {
+            self.backup_runs[outcome.index()].fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    pub fn backup_run_count(&self, outcome: BackupRunOutcome) -> u64 {
+        self.backup_runs[outcome.index()].load(Ordering::Relaxed)
     }
 
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
@@ -1352,6 +1405,25 @@ impl Metrics {
             }
         }
         push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
+
+        // 16: openmettle.backup.runs
+        // Always emit all 4 closed outcome series (including 0) on `openmettle-worker` from startup
+        // so Prometheus records a zero baseline before any first backup failure, incomplete run,
+        // or RPO overdue observation; otherwise `increase(...[15m])` treats the first failure as
+        // a series appearance with zero increase. These 4 streams are counted in `max_series: 4`.
+        let mut backup_points = Vec::new();
+        for &outcome in BackupRunOutcome::ALL {
+            let value = self.backup_runs[outcome.index()].load(Ordering::Relaxed);
+            if value > 0 || role == Process::Worker {
+                backup_points.push(counter_point(
+                    start,
+                    now,
+                    value,
+                    &[("outcome", outcome.as_str())],
+                ));
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[16], backup_points);
 
         if metrics.is_empty() {
             return None;

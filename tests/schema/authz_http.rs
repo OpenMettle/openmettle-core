@@ -152,6 +152,10 @@ impl Api {
         self.dir
     }
 
+    pub(super) fn bind(&self) -> &str {
+        &self.bind
+    }
+
     /// The sorted file names in `staging` or `revisions`.
     fn files(&self, sub: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(Path::new(&self.dir.path("artifacts")).join(sub))
