@@ -196,6 +196,15 @@ impl TestDb {
             .unwrap();
         db
     }
+    /// Migrated database holding the exclusive cluster test lock so concurrent `CREATE DATABASE` /
+    /// `DROP DATABASE` forced checkpoints cannot stall tight lock-timeout barrier races.
+    async fn migrated_exclusive() -> Self {
+        let db = Self::exclusive().await;
+        migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+            .await
+            .unwrap();
+        db
+    }
     async fn admin(&self) -> PgConnection {
         admin(Some(&self.0)).await
     }
