@@ -1430,11 +1430,11 @@ pub struct ArtifactScope {
     pub project_id: Option<String>,
 }
 
-/// Decide `action` (`Read`, `Download` or `Write`) on one artifact for `principal`, hydrated by
-/// the caller for this request, with [`super::authorize_resource`] (ADR 0031). A missing
+/// Decide `action` (`Read`, `Download`, `Write` or `Delete`) on one artifact for `principal`, hydrated by
+/// the caller for this request, with [`super::authorize_resource`] (ADR 0031, ADR 0041). A missing
 /// artifact, one in a deleted project and one the caller may not read are concealed; a caller
 /// who may read but not write is refused with `Policy`. Reads stay available in an archived
-/// project; a write there is refused with [`ARCHIVED`] once the caller is authorized.
+/// project; a write or delete there is refused with [`ARCHIVED`] once the caller is authorized.
 /// `openmettle_api` only.
 pub async fn authorize_artifact(
     c: &mut PgConnection,
@@ -1455,10 +1455,255 @@ pub async fn authorize_artifact(
     };
     let resource = hydrate_located(c, ResourceKind::Artifact, artifact_id, located, now_ms).await?;
     check(super::authorize_resource(principal, &resource, action))?;
-    if archived && action == Action::Write {
+    if archived && matches!(action, Action::Write | Action::Delete) {
         return Err(ARCHIVED);
     }
     Ok(scope)
+}
+
+/// Shared transactional protocol for artifact disassociation and pre-expiry restore (ADR 0041):
+/// locks project (if project-scoped), actor approval and actor user in canonical order, re-hydrates
+/// the actor and artifact at post-lock `clock_timestamp()`, authorizes `action` (refusing deleted
+/// projects with `NotFound` and archived projects with `ARCHIVED`), executes `work`, and re-verifies
+/// live authorization immediately before commit. `openmettle_api` only.
+async fn artifact_write<T>(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    artifact_id: &str,
+    action: Action,
+    work: impl AsyncFnOnce(&mut WriteTransaction<'_>, &AuditContext<'_>, &str) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    uuid(artifact_id, "artifact_id")?;
+    transact(c, ctx, async |tx| {
+        let c = tx.connection()?;
+        let Some(located) = locate(c, ResourceKind::Artifact, artifact_id).await? else {
+            lock_actor_authority(c, ctx).await?;
+            post_lock_acting(c, ctx).await?;
+            return Err(CONCEALED);
+        };
+        let archived = match (&located.personal_owner, &located.project_id) {
+            (_, Some(project)) => match lock_project(c, project).await? {
+                Some(locked) if !locked.deleted => {
+                    lock_actor_authority(c, ctx).await?;
+                    locked.archived
+                }
+                _ => {
+                    lock_actor_authority(c, ctx).await?;
+                    post_lock_acting(c, ctx).await?;
+                    return Err(CONCEALED);
+                }
+            },
+            (Some(_), None) => {
+                lock_actor_authority(c, ctx).await?;
+                false
+            }
+            (None, None) => {
+                lock_actor_authority(c, ctx).await?;
+                post_lock_acting(c, ctx).await?;
+                return Err(CONCEALED);
+            }
+        };
+        let (actor, post_lock_ctx) = post_lock_acting(c, ctx).await?;
+        let scope = located.scope_id.clone();
+        let located_for_recheck = located.clone();
+        let resource = hydrate_located(
+            c,
+            ResourceKind::Artifact,
+            artifact_id,
+            located,
+            post_lock_ctx.now_ms,
+        )
+        .await?;
+        check(super::authorize_resource(&actor, &resource, action))?;
+        if archived {
+            return Err(ARCHIVED);
+        }
+        let result = work(tx, &post_lock_ctx, &scope).await?;
+        let c = tx.connection()?;
+        let (fresh_actor, fresh_ctx) = post_lock_acting(c, &post_lock_ctx).await?;
+        let fresh_resource = hydrate_located(
+            c,
+            ResourceKind::Artifact,
+            artifact_id,
+            located_for_recheck,
+            fresh_ctx.now_ms,
+        )
+        .await?;
+        check(super::authorize_resource(
+            &fresh_actor,
+            &fresh_resource,
+            action,
+        ))?;
+        Ok(result)
+    })
+    .await
+}
+
+/// Disassociate all currently `active` revisions of `artifact_id` (`active -> retained`, locked
+/// in ascending revision ID order), preserving charged storage bytes until purge and recording
+/// one `artifact.delete` audit row with exact idempotency. `openmettle_api` only.
+pub async fn delete_artifact(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    artifact_id: &str,
+) -> Result<WriteOutcome, StoreError> {
+    let change = Change {
+        action: "artifact.delete",
+        target_kind: "artifact",
+        target_id: Some(artifact_id.to_owned()),
+        details: json!({}),
+    };
+    artifact_write(
+        c,
+        ctx,
+        artifact_id,
+        Action::Delete,
+        async |tx, post_lock_ctx, scope| {
+            let outcome = record(tx.connection()?, post_lock_ctx, &change).await?;
+            if matches!(outcome, WriteOutcome::Applied { .. }) {
+                let active_revisions: Vec<String> = sqlx::query_scalar(
+                    "SELECT id::text
+                   FROM openmettle.artifact_revisions
+                  WHERE scope_id = $1::uuid
+                    AND artifact_id = $2::uuid
+                    AND state = 'active'
+                  ORDER BY id ASC
+                    FOR UPDATE",
+                )
+                .bind(scope)
+                .bind(artifact_id)
+                .fetch_all(tx.connection()?)
+                .await?;
+                for rev_id in active_revisions {
+                    crate::storage::retain_revision(tx, scope, &rev_id).await?;
+                }
+            }
+            Ok(outcome)
+        },
+    )
+    .await
+}
+
+/// Disassociate one revision of `artifact_id` (`active -> retained`), returning the updated
+/// revision metadata. Exact retry replays the recorded audit row; a non-replayed call on an
+/// already `purging` or `purged` revision fails with `Conflict`. `openmettle_api` only.
+pub async fn delete_artifact_revision(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    artifact_id: &str,
+    revision_id: &str,
+) -> Result<crate::storage::Revision, StoreError> {
+    uuid(revision_id, "revision_id")?;
+    let change = Change {
+        action: "artifact_revision.delete",
+        target_kind: "artifact",
+        target_id: Some(artifact_id.to_owned()),
+        details: json!({ "revision_id": revision_id }),
+    };
+    artifact_write(
+        c,
+        ctx,
+        artifact_id,
+        Action::Delete,
+        async |tx, post_lock_ctx, scope| {
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT state
+               FROM openmettle.artifact_revisions
+              WHERE scope_id = $1::uuid
+                AND artifact_id = $2::uuid
+                AND id = $3::uuid
+                FOR UPDATE",
+            )
+            .bind(scope)
+            .bind(artifact_id)
+            .bind(revision_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            let Some(state) = state else {
+                return Err(CONCEALED);
+            };
+            let outcome = record(tx.connection()?, post_lock_ctx, &change).await?;
+            if matches!(outcome, WriteOutcome::Applied { .. }) {
+                match state.as_str() {
+                    "active" => {
+                        crate::storage::retain_revision(tx, scope, revision_id).await?;
+                    }
+                    "retained" => {}
+                    _ => {
+                        return Err(StoreError::Conflict(
+                            "artifact revision cannot be disassociated in its current state",
+                        ));
+                    }
+                }
+            }
+            crate::storage::read_revision(tx.connection()?, artifact_id, revision_id)
+                .await?
+                .ok_or(CONCEALED)
+        },
+    )
+    .await
+}
+
+/// Restore a retained revision of `artifact_id` back to `active` strictly before its
+/// `purge_after` deadline without reinstating any revoked shares. Fails with `Conflict` if
+/// already active (on a new key), expired, `purging` or `purged`. `openmettle_api` only.
+pub async fn restore_artifact_revision(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    artifact_id: &str,
+    revision_id: &str,
+) -> Result<crate::storage::Revision, StoreError> {
+    uuid(revision_id, "revision_id")?;
+    let change = Change {
+        action: "artifact_revision.restore",
+        target_kind: "artifact",
+        target_id: Some(artifact_id.to_owned()),
+        details: json!({ "revision_id": revision_id }),
+    };
+    artifact_write(
+        c,
+        ctx,
+        artifact_id,
+        Action::Write,
+        async |tx, post_lock_ctx, scope| {
+            let state: Option<String> = sqlx::query_scalar(
+                "SELECT state
+               FROM openmettle.artifact_revisions
+              WHERE scope_id = $1::uuid
+                AND artifact_id = $2::uuid
+                AND id = $3::uuid
+                FOR UPDATE",
+            )
+            .bind(scope)
+            .bind(artifact_id)
+            .bind(revision_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            let Some(state) = state else {
+                return Err(CONCEALED);
+            };
+            let outcome = record(tx.connection()?, post_lock_ctx, &change).await?;
+            if matches!(outcome, WriteOutcome::Applied { .. }) {
+                if state != "retained" {
+                    return Err(StoreError::Conflict(
+                        "artifact revision is not restorable in its current state",
+                    ));
+                }
+                crate::storage::restore_revision(tx, scope, revision_id)
+                    .await
+                    .map_err(|err| match err {
+                        crate::runs::Error::NotEligible => {
+                            StoreError::Conflict("artifact revision retention deadline has elapsed")
+                        }
+                        other => StoreError::from(other),
+                    })?;
+            }
+            crate::storage::read_revision(tx.connection()?, artifact_id, revision_id)
+                .await?
+                .ok_or(CONCEALED)
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

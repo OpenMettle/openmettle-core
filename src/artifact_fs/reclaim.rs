@@ -784,7 +784,10 @@ pub async fn purge_journaled(
                FROM openmettle.deletion_journal j
                JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
                JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
-              WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL AND j.journal_seq > $1
+              WHERE j.event_kind = 'artifact_revision.purged'
+                AND r.state = 'purging'
+                AND sr.payload_ino IS NOT NULL
+                AND j.journal_seq > $1
               ORDER BY j.journal_seq
               LIMIT 100",
         )

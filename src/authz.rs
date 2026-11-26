@@ -66,6 +66,7 @@ pub fn require(principal: Option<&Principal>) -> Result<&Principal, DenialReason
 pub enum Action {
     Read,
     Write,
+    Delete,
     Stream,
     Search,
     Download,
@@ -80,6 +81,7 @@ pub enum Action {
     ManageUserCapabilityDenies,
     ManageQuotas,
     ManageFamilyPolicies,
+    ManageRetention,
     InspectCapacity,
     ManageAccountAdmin,
     ManageAccounts,
@@ -485,7 +487,7 @@ pub fn authorize_resource(principal: &Principal, resource: &Resource, action: Ac
     };
     let required = match action {
         a if is_read(a) => ResourceAccess::Read,
-        Action::Write => ResourceAccess::Write,
+        Action::Write | Action::Delete => ResourceAccess::Write,
         Action::RunExecute => {
             // Runs charge the scope owner's accounting boundary, so a non-owner cannot execute
             // runs inside another user's personal scope even with a Write share.
@@ -658,6 +660,7 @@ pub fn authorize_admin(principal: &Principal, change: AdminChange) -> Decision {
                 | Action::ManageUserCapabilityDenies
                 | Action::ManageQuotas
                 | Action::ManageFamilyPolicies
+                | Action::ManageRetention
                 | Action::InspectCapacity
         );
     if !admin || (change.removes_enabled_admin && !lifecycle) {

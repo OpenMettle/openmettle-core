@@ -57,6 +57,9 @@ impl Api {
         let session = self.authenticate(channel).await?;
         let policy = parts.extensions.get::<ApprovalDisplayPolicy>();
         self.with_connection(async |c| {
+            if decision.is_some() {
+                crate::restore::require_open_gate(c).await?;
+            }
             let scope: String = sqlx::query_scalar(
                 "SELECT scope_id::text FROM openmettle.runs WHERE id=$1::uuid AND actor_user_id=$2::uuid",
             )

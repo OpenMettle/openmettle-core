@@ -1,0 +1,16 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "UpdateRetentionPolicyRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "reason": "Shorten retention grace to seven days"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/UpdateRetentionPolicyRequest",
+  "source": "#/components/examples/UpdateRetentionPolicyRequestTypical"
+}

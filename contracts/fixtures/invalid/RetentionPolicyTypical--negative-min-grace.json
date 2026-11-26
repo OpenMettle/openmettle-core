@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/min_grace_seconds",
+    "keyword": "minimum",
+    "valid": false
+  },
+  "fixture": "RetentionPolicyTypical--negative-min-grace",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "max_grace_seconds": 31536000,
+    "min_grace_seconds": -1,
+    "revision": "2"
+  },
+  "mutation": {
+    "name": "negative-min-grace",
+    "op": "set",
+    "path": "/min_grace_seconds",
+    "value": -1
+  },
+  "schema": "#/components/schemas/RetentionPolicy",
+  "source": "#/components/examples/RetentionPolicyTypical"
+}

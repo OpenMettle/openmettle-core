@@ -161,7 +161,9 @@ async fn attach(
 
 async fn journal(db: &TestDb) -> Vec<String> {
     sqlx::query_scalar(
-        "SELECT entity_id::text FROM openmettle.deletion_journal ORDER BY journal_seq",
+        "SELECT entity_id::text FROM openmettle.deletion_journal
+          WHERE event_kind = 'artifact_revision.purged'
+          ORDER BY journal_seq",
     )
     .fetch_all(&mut db.admin().await)
     .await
@@ -174,20 +176,22 @@ type JournalRow = (
     String,
     String,
     i64,
-    i64,
-    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
     Vec<u8>,
     Option<i64>,
     Vec<u8>,
 );
 
-/// Recomputes every chain digest from the encoding migration 28 documents, checks the sequence
-/// is gapless and the head names the last record.
-pub(super) async fn assert_chain(db: &TestDb) {
+/// Recomputes every chain digest from the encodings migrations 28 and 42 document, checks the
+/// sequence is gapless and the head names the last record.
+pub(crate) async fn assert_chain(db: &TestDb) {
     let mut admin = db.admin().await;
     let rows: Vec<JournalRow> = sqlx::query_as(
         "SELECT journal_seq, event_kind, entity_id::text, scope_id::text,
                 (extract(epoch FROM recorded_at) * 1000000)::bigint,
+                (extract(epoch FROM retained_at) * 1000000)::bigint,
                 (extract(epoch FROM original_purge_after) * 1000000)::bigint,
                 (extract(epoch FROM purged_at) * 1000000)::bigint,
                 content_digest, policy_revision, chain_digest
@@ -197,15 +201,28 @@ pub(super) async fn assert_chain(db: &TestDb) {
     .await
     .unwrap();
     let mut previous = vec![0u8; 32];
-    for (index, (seq, kind, entity, scope, at, after, purged, content, policy, chain)) in
+    for (index, (seq, kind, entity, scope, at, retained, after, purged, content, policy, chain)) in
         rows.iter().enumerate()
     {
         assert_eq!(*seq, index as i64 + 1);
         let hex: String = content.iter().map(|b| format!("{b:02x}")).collect();
         let policy = policy.map(|p| p.to_string()).unwrap_or_default();
-        let text = format!(
-            "openmettle.deletion_journal/1|{seq}|{kind}|{entity}|{scope}|{at}|{after}|{purged}|{hex}|{policy}"
-        );
+        let opt = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_default();
+        let text = if kind == "artifact_revision.purged" {
+            assert!(retained.is_none(), "journal_seq {seq}");
+            format!(
+                "openmettle.deletion_journal/1|{seq}|{kind}|{entity}|{scope}|{at}|{}|{}|{hex}|{policy}",
+                after.unwrap(),
+                purged.unwrap()
+            )
+        } else {
+            format!(
+                "openmettle.deletion_journal/2|{seq}|{kind}|{entity}|{scope}|{at}|{}|{}|{}|{hex}|{policy}",
+                opt(*retained),
+                opt(*after),
+                opt(*purged)
+            )
+        };
         let digest = Sha256::new()
             .chain_update(&previous)
             .chain_update(text.as_bytes())
@@ -742,7 +759,7 @@ async fn confirm_purge_journals_exactly_once_across_retries_duplicates_and_rollb
                 j.content_digest = r.content_digest,
                 (j.original_purge_after, j.purged_at) = (r.purge_after, r.purged_at)
            FROM openmettle.deletion_journal j JOIN openmettle.artifact_revisions r ON r.id = j.entity_id
-          WHERE j.entity_id = $1::uuid",
+          WHERE j.entity_id = $1::uuid AND j.event_kind = 'artifact_revision.purged'",
     )
     .bind(&second)
     .fetch_one(&mut f.db.admin().await)
@@ -779,7 +796,7 @@ async fn confirm_purge_journals_exactly_once_across_retries_duplicates_and_rollb
         let insert = sqlx::query(
             "INSERT INTO openmettle.deletion_journal SELECT journal_seq + 1, recorded_at, event_kind,
                  gen_random_uuid(), scope_id, original_purge_after, purged_at, content_digest,
-                 policy_revision, chain_digest FROM openmettle.deletion_journal",
+                 policy_revision, chain_digest, retained_at FROM openmettle.deletion_journal",
         )
         .execute(&mut c)
         .await;
@@ -934,7 +951,8 @@ async fn schema_27_removals_and_claims_complete_after_the_upgrade_with_one_journ
     // still attached: claims made before the upgrade completed, and operator-forced purges.
     let attached_purges: Vec<String> = sqlx::query_scalar(
         "SELECT j.entity_id::text FROM openmettle.deletion_journal j
-          WHERE EXISTS (SELECT FROM openmettle.message_parts p
+          WHERE j.event_kind = 'artifact_revision.purged'
+            AND EXISTS (SELECT FROM openmettle.message_parts p
                          WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id)
           ORDER BY j.journal_seq",
     )

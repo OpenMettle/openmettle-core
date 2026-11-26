@@ -297,6 +297,14 @@ pub(crate) async fn transact<T>(
 ) -> Result<T, StoreError> {
     ctx.validate()?;
     let mut tx = begin(c).await?;
+    let gate = match tx.connection() {
+        Ok(conn) => crate::restore::require_open_gate(conn).await,
+        Err(err) => Err(err.into()),
+    };
+    if let Err(error) = gate {
+        tx.rollback().await?;
+        return Err(error);
+    }
     match body(&mut tx).await {
         Ok(value) => {
             tx.commit().await?;

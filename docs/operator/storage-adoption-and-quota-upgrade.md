@@ -103,7 +103,8 @@ At any time afterwards, this lists every journaled purge whose revision is still
 ```sql
 SELECT j.journal_seq, j.entity_id
   FROM openmettle.deletion_journal j
- WHERE EXISTS (SELECT FROM openmettle.message_parts p
+ WHERE j.event_kind = 'artifact_revision.purged'
+   AND EXISTS (SELECT FROM openmettle.message_parts p
                 WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id);
 ```
 
@@ -226,9 +227,18 @@ Migration `0041` ([ADR 0041](../adr/0041-retention-purge-and-deletion-journal.md
 - `openmettle.authorization_audit` widens its `action` and `target_kind` CHECK constraints under a bounded `NOWAIT` lock retry loop to record `'restore.accept_coverage_gap'` against `'restore_gate'`.
 - Previous-release (`0040`) workers purge as before while the gate is open. Once an operator closes the gate during a restore, their purge claims and confirmations fail with SQLSTATE `OMR02`, logged as `worker.sweep.failed` for `purge_due`, but they still claim runs. Never start a `0040` or earlier worker against a restored database.
 
+## Upgrade from 0041 to 0042 (retention routes and journaled deadline commitments)
+
+Migration `0042` ([ADR 0041](../adr/0041-retention-purge-and-deletion-journal.md), V1-16 PR3) needs no activation step and no backfill. Apply it with `openmettle-migrate` and roll the API, worker and admin deployments.
+
+- `openmettle.deletion_journal` adds nullable `retained_at`, relaxes `original_purge_after` and `purged_at` for non-purge lifecycle events, narrows entity uniqueness to `event_kind = 'artifact_revision.purged'`, and appends hash-chained records (`openmettle.deletion_journal/2`) for disassociations (`artifact_revision.retained`), explicit admin deadline adjustments (`artifact_revision.deadline_adjusted`) and pre-expiry restores (`artifact_revision.restored`) while preserving `openmettle.deletion_journal/1` digests for existing and future `artifact_revision.purged` records.
+- `openmettle.artifact_revisions_restore_gate` guards all non-owner transitions on `state`, `retained_at`, `purge_after` and `retention_policy_revision` (`OMR02`), and `openmettle_api` receives `EXECUTE` on `openmettle.restore_gate_lock_open()` (still zero direct `SELECT` on `restore_reconciliation_gate`, `deletion_journal` or `deletion_journal_head`).
+- `openmettle.retention_set_grace` enforces the restore gate (`OMR02`) and exact idempotent replay on `(actor_user_id, request_key)`, joined by API-only `SECURITY DEFINER` helpers `openmettle.admin_retention_status`, `openmettle.retention_preview_deadlines` and `openmettle.retention_apply_deadlines`.
+- Always update `openmettle-admin` together with migration `0042` before exporting or replaying journals containing `retained`, `deadline_adjusted` or `restored` records.
+
 ## Restore the deletion journal after a database restore
 
-A database cannot detect that it was restored, and a backup carries `openmettle.restore_reconciliation_gate` open. The restore procedure therefore closes the gate before any API or worker starts. While it is closed, no application role can move a revision into `purging` or `purged` (`OMR02`), so nothing appends to the restored journal, and `openmettle-worker` claims no run and runs no purge sweep. The API does not read the gate in this release (V1-16 PR3 adds `503 unavailable`), so keep the API stopped until the gate opens.
+A database cannot detect that it was restored, and a backup carries `openmettle.restore_reconciliation_gate` open. The restore procedure therefore closes the gate before any API or worker starts. While it is closed, no application role can mutate `artifact_revisions` lifecycle or deadlines (`OMR02`), nothing appends to the restored journal, `openmettle-worker` claims no run and runs no purge sweep, and `openmettle-api` refuses every mutating `/v1` route and `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}/content` with `503 unavailable` (while keeping non-content read routes such as `GET /v1/admin/retention/status` available for inspection). Keep the API and worker stopped during volume rebind and replay; the gate enforces fail-closed behavior as a backstop if an API or worker starts early.
 
 **Export.** Run the export continuously and after quiescing writes before planned restores, as `openmettle_owner`, keeping each export file outside the primary storage failure domain for the full backup retention horizon. The command creates the file exclusively with `0600` permissions (on Unix), refuses to overwrite an existing file, `fsync`s both the file and its parent directory, and only then prints the watermark line `watermark <origin_us> <journal_seq> <chain_digest> <exported_at_unix_us>`. Record `<origin_us>`, `<journal_seq>` and `<chain_digest>` independently of the export file (for example in the recovery set manifest). The export carries a SHA-256 checksum that detects damage, not forgery; signing belongs to V1-30.
 
@@ -288,7 +298,7 @@ openmettle-admin journal export "$EXPORT_FILE"
 | `run \`openmettle-admin storage rebind\` first` | The artifact volume was restored by file copy and has not been rebound yet. |
 | `accounting drift detected` | Unsettled payloads, quarantines or volume/ledger drift remain. Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` and repair before rerunning. |
 
-This release journals confirmed purges only. Removals not yet purged (PR3) and revocations/tombstones are not journaled yet and still follow the README's pre-worker restore checklist.
+This release journals confirmed purges, disassociation deadline commitments (`artifact_revision.retained`), explicit admin deadline adjustments (`artifact_revision.deadline_adjusted`) and pre-expiry restores (`artifact_revision.restored`). Security revocations and conversation/project deletion tombstones still follow the README's pre-worker restore checklist until their owning increments land.
 
 ## Monitor overdue handoffs
 

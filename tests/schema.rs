@@ -858,6 +858,12 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "coverage_started_at",
         default: ColumnDefault::AnyNonNull,
     },
+    AdditiveColumn {
+        since: 42,
+        table: "deletion_journal",
+        column: "retained_at",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1359,6 +1365,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
         "49a30070ef07ae4471f0e7d2035c54a605a15e4abab24f2e6bff69953ee4f3ff",
         "3fb443c44eb91d520bff06b7b0eaef3615c15d0e86c2f1bfc768c1d5dcff96ca",
+        "02b45c38a72a4651fbd9bf403e2c3a26e7b6aaf1c5a0eb4dcb5aa7465682b9e5",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

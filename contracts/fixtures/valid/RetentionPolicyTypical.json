@@ -1,0 +1,18 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RetentionPolicyTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "max_grace_seconds": 31536000,
+    "min_grace_seconds": 0,
+    "revision": "2"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/RetentionPolicy",
+  "source": "#/components/examples/RetentionPolicyTypical"
+}

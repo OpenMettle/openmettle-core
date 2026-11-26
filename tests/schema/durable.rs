@@ -916,9 +916,9 @@ mod cancellation;
 #[path = "restore.rs"]
 mod restore;
 #[path = "retention.rs"]
-mod retention;
+pub(crate) mod retention;
 #[path = "storage.rs"]
-mod storage;
+pub(crate) mod storage;
 
 #[path = "grants.rs"]
 mod grants;

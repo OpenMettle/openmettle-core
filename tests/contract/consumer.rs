@@ -757,6 +757,8 @@ pub struct ArtifactRevision {
     pub sha256: String,
     pub display_name: Option<String>,
     pub state: RevisionState,
+    pub retained_at: Option<String>,
+    pub purge_after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -778,6 +780,10 @@ struct WireArtifactRevision {
     state: String,
     #[allow(dead_code)]
     created_at: String,
+    #[serde(deserialize_with = "required_nullable")]
+    retained_at: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    purge_after: Option<String>,
 }
 
 /// The revision number and size are exact; the digest is 64 lowercase hexadecimal digits.
@@ -798,6 +804,8 @@ pub fn decode_revision(value: &Value) -> Result<ArtifactRevision, String> {
         sha256: wire.sha256,
         display_name: wire.display_name,
         state: RevisionState::from_wire(wire.state),
+        retained_at: wire.retained_at,
+        purge_after: wire.purge_after,
     })
 }
 
@@ -1588,4 +1596,180 @@ pub fn decode_admin_capacity_groups(value: &Value) -> Result<Vec<AdminCapacityGr
         });
     }
     Ok(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub revision: i64,
+    pub grace_seconds: i32,
+    pub min_grace_seconds: i32,
+    pub max_grace_seconds: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestoreGateStatus {
+    pub open: bool,
+    pub snapshot_journal_seq: Option<i64>,
+    pub required_journal_seq: Option<i64>,
+    pub coverage_complete: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeletionJournalStatus {
+    pub journal_seq: i64,
+    pub coverage_started_at: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AdminRetentionStatus {
+    pub policy: RetentionPolicy,
+    pub restore_gate: RestoreGateStatus,
+    pub deletion_journal: DeletionJournalStatus,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetentionDeadlinesSummary {
+    pub policy_revision: i64,
+    pub target_grace_seconds: i32,
+    pub scope_id: Option<String>,
+    pub affected_revisions: i64,
+    pub affected_bytes: i64,
+}
+
+#[derive(Deserialize)]
+struct WireRetentionPolicy {
+    revision: String,
+    grace_seconds: i32,
+    min_grace_seconds: i32,
+    max_grace_seconds: i32,
+}
+
+#[derive(Deserialize)]
+struct WireRestoreGateStatus {
+    open: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    snapshot_journal_seq: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    required_journal_seq: Option<String>,
+    coverage_complete: bool,
+}
+
+#[derive(Deserialize)]
+struct WireDeletionJournalStatus {
+    journal_seq: String,
+    coverage_started_at: String,
+}
+
+#[derive(Deserialize)]
+struct WireAdminRetentionStatus {
+    policy: WireRetentionPolicy,
+    restore_gate: WireRestoreGateStatus,
+    deletion_journal: WireDeletionJournalStatus,
+}
+
+#[derive(Deserialize)]
+struct WireRetentionDeadlinesPreview {
+    current_policy_revision: String,
+    target_grace_seconds: i32,
+    #[serde(deserialize_with = "required_nullable")]
+    scope_id: Option<String>,
+    affected_revisions: String,
+    affected_bytes: String,
+}
+
+#[derive(Deserialize)]
+struct WireRetentionDeadlinesApplyResult {
+    policy_revision: String,
+    target_grace_seconds: i32,
+    #[serde(deserialize_with = "required_nullable")]
+    scope_id: Option<String>,
+    affected_revisions: String,
+    affected_bytes: String,
+}
+
+pub fn decode_retention_policy(value: &Value) -> Result<RetentionPolicy, String> {
+    let wire: WireRetentionPolicy =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.grace_seconds < 0 || wire.min_grace_seconds < 0 || wire.max_grace_seconds < 0 {
+        return Err("negative grace_seconds".into());
+    }
+    Ok(RetentionPolicy {
+        revision: parse_decimal(&wire.revision, false)?,
+        grace_seconds: wire.grace_seconds,
+        min_grace_seconds: wire.min_grace_seconds,
+        max_grace_seconds: wire.max_grace_seconds,
+    })
+}
+
+pub fn decode_admin_retention_status(value: &Value) -> Result<AdminRetentionStatus, String> {
+    let wire: WireAdminRetentionStatus =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.policy.grace_seconds < 0
+        || wire.policy.min_grace_seconds < 0
+        || wire.policy.max_grace_seconds < 0
+    {
+        return Err("negative grace_seconds".into());
+    }
+    Ok(AdminRetentionStatus {
+        policy: RetentionPolicy {
+            revision: parse_decimal(&wire.policy.revision, false)?,
+            grace_seconds: wire.policy.grace_seconds,
+            min_grace_seconds: wire.policy.min_grace_seconds,
+            max_grace_seconds: wire.policy.max_grace_seconds,
+        },
+        restore_gate: RestoreGateStatus {
+            open: wire.restore_gate.open,
+            snapshot_journal_seq: wire
+                .restore_gate
+                .snapshot_journal_seq
+                .as_deref()
+                .map(|s| parse_decimal(s, true))
+                .transpose()?,
+            required_journal_seq: wire
+                .restore_gate
+                .required_journal_seq
+                .as_deref()
+                .map(|s| parse_decimal(s, true))
+                .transpose()?,
+            coverage_complete: wire.restore_gate.coverage_complete,
+        },
+        deletion_journal: DeletionJournalStatus {
+            journal_seq: parse_decimal(&wire.deletion_journal.journal_seq, true)?,
+            coverage_started_at: wire.deletion_journal.coverage_started_at,
+        },
+    })
+}
+
+pub fn decode_retention_deadlines_preview(
+    value: &Value,
+) -> Result<RetentionDeadlinesSummary, String> {
+    let wire: WireRetentionDeadlinesPreview =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.target_grace_seconds < 0 {
+        return Err("negative target_grace_seconds".into());
+    }
+    Ok(RetentionDeadlinesSummary {
+        policy_revision: parse_decimal(&wire.current_policy_revision, false)?,
+        target_grace_seconds: wire.target_grace_seconds,
+        scope_id: wire.scope_id,
+        affected_revisions: parse_decimal(&wire.affected_revisions, true)?,
+        affected_bytes: parse_decimal(&wire.affected_bytes, true)?,
+    })
+}
+
+pub fn decode_retention_deadlines_apply_result(
+    value: &Value,
+) -> Result<RetentionDeadlinesSummary, String> {
+    let wire: WireRetentionDeadlinesApplyResult =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.target_grace_seconds < 0 {
+        return Err("negative target_grace_seconds".into());
+    }
+    Ok(RetentionDeadlinesSummary {
+        policy_revision: parse_decimal(&wire.policy_revision, false)?,
+        target_grace_seconds: wire.target_grace_seconds,
+        scope_id: wire.scope_id,
+        affected_revisions: parse_decimal(&wire.affected_revisions, true)?,
+        affected_bytes: parse_decimal(&wire.affected_bytes, true)?,
+    })
 }

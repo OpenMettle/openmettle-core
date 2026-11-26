@@ -13,18 +13,18 @@
 //!   artifact on every request, then only an `active` revision streams from the store.
 use super::{
     Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, PROVISIONING, Problem,
-    Session, TIMEOUT, UNAVAILABLE, path_id, principal, problem, quota_problem, reply, request_id,
-    request_key, response_headers, single_header, timestamp,
+    Session, TIMEOUT, UNAVAILABLE, no_content, path_id, principal, problem, quota_problem, reply,
+    request_id, request_key, response_headers, single_header, timestamp,
 };
 use crate::{
     artifact_fs::{self, UPLOAD_TIMEOUT},
     authz::{
         Action, DenialReason,
         projects::{self, hex},
-        store::StoreError,
+        store::{AuditContext, StoreError},
     },
     multipart::Parser,
-    runs,
+    restore, runs,
     storage::{self, Revision},
 };
 use axum::{
@@ -209,6 +209,8 @@ fn revision_json(r: &Revision) -> Result<Value, Problem> {
         "display_name": r.display_name,
         "state": r.state,
         "created_at": timestamp(r.created_us)?,
+        "retained_at": r.retained_us.map(timestamp).transpose()?,
+        "purge_after": r.purge_after_us.map(timestamp).transpose()?,
     }))
 }
 
@@ -326,6 +328,7 @@ impl Api {
             let artifact = self
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
+                    restore::require_open_gate(c).await?;
                     projects::authorize_create_in_scope(c, &principal, scope, now).await?;
                     Ok(storage::upload_artifact(c, scope, actor, &key).await?)
                 })
@@ -335,6 +338,7 @@ impl Api {
             let located = self
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
+                    restore::require_open_gate(c).await?;
                     projects::authorize_artifact(c, &principal, target, Action::Write, now).await
                 })
                 .await?;
@@ -393,6 +397,9 @@ impl Api {
         let revision = self
             .database(async |c| {
                 let principal = principal(c, &context).await?;
+                if download {
+                    restore::require_open_gate(c).await?;
+                }
                 let now = context.observed_ms();
                 projects::authorize_artifact(c, &principal, artifact, action, now).await?;
                 read_revision(c, artifact, revision_id).await
@@ -443,6 +450,64 @@ impl Api {
             headers.insert(header::CONTENT_RANGE, range.map_err(|_| INTERNAL)?);
         }
         Ok(response)
+    }
+
+    /// `deleteArtifact`, `deleteArtifactRevision` and `restoreArtifactRevision` (ADR 0041 PR3).
+    pub(super) async fn lifecycle(
+        &self,
+        op: Op,
+        parts: &Parts,
+        session: Session,
+        artifact: &str,
+        client_key: &str,
+    ) -> Result<Response, Problem> {
+        if parts.uri.query().is_some() {
+            return Err(INVALID);
+        }
+        let revision_id = match op {
+            Op::DeleteArtifact => None,
+            Op::DeleteArtifactRevision | Op::RestoreArtifactRevision => Some(path_id(parts, 5)?),
+            _ => return Err(INTERNAL),
+        };
+        let context = self.authenticate(&session).await?;
+        let key_target = match revision_id {
+            Some(rev) => format!("{artifact}/{rev}"),
+            None => artifact.to_owned(),
+        };
+        let key = request_key(op, &key_target, client_key);
+        let audit = AuditContext {
+            actor_user_id: context.user_id(),
+            actor_approval_id: context.approval_id(),
+            now_ms: context.observed_ms(),
+            request_key: &key,
+            reason: op.id(),
+        };
+        match op {
+            Op::DeleteArtifact => {
+                self.database(async |c| projects::delete_artifact(c, &audit, artifact).await)
+                    .await?;
+                Ok(no_content())
+            }
+            Op::DeleteArtifactRevision => {
+                let rev_id = revision_id.ok_or(INTERNAL)?;
+                let rev = self
+                    .database(async |c| {
+                        projects::delete_artifact_revision(c, &audit, artifact, rev_id).await
+                    })
+                    .await?;
+                Ok(reply(StatusCode::OK, revision_json(&rev)?))
+            }
+            Op::RestoreArtifactRevision => {
+                let rev_id = revision_id.ok_or(INTERNAL)?;
+                let rev = self
+                    .database(async |c| {
+                        projects::restore_artifact_revision(c, &audit, artifact, rev_id).await
+                    })
+                    .await?;
+                Ok(reply(StatusCode::OK, revision_json(&rev)?))
+            }
+            _ => Err(INTERNAL),
+        }
     }
 }
 

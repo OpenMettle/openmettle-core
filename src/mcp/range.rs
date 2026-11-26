@@ -113,6 +113,8 @@ mod tests {
             display_name: None,
             state: "active".into(),
             created_us: 0,
+            retained_us: None,
+            purge_after_us: None,
         }
     }
     #[test]

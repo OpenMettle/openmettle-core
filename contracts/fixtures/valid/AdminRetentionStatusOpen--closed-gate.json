@@ -1,0 +1,40 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "AdminRetentionStatusOpen--closed-gate",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "deletion_journal": {
+      "coverage_started_at": "2026-11-23T09:00:00.000000Z",
+      "journal_seq": "4"
+    },
+    "policy": {
+      "grace_seconds": 2592000,
+      "max_grace_seconds": 2592000,
+      "min_grace_seconds": 2592000,
+      "revision": "1"
+    },
+    "restore_gate": {
+      "coverage_complete": false,
+      "open": false,
+      "required_journal_seq": "4",
+      "snapshot_journal_seq": "2"
+    }
+  },
+  "mutation": {
+    "name": "closed-gate",
+    "op": "set",
+    "path": "/restore_gate",
+    "value": {
+      "coverage_complete": false,
+      "open": false,
+      "required_journal_seq": "4",
+      "snapshot_journal_seq": "2"
+    }
+  },
+  "schema": "#/components/schemas/AdminRetentionStatus",
+  "source": "#/components/examples/AdminRetentionStatusOpen"
+}

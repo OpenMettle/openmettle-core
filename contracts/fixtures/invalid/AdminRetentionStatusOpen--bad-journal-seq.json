@@ -1,0 +1,37 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/deletion_journal/journal_seq",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "AdminRetentionStatusOpen--bad-journal-seq",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "deletion_journal": {
+      "coverage_started_at": "2026-11-23T09:00:00.000000Z",
+      "journal_seq": "01"
+    },
+    "policy": {
+      "grace_seconds": 2592000,
+      "max_grace_seconds": 2592000,
+      "min_grace_seconds": 2592000,
+      "revision": "1"
+    },
+    "restore_gate": {
+      "coverage_complete": true,
+      "open": true,
+      "required_journal_seq": null,
+      "snapshot_journal_seq": null
+    }
+  },
+  "mutation": {
+    "name": "bad-journal-seq",
+    "op": "set",
+    "path": "/deletion_journal/journal_seq",
+    "value": "01"
+  },
+  "schema": "#/components/schemas/AdminRetentionStatus",
+  "source": "#/components/examples/AdminRetentionStatusOpen"
+}

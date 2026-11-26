@@ -1295,6 +1295,7 @@ pub async fn decide(
         ],
     )));
     runs::transaction(c, async |c| {
+        crate::restore::require_open_gate(c).await?;
         let r = locked_actor_run(c, session, i.scope, i.run).await?;
         let (reader, view) = readable(c, session, i.scope, i.run, &r).await?;
         let a = sqlx::query(REQUEST)

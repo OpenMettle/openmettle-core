@@ -1,0 +1,32 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "AdminRetentionStatusOpen--auto-missing-deletion_journal",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "policy": {
+      "grace_seconds": 2592000,
+      "max_grace_seconds": 2592000,
+      "min_grace_seconds": 2592000,
+      "revision": "1"
+    },
+    "restore_gate": {
+      "coverage_complete": true,
+      "open": true,
+      "required_journal_seq": null,
+      "snapshot_journal_seq": null
+    }
+  },
+  "mutation": {
+    "name": "auto-missing-deletion_journal",
+    "op": "remove",
+    "path": "/deletion_journal"
+  },
+  "schema": "#/components/schemas/AdminRetentionStatus",
+  "source": "#/components/examples/AdminRetentionStatusOpen"
+}

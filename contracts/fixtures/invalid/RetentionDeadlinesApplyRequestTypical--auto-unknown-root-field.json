@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesApplyRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_policy_revision": "2",
+    "reason": "Align retained deadlines with updated seven-day policy",
+    "scope_id": null,
+    "target_grace_seconds": 604800,
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+  "source": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+}

@@ -1,0 +1,37 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "AdminRetentionStatusOpen--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "deletion_journal": {
+      "coverage_started_at": "2026-11-23T09:00:00.000000Z",
+      "journal_seq": "4"
+    },
+    "policy": {
+      "grace_seconds": 2592000,
+      "max_grace_seconds": 2592000,
+      "min_grace_seconds": 2592000,
+      "revision": "1"
+    },
+    "restore_gate": {
+      "coverage_complete": true,
+      "open": true,
+      "required_journal_seq": null,
+      "snapshot_journal_seq": null
+    },
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/AdminRetentionStatus",
+  "source": "#/components/examples/AdminRetentionStatusOpen"
+}

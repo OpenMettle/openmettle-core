@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesApplyRequestTypical--auto-missing-target_grace_seconds",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_policy_revision": "2",
+    "reason": "Align retained deadlines with updated seven-day policy",
+    "scope_id": null
+  },
+  "mutation": {
+    "name": "auto-missing-target_grace_seconds",
+    "op": "remove",
+    "path": "/target_grace_seconds"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+  "source": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+}

@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesPreviewRequestTypical--auto-missing-target_grace_seconds",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "scope_id": null
+  },
+  "mutation": {
+    "name": "auto-missing-target_grace_seconds",
+    "op": "remove",
+    "path": "/target_grace_seconds"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+  "source": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+}

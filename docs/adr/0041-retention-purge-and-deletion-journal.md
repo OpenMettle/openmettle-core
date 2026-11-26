@@ -275,6 +275,41 @@ PR2b (migration 41, 26 November 2026) settles the restore barrier contract on to
 - **Durability and limits.** `openmettle-admin journal export FILE` creates the file exclusively
   with `0600` permissions on Unix and `fsync`s both the file and its parent directory before
   printing the `watermark` line. The export
-  is checksummed, not signed (signing belongs to V1-30). Only confirmed purges are journaled;
-  PR3's removal routes must journal deadline commitments, and revocations/tombstones follow their
-  owning increments.
+  is checksummed, not signed (signing belongs to V1-30).
+
+PR3 (migration 42, 26 November 2026) delivers the authenticated `/v1` retention routes, journaled deadline commitments and pre-expiry restores, and `/v1` closed-gate `503 unavailable` enforcement:
+
+- **Journaled deadline commitments and pre-expiry restores.** Migration 42 extends
+  `openmettle.deletion_journal` with nullable `retained_at`, nullable `original_purge_after` and
+  `purged_at`, strict per-`event_kind` `CHECK` constraints covering `'artifact_revision.purged'`,
+  `'artifact_revision.retained'`, `'artifact_revision.deadline_adjusted'` and
+  `'artifact_revision.restored'`, and narrows entity uniqueness to a partial unique index on
+  `event_kind = 'artifact_revision.purged'`. Purged rows keep migration 28/41's
+  `openmettle.deletion_journal/1` hash-chain encoding unchanged; the three new lifecycle commitment
+  event kinds append domain-separated `openmettle.deletion_journal/2` records via a
+  `DEFERRABLE INITIALLY DEFERRED` `AFTER UPDATE` trigger (`artifact_revisions_lifecycle_journal`,
+  skipped during owner `deletion_journal_replay`). `openmettle-admin journal export` and
+  `restore replay` (`deletion_journal_replay` 11-arg overload) preserve original and adjusted
+  `purge_after` deadlines across backup/restore without restarting the 30-day grace window,
+  accurately reconcile `active_bytes`/`retained_bytes` across `retained` and `restored` sequences,
+  and require only `'artifact_revision.purged'` rows to reach `state = 'purged'` before
+  `restore_gate_open` succeeds.
+- **`/v1` disassociation, pre-expiry restore and `account_admin` routes.** Extends `ArtifactRevision`
+  wire JSON with `retained_at` and `purge_after`; mounts `DELETE /v1/artifacts/{artifact_id}`,
+  `DELETE /v1/artifacts/{artifact_id}/revisions/{revision_id}` and
+  `POST /v1/artifacts/{artifact_id}/revisions/{revision_id}/restore` (refusing `retained` revisions
+  with `409 conflict` on downloads and message attachments while concealing inaccessible targets
+  with `404 not_found`); and mounts audited `account_admin` routes `GET /v1/admin/retention/status`,
+  `PUT /v1/admin/retention/policy`, `POST /v1/admin/retention/deadlines/preview` and
+  `POST /v1/admin/retention/deadlines/apply` backed by least-privilege `SECURITY DEFINER` SQL
+  functions without granting `openmettle_api` direct `SELECT` on `deletion_journal`,
+  `deletion_journal_head` or `restore_reconciliation_gate`.
+- **`/v1` restore-gate `503 unavailable` gating.** Grants `openmettle_api` `EXECUTE` on
+  `openmettle.restore_gate_lock_open()` and extends `artifact_revisions_restore_gate` to guard all
+  `artifact_revisions` lifecycle and deadline transitions (`OMR02`). While
+  `restore_reconciliation_gate.open = false`, `openmettle-api` refuses every mutating `/v1` route
+  and `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}/content` with `503 unavailable`
+  while keeping non-content read routes (including `GET /v1/admin/retention/status` and
+  `POST /v1/admin/retention/deadlines/preview`) available for administrative inspection.
+  Security revocations and conversation/project deletion tombstones remain tracked in their owning
+  increments.

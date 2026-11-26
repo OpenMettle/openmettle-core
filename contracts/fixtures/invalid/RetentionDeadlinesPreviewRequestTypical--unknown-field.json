@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesPreviewRequestTypical--unknown-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "extra": 1,
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "unknown-field",
+    "op": "set",
+    "path": "/extra",
+    "value": 1
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+  "source": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+}

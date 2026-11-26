@@ -383,6 +383,13 @@ pub(super) async fn preview(
             if input
                 .parts
                 .iter()
+                .any(|p| matches!(p.value, PartContent::RetainedAttachment(_)))
+            {
+                return Err(CONFLICT);
+            }
+            if input
+                .parts
+                .iter()
                 .any(|p| !matches!(p.value, PartContent::Available(_)))
             {
                 return Err(NOT_FOUND);
@@ -453,6 +460,7 @@ pub(super) async fn submit(
 ) -> Result<(StatusCode, String, i64), Problem> {
     let ctx = call.context;
     let actor = principal(c, ctx).await?;
+    crate::restore::require_open_gate(c).await?;
     let visible = projects::read_resource(
         c,
         &actor,
@@ -518,6 +526,7 @@ async fn admission(
     catalog: Option<&Catalog>,
 ) -> Result<(Admission, bool, i64), Problem> {
     let c = tx.connection()?;
+    crate::restore::require_open_gate(c).await?;
     let ctx = call.context;
     let (personal_owner, project_id) =
         queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;
@@ -836,6 +845,7 @@ pub(super) async fn cancel(
 ) -> Result<(StatusCode, String, i64), Problem> {
     let ctx = call.context;
     let actor = principal(c, ctx).await?;
+    crate::restore::require_open_gate(c).await?;
     let (scope, conversation): (String, String) = sqlx::query_as(
         "SELECT scope_id::text, conversation_id::text FROM openmettle.runs
          WHERE id=$1::uuid AND actor_user_id=$2::uuid",

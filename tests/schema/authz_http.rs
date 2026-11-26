@@ -115,6 +115,37 @@ impl Api {
         Self { process, dir, bind }
     }
 
+    pub(super) fn configured_logged(
+        db: &TestDb,
+        dir: auth_config_support::Dir,
+        document: Value,
+        connections: u32,
+    ) -> (Self, std::path::PathBuf) {
+        let auth = dir.write("auth.json", document.to_string().as_bytes());
+        let log_path = std::path::PathBuf::from(dir.path("api.stderr.log"));
+        let log_file = fs::File::create(&log_path).unwrap();
+        let bind = address();
+        let mut cmd = binary("api");
+        if Path::new(&dir.path("artifacts")).is_dir() {
+            cmd.env("OPENMETTLE_API_ARTIFACTS_DIR", dir.path("artifacts"));
+        }
+        let child = cmd
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
+            .env("OPENMETTLE_API_DB_MAX_CONNECTIONS", connections.to_string())
+            .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
+            .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
+            .env("OPENMETTLE_API_LOG_LEVEL", "debug")
+            .stdout(Stdio::null())
+            .stderr(log_file)
+            .spawn()
+            .unwrap();
+        let mut process = Process(child);
+        wait_ready(&mut process, &bind);
+        (Self { process, dir, bind }, log_path)
+    }
+
     /// Kills the process as a crash would, keeping its directory.
     fn kill(self) -> auth_config_support::Dir {
         drop(self.process);
@@ -5485,3 +5516,6 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
 
 #[path = "run_events_http.rs"]
 mod run_events_http;
+
+#[path = "retention_http.rs"]
+mod retention_http;

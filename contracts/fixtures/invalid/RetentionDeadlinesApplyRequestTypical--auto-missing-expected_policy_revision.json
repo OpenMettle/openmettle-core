@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesApplyRequestTypical--auto-missing-expected_policy_revision",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "reason": "Align retained deadlines with updated seven-day policy",
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "auto-missing-expected_policy_revision",
+    "op": "remove",
+    "path": "/expected_policy_revision"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+  "source": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+}

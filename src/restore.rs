@@ -10,9 +10,12 @@
 //! Export format, one line each, `\n` terminated:
 //! - header `openmettle.deletion_journal.export/1`
 //! - `origin <coverage_started_us>` (Unix microseconds of `deletion_journal_head.coverage_started_at`)
-//! - zero or more record lines:
-//!   `seq recorded_us event_kind entity_id scope_id original_purge_after_us purged_us content_digest policy_revision chain_digest`
-//!   (times in Unix microseconds, digests in 64-character lowercase hex, canonical UUIDs, `-` for NULL policy revision)
+//! - zero or more record lines (times in Unix microseconds, digests in 64-character lowercase hex,
+//!   canonical UUIDs, `-` for NULL optional columns):
+//!   - `artifact_revision.purged` (10 fields):
+//!     `seq recorded_us event_kind entity_id scope_id original_purge_after_us purged_us content_digest policy_revision chain_digest`
+//!   - `artifact_revision.retained`, `artifact_revision.deadline_adjusted`, `artifact_revision.restored` (11 fields):
+//!     `seq recorded_us event_kind entity_id scope_id original_purge_after_us purged_us content_digest policy_revision chain_digest retained_us`
 //! - `watermark <origin_us> <seq> <chain_digest> <exported_us>`
 //! - `sha256 <hex>` over every preceding byte.
 //!
@@ -75,19 +78,35 @@ impl From<artifact_fs::Error> for Error {
     }
 }
 
-/// `(seq, recorded_us, event_kind, entity_id, scope_id, original_purge_after_us, purged_us,
-/// content_digest, policy_revision, chain_digest)`, as exported.
-type Record = (
+/// One exported `openmettle.deletion_journal` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Record {
+    seq: i64,
+    recorded_us: i64,
+    event_kind: String,
+    entity_id: String,
+    scope_id: String,
+    original_purge_after_us: Option<i64>,
+    purged_us: Option<i64>,
+    content_digest: String,
+    policy_revision: Option<i64>,
+    chain_digest: String,
+    retained_us: Option<i64>,
+}
+
+/// Raw SQL tuple matching [`export`].
+type ExportRow = (
     i64,
     i64,
     String,
     String,
     String,
-    i64,
-    i64,
+    Option<i64>,
+    Option<i64>,
     String,
     Option<i64>,
     String,
+    Option<i64>,
 );
 
 /// A checksummed export: installation origin, every record from 1 in order, and watermark.
@@ -137,19 +156,36 @@ pub async fn gate_open(c: &mut PgConnection) -> Result<bool, sqlx::Error> {
 }
 
 /// Lock the restore reconciliation gate `FOR SHARE` inside the caller's transaction, returning
-/// `true` only when it is open (or on pre-41 schemas where the gate helper does not exist yet).
+/// `true` only when it is open (or on pre-41/pre-42 schemas where this role does not yet hold
+/// `EXECUTE` on `restore_gate_lock_open()`).
 pub(crate) async fn lock_open_gate(c: &mut PgConnection) -> Result<bool, sqlx::Error> {
-    let gated: bool = sqlx::query_scalar(
-        "SELECT to_regprocedure('openmettle.restore_gate_lock_open()') IS NOT NULL",
+    let callable: bool = sqlx::query_scalar(
+        "SELECT CASE
+                    WHEN to_regprocedure('openmettle.restore_gate_lock_open()') IS NULL THEN false
+                    ELSE has_function_privilege('openmettle.restore_gate_lock_open()', 'EXECUTE')
+                END",
     )
     .fetch_one(&mut *c)
     .await?;
-    if !gated {
+    if !callable {
         return Ok(true);
     }
     sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open()")
         .fetch_one(c)
         .await
+}
+
+/// Lock the restore reconciliation gate `FOR SHARE` and refuse with a `StoreError::Database`
+/// (`503 unavailable` on `/v1`) when the gate is closed.
+pub(crate) async fn require_open_gate(
+    c: &mut PgConnection,
+) -> Result<(), crate::authz::store::StoreError> {
+    if !lock_open_gate(c).await? {
+        return Err(crate::authz::store::StoreError::Database(
+            sqlx::Error::Protocol("restore reconciliation pending".into()),
+        ));
+    }
+    Ok(())
 }
 
 /// Exports the whole journal and its installation origin from one snapshot, as the owner.
@@ -159,13 +195,30 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         .execute(&mut *tx)
         .await?;
     let us = |column: &str| format!("(extract(epoch FROM {column}) * 1000000)::bigint");
-    let records: Vec<Record> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let has_retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM pg_catalog.pg_attribute
+              WHERE attrelid = to_regclass('openmettle.deletion_journal')
+                AND attname = 'retained_at'
+                AND NOT attisdropped
+         )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let retained_expr = if has_retained {
+        us("retained_at")
+    } else {
+        "NULL::bigint".to_owned()
+    };
+    let rows: Vec<ExportRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT journal_seq, {}, event_kind, entity_id::text, scope_id::text, {}, {},
-                encode(content_digest, 'hex'), policy_revision, encode(chain_digest, 'hex')
+                encode(content_digest, 'hex'), policy_revision, encode(chain_digest, 'hex'), {}
            FROM openmettle.deletion_journal ORDER BY journal_seq",
         us("recorded_at"),
         us("original_purge_after"),
-        us("purged_at")
+        us("purged_at"),
+        retained_expr,
     )))
     .fetch_all(&mut *tx)
     .await?;
@@ -179,19 +232,31 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    let fmt_opt = |v: Option<i64>| v.map_or_else(|| "-".to_owned(), |n| n.to_string());
     let mut text = format!("{HEADER}\norigin {origin_us}\n");
-    for (i, r) in records.iter().enumerate() {
+    for (i, r) in rows.iter().enumerate() {
         if r.0 != i as i64 + 1 {
             return Err(Error::Export("journal out of sequence"));
         }
-        let policy = r.8.map_or("-".into(), |p| p.to_string());
-        let _ = writeln!(
-            text,
-            "{} {} {} {} {} {} {} {} {policy} {}",
-            r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.9
-        );
+        let after = fmt_opt(r.5);
+        let purged = fmt_opt(r.6);
+        let policy = fmt_opt(r.8);
+        if r.2 == "artifact_revision.purged" {
+            let _ = writeln!(
+                text,
+                "{} {} {} {} {} {after} {purged} {} {policy} {}",
+                r.0, r.1, r.2, r.3, r.4, r.7, r.9
+            );
+        } else {
+            let retained = fmt_opt(r.10);
+            let _ = writeln!(
+                text,
+                "{} {} {} {} {} {after} {purged} {} {policy} {} {retained}",
+                r.0, r.1, r.2, r.3, r.4, r.7, r.9
+            );
+        }
     }
-    if (seq, chain.as_str()) != records.last().map_or((0, GENESIS), |r| (r.0, r.9.as_str())) {
+    if (seq, chain.as_str()) != rows.last().map_or((0, GENESIS), |r| (r.0, r.9.as_str())) {
         return Err(Error::Export("journal head does not match its last record"));
     }
     let _ = writeln!(text, "watermark {origin_us} {seq} {chain} {at}");
@@ -225,6 +290,12 @@ impl Export {
             s.parse::<i64>()
                 .map_err(|_| Error::Export("malformed number"))
         };
+        let opt_number = |s: &str| -> Result<Option<i64>, Error> {
+            match s {
+                "-" => Ok(None),
+                other => Ok(Some(number(other)?)),
+            }
+        };
         let origin_us = match lines.next() {
             Some(line) => match line.split(' ').collect::<Vec<_>>()[..] {
                 ["origin", origin] => number(origin)?,
@@ -235,7 +306,8 @@ impl Export {
         let mut records: Vec<Record> = Vec::new();
         let mut watermark = None;
         for line in lines {
-            match line.split(' ').collect::<Vec<_>>()[..] {
+            let fields: Vec<&str> = line.split(' ').collect();
+            match fields[..] {
                 ["watermark", wm_origin, seq, chain, at] if watermark.is_none() => {
                     let wm_origin = number(wm_origin)?;
                     if wm_origin != origin_us {
@@ -288,24 +360,108 @@ impl Export {
                             Some(rev)
                         }
                     };
-                    records.push((
+                    records.push(Record {
                         seq,
-                        number(at)?,
-                        kind.into(),
-                        entity.into(),
-                        scope.into(),
-                        number(after)?,
-                        number(purged)?,
-                        content.into(),
-                        policy,
-                        chain.into(),
-                    ));
+                        recorded_us: number(at)?,
+                        event_kind: kind.into(),
+                        entity_id: entity.into(),
+                        scope_id: scope.into(),
+                        original_purge_after_us: Some(number(after)?),
+                        purged_us: Some(number(purged)?),
+                        content_digest: content.into(),
+                        policy_revision: policy,
+                        chain_digest: chain.into(),
+                        retained_us: None,
+                    });
+                }
+                [
+                    seq,
+                    at,
+                    kind,
+                    entity,
+                    scope,
+                    after,
+                    purged,
+                    content,
+                    policy,
+                    chain,
+                    retained,
+                ] if watermark.is_none() => {
+                    let seq = number(seq)?;
+                    if seq != records.len() as i64 + 1 {
+                        return Err(Error::Export("records out of sequence"));
+                    }
+                    if !matches!(
+                        kind,
+                        "artifact_revision.retained"
+                            | "artifact_revision.deadline_adjusted"
+                            | "artifact_revision.restored"
+                    ) {
+                        return Err(Error::Export("unknown event kind"));
+                    }
+                    if !runs::is_canonical_uuid(entity) || !runs::is_canonical_uuid(scope) {
+                        return Err(Error::Export("malformed uuid"));
+                    }
+                    if !is_valid_digest(content) || !is_valid_digest(chain) {
+                        return Err(Error::Export("malformed digest"));
+                    }
+                    let policy = match policy {
+                        "-" => None,
+                        p => {
+                            let rev = number(p)?;
+                            if rev <= 0 {
+                                return Err(Error::Export("malformed number"));
+                            }
+                            Some(rev)
+                        }
+                    };
+                    let original_purge_after_us = opt_number(after)?;
+                    let purged_us = opt_number(purged)?;
+                    let retained_us = opt_number(retained)?;
+                    match kind {
+                        "artifact_revision.retained" | "artifact_revision.deadline_adjusted" => {
+                            let (Some(a), None, Some(r)) =
+                                (original_purge_after_us, purged_us, retained_us)
+                            else {
+                                return Err(Error::Export("malformed line"));
+                            };
+                            if a < r {
+                                return Err(Error::Export("malformed number"));
+                            }
+                        }
+                        "artifact_revision.restored" => {
+                            if original_purge_after_us.is_some()
+                                || purged_us.is_some()
+                                || retained_us.is_some()
+                            {
+                                return Err(Error::Export("malformed line"));
+                            }
+                        }
+                        _ => return Err(Error::Export("unknown event kind")),
+                    }
+                    records.push(Record {
+                        seq,
+                        recorded_us: number(at)?,
+                        event_kind: kind.into(),
+                        entity_id: entity.into(),
+                        scope_id: scope.into(),
+                        original_purge_after_us,
+                        purged_us,
+                        content_digest: content.into(),
+                        policy_revision: policy,
+                        chain_digest: chain.into(),
+                        retained_us,
+                    });
                 }
                 _ => return Err(Error::Export("malformed line")),
             }
         }
         let (seq, digest) = watermark.ok_or(Error::Export("missing watermark"))?;
-        if (seq, digest.as_str()) != records.last().map_or((0, GENESIS), |r| (r.0, r.9.as_str())) {
+        if (seq, digest.as_str())
+            != records
+                .last()
+                .map_or((0, GENESIS), |r| (r.seq, r.chain_digest.as_str()))
+        {
             return Err(Error::Export("watermark does not match the last record"));
         }
         Ok(Self {
@@ -435,18 +591,19 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
     for r in &export.records {
         let new: bool = sqlx::query_scalar(
             "SELECT openmettle.deletion_journal_replay($1, $2, $3, $4::uuid, $5::uuid, $6, $7,
-                    decode($8, 'hex'), $9, decode($10, 'hex'))",
+                    decode($8, 'hex'), $9, decode($10, 'hex'), $11)",
         )
-        .bind(r.0)
-        .bind(r.1)
-        .bind(&r.2)
-        .bind(&r.3)
-        .bind(&r.4)
-        .bind(r.5)
-        .bind(r.6)
-        .bind(&r.7)
-        .bind(r.8)
-        .bind(&r.9)
+        .bind(r.seq)
+        .bind(r.recorded_us)
+        .bind(&r.event_kind)
+        .bind(&r.entity_id)
+        .bind(&r.scope_id)
+        .bind(r.original_purge_after_us)
+        .bind(r.purged_us)
+        .bind(&r.content_digest)
+        .bind(r.policy_revision)
+        .bind(&r.chain_digest)
+        .bind(r.retained_us)
         .fetch_one(&mut *tx)
         .await?;
         applied += u64::from(new);
@@ -899,5 +1056,41 @@ mod tests {
         let parsed = Export::parse(&valid_one).unwrap();
         assert_eq!(parsed.seq, 1);
         assert_eq!(parsed.digest, d);
+
+        // PR3 lifecycle commitment event kinds (11 fields) parse cleanly and enforce per-kind invariants.
+        let valid_lifecycle = seal(&format!(
+            "{HEADER}\norigin 1\n\
+             1 10 artifact_revision.retained {entity} {scope} 100 - {d} 1 {d} 50\n\
+             2 20 artifact_revision.deadline_adjusted {entity} {scope} 80 - {d} 2 {d} 50\n\
+             3 30 artifact_revision.restored {entity} {scope} - - {d} - {d} -\n\
+             4 40 artifact_revision.purged {entity} {scope} 90 95 {d} 2 {d}\n\
+             watermark 1 4 {d} 41\n"
+        ));
+        let parsed = Export::parse(&valid_lifecycle).unwrap();
+        assert_eq!(parsed.seq, 4);
+        assert_eq!(parsed.records[0].retained_us, Some(50));
+        assert_eq!(parsed.records[0].original_purge_after_us, Some(100));
+        assert_eq!(parsed.records[0].purged_us, None);
+        assert_eq!(parsed.records[2].retained_us, None);
+        assert_eq!(parsed.records[2].original_purge_after_us, None);
+        assert_eq!(parsed.records[3].purged_us, Some(95));
+
+        // Retained record with purge_after < retained_at is refused.
+        let bad_order = seal(&format!(
+            "{HEADER}\norigin 1\n1 10 artifact_revision.retained {entity} {scope} 40 - {d} 1 {d} 50\nwatermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&bad_order),
+            Err(Error::Export("malformed number"))
+        ));
+
+        // Restored record carrying a timestamp is refused.
+        let bad_restored = seal(&format!(
+            "{HEADER}\norigin 1\n1 10 artifact_revision.restored {entity} {scope} 40 - {d} - {d} -\nwatermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&bad_restored),
+            Err(Error::Export("malformed line"))
+        ));
     }
 }

@@ -124,6 +124,11 @@ async fn reserve_inner(
     let result = async {
         let kind: String = sqlx::query_scalar("SELECT kind FROM openmettle.scopes WHERE id=$1::uuid")
             .bind(r.scope).fetch_optional(&mut *sp).await?.ok_or(Error::NotFound)?;
+        if !crate::restore::lock_open_gate(&mut sp).await? {
+            return Err(Error::Database(sqlx::Error::Protocol(
+                "restore reconciliation pending".into(),
+            )));
+        }
         // On a pinned deployment serialize acquisition with adoption before locking counters.
         // Existing unpinned HTTP uploads can proceed while the fleet is being replaced.
         sqlx::query("SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
@@ -254,6 +259,10 @@ pub struct Revision {
     pub state: String,
     /// Creation time in Unix microseconds.
     pub created_us: i64,
+    /// Disassociation time in Unix microseconds, or `None` while `active`.
+    pub retained_us: Option<i64>,
+    /// Earliest purge deadline in Unix microseconds, or `None` while `active`.
+    pub purge_after_us: Option<i64>,
 }
 
 /// Reads revision `revision_id` of `artifact_id`, or `None` when it does not exist or belongs
@@ -269,7 +278,9 @@ pub async fn read_revision(
         "SELECT r.id::text, r.artifact_id::text, r.revision, r.scope_id::text, s.project_id::text,
                 r.reservation_id::text, r.size_bytes, r.content_digest, r.media_type,
                 r.display_name, r.state,
-                (extract(epoch FROM r.created_at) * 1000000)::bigint
+                (extract(epoch FROM r.created_at) * 1000000)::bigint,
+                (extract(epoch FROM r.retained_at) * 1000000)::bigint,
+                (extract(epoch FROM r.purge_after) * 1000000)::bigint
            FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
           WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid",
     )
@@ -293,6 +304,8 @@ pub async fn read_revision(
         display_name: row.try_get(9)?,
         state: row.try_get(10)?,
         created_us: row.try_get(11)?,
+        retained_us: row.try_get(12)?,
+        purge_after_us: row.try_get(13)?,
     }))
 }
 
@@ -419,6 +432,11 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
             .bind(&artifact).fetch_one(&mut *sp).await?;
         if owner != s.scope {
             return Err(Error::Conflict);
+        }
+        if !crate::restore::lock_open_gate(&mut sp).await? {
+            return Err(Error::Database(sqlx::Error::Protocol(
+                "restore reconciliation pending".into(),
+            )));
         }
         let number: i64 = sqlx::query_scalar("UPDATE openmettle.artifacts SET last_revision=last_revision+1
              WHERE id=$1::uuid RETURNING last_revision")
@@ -625,12 +643,18 @@ pub async fn retain_revision(
 ) -> Result<String, Error> {
     lifecycle(StorageOperation::Retain, tx, scope, revision, async |sp| {
         let (state, size, deadline, _) = lock_revision(sp, scope, revision).await?;
+        let gate_open = crate::restore::lock_open_gate(sp).await?;
         if state != "active" {
+            if !gate_open {
+                return Err(Error::Database(sqlx::Error::Protocol(
+                    "restore reconciliation pending".into(),
+                )));
+            }
             return deadline.ok_or(Error::Invalid);
         }
         adjust(sp, scope, -size, size, 0).await?;
         // Naming the retention columns keeps their API-only grants deciding who may retain;
-        // the trigger replaces these values.
+        // the trigger replaces these values (and refuses closed restore gates with OMR02).
         Ok(sqlx::query_scalar(
             "UPDATE openmettle.artifact_revisions SET state='retained',retained_at=NULL,purge_after=NULL,
              retention_policy_revision=NULL WHERE scope_id=$1::uuid AND id=$2::uuid RETURNING purge_after::text",
@@ -653,8 +677,16 @@ pub async fn restore_revision(
 ) -> Result<(), Error> {
     lifecycle(StorageOperation::Restore, tx, scope, revision, async |sp| {
         let (state, size, ..) = lock_revision(sp, scope, revision).await?;
+        let gate_open = crate::restore::lock_open_gate(sp).await?;
         match state.as_str() {
-            "active" => return Ok(()),
+            "active" => {
+                if !gate_open {
+                    return Err(Error::Database(sqlx::Error::Protocol(
+                        "restore reconciliation pending".into(),
+                    )));
+                }
+                return Ok(());
+            }
             "retained" => {}
             _ => return Err(Error::NotEligible),
         }
