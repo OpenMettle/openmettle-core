@@ -464,31 +464,46 @@ impl Subscription {
         }
     }
 
-    async fn check_gate_generation(&self) -> Result<(), Problem> {
+    async fn send_gated(&self, tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
+        // Wait for backpressure clearance BEFORE acquiring the restore gate share lock, then hold
+        // that READ COMMITTED transaction across synchronous `permit.send(bytes)` so gate closure
+        // cannot commit between checking `gate_generation` and enqueuing the frame.
+        let permit = reserve_send(tx).await?;
         let Some(expected) = self.gate_generation else {
+            permit.send(bytes);
             return Ok(());
         };
-        let current = self
-            .api
+        let mut permit = Some(permit);
+        let mut bytes = Some(bytes);
+        self.api
             .database(async |c| {
-                Ok::<_, StoreError>(crate::restore::lock_open_gate_generation(c).await?)
+                let mut db_tx = authz::store::begin(c).await?;
+                let result = async {
+                    let conn = db_tx.connection()?;
+                    let current = crate::restore::lock_open_gate_generation(conn).await?;
+                    if current != Some(expected) {
+                        return Err(StoreError::Database(sqlx::Error::Protocol(
+                            "restore reconciliation pending".into(),
+                        )));
+                    }
+                    if let (Some(permit), Some(bytes)) = (permit.take(), bytes.take()) {
+                        permit.send(bytes);
+                    }
+                    Ok::<_, StoreError>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        db_tx.commit().await?;
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let _ = db_tx.rollback().await;
+                        Err(err)
+                    }
+                }
             })
             .await?;
-        if current != Some(expected) {
-            return Err(UNAVAILABLE);
-        }
-        Ok(())
-    }
-
-    async fn send_gated(&self, tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
-        // Wait for backpressure clearance BEFORE checking the restore gate so any gate closure
-        // or close/reopen generation cycle that happened while blocked aborts delivery immediately.
-        let permit = reserve_send(tx).await?;
-        if let Err(err) = self.check_gate_generation().await {
-            drop(permit);
-            return Err(err);
-        }
-        permit.send(bytes);
         Ok(())
     }
 

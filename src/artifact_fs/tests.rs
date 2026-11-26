@@ -91,7 +91,7 @@ fn open_refuses_unusable_directories() {
 async fn paths_come_only_from_a_canonical_reservation_uuid() {
     let dir = Dir::new();
     let store = store(&dir);
-    assert!(store.stage(RESERVATION).await.is_ok());
+    assert!(store.stage(RESERVATION, None).await.is_ok());
     for refused in [
         "../0b0a5d9e-1c1e-4c6a-9a49-3f1d2b7c8e1",
         "0B0A5D9E-1C1E-4C6A-9A49-3F1D2B7C8E10",
@@ -99,7 +99,7 @@ async fn paths_come_only_from_a_canonical_reservation_uuid() {
         "report.pdf",
         "",
     ] {
-        assert!(store.stage(refused).await.is_err(), "{refused:?}");
+        assert!(store.stage(refused, None).await.is_err(), "{refused:?}");
     }
 }
 
@@ -107,12 +107,12 @@ async fn paths_come_only_from_a_canonical_reservation_uuid() {
 async fn staging_is_exclusive_private_and_keeps_abandoned_inode_for_reclamation() {
     let dir = Dir::new();
     let store = store(&dir);
-    let mut staged = store.stage(RESERVATION).await.unwrap();
+    let mut staged = store.stage(RESERVATION, None).await.unwrap();
     let path = Path::new(&dir.path("root/staging")).join(RESERVATION);
     assert_eq!(mode(&path), 0o600);
     // A second request under the same reservation never touches the first one's file.
     assert!(matches!(
-        store.stage(RESERVATION).await,
+        store.stage(RESERVATION, None).await,
         Err(Error::InProgress)
     ));
     staged.write(b"partial".to_vec()).await.unwrap();
@@ -157,7 +157,7 @@ async fn publish_never_replaces_a_collision_and_preserves_both_links_until_detac
         b"stale",
     )
     .unwrap();
-    let mut staged = store.stage(RESERVATION).await.unwrap();
+    let mut staged = store.stage(RESERVATION, None).await.unwrap();
     for chunk in [b"hello ".to_vec(), b"world".to_vec()] {
         staged.write(chunk).await.unwrap();
     }
@@ -192,7 +192,7 @@ async fn sink_enforces_the_ceiling_without_a_declared_length() {
         hasher: Sha256::new(),
         size: 0,
         max: 10,
-        staged: Some(store.stage(RESERVATION).await.unwrap()),
+        staged: Some(store.stage(RESERVATION, None).await.unwrap()),
     };
     for _ in 0..10 {
         sink.write(vec![b'a']).await.unwrap();
@@ -249,7 +249,7 @@ async fn store_descriptors_are_close_on_exec() {
     ] {
         assert_cloexec(fd, what);
     }
-    let staged = store.stage(RESERVATION).await.unwrap();
+    let staged = store.stage(RESERVATION, None).await.unwrap();
     assert_cloexec(staged.file.as_ref().unwrap(), "staged payload");
     for writable in [false, true] {
         assert_cloexec(
@@ -273,7 +273,7 @@ async fn a_child_process_does_not_keep_a_released_store_lock() {
     let dir = Dir::new();
     let store = store(&dir);
     // `Staged` holds a shared `flock` on the payload until it is dropped.
-    let staged = store.stage(RESERVATION).await.unwrap();
+    let staged = store.stage(RESERVATION, None).await.unwrap();
     let _child = Child(
         std::process::Command::new("sleep")
             .arg("60")
@@ -319,7 +319,7 @@ fn unlink_before_refuses_expired_deadline_and_leaves_file_intact() {
 async fn publish_refuses_expired_fence_deadline_without_linking_revision() {
     let dir = Dir::new();
     let store = store(&dir);
-    let mut staged = store.stage(RESERVATION).await.unwrap();
+    let mut staged = store.stage(RESERVATION, None).await.unwrap();
     staged.write(b"fenced-payload".to_vec()).await.unwrap();
     staged.sync().await.unwrap();
 
@@ -334,4 +334,25 @@ async fn publish_refuses_expired_fence_deadline_without_linking_revision() {
     let valid = Instant::now() + Duration::from_secs(60);
     staged.publish(valid).unwrap();
     assert_eq!(fs::read(&published).unwrap(), b"fenced-payload");
+}
+
+#[test]
+fn create_stage_refuses_expired_deadline_without_creating_staging_file() {
+    let dir = Dir::new();
+    let store = store(&dir);
+    let expired = Instant::now() - Duration::from_secs(1);
+    assert!(matches!(
+        store.create_stage(RESERVATION, false, Some(expired)),
+        Err(Error::Io)
+    ));
+    let staged_path = Path::new(&dir.path("root/staging")).join(RESERVATION);
+    assert!(
+        !staged_path.exists(),
+        "expired stage deadline must abort before volume::open_at creates staging file"
+    );
+
+    let valid = Instant::now() + Duration::from_secs(60);
+    let staged = store.create_stage(RESERVATION, false, Some(valid)).unwrap();
+    assert!(staged_path.exists());
+    drop(staged);
 }

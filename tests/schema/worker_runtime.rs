@@ -184,7 +184,7 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
     .await
     .unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2)",
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2, decode(repeat('00', 32), 'hex'))",
     )
     .bind(origin_us)
     .bind(lifecycle_origin_us)
@@ -203,9 +203,10 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
                     0,
                     decode(repeat('00', 32), 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $2
+                    $2,
+                    decode(repeat('00', 32), 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'), $2) AS c",
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'), $2, decode(repeat('00', 32), 'hex')) AS c",
     )
     .bind(origin_us)
     .bind(lifecycle_origin_us)
@@ -260,7 +261,7 @@ async fn claim_next_waiting_on_dispatch_lock_returns_none_after_gate_closes() {
     wait_for_blocked_peer(&f.db, holder).await;
     // Close the gate while `claim_next` is blocked on `run_dispatch_lock`, then release the lock.
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2)",
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2, decode(repeat('00', 32), 'hex'))",
     )
     .bind(origin_us)
     .bind(lifecycle_origin_us)

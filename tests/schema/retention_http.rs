@@ -1154,21 +1154,28 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
         .connect_with(role_options(&db.0, OWNER))
         .await
         .unwrap();
-    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, Option<i64>, i64, String) =
-        sqlx::query_as(
-            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
-                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
-                    journal_seq,
-                    encode(chain_digest, 'hex')
-               FROM openmettle.deletion_journal_head WHERE id",
-        )
-        .fetch_one(&owner_pool)
-        .await
-        .unwrap();
+    let (origin_us, lifecycle_origin_us, lifecycle_baseline, head_seq, head_digest): (
+        i64,
+        Option<i64>,
+        Option<String>,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                encode(lifecycle_baseline_digest, 'hex'),
+                journal_seq,
+                encode(chain_digest, 'hex')
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
     restore::lock(
         &owner_pool,
         origin_us,
         lifecycle_origin_us,
+        lifecycle_baseline.as_deref(),
         head_seq,
         &head_digest,
         true,
@@ -1432,14 +1439,16 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
                     $2,
                     decode($3, 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $4
+                    $4,
+                    decode($5, 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) c",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lifecycle_origin_us)
+    .bind(lifecycle_baseline.as_deref())
     .execute(&owner_pool)
     .await
     .unwrap();
@@ -1976,17 +1985,23 @@ async fn review_regressions_live_refs_holds_receipts_concealment_unshare_and_adm
     assert_eq!(col_state, "active");
 
     // --- P1 #4: DownloadArtifactRevision admission serializes with restore_gate_lock ---
-    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, Option<i64>, i64, String) =
-        sqlx::query_as(
-            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
-                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
-                    journal_seq,
-                    encode(chain_digest, 'hex')
-               FROM openmettle.deletion_journal_head WHERE id",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
+    let (origin_us, lifecycle_origin_us, lifecycle_baseline, head_seq, head_digest): (
+        i64,
+        Option<i64>,
+        Option<String>,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                encode(lifecycle_baseline_digest, 'hex'),
+                journal_seq,
+                encode(chain_digest, 'hex')
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
     let mut gate_holder = connect(&db.0, OWNER).await;
     let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut gate_holder)
@@ -1994,12 +2009,13 @@ async fn review_regressions_live_refs_holds_receipts_concealment_unshare_and_adm
         .unwrap();
     let mut gate_tx = gate_holder.begin().await.unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4, decode($5, 'hex'))",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lifecycle_origin_us)
+    .bind(lifecycle_baseline.as_deref())
     .execute(&mut *gate_tx)
     .await
     .unwrap();
@@ -2428,10 +2444,11 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         }
     };
 
-    async fn head_state(pool: &PgPool) -> (i64, Option<i64>, i64, String) {
-        sqlx::query_as::<_, (i64, Option<i64>, i64, String)>(
+    async fn head_state(pool: &PgPool) -> (i64, Option<i64>, Option<String>, i64, String) {
+        sqlx::query_as::<_, (i64, Option<i64>, Option<String>, i64, String)>(
             "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
                     (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    encode(lifecycle_baseline_digest, 'hex'),
                     journal_seq,
                     encode(chain_digest, 'hex')
                FROM openmettle.deletion_journal_head WHERE id",
@@ -2445,6 +2462,7 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         pool: &PgPool,
         origin_us: i64,
         lc_origin: Option<i64>,
+        lc_baseline: Option<String>,
         head_seq: i64,
         head_digest: String,
     ) {
@@ -2456,14 +2474,16 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
                         $2,
                         decode($3, 'hex'),
                         (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                        $4
+                        $4,
+                        decode($5, 'hex')
                     )
-               FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
+               FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) c",
         )
         .bind(origin_us)
         .bind(head_seq)
         .bind(&head_digest)
         .bind(lc_origin)
+        .bind(lc_baseline.as_deref())
         .execute(pool)
         .await
         .unwrap();
@@ -2512,11 +2532,12 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
     let mut total_downloaded = first.len();
 
     // Pause client after reading the first slice across a FULL close -> reopen -> retain cycle!
-    let (origin_us, lc_origin, head_seq, head_digest) = head_state(&owner_pool).await;
+    let (origin_us, lc_origin, lc_baseline, head_seq, head_digest) = head_state(&owner_pool).await;
     restore::lock(
         &owner_pool,
         origin_us,
         lc_origin,
+        lc_baseline.as_deref(),
         head_seq,
         &head_digest,
         true,
@@ -2525,7 +2546,15 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
     )
     .await
     .unwrap();
-    reopen_gate(&owner_pool, origin_us, lc_origin, head_seq, head_digest).await;
+    reopen_gate(
+        &owner_pool,
+        origin_us,
+        lc_origin,
+        lc_baseline,
+        head_seq,
+        head_digest,
+    )
+    .await;
     let (del_resp, _del_guard) = open_req(
         64 * 1024,
         "DELETE",
@@ -2702,11 +2731,12 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
     }
 
     // Close the restore gate while ListRunApprovals is blocked on `runs FOR UPDATE`!
-    let (origin_us, lc_origin, head_seq, head_digest) = head_state(&owner_pool).await;
+    let (origin_us, lc_origin, lc_baseline, head_seq, head_digest) = head_state(&owner_pool).await;
     restore::lock(
         &owner_pool,
         origin_us,
         lc_origin,
+        lc_baseline.as_deref(),
         head_seq,
         &head_digest,
         true,
@@ -2740,6 +2770,7 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         &owner_pool,
         origin_us,
         lc_origin,
+        lc_baseline.clone(),
         head_seq,
         head_digest.clone(),
     )
@@ -2753,12 +2784,13 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         .unwrap();
     let mut gate_tx = gate_holder.begin().await.unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4, decode($5, 'hex'))",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lc_origin)
+    .bind(lc_baseline.as_deref())
     .execute(&mut *gate_tx)
     .await
     .unwrap();
@@ -2798,6 +2830,7 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         &owner_pool,
         origin_us,
         lc_origin,
+        lc_baseline.clone(),
         head_seq,
         head_digest.clone(),
     )
@@ -2877,6 +2910,7 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
         &owner_pool,
         origin_us,
         lc_origin,
+        lc_baseline.as_deref(),
         head_seq,
         &head_digest,
         true,

@@ -329,13 +329,13 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[])) AS f WHERE $1 = 41
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.retention_upgrade_baseline_immutable()',false,ARRAY[]::text[]),
-        ('openmettle.retention_baseline_step(bytea,uuid,uuid,bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.retention_baseline_step(bytea,uuid,uuid,text,bigint,bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
         ('openmettle.restore_gate_lock_open_generation()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.restore_gate_is_closed_for_owner()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.deletion_journal_append_lifecycle()',true,ARRAY[]::text[]),
         ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.restore_verify_export(bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
-        ('openmettle.restore_replay_baseline(bigint,bytea,uuid[],uuid[],bigint[],bigint[],bytea[],bigint[])',false,ARRAY[]::text[]),
+        ('openmettle.restore_replay_baseline(bigint,bytea,uuid[],uuid[],text[],bigint[],bigint[],bigint[],bytea[],bigint[])',false,ARRAY[]::text[]),
         ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea,bigint)',false,ARRAY[]::text[]),

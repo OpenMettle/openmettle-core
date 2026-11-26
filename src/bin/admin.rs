@@ -172,8 +172,10 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
     if new_restore_flag && replace_restore_run.is_none() {
         return Err("--new-restore requires --replace-restore-run");
     }
-    if lifecycle_baseline_digest.is_some() && lifecycle_origin_us.is_none() {
-        return Err("--required-lifecycle-baseline-digest requires --required-lifecycle-origin");
+    if lifecycle_origin_us.is_some() != lifecycle_baseline_digest.is_some() {
+        return Err(
+            "--required-lifecycle-origin and --required-lifecycle-baseline-digest must be supplied together",
+        );
     }
     let origin_us = origin_us.ok_or(usage)?;
     let required_seq = required_seq.ok_or(usage)?;
@@ -664,4 +666,79 @@ fn print_drift(report: &openmettle_core::artifact_fs::Drift) {
         report.quarantined,
         report.unsettled_payloads
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_restore_lock_args;
+    use openmettle_core::restore::GENESIS;
+
+    fn vecs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn restore_lock_requires_paired_lifecycle_origin_and_baseline_digest() {
+        let origin_only = vecs(&[
+            "--required-origin",
+            "100",
+            "--required-lifecycle-origin",
+            "200",
+            "--required-seq",
+            "0",
+            "--required-digest",
+            GENESIS,
+        ]);
+        assert_eq!(
+            parse_restore_lock_args(&origin_only).err(),
+            Some(
+                "--required-lifecycle-origin and --required-lifecycle-baseline-digest must be supplied together"
+            )
+        );
+
+        let digest_only = vecs(&[
+            "--required-origin",
+            "100",
+            "--required-lifecycle-baseline-digest",
+            GENESIS,
+            "--required-seq",
+            "0",
+            "--required-digest",
+            GENESIS,
+        ]);
+        assert_eq!(
+            parse_restore_lock_args(&digest_only).err(),
+            Some(
+                "--required-lifecycle-origin and --required-lifecycle-baseline-digest must be supplied together"
+            )
+        );
+
+        let paired = vecs(&[
+            "--required-origin",
+            "100",
+            "--required-lifecycle-origin",
+            "200",
+            "--required-lifecycle-baseline-digest",
+            GENESIS,
+            "--required-seq",
+            "0",
+            "--required-digest",
+            GENESIS,
+        ]);
+        let parsed = parse_restore_lock_args(&paired).unwrap();
+        assert_eq!(parsed.lifecycle_origin_us, Some(200));
+        assert_eq!(parsed.lifecycle_baseline_digest.as_deref(), Some(GENESIS));
+
+        let neither = vecs(&[
+            "--required-origin",
+            "100",
+            "--required-seq",
+            "0",
+            "--required-digest",
+            GENESIS,
+        ]);
+        let parsed = parse_restore_lock_args(&neither).unwrap();
+        assert_eq!(parsed.lifecycle_origin_us, None);
+        assert_eq!(parsed.lifecycle_baseline_digest, None);
+    }
 }

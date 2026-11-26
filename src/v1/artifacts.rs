@@ -422,11 +422,15 @@ impl Api {
                 let outcome = async {
                     let conn = tx.connection()?;
                     let principal = principal(conn, &context).await?;
-                    let expected_generation = restore::require_open_gate_generation(conn).await?;
                     let now = context.observed_ms();
                     projects::authorize_artifact(conn, &principal, artifact, Action::Download, now)
                         .await?;
-                    let revision = read_revision(conn, artifact, revision_id).await?;
+                    // Canonical lock order (storage.rs): lock artifact_revisions FOR SHARE first,
+                    // then restore_reconciliation_gate FOR SHARE.
+                    let revision = storage::read_revision_for_share(conn, artifact, revision_id)
+                        .await?
+                        .ok_or(StoreError::Denied(DenialReason::NotFound))?;
+                    let expected_generation = restore::require_open_gate_generation(conn).await?;
                     if revision.state != "active" {
                         return Err(NOT_SERVABLE);
                     }
@@ -470,7 +474,7 @@ impl Api {
                 .await;
                 match outcome {
                     Ok(plan) => {
-                        tx.rollback().await.map_err(|_| UNAVAILABLE)?;
+                        tx.commit().await.map_err(|_| UNAVAILABLE)?;
                         Ok(plan)
                     }
                     Err(err) => {

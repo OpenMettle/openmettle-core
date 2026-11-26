@@ -1086,24 +1086,31 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
     let f = Fixture::new().await;
     let mut owner = connect(&f.db.0, OWNER).await;
     let s = due(&f, "gated").await;
-    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, i64, i64, String) =
-        sqlx::query_as(
-            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
-                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
-                    journal_seq,
-                    encode(chain_digest, 'hex')
-               FROM openmettle.deletion_journal_head WHERE id",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
+    let (origin_us, lifecycle_origin_us, lifecycle_baseline_digest, head_seq, head_digest): (
+        i64,
+        i64,
+        String,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                encode(lifecycle_baseline_digest, 'hex'),
+                journal_seq,
+                encode(chain_digest, 'hex')
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4, decode($5, 'hex'))",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lifecycle_origin_us)
+    .bind(&lifecycle_baseline_digest)
     .execute(&mut owner)
     .await
     .unwrap();
@@ -1124,14 +1131,16 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
                     $2,
                     decode($3, 'hex'),
                     (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
-                    $4
+                    $4,
+                    decode($5, 'hex')
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) AS c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex')) AS c",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
     .bind(lifecycle_origin_us)
+    .bind(&lifecycle_baseline_digest)
     .execute(&mut owner)
     .await
     .unwrap();

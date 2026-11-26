@@ -13,7 +13,7 @@
 //! - optional schema-42+ lifecycle upgrade baseline section (absent on pre-42 exports):
 //!   - `lifecycle_origin <lifecycle_coverage_started_us>`
 //!   - `lifecycle_baseline <lifecycle_baseline_digest_hex>`
-//!   - zero or more sorted `baseline <entity_id> <scope_id> <retained_us> <original_purge_after_us> <content_digest_hex> <policy_revision|->` lines
+//!   - zero or more sorted `baseline <entity_id> <scope_id> <state> <retained_us> <original_purge_after_us> <purging_us|-> <content_digest_hex> <policy_revision|->` lines
 //! - zero or more record lines (times in Unix microseconds, digests in 64-character lowercase hex,
 //!   canonical UUIDs, `-` for NULL optional columns):
 //!   - `artifact_revision.purged` (10 fields):
@@ -121,20 +121,26 @@ struct Record {
 struct BaselineEntry {
     entity_id: String,
     scope_id: String,
+    state: String,
     retained_us: i64,
     original_purge_after_us: i64,
+    purging_us: Option<i64>,
     content_digest: String,
     policy_revision: Option<i64>,
 }
 
 fn baseline_step(prev_hex: &str, entry: &BaselineEntry) -> String {
+    let purging = entry
+        .purging_us
+        .map_or_else(|| "-".to_owned(), |n| n.to_string());
     let policy = entry
         .policy_revision
         .map_or_else(|| "-".to_owned(), |n| n.to_string());
     let input = format!(
-        "{prev_hex}:{}:{}:{}:{}:{}:{policy}",
+        "{prev_hex}:{}:{}:{}:{}:{}:{purging}:{}:{policy}",
         entry.entity_id,
         entry.scope_id,
+        entry.state,
         entry.retained_us,
         entry.original_purge_after_us,
         entry.content_digest,
@@ -143,7 +149,16 @@ fn baseline_step(prev_hex: &str, entry: &BaselineEntry) -> String {
 }
 
 /// Raw SQL tuple matching [`export`] for `retention_upgrade_baseline`.
-type BaselineRow = (String, String, i64, i64, String, Option<i64>);
+type BaselineRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    String,
+    Option<i64>,
+);
 
 /// Raw SQL tuple matching [`export`].
 type ExportRow = (
@@ -383,8 +398,11 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         sqlx::query_as(
             "SELECT artifact_revision_id::text,
                     scope_id::text,
+                    state,
                     round(extract(epoch FROM retained_at) * 1000000)::bigint,
                     round(extract(epoch FROM original_purge_after) * 1000000)::bigint,
+                    CASE WHEN purging_at IS NOT NULL
+                         THEN round(extract(epoch FROM purging_at) * 1000000)::bigint END,
                     encode(content_digest, 'hex'),
                     policy_revision
                FROM openmettle.retention_upgrade_baseline
@@ -409,17 +427,20 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
             let entry = BaselineEntry {
                 entity_id: b.0.clone(),
                 scope_id: b.1.clone(),
-                retained_us: b.2,
-                original_purge_after_us: b.3,
-                content_digest: b.4.clone(),
-                policy_revision: b.5,
+                state: b.2.clone(),
+                retained_us: b.3,
+                original_purge_after_us: b.4,
+                purging_us: b.5,
+                content_digest: b.6.clone(),
+                policy_revision: b.7,
             };
             folded = baseline_step(&folded, &entry);
-            let policy = fmt_opt(b.5);
+            let purging = fmt_opt(b.5);
+            let policy = fmt_opt(b.7);
             let _ = writeln!(
                 text,
-                "baseline {} {} {} {} {} {policy}",
-                b.0, b.1, b.2, b.3, b.4
+                "baseline {} {} {} {} {} {purging} {} {policy}",
+                b.0, b.1, b.2, b.3, b.4, b.6
             );
         }
         if folded != baseline_digest {
@@ -529,7 +550,17 @@ impl Export {
             {
                 let line = lines.next().unwrap_or_default();
                 let fields: Vec<&str> = line.split(' ').collect();
-                let ["baseline", entity, scope, retained, after, content, policy] = fields[..]
+                let [
+                    "baseline",
+                    entity,
+                    scope,
+                    state,
+                    retained,
+                    after,
+                    purging,
+                    content,
+                    policy,
+                ] = fields[..]
                 else {
                     return Err(Error::Export("malformed baseline line"));
                 };
@@ -539,6 +570,9 @@ impl Export {
                 if prev_entity.as_deref().is_some_and(|prev| entity <= prev) {
                     return Err(Error::Export("baseline out of order"));
                 }
+                if !matches!(state, "retained" | "purging") {
+                    return Err(Error::Export("malformed baseline line"));
+                }
                 if !is_valid_digest(content) {
                     return Err(Error::Export("malformed digest"));
                 }
@@ -546,6 +580,12 @@ impl Export {
                 let original_purge_after_us = number(after)?;
                 if original_purge_after_us < retained_us {
                     return Err(Error::Export("malformed number"));
+                }
+                let purging_us = opt_number(purging)?;
+                match (state, purging_us) {
+                    ("retained", None) => {}
+                    ("purging", Some(p)) if p >= original_purge_after_us => {}
+                    _ => return Err(Error::Export("malformed baseline line")),
                 }
                 let policy_revision = match policy {
                     "-" => None,
@@ -560,8 +600,10 @@ impl Export {
                 let entry = BaselineEntry {
                     entity_id: entity.into(),
                     scope_id: scope.into(),
+                    state: state.into(),
                     retained_us,
                     original_purge_after_us,
+                    purging_us,
                     content_digest: content.into(),
                     policy_revision,
                 };
@@ -761,15 +803,15 @@ pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateL
     if !is_valid_digest(req.required_digest) {
         return Err(Error::Invalid("invalid chain digest"));
     }
-    if let Some(baseline) = req.lifecycle_baseline_digest {
-        if !is_valid_digest(baseline) {
-            return Err(Error::Invalid("invalid lifecycle baseline digest"));
-        }
-        if req.lifecycle_origin_us.is_none() {
-            return Err(Error::Invalid(
-                "lifecycle baseline digest requires lifecycle origin",
-            ));
-        }
+    if req.lifecycle_origin_us.is_some() != req.lifecycle_baseline_digest.is_some() {
+        return Err(Error::Invalid(
+            "lifecycle origin and lifecycle baseline digest must be supplied together",
+        ));
+    }
+    if let Some(baseline) = req.lifecycle_baseline_digest
+        && !is_valid_digest(baseline)
+    {
+        return Err(Error::Invalid("invalid lifecycle baseline digest"));
     }
     if let Some(run_id) = req.replace_restore_run
         && !runs::is_canonical_uuid(run_id)
@@ -814,14 +856,16 @@ pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateL
 }
 
 /// Closes or updates the gate after a restore (migration 41/42's `restore_gate_lock`) with the
-/// independently recorded installation `origin_us`, optional schema-42 `lifecycle_origin_us`,
-/// target watermark `(required_seq, required_digest)`, `coverage_complete` flag, optional
-/// `replace_restore_run`, and `new_restore`.
+/// independently recorded installation `origin_us`, optional paired schema-42
+/// `(lifecycle_origin_us, lifecycle_baseline_digest)`, target watermark
+/// `(required_seq, required_digest)`, `coverage_complete` flag, optional `replace_restore_run`,
+/// and `new_restore`.
 #[allow(clippy::too_many_arguments)]
 pub async fn lock(
     pool: &PgPool,
     origin_us: i64,
     lifecycle_origin_us: Option<i64>,
+    lifecycle_baseline_digest: Option<&str>,
     required_seq: i64,
     required_digest: &str,
     coverage_complete: bool,
@@ -833,7 +877,7 @@ pub async fn lock(
         &GateLockRequest {
             origin_us,
             lifecycle_origin_us,
-            lifecycle_baseline_digest: None,
+            lifecycle_baseline_digest,
             required_seq,
             required_digest,
             coverage_complete,
@@ -916,15 +960,19 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
     ) {
         let mut entity_ids = Vec::with_capacity(export.baseline.len());
         let mut scope_ids = Vec::with_capacity(export.baseline.len());
+        let mut states = Vec::with_capacity(export.baseline.len());
         let mut retained_us = Vec::with_capacity(export.baseline.len());
         let mut purge_after_us = Vec::with_capacity(export.baseline.len());
+        let mut purging_us = Vec::with_capacity(export.baseline.len());
         let mut content_digests = Vec::with_capacity(export.baseline.len());
         let mut policy_revisions = Vec::with_capacity(export.baseline.len());
         for b in &export.baseline {
             entity_ids.push(b.entity_id.as_str());
             scope_ids.push(b.scope_id.as_str());
+            states.push(b.state.as_str());
             retained_us.push(b.retained_us);
             purge_after_us.push(b.original_purge_after_us);
+            purging_us.push(b.purging_us);
             content_digests.push(decode_hex_digest(&b.content_digest)?);
             policy_revisions.push(b.policy_revision);
         }
@@ -937,15 +985,19 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
                         $5,
                         $6,
                         $7,
-                        $8
+                        $8,
+                        $9,
+                        $10
                     )",
         )
         .bind(lc_origin)
         .bind(lc_baseline)
         .bind(&entity_ids)
         .bind(&scope_ids)
+        .bind(&states)
         .bind(&retained_us)
         .bind(&purge_after_us)
+        .bind(&purging_us)
         .bind(&content_digests)
         .bind(&policy_revisions)
         .execute(&mut *tx)
@@ -1448,12 +1500,14 @@ mod tests {
         assert_eq!(parsed.records[2].original_purge_after_us, None);
         assert_eq!(parsed.records[3].purged_us, Some(95));
 
-        // Non-empty sorted upgrade baseline verifies folded SHA-256 and refuses tampering/unsorted.
+        // Non-empty sorted upgrade baseline verifies folded SHA-256 (retained + purging) and refuses tampering/unsorted.
         let entry1 = BaselineEntry {
             entity_id: entity.into(),
             scope_id: scope.into(),
+            state: "retained".into(),
             retained_us: 10,
             original_purge_after_us: 20,
+            purging_us: None,
             content_digest: d.clone(),
             policy_revision: Some(1),
         };
@@ -1461,16 +1515,18 @@ mod tests {
         let entry2 = BaselineEntry {
             entity_id: entity2.into(),
             scope_id: scope.into(),
+            state: "purging".into(),
             retained_us: 15,
             original_purge_after_us: 25,
+            purging_us: Some(30),
             content_digest: d.clone(),
             policy_revision: None,
         };
         let b_digest = baseline_step(&baseline_step(GENESIS, &entry1), &entry2);
         let valid_baseline = seal(&format!(
             "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {b_digest}\n\
-             baseline {entity} {scope} 10 20 {d} 1\n\
-             baseline {entity2} {scope} 15 25 {d} -\n\
+             baseline {entity} {scope} retained 10 20 - {d} 1\n\
+             baseline {entity2} {scope} purging 15 25 30 {d} -\n\
              watermark 1 0 {GENESIS} 3\n"
         ));
         let parsed_b = Export::parse(&valid_baseline).unwrap();
@@ -1483,7 +1539,7 @@ mod tests {
         // Tampered baseline digest is refused.
         let bad_b_digest = seal(&format!(
             "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
-             baseline {entity} {scope} 10 20 {d} 1\n\
+             baseline {entity} {scope} retained 10 20 - {d} 1\n\
              watermark 1 0 {GENESIS} 3\n"
         ));
         assert!(matches!(
@@ -1494,13 +1550,24 @@ mod tests {
         // Unsorted baseline entries are refused.
         let unsorted_b = seal(&format!(
             "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {b_digest}\n\
-             baseline {entity2} {scope} 15 25 {d} -\n\
-             baseline {entity} {scope} 10 20 {d} 1\n\
+             baseline {entity2} {scope} purging 15 25 30 {d} -\n\
+             baseline {entity} {scope} retained 10 20 - {d} 1\n\
              watermark 1 0 {GENESIS} 3\n"
         ));
         assert!(matches!(
             Export::parse(&unsorted_b),
             Err(Error::Export("baseline out of order"))
+        ));
+
+        // Invalid baseline state/purging_us combinations are refused.
+        let bad_b_purging = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             baseline {entity} {scope} purging 10 20 - {d} 1\n\
+             watermark 1 0 {GENESIS} 3\n"
+        ));
+        assert!(matches!(
+            Export::parse(&bad_b_purging),
+            Err(Error::Export("malformed baseline line"))
         ));
 
         // lifecycle_origin without lifecycle_baseline is refused.

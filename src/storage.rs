@@ -272,9 +272,30 @@ pub async fn read_revision(
     artifact_id: &str,
     revision_id: &str,
 ) -> Result<Option<Revision>, Error> {
+    read_revision_locked(c, artifact_id, revision_id, false).await
+}
+
+/// Like [`read_revision`], acquiring `FOR SHARE` on `openmettle.artifact_revisions` so concurrent
+/// disassociation cannot commit while download admission checks the restore gate and opens the
+/// payload (preserving canonical lock order: `artifact_revisions` before
+/// `restore_reconciliation_gate`).
+pub(crate) async fn read_revision_for_share(
+    c: &mut PgConnection,
+    artifact_id: &str,
+    revision_id: &str,
+) -> Result<Option<Revision>, Error> {
+    read_revision_locked(c, artifact_id, revision_id, true).await
+}
+
+async fn read_revision_locked(
+    c: &mut PgConnection,
+    artifact_id: &str,
+    revision_id: &str,
+    for_share: bool,
+) -> Result<Option<Revision>, Error> {
     uuid(artifact_id)?;
     uuid(revision_id)?;
-    let row = sqlx::query(
+    let sql = if for_share {
         "SELECT r.id::text, r.artifact_id::text, r.revision, r.scope_id::text, s.project_id::text,
                 r.reservation_id::text, r.size_bytes, r.content_digest, r.media_type,
                 r.display_name, r.state,
@@ -282,12 +303,23 @@ pub async fn read_revision(
                 (extract(epoch FROM r.retained_at) * 1000000)::bigint,
                 (extract(epoch FROM r.purge_after) * 1000000)::bigint
            FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
-          WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid",
-    )
-    .bind(artifact_id)
-    .bind(revision_id)
-    .fetch_optional(c)
-    .await?;
+          WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid
+            FOR SHARE OF r"
+    } else {
+        "SELECT r.id::text, r.artifact_id::text, r.revision, r.scope_id::text, s.project_id::text,
+                r.reservation_id::text, r.size_bytes, r.content_digest, r.media_type,
+                r.display_name, r.state,
+                (extract(epoch FROM r.created_at) * 1000000)::bigint,
+                (extract(epoch FROM r.retained_at) * 1000000)::bigint,
+                (extract(epoch FROM r.purge_after) * 1000000)::bigint
+           FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
+          WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid"
+    };
+    let row = sqlx::query(sql)
+        .bind(artifact_id)
+        .bind(revision_id)
+        .fetch_optional(c)
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };
