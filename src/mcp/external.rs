@@ -983,6 +983,7 @@ fn redact_value_strings_with(
     needle: &str,
     marker: &str,
     redact_primitives: bool,
+    withhold_unverified_f64: bool,
 ) {
     if needle.is_empty() {
         return;
@@ -997,11 +998,11 @@ fn redact_value_strings_with(
             let raw = n.to_string();
             if raw.contains(needle) {
                 *value = Value::String(redact_plain_str_with(&raw, needle, marker));
-            } else if n.is_f64() && is_json_number_alphabet(needle) {
-                // Defense-in-depth: for any already-parsed `Value::Number` whose representation
-                // fell back to `f64` (integers outside `i64::MIN..=u64::MAX`, exponents, floats),
-                // the original wire spelling is unavailable, so withhold when the secret is in
-                // the JSON number alphabet.
+            } else if withhold_unverified_f64 && n.is_f64() && is_json_number_alphabet(needle) {
+                // Defense-in-depth strictly for already-parsed `Value::Number` whose original raw
+                // JSON spelling was unavailable (no prior wire/text-block scan): `f64` numbers
+                // (integers outside `i64::MIN..=u64::MAX`, exponents, floats) are withheld when
+                // the secret belongs to the JSON number alphabet.
                 *value = Value::String(marker.to_owned());
             }
         }
@@ -1013,7 +1014,13 @@ fn redact_value_strings_with(
         }
         Value::Array(items) => {
             for item in items {
-                redact_value_strings_with(item, needle, marker, redact_primitives);
+                redact_value_strings_with(
+                    item,
+                    needle,
+                    marker,
+                    redact_primitives,
+                    withhold_unverified_f64,
+                );
             }
         }
         Value::Object(map) => {
@@ -1022,7 +1029,13 @@ fn redact_value_strings_with(
             let mut cursors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
             let mut out = Map::with_capacity(entries.len());
             for (k, mut v) in entries {
-                redact_value_strings_with(&mut v, needle, marker, redact_primitives);
+                redact_value_strings_with(
+                    &mut v,
+                    needle,
+                    marker,
+                    redact_primitives,
+                    withhold_unverified_f64,
+                );
                 let new_key = if k.contains(needle) {
                     let base = redact_plain_str_with(&k, needle, marker);
                     disambiguate_redacted_key(base, needle, &out, &original_keys, &mut cursors)
@@ -1039,7 +1052,7 @@ fn redact_value_strings_with(
 
 fn redact_value_strings(value: &mut Value, handle: &str) {
     let marker = choose_safe_marker(handle);
-    redact_value_strings_with(value, handle, &marker, false);
+    redact_value_strings_with(value, handle, &marker, false, false);
 }
 
 fn has_json_escape_sequence(s: &str) -> bool {
@@ -1147,7 +1160,9 @@ fn sanitize_text_block(
         }
         if let Some(s) = secret {
             let marker = choose_credential_marker(s);
-            redact_value_strings_with(&mut parsed, s, &marker, true);
+            // `block` was already scanned by `redact_json_number_literals` before JSON parsing,
+            // so unrelated decimal values (e.g. `0.75`) are verified and preserved.
+            redact_value_strings_with(&mut parsed, s, &marker, true, false);
         }
         parsed.sort_all_objects();
         return parsed.to_string();
@@ -1206,8 +1221,13 @@ fn sanitize_tool_success(
             ));
         }
         sanitized_blocks.join("\n")
-    } else if let Some(structured) = &success.structured {
-        let mut sanitized = structured.clone();
+    } else if let Some((base, withhold_unverified_f64)) = success
+        .scrubbed_structured
+        .as_ref()
+        .map(|v| (v, false))
+        .or_else(|| success.structured.as_ref().map(|v| (v, true)))
+    {
+        let mut sanitized = base.clone();
         if let (Some(field), Some(map)) = (handle_field, sanitized.as_object_mut()) {
             map.remove(field);
         }
@@ -1216,7 +1236,7 @@ fn sanitize_tool_success(
         }
         if let Some(s) = secret {
             let marker = choose_credential_marker(s);
-            redact_value_strings_with(&mut sanitized, s, &marker, true);
+            redact_value_strings_with(&mut sanitized, s, &marker, true, withhold_unverified_f64);
         }
         sanitized.sort_all_objects();
         sanitized.to_string()
@@ -1828,6 +1848,7 @@ mod tests {
                 "nested": [format!("again:{escaped_handle}")],
                 "count": 1
             })),
+            scrubbed_structured: None,
             meta: None,
         };
         let (text, handle) =
@@ -1851,6 +1872,7 @@ mod tests {
                 "label": "item-1",
                 "ok": true
             })),
+            scrubbed_structured: None,
             meta: None,
         };
         let (short_text, short_handle) =
@@ -1874,6 +1896,7 @@ mod tests {
                 .to_string(),
             ],
             structured: Some(json!({"handle": "1"})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (ctext, chandle) = sanitize_tool_success(&json_content, Some("handle"), None).unwrap();
@@ -1888,6 +1911,7 @@ mod tests {
             text: String::new(),
             content_blocks: vec![format!("done {escaped_handle} end")],
             structured: Some(json!({"handle": escaped_handle})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (ptext, phandle) = sanitize_tool_success(&plain_content, Some("handle"), None).unwrap();
@@ -1904,6 +1928,7 @@ mod tests {
                 "[REDACTED]": "keep",
                 "h-key": {"nested-h-key": "val-h-key"}
             })),
+            scrubbed_structured: None,
             meta: None,
         };
         let (ktext, khandle) = sanitize_tool_success(&key_collision, Some("handle"), None).unwrap();
@@ -1924,6 +1949,7 @@ mod tests {
                 "[REDACTED]": 1,
                 "2": 2
             })),
+            scrubbed_structured: None,
             meta: None,
         };
         let (dtext, dhandle) = sanitize_tool_success(&digit_two, Some("handle"), None).unwrap();
@@ -1941,6 +1967,7 @@ mod tests {
                 "[REDACTED]": "a",
                 "#": "b"
             })),
+            scrubbed_structured: None,
             meta: None,
         };
         let (htext, hhandle) = sanitize_tool_success(&hash_handle, Some("handle"), None).unwrap();
@@ -1955,6 +1982,7 @@ mod tests {
             text: String::new(),
             content_blocks: vec![json!(format!("prefix {escaped_handle} suffix")).to_string()],
             structured: Some(json!({"handle": escaped_handle})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (stext, shandle) =
@@ -1976,6 +2004,7 @@ mod tests {
                     .to_string(),
             ],
             structured: Some(json!({"handle": escaped_handle})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (mb_text, mb_handle) =
@@ -2007,6 +2036,7 @@ mod tests {
                     format!("k1-{tricky_handle}{tricky_handle}"): "v2",
                     tricky_handle: "v3"
                 })),
+                scrubbed_structured: None,
                 meta: None,
             };
             let (t_out, t_h) = sanitize_tool_success(&tricky, Some("handle"), None).unwrap();
@@ -2038,6 +2068,7 @@ mod tests {
                 "null".into(),
             ],
             structured: Some(json!({"handle": "1"})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (dp_out, dp_h) =
@@ -2062,6 +2093,7 @@ mod tests {
             text: String::new(),
             content_blocks: vec!["true".into(), "false".into(), "null".into()],
             structured: Some(json!({"handle": "t"})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle"), None).unwrap();
@@ -2077,6 +2109,7 @@ mod tests {
                 "18446744073709551618".into(),
             ],
             structured: Some(json!({"handle": "18446744073709551617"})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (ene_out, ene_h) =
@@ -2092,6 +2125,7 @@ mod tests {
             text: String::new(),
             content_blocks: vec!["\x0c10\x0c".into(), "\x0c18446744073709551617\x0c".into()],
             structured: Some(json!({"handle": "1"})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (ff_out, ff_h) =
@@ -2156,6 +2190,7 @@ mod tests {
             text: String::new(),
             content_blocks: Vec::new(),
             structured: Some(Value::Object(many_keys)),
+            scrubbed_structured: None,
             meta: None,
         };
         let (m_out, m_h) = sanitize_tool_success(&many, Some("handle"), None).unwrap();
@@ -2176,6 +2211,7 @@ mod tests {
             text: "ok".into(),
             content_blocks: vec!["ok".into()],
             structured: Some(json!({"ok": true})),
+            scrubbed_structured: None,
             meta: None,
         };
         assert!(matches!(
@@ -2193,6 +2229,7 @@ mod tests {
             text: "ok".into(),
             content_blocks: vec!["ok".into()],
             structured: Some(json!({"handle": "op_123-abc"})),
+            scrubbed_structured: None,
             meta: None,
         };
         assert!(matches!(
@@ -2215,6 +2252,7 @@ mod tests {
                 text: "ok".into(),
                 content_blocks: vec!["ok".into()],
                 structured: Some(json!({"handle": bad})),
+                scrubbed_structured: None,
                 meta: None,
             };
             assert!(
@@ -2242,6 +2280,7 @@ mod tests {
                 json!({"echo": format!("tok={secret}"), "secret_key": secret}).to_string(),
             ],
             structured: Some(json!({"handle": "op-clean-1", "echo": secret})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (out, handle) =
@@ -2254,6 +2293,7 @@ mod tests {
             text: String::new(),
             content_blocks: Vec::new(),
             structured: Some(json!({"result": format!("Bearer {secret}")})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (s_out, _) = sanitize_tool_success(&echoed_structured, None, Some(secret)).unwrap();
@@ -2264,6 +2304,7 @@ mod tests {
             text: "ok".into(),
             content_blocks: vec!["ok".into()],
             structured: Some(json!({"handle": format!("h-{secret}")})),
+            scrubbed_structured: None,
             meta: None,
         };
         assert!(matches!(
@@ -2288,6 +2329,7 @@ mod tests {
                 "198765432101234569".into(),
             ],
             structured: None,
+            scrubbed_structured: None,
             meta: None,
         };
         let (num_out, _) =
@@ -2302,6 +2344,7 @@ mod tests {
             text: String::new(),
             content_blocks: Vec::new(),
             structured: Some(json!({"echo_num": 9876543210123456u64, "ok": true})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (s_num_out, _) =
@@ -2318,6 +2361,7 @@ mod tests {
             text: String::new(),
             content_blocks: Vec::new(),
             structured: Some(json!({"flag": true, "other": false})),
+            scrubbed_structured: None,
             meta: None,
         };
         let (bool_out, _) = sanitize_tool_success(&in_bool, None, Some("true")).unwrap();
@@ -2331,14 +2375,18 @@ mod tests {
 
         // Integers exceeding `u64::MAX` (e.g. `10^20`), which `serde_json` otherwise normalizes
         // to `f64` (`1e+20`), must be redacted before `f64` conversion in `content_blocks` and
-        // withheld via `is_f64()` defense-in-depth in already-parsed `structured` `Value`s.
+        // wire-verified `scrubbed_structured` while preserving unrelated decimals (`0.75`),
+        // whereas unverified in-memory `structured` (`scrubbed_structured: None`) still withholds
+        // `f64` numbers while keeping exact integers (`42`). Numeric `handle` fields on unmodified
+        // wire `structured` must always be rejected (`TerminalRefusal`).
         let big_bearer = "100000000000000000000";
         let big_in_content = ToolCallSuccess {
             text: String::new(),
             content_blocks: vec![format!(
-                r#"{{"nested": [{big_bearer}], "wrapped": 1{big_bearer}9, "keep_int": 42}}"#
+                r#"{{"nested": [{big_bearer}], "wrapped": 1{big_bearer}9, "keep_int": 42, "score": 0.75}}"#
             )],
             structured: None,
+            scrubbed_structured: None,
             meta: None,
         };
         let (big_c_out, _) =
@@ -2353,13 +2401,51 @@ mod tests {
         assert_eq!(parsed_big_c["nested"][0], "[REDACTED_CREDENTIAL]");
         assert_eq!(parsed_big_c["wrapped"], "1[REDACTED_CREDENTIAL]9");
         assert_eq!(parsed_big_c["keep_int"], 42);
+        assert_eq!(parsed_big_c["score"], json!(0.75));
 
+        // Wire-scrubbed `structuredContent` preserves unrelated decimal `0.75`.
+        let wire_scrubbed = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(
+                serde_json::from_str(r#"{"leak": 100000000000000000000, "score": 0.75}"#).unwrap(),
+            ),
+            scrubbed_structured: Some(json!({"leak": "[REDACTED_CREDENTIAL]", "score": 0.75})),
+            meta: None,
+        };
+        let (ws_out, _) = sanitize_tool_success(&wire_scrubbed, None, Some(big_bearer)).unwrap();
+        for forbidden in [big_bearer, "1e+20", "1e20", "1E+20", "1E20", "1E"] {
+            assert!(!ws_out.contains(forbidden), "{ws_out}");
+        }
+        let parsed_ws: Value = serde_json::from_str(&ws_out).expect("valid JSON");
+        assert_eq!(parsed_ws["leak"], "[REDACTED_CREDENTIAL]");
+        assert_eq!(parsed_ws["score"], json!(0.75));
+
+        // Numeric `handle` on unmodified wire `structured` must fail with `TerminalRefusal`
+        // even when `scrubbed_structured` replaced the numeric token with `[REDACTED_CREDENTIAL]`.
+        let numeric_handle_wire = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(
+                serde_json::from_str(r#"{"handle": 100000000000000000000, "ok": true}"#).unwrap(),
+            ),
+            scrubbed_structured: Some(json!({"handle": "[REDACTED_CREDENTIAL]", "ok": true})),
+            meta: None,
+        };
+        assert_eq!(
+            sanitize_tool_success(&numeric_handle_wire, Some("handle"), Some(big_bearer)),
+            Err(ToolFault::TerminalRefusal)
+        );
+
+        // Unverified in-memory `structured` (`scrubbed_structured: None`) still withholds `f64`
+        // while preserving exact integers (`42`).
         let pre_parsed_big: Value =
             serde_json::from_str(r#"{"leak": 100000000000000000000, "keep_int": 42}"#).unwrap();
         let big_in_structured = ToolCallSuccess {
             text: String::new(),
             content_blocks: Vec::new(),
             structured: Some(pre_parsed_big),
+            scrubbed_structured: None,
             meta: None,
         };
         let (big_s_out, _) =

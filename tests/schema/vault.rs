@@ -4574,7 +4574,7 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
             let raw_wire_json = match mode {
                 "inline_num" => {
                     let payload = format!(
-                        r#"{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42}}"#
+                        r#"{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42,"score":0.75}}"#
                     );
                     json!({
                         "jsonrpc": "2.0",
@@ -4588,13 +4588,13 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
                 "inline_structured" => {
                     let id_json = serde_json::to_string(id).unwrap();
                     format!(
-                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42}}}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42,"score":0.75}}}}}}"#
                     )
                 }
                 "spill_num" => {
                     let pad = "p".repeat(20 * 1024);
                     let payload = format!(
-                        r#"{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42}}"#
+                        r#"{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42,"score":0.75}}"#
                     );
                     json!({
                         "jsonrpc": "2.0",
@@ -4609,7 +4609,7 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
                     let id_json = serde_json::to_string(id).unwrap();
                     let pad = "q".repeat(20 * 1024);
                     format!(
-                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42}}}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42,"score":0.75}}}}}}"#
                     )
                 }
                 _ => unreachable!(),
@@ -4971,6 +4971,10 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
         assert!(
             text.contains("[REDACTED_CREDENTIAL]"),
             "{label}: missing redaction marker: {text}"
+        );
+        assert!(
+            text.contains("\"score\":0.75") || text.contains(r#"\\\"score\\\":0.75"#),
+            "{label}: unrelated decimal score 0.75 must be preserved: {text}"
         );
         for forbidden in [numeric_bearer, "1e+20", "1e20", "1E+20", "1E20"] {
             assert!(

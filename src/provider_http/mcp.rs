@@ -204,7 +204,12 @@ pub struct ToolCallSuccess {
     pub text: String,
     /// Decoded text `content` blocks in wire order; empty for structured-only replies.
     pub content_blocks: Vec<String>,
+    /// Unmodified wire `structuredContent` (used for strict schema/handle validation).
     pub structured: Option<Value>,
+    /// Wire-verified `structuredContent` with matching RFC 8259 numeric literals pre-scrubbed
+    /// prior to `serde_json` `f64` conversion. `None` when constructed in memory without wire
+    /// bytes or when no bearer token was sent.
+    pub(crate) scrubbed_structured: Option<Value>,
     pub meta: Option<Value>,
 }
 
@@ -314,7 +319,7 @@ impl McpTransport {
                 }
             }
         });
-        let result = self
+        let (result, _) = self
             .send_jsonrpc(headers, body, request_id, None, deadline, stop)
             .await?;
         parse_tools_list(&result).ok_or(TransportFault {
@@ -374,7 +379,7 @@ impl McpTransport {
                 "_meta": Value::Object(meta),
             }
         });
-        let result = self
+        let (result, scrubbed_result) = self
             .send_jsonrpc(
                 headers,
                 body,
@@ -384,7 +389,7 @@ impl McpTransport {
                 stop,
             )
             .await?;
-        parse_tool_call_result(&result).map_err(|kind| TransportFault {
+        parse_tool_call_result(&result, scrubbed_result.as_ref()).map_err(|kind| TransportFault {
             kind,
             bytes_may_have_left: true,
         })
@@ -410,7 +415,7 @@ impl McpTransport {
         redact_bearer: Option<&str>,
         caller_deadline: Instant,
         stop: &mut watch::Receiver<Option<Stop>>,
-    ) -> Result<Value, TransportFault> {
+    ) -> Result<(Value, Option<Value>), TransportFault> {
         if let Some(why) = *stop.borrow() {
             return Err(pre_send(FaultKind::Stopped(why)));
         }
@@ -562,7 +567,7 @@ async fn exchange_mcp(
     redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
-) -> Result<Value, TransportFault> {
+) -> Result<(Value, Option<Value>), TransportFault> {
     let interim_count = Arc::new(AtomicUsize::new(0));
     let interim_overflow = Arc::new(Notify::new());
     let interim_activity = Arc::new(Notify::new());
@@ -718,19 +723,18 @@ fn map_body_frame_error(err: Box<dyn std::error::Error + Send + Sync>) -> Transp
 }
 
 fn scrub_final_result(
-    result: Value,
+    result: &Value,
     raw_bytes: &[u8],
     redact_bearer: Option<&str>,
-) -> Result<Value, TransportFault> {
-    let Some(secret) = redact_bearer.filter(|s| crate::mcp::external::is_json_number_alphabet(s))
-    else {
-        return Ok(result);
+) -> Result<Option<Value>, TransportFault> {
+    let Some(secret) = redact_bearer else {
+        return Ok(None);
     };
     let Ok(raw_utf8) = std::str::from_utf8(raw_bytes) else {
-        return Ok(result);
+        return Ok(None);
     };
-    if !raw_utf8.contains(secret) {
-        return Ok(result);
+    if !crate::mcp::external::is_json_number_alphabet(secret) || !raw_utf8.contains(secret) {
+        return Ok(Some(result.clone()));
     }
     let marker = crate::mcp::external::choose_credential_marker(secret);
     let scrubbed = crate::mcp::external::redact_json_number_literals(raw_utf8, secret, &marker);
@@ -739,6 +743,7 @@ fn scrub_final_result(
         .as_object()
         .and_then(|obj| obj.get("result"))
         .cloned()
+        .map(Some)
         .ok_or_else(|| post_send(FaultKind::TerminalRefusal))
 }
 
@@ -748,7 +753,7 @@ async fn decode_response(
     redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
-) -> Result<Value, TransportFault> {
+) -> Result<(Value, Option<Value>), TransportFault> {
     let (head, body) = response.into_parts();
     if head.status == StatusCode::SWITCHING_PROTOCOLS {
         return Err(post_send(FaultKind::TerminalRefusal));
@@ -792,7 +797,8 @@ async fn decode_response(
             let value = unique(&buf).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
             match classify_jsonrpc_message(value, expected_id, false)? {
                 JsonRpcFrame::Final(FinalPayload::Result(result)) => {
-                    scrub_final_result(result, &buf, redact_bearer)
+                    let scrubbed = scrub_final_result(&result, &buf, redact_bearer)?;
+                    Ok((result, scrubbed))
                 }
                 JsonRpcFrame::Final(FinalPayload::InvalidParams) => {
                     Err(post_send(FaultKind::Semantic {
@@ -804,7 +810,7 @@ async fn decode_response(
         }
         ResponseMedia::Sse => {
             let mut parser = McpSseParser::default();
-            let mut final_payload: Option<FinalPayload> = None;
+            let mut final_payload: Option<(FinalPayload, Option<Value>)> = None;
             loop {
                 let read_deadline = deadline.min(Instant::now() + idle_read);
                 let Some(frame) = timeout_at(read_deadline, limited.frame())
@@ -835,11 +841,11 @@ async fn decode_response(
                     match classify_jsonrpc_message(value, expected_id, true)? {
                         JsonRpcFrame::Progress => {}
                         JsonRpcFrame::Final(FinalPayload::Result(result)) => {
-                            let scrubbed = scrub_final_result(result, &event.data, redact_bearer)?;
-                            final_payload = Some(FinalPayload::Result(scrubbed));
+                            let scrubbed = scrub_final_result(&result, &event.data, redact_bearer)?;
+                            final_payload = Some((FinalPayload::Result(result), scrubbed));
                         }
                         JsonRpcFrame::Final(FinalPayload::InvalidParams) => {
-                            final_payload = Some(FinalPayload::InvalidParams);
+                            final_payload = Some((FinalPayload::InvalidParams, None));
                         }
                     }
                 }
@@ -848,8 +854,8 @@ async fn decode_response(
                 return Err(post_send(FaultKind::TerminalRefusal));
             }
             match final_payload {
-                Some(FinalPayload::Result(result)) => Ok(result),
-                Some(FinalPayload::InvalidParams) => Err(post_send(FaultKind::Semantic {
+                Some((FinalPayload::Result(result), scrubbed)) => Ok((result, scrubbed)),
+                Some((FinalPayload::InvalidParams, _)) => Err(post_send(FaultKind::Semantic {
                     is_tool_error: false,
                 })),
                 None => Err(post_send(FaultKind::TerminalRefusal)),
@@ -1035,7 +1041,10 @@ fn parse_tools_list(result: &Value) -> Option<Vec<RemoteToolDeclaration>> {
     Some(out)
 }
 
-fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> {
+fn parse_tool_call_result(
+    result: &Value,
+    scrubbed_result: Option<&Value>,
+) -> Result<ToolCallSuccess, FaultKind> {
     let obj = result.as_object().ok_or(FaultKind::TerminalRefusal)?;
     check_stateless_result_envelope(obj)?;
     if let Some(is_error) = obj.get("isError") {
@@ -1050,6 +1059,14 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
         }
     }
     let structured = obj.get("structuredContent").cloned();
+    let scrubbed_structured = if structured.is_some() {
+        scrubbed_result
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("structuredContent"))
+            .cloned()
+    } else {
+        None
+    };
     let meta = obj.get("_meta").cloned();
     let mut chunks = Vec::new();
     if let Some(content) = obj.get("content") {
@@ -1076,7 +1093,7 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
         let joined = chunks.join("\n");
         let blocks = chunks.into_iter().map(str::to_owned).collect();
         (blocks, joined)
-    } else if let Some(ref s) = structured {
+    } else if let Some(s) = scrubbed_structured.as_ref().or(structured.as_ref()) {
         (Vec::new(), s.to_string())
     } else {
         return Err(FaultKind::TerminalRefusal);
@@ -1088,6 +1105,7 @@ fn parse_tool_call_result(result: &Value) -> Result<ToolCallSuccess, FaultKind> 
         text,
         content_blocks,
         structured,
+        scrubbed_structured,
         meta,
     })
 }
@@ -2132,7 +2150,7 @@ mod tests {
             match id {
                 "json-big" => {
                     let payload = format!(
-                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"wrapped":1{big_bearer}9,"keep":42}}}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"wrapped":1{big_bearer}9,"keep":42,"score":0.75}}}}}}"#
                     );
                     Reply::Bytes(response(
                         200,
@@ -2142,13 +2160,23 @@ mod tests {
                 }
                 "sse-big" => {
                     let frame = format!(
-                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"keep":7}}}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"keep":7,"score":0.75}}}}}}"#
                     );
                     let sse = format!("event: message\ndata: {frame}\n\n");
                     Reply::Bytes(response(
                         200,
                         &[("content-type", "text/event-stream")],
                         sse.as_bytes(),
+                    ))
+                }
+                "bad-content-num" => {
+                    let payload = format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"content":[{{"type":"text","text":{big_bearer}}}]}}}}"#
+                    );
+                    Reply::Bytes(response(
+                        200,
+                        &[("content-type", "application/json")],
+                        payload.as_bytes(),
                     ))
                 }
                 "err-32602" => {
@@ -2187,22 +2215,50 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let structured = out.structured.expect("structuredContent");
-            let serialized = structured.to_string();
+            let scrubbed = out
+                .scrubbed_structured
+                .expect("wire-verified scrubbed_structured");
+            let serialized = scrubbed.to_string();
             for forbidden in [big_bearer, "1e+20", "1e20", "1E+20", "1E20"] {
                 assert!(
                     !serialized.contains(forbidden) && !out.text.contains(forbidden),
                     "{req_id}: leaked {forbidden} in {serialized}"
                 );
             }
-            assert_eq!(structured["nested"][0], "[REDACTED_CREDENTIAL]");
+            assert_eq!(scrubbed["nested"][0], "[REDACTED_CREDENTIAL]");
+            assert_eq!(scrubbed["score"], json!(0.75));
             if req_id == "json-big" {
-                assert_eq!(structured["wrapped"], "1[REDACTED_CREDENTIAL]9");
-                assert_eq!(structured["keep"], 42);
+                assert_eq!(scrubbed["wrapped"], "1[REDACTED_CREDENTIAL]9");
+                assert_eq!(scrubbed["keep"], 42);
             } else {
-                assert_eq!(structured["keep"], 7);
+                assert_eq!(scrubbed["keep"], 7);
             }
         }
+
+        // Malformed numeric `content[].text` must still fail with TerminalRefusal even when
+        // the numeric token equals the bearer secret.
+        let bad_content = transport
+            .tools_call(
+                &ToolCallRequest {
+                    request_id: "bad-content-num",
+                    tool_name: "echo_num",
+                    arguments: &args,
+                    bearer_token: Some(big_bearer),
+                    idempotency_header: None,
+                    idempotency_meta: None,
+                },
+                deadline(),
+                &mut stop,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            bad_content,
+            TransportFault {
+                kind: FaultKind::TerminalRefusal,
+                bytes_may_have_left: true,
+            }
+        );
 
         // Error classification (`code == -32602`) must remain intact even when bearer == "32602".
         let err = transport
