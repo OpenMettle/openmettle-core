@@ -36,9 +36,9 @@ It records:
 - ADR 0033 adds `openmettle.runs.cancellations`. It counts terminal cancellation events
   appended by store helpers before commit. Its reason is `requested` or `revoked`.
 - Reserved future signal namespaces (`openmettle.runs.queue.age`,
-  `openmettle.capacity.grants`,
-  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-17,
-  V1-18 and V1-30 respectively.
+  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-17
+  and V1-30 respectively (`openmettle.capacity.grants` moved into the implemented v1 metrics
+  catalog in V1-18 PR3).
 
 ### Statically bounded metrics registry
 
@@ -53,8 +53,9 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
-  *Update, 24 November 2026:* the contract has since grown to 12 metrics, **412** data-point
-  streams and **1,075** Prometheus series per process. `policy.max_data_point_streams` and
+  *Update, 25 November 2026:* the contract has since grown to 15 metrics, **468** data-point
+  streams and **1,196** Prometheus series per process (adding V1-18 capacity grant, stale
+  observation and wait duration signals). `policy.max_data_point_streams` and
   `policy.max_prometheus_series_per_process` in `contracts/telemetry/v1.json` define the current
   ceilings; `tests/telemetry_contract.rs` checks them against `metrics::DESCRIPTORS`.
 - Histogram snapshots derive `count` from the sum of loaded bucket counts so the OTLP

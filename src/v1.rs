@@ -52,7 +52,7 @@ use axum::{
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
@@ -329,6 +329,8 @@ enum Op {
     GetProjectQuotas,
     SetQuotaOverride,
     RevokeQuotaOverride,
+    GetCapacity,
+    ListAdminCapacityGroups,
 }
 
 impl Op {
@@ -375,6 +377,8 @@ impl Op {
             Self::GetProjectQuotas => "getProjectQuotas",
             Self::SetQuotaOverride => "setQuotaOverride",
             Self::RevokeQuotaOverride => "revokeQuotaOverride",
+            Self::GetCapacity => "getCapacity",
+            Self::ListAdminCapacityGroups => "listAdminCapacityGroups",
         }
     }
     fn reads(self) -> bool {
@@ -398,6 +402,8 @@ impl Op {
                 | Self::DownloadArtifactRevision
                 | Self::GetPersonalQuotas
                 | Self::GetProjectQuotas
+                | Self::GetCapacity
+                | Self::ListAdminCapacityGroups
         )
     }
     /// Streams a `multipart/form-data` artifact upload (ADR 0031).
@@ -439,6 +445,8 @@ impl Op {
                 | Self::GetPersonalQuotas
                 | Self::SetQuotaOverride
                 | Self::RevokeQuotaOverride
+                | Self::GetCapacity
+                | Self::ListAdminCapacityGroups
         )
     }
 }
@@ -838,7 +846,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 35] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 37] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -953,7 +961,7 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 35] {
         ),
         (
             "/v1/projects/{project_id}/quotas",
-            vec![(get, GetProjectQuotas)],
+            vec![(get.clone(), GetProjectQuotas)],
         ),
         (
             "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}",
@@ -962,6 +970,11 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 35] {
         (
             "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}/revoke",
             vec![(post, RevokeQuotaOverride)],
+        ),
+        ("/v1/capacity", vec![(get.clone(), GetCapacity)]),
+        (
+            "/v1/admin/capacity/groups",
+            vec![(get, ListAdminCapacityGroups)],
         ),
     ]
 }
@@ -1048,6 +1061,9 @@ impl Api {
             return self
                 .quota_operation(op, &parts, session, target, key.as_deref(), &body)
                 .await;
+        }
+        if matches!(op, Op::GetCapacity | Op::ListAdminCapacityGroups) {
+            return self.capacity_operation(op, &parts, session).await;
         }
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
             return self.revision(op, &parts, session, target).await;
@@ -1406,9 +1422,39 @@ impl From<crate::model_config::Error> for Problem {
     }
 }
 
+async fn read_only_snapshot<T>(
+    c: &mut PgConnection,
+    work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, Problem>,
+) -> Result<T, Problem> {
+    let mut tx = c.begin().await.map_err(|_| UNAVAILABLE)?;
+    if sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        || sqlx::query("SELECT set_config('statement_timeout', '3s', true)")
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    {
+        let _ = tx.rollback().await;
+        return Err(UNAVAILABLE);
+    }
+    match work(&mut tx).await {
+        Ok(value) => {
+            tx.commit().await.map_err(|_| UNAVAILABLE)?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await.map_err(|_| UNAVAILABLE)?;
+            Err(error)
+        }
+    }
+}
+
 mod approvals;
 pub use approvals::ApprovalDisplayPolicy;
 mod artifacts;
+mod capacity;
 mod catalog;
 mod conversations;
 mod pagination;

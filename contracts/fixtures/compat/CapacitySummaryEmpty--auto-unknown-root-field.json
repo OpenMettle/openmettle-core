@@ -1,0 +1,22 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapacitySummaryEmpty--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "profiles": [],
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryEmpty"
+}

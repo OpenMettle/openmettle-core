@@ -1,0 +1,43 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/profiles/2/estimated_wait_seconds",
+    "keyword": "type",
+    "valid": false
+  },
+  "fixture": "CapacitySummaryMixed--queued-estimate-missing-wait",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "profiles": [
+      {
+        "availability": "ready",
+        "estimated_wait_seconds": null,
+        "profile": "chat.base"
+      },
+      {
+        "availability": "busy",
+        "estimated_wait_seconds": null,
+        "profile": "media.image"
+      },
+      {
+        "availability": "queued_estimate",
+        "estimated_wait_seconds": null,
+        "profile": "media.video"
+      },
+      {
+        "availability": "unavailable",
+        "estimated_wait_seconds": null,
+        "profile": "eval.large"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "queued-estimate-missing-wait",
+    "op": "set",
+    "path": "/profiles/2/estimated_wait_seconds",
+    "value": null
+  },
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryMixed"
+}

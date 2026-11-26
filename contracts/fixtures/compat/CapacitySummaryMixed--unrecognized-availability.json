@@ -1,0 +1,41 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapacitySummaryMixed--unrecognized-availability",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "profiles": [
+      {
+        "availability": "warming",
+        "estimated_wait_seconds": null,
+        "profile": "chat.base"
+      },
+      {
+        "availability": "busy",
+        "estimated_wait_seconds": null,
+        "profile": "media.image"
+      },
+      {
+        "availability": "queued_estimate",
+        "estimated_wait_seconds": 30,
+        "profile": "media.video"
+      },
+      {
+        "availability": "unavailable",
+        "estimated_wait_seconds": null,
+        "profile": "eval.large"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "unrecognized-availability",
+    "op": "set",
+    "path": "/profiles/0/availability",
+    "value": "warming"
+  },
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryMixed"
+}

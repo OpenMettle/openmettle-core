@@ -221,6 +221,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "mcp runtime gates and write intents",
         sql: include_str!("../migrations/0039_mcp_runtime_gates_and_write_intents.sql"),
     },
+    Source {
+        version: 40,
+        description: "api capacity visibility",
+        sql: include_str!("../migrations/0040_api_capacity_visibility.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

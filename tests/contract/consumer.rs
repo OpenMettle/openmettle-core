@@ -1376,3 +1376,216 @@ pub fn decode_quota_override(value: &Value) -> Result<QuotaOverride, String> {
         updated_at: wire.updated_at,
     })
 }
+
+// --- shared capacity visibility & operator inspection (V1-18 / ADR 0042) -----------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CapacityAvailability {
+    Ready,
+    Busy,
+    QueuedEstimate,
+    Unavailable,
+    Unrecognized(String),
+}
+
+impl CapacityAvailability {
+    fn from_wire(value: String) -> Self {
+        match value.as_str() {
+            "ready" => Self::Ready,
+            "busy" => Self::Busy,
+            "queued_estimate" => Self::QueuedEstimate,
+            "unavailable" => Self::Unavailable,
+            _ => Self::Unrecognized(value),
+        }
+    }
+
+    pub fn ready_now(&self) -> bool {
+        *self == Self::Ready
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProfileCapacity {
+    pub profile: String,
+    pub availability: CapacityAvailability,
+    pub estimated_wait_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WireProfileCapacity {
+    profile: String,
+    availability: String,
+    #[serde(deserialize_with = "required_nullable")]
+    estimated_wait_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WireCapacitySummary {
+    profiles: Vec<WireProfileCapacity>,
+}
+
+pub fn decode_capacity_summary(value: &Value) -> Result<Vec<ProfileCapacity>, String> {
+    let wire: WireCapacitySummary =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(wire.profiles.len());
+    for item in wire.profiles {
+        if item.profile.is_empty() || item.profile.len() > 128 {
+            return Err("invalid profile name".into());
+        }
+        let availability = CapacityAvailability::from_wire(item.availability);
+        match (&availability, item.estimated_wait_seconds) {
+            (CapacityAvailability::QueuedEstimate, Some(wait)) if (1..=86_400).contains(&wait) => {}
+            (CapacityAvailability::QueuedEstimate, _) => {
+                return Err("queued_estimate requires estimated_wait_seconds in 1..=86400".into());
+            }
+            (
+                CapacityAvailability::Ready
+                | CapacityAvailability::Busy
+                | CapacityAvailability::Unavailable,
+                None,
+            ) => {}
+            (
+                CapacityAvailability::Ready
+                | CapacityAvailability::Busy
+                | CapacityAvailability::Unavailable,
+                Some(_),
+            ) => {
+                return Err(
+                    "non-queued availability must report null estimated_wait_seconds".into(),
+                );
+            }
+            (CapacityAvailability::Unrecognized(_), Some(wait))
+                if !(1..=86_400).contains(&wait) =>
+            {
+                return Err("estimated_wait_seconds out of bounds".into());
+            }
+            (CapacityAvailability::Unrecognized(_), _) => {}
+        }
+        out.push(ProfileCapacity {
+            profile: item.profile,
+            availability,
+            estimated_wait_seconds: item.estimated_wait_seconds,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CapacityDeviceObservation {
+    pub device_id: String,
+    pub total_bytes: i64,
+    pub committed_bytes: i64,
+    pub actual_used_bytes: i64,
+    pub reclaimable_bytes: i64,
+    pub safety_headroom_bytes: i64,
+    pub active_chat_floor_bytes: i64,
+    pub grantable_bytes: i64,
+    pub effective_grantable_bytes: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CapacityGroupTotals {
+    pub total_bytes: u128,
+    pub committed_bytes: u128,
+    pub actual_used_bytes: u128,
+    pub reclaimable_bytes: u128,
+    pub safety_headroom_bytes: u128,
+    pub active_chat_floor_bytes: u128,
+    pub grantable_bytes: u128,
+    pub effective_grantable_bytes: u128,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AdminCapacityGroup {
+    pub group_id: String,
+    pub controller_epoch: i64,
+    pub admits_bursts: bool,
+    pub observation_revision: i64,
+    pub observed_at: Option<String>,
+    pub totals: CapacityGroupTotals,
+    pub devices: Vec<CapacityDeviceObservation>,
+}
+
+#[derive(Deserialize)]
+struct WireCapacityDeviceObservation {
+    device_id: String,
+    total_bytes: String,
+    committed_bytes: String,
+    actual_used_bytes: String,
+    reclaimable_bytes: String,
+    safety_headroom_bytes: String,
+    active_chat_floor_bytes: String,
+    grantable_bytes: String,
+    effective_grantable_bytes: String,
+}
+
+#[derive(Deserialize)]
+struct WireCapacityGroupTotals {
+    total_bytes: String,
+    committed_bytes: String,
+    actual_used_bytes: String,
+    reclaimable_bytes: String,
+    safety_headroom_bytes: String,
+    active_chat_floor_bytes: String,
+    grantable_bytes: String,
+    effective_grantable_bytes: String,
+}
+
+#[derive(Deserialize)]
+struct WireAdminCapacityGroup {
+    group_id: String,
+    controller_epoch: String,
+    admits_bursts: bool,
+    observation_revision: String,
+    #[serde(deserialize_with = "required_nullable")]
+    observed_at: Option<String>,
+    totals: WireCapacityGroupTotals,
+    devices: Vec<WireCapacityDeviceObservation>,
+}
+
+#[derive(Deserialize)]
+struct WireAdminCapacityGroupList {
+    groups: Vec<WireAdminCapacityGroup>,
+}
+
+pub fn decode_admin_capacity_groups(value: &Value) -> Result<Vec<AdminCapacityGroup>, String> {
+    let wire: WireAdminCapacityGroupList =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(wire.groups.len());
+    for g in wire.groups {
+        let totals = CapacityGroupTotals {
+            total_bytes: parse_wide_decimal(&g.totals.total_bytes)?,
+            committed_bytes: parse_wide_decimal(&g.totals.committed_bytes)?,
+            actual_used_bytes: parse_wide_decimal(&g.totals.actual_used_bytes)?,
+            reclaimable_bytes: parse_wide_decimal(&g.totals.reclaimable_bytes)?,
+            safety_headroom_bytes: parse_wide_decimal(&g.totals.safety_headroom_bytes)?,
+            active_chat_floor_bytes: parse_wide_decimal(&g.totals.active_chat_floor_bytes)?,
+            grantable_bytes: parse_wide_decimal(&g.totals.grantable_bytes)?,
+            effective_grantable_bytes: parse_wide_decimal(&g.totals.effective_grantable_bytes)?,
+        };
+        let mut devices = Vec::with_capacity(g.devices.len());
+        for d in g.devices {
+            devices.push(CapacityDeviceObservation {
+                device_id: d.device_id,
+                total_bytes: parse_decimal(&d.total_bytes, true)?,
+                committed_bytes: parse_decimal(&d.committed_bytes, true)?,
+                actual_used_bytes: parse_decimal(&d.actual_used_bytes, true)?,
+                reclaimable_bytes: parse_decimal(&d.reclaimable_bytes, true)?,
+                safety_headroom_bytes: parse_decimal(&d.safety_headroom_bytes, true)?,
+                active_chat_floor_bytes: parse_decimal(&d.active_chat_floor_bytes, true)?,
+                grantable_bytes: parse_decimal(&d.grantable_bytes, true)?,
+                effective_grantable_bytes: parse_decimal(&d.effective_grantable_bytes, true)?,
+            });
+        }
+        out.push(AdminCapacityGroup {
+            group_id: g.group_id,
+            controller_epoch: parse_decimal(&g.controller_epoch, true)?,
+            admits_bursts: g.admits_bursts,
+            observation_revision: parse_decimal(&g.observation_revision, true)?,
+            observed_at: g.observed_at,
+            totals,
+            devices,
+        });
+    }
+    Ok(out)
+}

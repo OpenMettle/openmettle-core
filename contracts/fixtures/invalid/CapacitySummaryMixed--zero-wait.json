@@ -1,0 +1,43 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/profiles/2/estimated_wait_seconds",
+    "keyword": "minimum",
+    "valid": false
+  },
+  "fixture": "CapacitySummaryMixed--zero-wait",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "profiles": [
+      {
+        "availability": "ready",
+        "estimated_wait_seconds": null,
+        "profile": "chat.base"
+      },
+      {
+        "availability": "busy",
+        "estimated_wait_seconds": null,
+        "profile": "media.image"
+      },
+      {
+        "availability": "queued_estimate",
+        "estimated_wait_seconds": 0,
+        "profile": "media.video"
+      },
+      {
+        "availability": "unavailable",
+        "estimated_wait_seconds": null,
+        "profile": "eval.large"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "zero-wait",
+    "op": "set",
+    "path": "/profiles/2/estimated_wait_seconds",
+    "value": 0
+  },
+  "schema": "#/components/schemas/CapacitySummary",
+  "source": "#/components/examples/CapacitySummaryMixed"
+}

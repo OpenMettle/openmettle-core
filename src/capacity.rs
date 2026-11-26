@@ -23,11 +23,16 @@
 //! `Fenced`, `Expired`) has already aborted the transaction, losing its earlier writes; an
 //! `Invalid` the Rust API returns before sending any SQL has not. An `Ok` outcome, including
 //! `Decision::Insufficient` and `Decision::Unavailable`, leaves the transaction intact.
-use crate::runs::is_canonical_uuid;
+use crate::{
+    runs::is_canonical_uuid,
+    telemetry::metrics::{self, CapacityOperation, CapacityOutcome, CapacityStaleSurface},
+};
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
 use std::{fmt, time::Duration};
+
+pub mod adapter;
 
 /// All failure classes are safe to display or log.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,6 +91,15 @@ fn ids(values: &[&str]) -> Result<(), Error> {
         .all(|v| is_canonical_uuid(v))
         .then_some(())
         .ok_or(Error::Invalid)
+}
+
+/// Locale-independent capacity profile/model name check matching `openmettle.capacity_valid_name`:
+/// 1..=128 UTF-8 bytes, no leading or trailing Unicode whitespace (`str::trim()`), and no C0/C1
+/// control characters (`char::is_control`).
+pub(crate) fn valid_capacity_name(value: &str) -> bool {
+    crate::runs::bounded(value, 128)
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 fn lease_ms(lease: Duration) -> Result<i32, Error> {
@@ -213,22 +227,89 @@ pub async fn publish(
     .await?)
 }
 
-/// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
-/// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
-/// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
-pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
-    Ok(
+fn error_outcome(error: &Error) -> CapacityOutcome {
+    match error {
+        Error::Fenced => CapacityOutcome::Fenced,
+        Error::Expired => CapacityOutcome::Expired,
+        Error::Invalid | Error::LeaseLost | Error::SlotRequired | Error::Conflict => {
+            CapacityOutcome::Refused
+        }
+        Error::Database => CapacityOutcome::Error,
+    }
+}
+
+pub(crate) fn store_error_outcome(error: &Error) -> CapacityOutcome {
+    error_outcome(error)
+}
+
+async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> Result<bool, Error> {
+    let stale = sqlx::query_scalar::<_, bool>(
+        "SELECT coalesce(
+             observed_at IS NOT NULL
+             AND observed_at + observation_ttl_ms * interval '1 millisecond' <= clock_timestamp(),
+             false
+         )
+           FROM openmettle.capacity_groups
+          WHERE id = $1::uuid",
+    )
+    .bind(group_id)
+    .fetch_optional(c)
+    .await?
+    .unwrap_or(false);
+    Ok(stale)
+}
+
+/// Toggle the group's durable backend-unknown recovery fence under the controller lease.
+///
+/// Newly acquired epochs start with `backend_unknown = true` so bursts cannot reopen until
+/// backend inventory has been reconciled. Setting `unknown = true` also clears `ready_epoch`.
+pub async fn set_backend_unknown(
+    c: &mut PgConnection,
+    controller: &Controller,
+    unknown: bool,
+) -> Result<(), Error> {
+    sqlx::query("SELECT openmettle.capacity_set_backend_unknown($1::uuid, $2, $3, $4)")
+        .bind(&controller.group_id)
+        .bind(controller.secret.as_slice())
+        .bind(controller.epoch)
+        .bind(unknown)
+        .execute(c)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn resume_with_metrics(
+    c: &mut PgConnection,
+    controller: &Controller,
+    m: &metrics::Metrics,
+) -> Result<bool, Error> {
+    let result: Result<bool, Error> =
         sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
             .bind(&controller.group_id)
             .bind(controller.secret.as_slice())
             .bind(controller.epoch)
             .fetch_one(c)
-            .await?,
-    )
+            .await
+            .map_err(Error::from);
+    let outcome = match &result {
+        Ok(true) => CapacityOutcome::Resumed,
+        Ok(false) => CapacityOutcome::Unavailable,
+        Err(err) => error_outcome(err),
+    };
+    m.record_capacity_grant(CapacityOperation::Resume, outcome);
+    result
+}
+
+/// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
+/// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
+/// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
+pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
+    resume_with_metrics(c, controller, metrics::global()).await
 }
 
 /// Bytes one grant commits on one device.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceBytes {
     pub device_id: String,
     pub bytes: i64,
@@ -286,11 +367,53 @@ pub async fn grant(
     controller: &Controller,
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
+    let result = match grant_inner(&mut *c, controller, request).await {
+        Ok(Decision::Unavailable) => {
+            match group_observation_stale(&mut *c, &controller.group_id).await {
+                Ok(true) => {
+                    metrics::global()
+                        .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+                    Ok(Decision::Unavailable)
+                }
+                Ok(false) => Ok(Decision::Unavailable),
+                Err(err) => Err(err),
+            }
+        }
+        other => other,
+    };
+    let outcome = match &result {
+        Ok(Decision::Grant { state, .. }) => match state {
+            GrantState::Granted => CapacityOutcome::Granted,
+            GrantState::Releasing => CapacityOutcome::Releasing,
+            GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
+            GrantState::Released => CapacityOutcome::Released,
+        },
+        Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
+        Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
+        Err(err) => {
+            if *err == Error::Expired {
+                metrics::global()
+                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+            }
+            error_outcome(err)
+        }
+    };
+    metrics::global().record_capacity_grant(CapacityOperation::Grant, outcome);
+    result
+}
+
+async fn grant_inner(
+    c: &mut PgConnection,
+    controller: &Controller,
+    request: &GrantRequest<'_>,
+) -> Result<Decision, Error> {
     ids(&[request.scope_id, request.run_id, request.claim_token])?;
-    if request
-        .footprint
-        .iter()
-        .any(|d| !is_canonical_uuid(&d.device_id))
+    if !crate::runs::bounded(request.request_key, 128)
+        || !crate::runs::bounded(request.profile, 128)
+        || request
+            .footprint
+            .iter()
+            .any(|d| !is_canonical_uuid(&d.device_id))
     {
         return Err(Error::Invalid);
     }
@@ -344,11 +467,42 @@ pub enum Evidence<'a> {
     NotAllocated(&'a [String]),
 }
 
+pub(super) async fn reconcile_with_metrics(
+    c: &mut PgConnection,
+    controller: &Controller,
+    grant_id: &str,
+    evidence: Evidence<'_>,
+    m: &metrics::Metrics,
+) -> Result<GrantState, Error> {
+    let result = reconcile_inner(c, controller, grant_id, evidence).await;
+    let outcome = match &result {
+        Ok(GrantState::Granted) => CapacityOutcome::Granted,
+        Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
+        Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
+        Ok(GrantState::Released) => match evidence {
+            Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
+            _ => CapacityOutcome::Released,
+        },
+        Err(err) => error_outcome(err),
+    };
+    m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
+    result
+}
+
 /// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
 /// settled in the same transaction, only when every device of its footprint has confirmed. If
 /// the controller lease expires while any step waits for a lock, every change rolls back and it
 /// returns `Fenced`, with the caller's transaction already aborted.
 pub async fn reconcile(
+    c: &mut PgConnection,
+    controller: &Controller,
+    grant_id: &str,
+    evidence: Evidence<'_>,
+) -> Result<GrantState, Error> {
+    reconcile_with_metrics(c, controller, grant_id, evidence, metrics::global()).await
+}
+
+async fn reconcile_inner(
     c: &mut PgConnection,
     controller: &Controller,
     grant_id: &str,
@@ -526,5 +680,33 @@ mod tests {
         assert_eq!(lease_ms(Duration::from_secs(u64::MAX)), Err(Error::Invalid));
         assert_eq!(GrantState::parse("released"), Ok(GrantState::Released));
         assert_eq!(GrantState::parse("requested"), Err(Error::Database));
+    }
+
+    #[test]
+    fn valid_capacity_name_rejects_unicode_whitespace_and_control_characters() {
+        assert!(valid_capacity_name("synthetic-image"));
+        assert!(valid_capacity_name("model v1"));
+        assert!(valid_capacity_name(&"a".repeat(128)));
+        assert!(!valid_capacity_name(""));
+        assert!(!valid_capacity_name(&"a".repeat(129)));
+        for bad in [
+            " leading",
+            "trailing ",
+            "\tleading",
+            "trailing\n",
+            "\u{00a0}model",
+            "model\u{00a0}",
+            "\u{3000}model",
+            "model\u{2028}",
+            "model\tname",
+            "model\u{0085}name",
+            "model\u{007f}name",
+            "model\u{0000}name",
+        ] {
+            assert!(
+                !valid_capacity_name(bad),
+                "expected invalid capacity name: {bad:?}"
+            );
+        }
     }
 }

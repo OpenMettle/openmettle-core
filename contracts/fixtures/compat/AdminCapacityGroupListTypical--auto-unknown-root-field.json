@@ -1,0 +1,82 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "AdminCapacityGroupListTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "groups": [
+      {
+        "admits_bursts": true,
+        "controller_epoch": "3",
+        "devices": [
+          {
+            "active_chat_floor_bytes": "17179869184",
+            "actual_used_bytes": "21474836480",
+            "committed_bytes": "4294967296",
+            "device_id": "00000000-0000-4000-8000-00000000c0d0",
+            "effective_grantable_bytes": "1073741824",
+            "grantable_bytes": "3221225472",
+            "reclaimable_bytes": "2147483648",
+            "safety_headroom_bytes": "1073741824",
+            "total_bytes": "25769803776"
+          },
+          {
+            "active_chat_floor_bytes": "17179869184",
+            "actual_used_bytes": "17179869184",
+            "committed_bytes": "0",
+            "device_id": "00000000-0000-4000-8000-00000000c0d1",
+            "effective_grantable_bytes": "7516192768",
+            "grantable_bytes": "7516192768",
+            "reclaimable_bytes": "0",
+            "safety_headroom_bytes": "1073741824",
+            "total_bytes": "25769803776"
+          }
+        ],
+        "group_id": "00000000-0000-4000-8000-00000000c001",
+        "observation_revision": "12",
+        "observed_at": "2026-11-25T12:00:00.123456Z",
+        "totals": {
+          "active_chat_floor_bytes": "34359738368",
+          "actual_used_bytes": "38654705664",
+          "committed_bytes": "4294967296",
+          "effective_grantable_bytes": "8589934592",
+          "grantable_bytes": "10737418240",
+          "reclaimable_bytes": "2147483648",
+          "safety_headroom_bytes": "2147483648",
+          "total_bytes": "51539607552"
+        }
+      },
+      {
+        "admits_bursts": false,
+        "controller_epoch": "0",
+        "devices": [],
+        "group_id": "00000000-0000-4000-8000-00000000c002",
+        "observation_revision": "0",
+        "observed_at": null,
+        "totals": {
+          "active_chat_floor_bytes": "0",
+          "actual_used_bytes": "0",
+          "committed_bytes": "0",
+          "effective_grantable_bytes": "0",
+          "grantable_bytes": "0",
+          "reclaimable_bytes": "0",
+          "safety_headroom_bytes": "0",
+          "total_bytes": "0"
+        }
+      }
+    ],
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/AdminCapacityGroupList",
+  "source": "#/components/examples/AdminCapacityGroupListTypical"
+}

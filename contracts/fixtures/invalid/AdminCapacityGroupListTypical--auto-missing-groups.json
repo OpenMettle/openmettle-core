@@ -1,0 +1,19 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "AdminCapacityGroupListTypical--auto-missing-groups",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {},
+  "mutation": {
+    "name": "auto-missing-groups",
+    "op": "remove",
+    "path": "/groups"
+  },
+  "schema": "#/components/schemas/AdminCapacityGroupList",
+  "source": "#/components/examples/AdminCapacityGroupListTypical"
+}
