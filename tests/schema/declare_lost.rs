@@ -2270,3 +2270,459 @@ async fn declare_lost_refuses_unapplied_lifecycle_baseline_when_journal_seq_matc
     );
     assert_eq!(storage_account(&restored_db, &c.scope).await, (0, 0, 0));
 }
+
+/// Review #3 P2 #1 regression: on a closed restore gate with `head.journal_seq >
+/// required_journal_seq`, an exact `--request-key` retry MUST verify
+/// `restore_verify_lost_journal_tail` in both CLI preflight (before opening/unlinking leftover
+/// files) and inside `storage_declare_payload_lost` under `deletion_journal_head FOR SHARE`,
+/// failing closed (`OMR03`) when the tail is not bound to the current `restore_run_id`.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_exact_retry_verifies_lost_journal_tail_and_refuses_mismatched_restore_run_without_unlinking()
+ {
+    let f = Fixture::new().await;
+    let target = f.payload("r3-tail", b"tail-verify-payload").await;
+    let dir = Dir::new();
+    let export_path = dir.path("r3-tail.export");
+    let (ok, _, err) = cli(&f.db, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export = Export::parse(&fs::read_to_string(&export_path).unwrap()).unwrap();
+
+    let copy = tar_copy(&f.root, &dir, "copy-r3-tail");
+    fs::write(copy.join("revisions").join(&target.reservation), b"bad!").unwrap();
+
+    // 1. Lock restore run 1, fail rebind, and declare `target` lost (`head_seq = export.seq + 1`).
+    let mut lock_args = vec![
+        "restore".to_owned(),
+        "lock".to_owned(),
+        "--required-origin".to_owned(),
+        export.origin_us.to_string(),
+        "--required-lifecycle-origin".to_owned(),
+        export.lifecycle_origin_us.unwrap().to_string(),
+        "--required-lifecycle-baseline-digest".to_owned(),
+        export.lifecycle_baseline_digest.clone().unwrap(),
+        "--required-seq".to_owned(),
+        export.seq.to_string(),
+        "--required-digest".to_owned(),
+        export.digest.clone(),
+        "--export-complete".to_owned(),
+    ];
+    if let Some(co) = export.connection_origin_us {
+        lock_args.push("--required-connection-origin".to_owned());
+        lock_args.push(co.to_string());
+    }
+    let lock_refs: Vec<&str> = lock_args.iter().map(String::as_str).collect();
+    let (ok, _, err) = cli(&f.db, &lock_refs);
+    assert!(ok, "{err}");
+    let run_1: String = sqlx::query_scalar(
+        "SELECT restore_run_id::text FROM openmettle.restore_reconciliation_gate WHERE id",
+    )
+    .fetch_one(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    let (ok, _, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok);
+    let (ok, out, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &target.revision,
+        OPERATOR_1,
+        "r3-tail-retry-key",
+        "corrupt payload under run 1",
+    );
+    assert!(ok, "{out}{err}");
+
+    // Place a leftover file on disk to prove a failed exact retry never unlinks anything.
+    let leftover = copy.join("revisions").join(&target.reservation);
+    fs::write(&leftover, b"leftover-before-retry").unwrap();
+
+    // 2. Rotate `restore_run_id` on the closed gate so `head.journal_seq (1) >
+    //    required_journal_seq (0)` while the post-replay lost tail audit still names `run_1`,
+    //    not the current `restore_run_id`.
+    sqlx::query(
+        "UPDATE openmettle.restore_reconciliation_gate
+            SET restore_run_id = gen_random_uuid()
+          WHERE id",
+    )
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+
+    // CLI preflight refuses before touching disk; leftover file stays intact.
+    let (ok, _, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &target.revision,
+        OPERATOR_1,
+        "r3-tail-retry-key",
+        "corrupt payload under run 1",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("post-replay lost journal tail verification failed"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&leftover).unwrap(), b"leftover-before-retry");
+
+    // Direct SQL exact-retry path also locks `deletion_journal_head FOR SHARE` and fails with OMR03.
+    let sql_res = sqlx::query(
+        "SELECT * FROM openmettle.storage_declare_payload_lost($1::uuid, $2::uuid, $3, $4)",
+    )
+    .bind(&target.revision)
+    .bind(OPERATOR_1)
+    .bind("r3-tail-retry-key")
+    .bind("corrupt payload under run 1")
+    .execute(&mut connect(&f.db.0, OWNER).await)
+    .await;
+    assert_eq!(sqlstate(sql_res), "OMR03");
+
+    // 3. Restore `run_1`, then corrupt `deletion_journal_head.chain_digest` so the post-replay
+    //    tail digest no longer matches the head; both CLI retry and direct SQL must refuse OMR03
+    //    without unlinking `leftover`.
+    sqlx::query(
+        "UPDATE openmettle.restore_reconciliation_gate
+            SET restore_run_id = $1::uuid
+          WHERE id",
+    )
+    .bind(&run_1)
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.deletion_journal_head
+            SET chain_digest = decode(repeat('ff', 32), 'hex')
+          WHERE id",
+    )
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+
+    let (ok, _, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &target.revision,
+        OPERATOR_1,
+        "r3-tail-retry-key",
+        "corrupt payload under run 1",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("post-replay lost journal tail verification failed"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&leftover).unwrap(), b"leftover-before-retry");
+
+    let sql_res = sqlx::query(
+        "SELECT * FROM openmettle.storage_declare_payload_lost($1::uuid, $2::uuid, $3, $4)",
+    )
+    .bind(&target.revision)
+    .bind(OPERATOR_1)
+    .bind("r3-tail-retry-key")
+    .bind("corrupt payload under run 1")
+    .execute(&mut connect(&f.db.0, OWNER).await)
+    .await;
+    assert_eq!(sqlstate(sql_res), "OMR03");
+}
+
+/// Review #3 P2 #2 regression: on a closed restore gate with `required_lifecycle_origin_us IS NOT
+/// NULL`, an uncovered `retained` revision absent from both `retention_upgrade_baseline` and
+/// `deletion_journal` MUST cause `storage declare-lost` (CLI preflight and SQL function) to refuse
+/// with `OMR04` rather than transitioning the row to `'lost'` and hiding it from `restore_gate_open`.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_refuses_uncovered_retained_revision_on_closed_gate_with_lifecycle_origin() {
+    use openmettle_core::runs::WriteTransaction;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = Dir::new();
+    let store_root = PathBuf::from(dir.path("r3-uncovered-store"));
+    fs::create_dir(&store_root).unwrap();
+    let store = Store::open(&store_root).unwrap();
+
+    // 1. Seed schema-41 DB with one settled `retained` revision `rev_uncovered`.
+    let live = TestDb::new().await;
+    migrate::apply(&live.settings(Duration::from_secs(10)), &MIGRATIONS[..41])
+        .await
+        .unwrap();
+    super::storage::configure_limits(&live, Some(1000), Some(1000), Some(1000)).await;
+    retention_grace(&live, 86_400).await;
+    let live_api_pool = pool(&live, API).await;
+    store.initialize_api(&live_api_pool).await.unwrap();
+    live_api_pool.close().await;
+
+    let c = super::Context::new(&live).await;
+    let doc = super::storage::new_uuid(&live).await;
+    let payload_bytes = b"uncovered-retained-payload";
+    let res = super::storage::reserve(
+        &live,
+        OWNER,
+        &super::storage::input(
+            &c.scope,
+            &c.actor,
+            "r3-p2-uncovered",
+            &doc,
+            payload_bytes.len() as i64,
+        ),
+    )
+    .await
+    .unwrap();
+    let rev_path = store_root.join("revisions").join(&res.id);
+    fs::write(&rev_path, payload_bytes).unwrap();
+    let ino = fs::metadata(&rev_path).unwrap().ino().to_string();
+    let rev_uncovered = {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.storage_reservations
+                SET stage_claimed = true, payload_ino = $2::text::numeric, publish_pending = true
+              WHERE id = $1::uuid",
+        )
+        .bind(&res.id)
+        .bind(&ino)
+        .execute(&mut live_owner)
+        .await
+        .unwrap();
+        let mut settle_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        let digest = Sha256::digest(payload_bytes).to_vec();
+        let rev = openmettle_core::storage::settle(
+            &mut settle_tx,
+            &openmettle_core::storage::Settlement {
+                scope: &c.scope,
+                reservation: &res.id,
+                size_bytes: payload_bytes.len() as i64,
+                content_digest: &digest,
+                media_type: "text/plain",
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle_tx.commit().await.unwrap();
+        let mut ret_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::retain_revision(&mut ret_tx, &c.scope, &rev)
+            .await
+            .unwrap();
+        ret_tx.commit().await.unwrap();
+        rev
+    };
+
+    // 2. Capture schema-41 backup (`rev_uncovered` is `'retained'`) and volume copy.
+    let copy_vol = tar_copy(&store_root, &dir, "r3-uncovered-copy");
+    let spoof_backup = backup_db(&live).await;
+
+    // 3. On `live`, restore `rev_uncovered` to `'active'` before migration 42 so migration 42
+    //    captures an EMPTY `retention_upgrade_baseline` with `journal_seq = 0`.
+    {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        let mut rest_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::restore_revision(&mut rest_tx, &c.scope, &rev_uncovered)
+            .await
+            .unwrap();
+        rest_tx.commit().await.unwrap();
+    }
+    migrate::apply(&live.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    let export_path = dir.path("r3-uncovered.export");
+    let (ok, _, err) = cli(&live, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export = Export::parse(&fs::read_to_string(&export_path).unwrap()).unwrap();
+    assert_eq!(export.seq, 0);
+
+    // 4. Upgrade `spoof_backup` to schema 44, lock the restore gate, and invoke
+    //    `restore_replay_baseline` passing `rev_uncovered` in `p_prebaseline_purged_ids` so
+    //    baseline headers match while `rev_uncovered` remains an uncovered `'retained'` row
+    //    outside both `retention_upgrade_baseline` and `deletion_journal`.
+    migrate::apply(&spoof_backup.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    let mut lock_args = vec![
+        "restore".to_owned(),
+        "lock".to_owned(),
+        "--required-origin".to_owned(),
+        export.origin_us.to_string(),
+        "--required-lifecycle-origin".to_owned(),
+        export.lifecycle_origin_us.unwrap().to_string(),
+        "--required-lifecycle-baseline-digest".to_owned(),
+        export.lifecycle_baseline_digest.clone().unwrap(),
+        "--required-seq".to_owned(),
+        export.seq.to_string(),
+        "--required-digest".to_owned(),
+        export.digest.clone(),
+    ];
+    if let Some(co) = export.connection_origin_us {
+        lock_args.push("--required-connection-origin".to_owned());
+        lock_args.push(co.to_string());
+    }
+    let lock_refs: Vec<&str> = lock_args.iter().map(String::as_str).collect();
+    let (ok, _, err) = cli(&spoof_backup, &lock_refs);
+    assert!(ok, "{err}");
+
+    let empty_uuids: Vec<&str> = Vec::new();
+    let empty_text: Vec<&str> = Vec::new();
+    let empty_i64: Vec<i64> = Vec::new();
+    let empty_opt_i64: Vec<Option<i64>> = Vec::new();
+    let empty_bytes: Vec<Vec<u8>> = Vec::new();
+    let spoofed_purged = vec![rev_uncovered.as_str()];
+    sqlx::query(
+        "SELECT openmettle.restore_replay_baseline(
+                    $1, decode($2, 'hex'), $3::uuid[], $4::uuid[], $5, $6, $7, $8, $9, $10, $11::uuid[]
+                )",
+    )
+    .bind(export.lifecycle_origin_us.unwrap())
+    .bind(export.lifecycle_baseline_digest.as_deref().unwrap())
+    .bind(&empty_uuids)
+    .bind(&empty_uuids)
+    .bind(&empty_text)
+    .bind(&empty_i64)
+    .bind(&empty_i64)
+    .bind(&empty_opt_i64)
+    .bind(&empty_bytes)
+    .bind(&empty_opt_i64)
+    .bind(&spoofed_purged)
+    .execute(&mut connect(&spoof_backup.0, OWNER).await)
+    .await
+    .unwrap();
+
+    // Corrupt `rev_uncovered`'s payload on disk and hold the rebind barrier.
+    let corrupt_path = copy_vol.join("revisions").join(&res.id);
+    fs::write(&corrupt_path, b"corrupt!").unwrap();
+    let (ok, _, _) = cli(
+        &spoof_backup,
+        &["storage", "rebind", copy_vol.to_str().unwrap()],
+    );
+    assert!(!ok);
+    assert!(barrier_of(&spoof_backup).await.is_some());
+
+    // 5. Both CLI preflight and direct SQL refuse to hide the uncovered `'retained'` row behind `'lost'`.
+    let (ok, _, err) = declare_lost_cli(
+        &spoof_backup,
+        OWNER,
+        &copy_vol,
+        &rev_uncovered,
+        OPERATOR_1,
+        "r3-uncovered-cli",
+        "attempt to declare uncovered retained row lost",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains(
+            "unreconciled retained or purging revisions remain outside lifecycle baseline and deletion journal"
+        ),
+        "{err}"
+    );
+    assert_eq!(fs::read(&corrupt_path).unwrap(), b"corrupt!");
+    assert_eq!(
+        revision_row(&spoof_backup, &rev_uncovered).await.0,
+        "retained"
+    );
+
+    let sql_res = sqlx::query(
+        "SELECT * FROM openmettle.storage_declare_payload_lost($1::uuid, $2::uuid, $3, $4)",
+    )
+    .bind(&rev_uncovered)
+    .bind(OPERATOR_1)
+    .bind("r3-uncovered-sql")
+    .bind("direct sql attempt on uncovered retained row")
+    .execute(&mut connect(&spoof_backup.0, OWNER).await)
+    .await;
+    assert_eq!(sqlstate(sql_res), "OMR04");
+    assert_eq!(
+        revision_row(&spoof_backup, &rev_uncovered).await.0,
+        "retained"
+    );
+}
+
+/// Review #3 P2 #3 regression: `artifact_revisions_lost_owner_only` fires on EVERY `UPDATE` (not
+/// just `UPDATE OF state, lost_at`), so runtime roles (`openmettle_api` and `openmettle_worker`)
+/// cannot mutate non-state columns (`purge_after`, `retention_policy_revision`, `purge_stage`) on
+/// a `'lost'` revision (`42501`).
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn non_owner_metadata_update_on_lost_revision_is_refused_with_42501() {
+    let f = Fixture::new().await;
+    let target = f
+        .payload("r3-meta-guard", b"retained-then-lost-bytes")
+        .await;
+    retention_grace(&f.db, 86_400).await;
+    step(&f.db.0, &f.c.scope, &target.revision, Step::Retain)
+        .await
+        .unwrap();
+
+    let dir = Dir::new();
+    let copy = tar_copy(&f.root, &dir, "copy-r3-guard");
+    fs::write(copy.join("revisions").join(&target.reservation), b"bad!").unwrap();
+    let (ok, _, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok);
+    let held_barrier = barrier_of(&f.db).await.unwrap();
+
+    let (ok, out, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &target.revision,
+        OPERATOR_1,
+        "r3-guard-lost",
+        "corrupt retained payload declared lost",
+    );
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = cli(
+        &f.db,
+        &[
+            "storage",
+            "rebind",
+            copy.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(ok, "{out}{err}");
+
+    let before = revision_row(&f.db, &target.revision).await;
+    assert_eq!(before.0, "lost");
+    assert!(
+        before.3.is_some(),
+        "retained purge_after should be preserved"
+    );
+
+    // `openmettle_api` holds UPDATE on `purge_after` and `retention_policy_revision`, yet updating
+    // either column on a `'lost'` row must fail with 42501.
+    let mut api_cn = connect(&f.db.0, API).await;
+    let res = sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET purge_after = purge_after + interval '1 day'
+          WHERE id = $1::uuid",
+    )
+    .bind(&target.revision)
+    .execute(&mut api_cn)
+    .await;
+    assert_eq!(sqlstate(res), "42501");
+
+    let res = sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET retention_policy_revision = 999
+          WHERE id = $1::uuid",
+    )
+    .bind(&target.revision)
+    .execute(&mut api_cn)
+    .await;
+    assert_eq!(sqlstate(res), "42501");
+
+    // `openmettle_worker` holds UPDATE on `purge_stage`, yet updating it on a `'lost'` row must
+    // also fail with 42501.
+    let mut worker_cn = connect(&f.db.0, WORKER).await;
+    let res = sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET purge_stage = 'anchor_pending_unlink'
+          WHERE id = $1::uuid",
+    )
+    .bind(&target.revision)
+    .execute(&mut worker_cn)
+    .await;
+    assert_eq!(sqlstate(res), "42501");
+
+    assert_eq!(revision_row(&f.db, &target.revision).await, before);
+}

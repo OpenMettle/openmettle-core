@@ -132,7 +132,7 @@ ALTER TABLE openmettle.artifact_revisions
     );
 
 -- Owner-only trigger guard: no runtime role may insert or transition a revision into 'lost',
--- transition a 'lost' revision to another state, or modify lost_at.
+-- update any column on a 'lost' revision, or modify lost_at.
 CREATE FUNCTION openmettle.enforce_artifact_revision_lost_owner_only()
 RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 BEGIN
@@ -159,7 +159,7 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.enforce_artifact_revision_lost_owner_only() FROM PUBLIC;
 
 CREATE TRIGGER artifact_revisions_lost_owner_only
-    BEFORE INSERT OR UPDATE OF state, lost_at
+    BEFORE INSERT OR UPDATE
     ON openmettle.artifact_revisions
     FOR EACH ROW
     EXECUTE FUNCTION openmettle.enforce_artifact_revision_lost_owner_only();
@@ -483,6 +483,25 @@ BEGIN
                 RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
                     USING ERRCODE = 'OMR04';
             END IF;
+            IF EXISTS (
+                SELECT 1
+                  FROM openmettle.artifact_revisions r2
+                 WHERE r2.state IN ('retained', 'purging')
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM openmettle.retention_upgrade_baseline b
+                        WHERE b.artifact_revision_id = r2.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM openmettle.deletion_journal j
+                        WHERE j.entity_id = r2.id
+                          AND j.event_kind IN ('artifact_revision.retained', 'artifact_revision.purged')
+                   )
+            ) THEN
+                RAISE EXCEPTION 'unreconciled retained or purging revisions remain outside lifecycle baseline and deletion journal'
+                    USING ERRCODE = 'OMR04';
+            END IF;
         END IF;
     END IF;
 
@@ -505,6 +524,39 @@ BEGIN
             IF NOT v_rev_found OR r.state <> 'lost' THEN
                 RAISE EXCEPTION 'replayed declare-lost target revision is not in lost state'
                     USING ERRCODE = 'OMQ03';
+            END IF;
+            IF NOT g.open THEN
+                -- Exact retry touches neither storage_accounts nor storage_instance, so taking
+                -- deletion_journal_head FOR SHARE here strictly follows canonical lock order.
+                SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR SHARE;
+                IF head.journal_seq < g.required_journal_seq
+                   OR (head.journal_seq = g.required_journal_seq
+                       AND head.chain_digest IS DISTINCT FROM g.required_chain_digest) THEN
+                    RAISE EXCEPTION 'replay the deletion journal before declaring payloads lost'
+                        USING ERRCODE = 'OMR04';
+                END IF;
+                IF head.journal_seq > g.required_journal_seq THEN
+                    PERFORM openmettle.restore_verify_lost_journal_tail(
+                        g.required_journal_seq,
+                        g.required_chain_digest,
+                        g.restore_run_id
+                    );
+                END IF;
+                IF g.required_lifecycle_origin_us IS NOT NULL THEN
+                    v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+                    IF g.required_lifecycle_origin_us = g.snapshot_lifecycle_origin_us THEN
+                        IF g.required_lifecycle_baseline_digest IS DISTINCT FROM g.snapshot_lifecycle_baseline_digest
+                           OR g.required_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+                            RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                                USING ERRCODE = 'OMR04';
+                        END IF;
+                    ELSIF g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
+                          OR v_head_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us
+                          OR head.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+                        RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                            USING ERRCODE = 'OMR04';
+                    END IF;
+                END IF;
             END IF;
             RETURN QUERY SELECT
                 false,
@@ -610,6 +662,25 @@ BEGIN
                   OR v_head_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us
                   OR head.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
                 RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                    USING ERRCODE = 'OMR04';
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                  FROM openmettle.artifact_revisions r2
+                 WHERE r2.state IN ('retained', 'purging')
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM openmettle.retention_upgrade_baseline b
+                        WHERE b.artifact_revision_id = r2.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM openmettle.deletion_journal j
+                        WHERE j.entity_id = r2.id
+                          AND j.event_kind IN ('artifact_revision.retained', 'artifact_revision.purged')
+                   )
+            ) THEN
+                RAISE EXCEPTION 'unreconciled retained or purging revisions remain outside lifecycle baseline and deletion journal'
                     USING ERRCODE = 'OMR04';
             END IF;
         END IF;

@@ -65,8 +65,14 @@ fn map_sql_error(err: sqlx::Error) -> Failure {
             Some("23505") => Failure("request key already used with different parameters"),
             Some("22023") => Failure("invalid declare-lost parameters"),
             Some("P0002") => Failure("artifact revision not found"),
+            Some("OMR03") => Failure("post-replay lost journal tail verification failed"),
             Some("OMR04") => {
-                if db.message().contains("lifecycle baseline") {
+                let msg = db.message();
+                if msg.contains("unreconciled retained or purging") {
+                    Failure(
+                        "unreconciled retained or purging revisions remain outside lifecycle baseline and deletion journal",
+                    )
+                } else if msg.contains("lifecycle baseline") {
                     Failure(
                         "replay the deletion journal and lifecycle baseline before declaring payloads lost",
                     )
@@ -287,18 +293,11 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     // Read-only preflight outside the write transaction so hashing a large intact payload never
     // holds PostgreSQL row locks across disk I/O. Exclusive file locks acquired here are held
     // continuously across the locked READ COMMITTED transaction and post-commit unlink.
-    let (pin, adopting, gate_open, volume_active, journal_pending, baseline_pending): (
-        Option<String>,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-    ) = sqlx::query_as(
-        "SELECT svc.volume_id::text,
-                svc.adoption_run_id IS NOT NULL,
-                g.open,
-                (NOT g.open AND g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp()),
+    let preflight = sqlx::query(
+        "SELECT svc.volume_id::text AS pin,
+                svc.adoption_run_id IS NOT NULL AS adopting,
+                g.open AS gate_open,
+                (NOT g.open AND g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp()) AS volume_active,
                 (
                     NOT g.open
                     AND (
@@ -306,7 +305,8 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
                         OR (h.journal_seq = g.required_journal_seq
                             AND h.chain_digest IS DISTINCT FROM g.required_chain_digest)
                     )
-                ),
+                ) AS journal_pending,
+                (NOT g.open AND h.journal_seq > g.required_journal_seq) AS tail_verify_needed,
                 (
                     NOT g.open
                     AND g.required_lifecycle_origin_us IS NOT NULL
@@ -320,7 +320,27 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
                                 IS DISTINCT FROM g.required_lifecycle_origin_us
                             OR h.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
                     END
-                )
+                ) AS baseline_pending,
+                (
+                    NOT g.open
+                    AND g.required_lifecycle_origin_us IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM openmettle.artifact_revisions r2
+                         WHERE r2.state IN ('retained', 'purging')
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM openmettle.retention_upgrade_baseline b
+                                WHERE b.artifact_revision_id = r2.id
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM openmettle.deletion_journal j
+                                WHERE j.entity_id = r2.id
+                                  AND j.event_kind IN ('artifact_revision.retained', 'artifact_revision.purged')
+                           )
+                    )
+                ) AS uncovered_lifecycle
            FROM openmettle.storage_volume_control svc
            JOIN openmettle.restore_reconciliation_gate g ON g.id
            JOIN openmettle.deletion_journal_head h ON h.id
@@ -328,6 +348,15 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     )
     .fetch_one(&mut *c)
     .await?;
+
+    let pin: Option<String> = preflight.try_get("pin")?;
+    let adopting: bool = preflight.try_get("adopting")?;
+    let gate_open: bool = preflight.try_get("gate_open")?;
+    let volume_active: bool = preflight.try_get("volume_active")?;
+    let journal_pending: bool = preflight.try_get("journal_pending")?;
+    let tail_verify_needed: bool = preflight.try_get("tail_verify_needed")?;
+    let baseline_pending: bool = preflight.try_get("baseline_pending")?;
+    let uncovered_lifecycle: bool = preflight.try_get("uncovered_lifecycle")?;
 
     let pin = pin.ok_or(Failure("volume is not pinned"))?;
     v.verify(&pin)?;
@@ -344,9 +373,28 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
             "replay the deletion journal before declaring payloads lost",
         ));
     }
+    if tail_verify_needed {
+        sqlx::query(
+            "SELECT openmettle.restore_verify_lost_journal_tail(
+                        g.required_journal_seq,
+                        g.required_chain_digest,
+                        g.restore_run_id
+                    )
+               FROM openmettle.restore_reconciliation_gate g
+              WHERE g.id AND NOT g.open",
+        )
+        .execute(&mut *c)
+        .await
+        .map_err(map_sql_error)?;
+    }
     if baseline_pending {
         return Err(Failure(
             "replay the deletion journal and lifecycle baseline before declaring payloads lost",
+        ));
+    }
+    if uncovered_lifecycle {
+        return Err(Failure(
+            "unreconciled retained or purging revisions remain outside lifecycle baseline and deletion journal",
         ));
     }
 
