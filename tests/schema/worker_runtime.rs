@@ -171,6 +171,31 @@ async fn finished_during_cancel_drain_wins_over_the_request() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
+    let f = Fixture::new().await;
+    let id = f.admit("restore-gate").await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("SELECT openmettle.restore_gate_lock(0, decode(repeat('00', 32), 'hex'), true)")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let mut w = Worker::start(&f.db).await;
+    // Fifteen claim polls (POLL_MS 100) pass without a claim while journal replay is pending.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(w.steps.try_recv().is_err());
+    sqlx::query("SELECT openmettle.restore_gate_open(0, decode(repeat('00', 32), 'hex'))")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let step = w.step().await;
+    step.reply.send(StepResult::Finished).ok().unwrap();
+    wait_terminal(&f, &id, "openmettle.run-succeeded", b"{}").await;
+    w.shutdown.send(()).unwrap();
+    bounded(w.task).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn shutdown_drain_settles_finished_and_failed_steps_once() {
     let f = Fixture::new().await;
     for (key, result, format, payload) in [

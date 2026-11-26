@@ -54,6 +54,9 @@
 -- `capacity_confirm_dispatch`), and the read-only SECURITY DEFINER projection
 -- `capacity_group_observations()` (`openmettle_api` only) so `/v1` capacity endpoints never hold
 -- table or column privileges on `capacity_groups` or `capacity_grants` (ADR 0042, V1-18 PR3).
+-- Version 41 adds `deletion_journal_head.coverage_started_at`, `restore_reconciliation_gate`
+-- (`SELECT` only for `openmettle_worker`), and owner-only restore gate, export verification,
+-- journal replay and coverage-gap break-glass functions (ADR 0041, V1-16 PR2b).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -123,6 +126,8 @@ capacity_tables (relation,role,privilege) AS (
 -- Version 28 (ADR 0041): the API reads the grace it applies and stamps its revision.
 retention_tables (relation,role,privilege) AS (
     SELECT 'retention_policy','openmettle_api','SELECT' WHERE $1 >= 28
+    -- Version 41: the worker claims no run and runs no purge sweep while the gate is closed.
+    UNION ALL SELECT 'restore_reconciliation_gate','openmettle_worker','SELECT' WHERE $1 >= 41
 ),
 retention_columns (relation,attribute,role,privilege) AS (
     SELECT 'artifact_revisions','retention_policy_revision','openmettle_api','UPDATE' WHERE $1 >= 28
@@ -295,6 +300,14 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.capacity_prepare_dispatch(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 40
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.restore_gate_guard_purge()',true,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_digest(bytea,openmettle.deletion_journal)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock(bigint,bytea,boolean)',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_export(bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_accept_coverage_gap(uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 41
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES
@@ -845,7 +858,8 @@ violations (violation) AS (
                     OR ($1>=28 AND (g.object_name LIKE 'deletion\_journal%' OR g.object_name LIKE 'retention\_%'
                                     OR g.object_name='artifact_retention_holds'))
                     OR ($1>=35 AND g.object_name LIKE 'family\_polic%')
-                    OR ($1>=39 AND g.object_name='runtime_feature_gates'))
+                    OR ($1>=39 AND g.object_name='runtime_feature_gates')
+                    OR ($1>=41 AND g.object_name LIKE 'restore\_%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1

@@ -633,3 +633,193 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
     anchors?;
     count
 }
+
+/// Restore replay (ADR 0041): finishes, through the same stages, every revision named by a
+/// journal record that is not yet purged. Replay moved each to `purging`, so no reference or
+/// deadline is rechecked; one without a verified payload binding stays and keeps the gate shut.
+pub async fn purge_journaled(pool: &PgPool, store: &Store) -> Result<usize, Error> {
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Err(Error::Io);
+    };
+    let page = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
+           FROM openmettle.deletion_journal j
+           JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
+           JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
+          WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL ORDER BY j.journal_seq",
+    )
+    .fetch_all(pool)
+    .await?;
+    let pin = pin.as_str();
+    let count = sweep_items(page, |(id, scope, res, ino)| async move {
+        purge_one(
+            pool,
+            store,
+            pin,
+            &scope,
+            &id,
+            &res,
+            ino.parse().map_err(|_| Error::Io)?,
+        )
+        .await
+    })
+    .await?;
+    sweep_anchors(pool, store, pin, MAX_BATCH, true).await?;
+    Ok(count)
+}
+
+/// Restore replay (ADR 0041): no upload writer survives a restore (including an in-place snapshot
+/// restore where `storage rebind` did not run). For every `state = 'reserved'` reservation:
+/// - If unquarantined, bound (`payload_ino IS NOT NULL`) and `reclaim_state = 'none'`: lock any
+///   present `staging/<id>` / `revisions/<id>` under the pinned volume check, refuse foreign hard
+///   links (`nlink` greater than the reservation's own present names), truncate the payload to 0
+///   bytes (`sync_all`), unlink `revisions/<id>` if present (keeping the empty `staging/<id>` link
+///   and syncing both directories), and clear `publish_pending = false`.
+/// - Then verify that NO `state = 'reserved'` reservation (including quarantined, unbound or
+///   mid-reclaim rows) still has `revisions/<id>` on disk or non-zero bytes in `staging/<id>`,
+///   failing closed so the restore gate stays shut.
+pub async fn scrub_unsettled_on_restore(pool: &PgPool, store: &Store) -> Result<usize, Error> {
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Err(Error::Io);
+    };
+    let v = &store.volume;
+    let mut scrubbed = 0usize;
+    let mut cursor = "00000000-0000-0000-0000-000000000000".to_owned();
+    loop {
+        let page = sqlx::query_as::<_, (String, bool, String, Option<String>, bool)>(
+            "SELECT id::text, adoption_unverified, reclaim_state, payload_ino::text, publish_pending
+               FROM openmettle.storage_reservations
+              WHERE state = 'reserved' AND id > $1::uuid
+              ORDER BY id
+              LIMIT 100",
+        )
+        .bind(&cursor)
+        .fetch_all(pool)
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+        for (id, quarantined, reclaim_state, payload_ino, publish_pending) in page {
+            cursor.clone_from(&id);
+            let bound = parse_ino(payload_ino)?;
+            v.verify(&pin)?;
+            let s_stat = v.stat(&v.staging, &id)?;
+            let r_stat = v.stat(&v.revisions, &id)?;
+            let a_stat = v.stat(&v.staging, format!(".reclaim.{id}"))?;
+            let p_stat = v.stat(&v.revisions, format!(".purge.{id}"))?;
+
+            if !quarantined && reclaim_state == "none" {
+                if a_stat.is_some() || p_stat.is_some() {
+                    return Err(Error::Io);
+                }
+                if let Some(ino) = bound {
+                    if s_stat.is_some_and(|st| st.st_ino != ino)
+                        || r_stat.is_some_and(|st| st.st_ino != ino)
+                    {
+                        return Err(Error::Io);
+                    }
+                    let (dir, src) = if s_stat.is_some() {
+                        (&v.staging, id.as_str())
+                    } else if r_stat.is_some() {
+                        (&v.revisions, id.as_str())
+                    } else {
+                        return Err(Error::Missing);
+                    };
+                    let file = lock_file(v, dir, src, ino, false)?;
+                    v.verify(&pin)?;
+                    let s_now = v.stat(&v.staging, &id)?;
+                    let r_now = v.stat(&v.revisions, &id)?;
+                    if s_now.is_some_and(|st| st.st_ino != ino)
+                        || r_now.is_some_and(|st| st.st_ino != ino)
+                    {
+                        return Err(Error::Io);
+                    }
+                    let own = u64::from(s_now.is_some()) + u64::from(r_now.is_some());
+                    let meta = file.metadata()?;
+                    if meta.nlink() != own {
+                        return Err(Error::Io);
+                    }
+                    let needs_scrub =
+                        r_now.is_some() || meta.len() != 0 || publish_pending || s_now.is_none();
+                    if needs_scrub {
+                        // Fence with the pinned volume and verify the row is still reserved before
+                        // mutating disk.
+                        let mut check_tx =
+                            WriteTransaction::begin_bounded_pool(pool, false).await?;
+                        let eligible = sqlx::query(
+                            "SELECT FROM openmettle.storage_reservations
+                              WHERE id = $1::uuid AND state = 'reserved'
+                                AND NOT adoption_unverified AND reclaim_state = 'none'
+                                AND payload_ino = $2::text::numeric
+                                FOR UPDATE",
+                        )
+                        .bind(&id)
+                        .bind(ino.to_string())
+                        .fetch_optional(check_tx.connection()?)
+                        .await?;
+                        if eligible.is_none() {
+                            return Err(Error::Io);
+                        }
+                        lock_pin(&mut check_tx, &pin).await?;
+                        check_tx.commit().await?;
+
+                        v.verify(&pin)?;
+                        v.matches(&file, dir, src, ino)?;
+                        if meta.len() != 0 {
+                            file.set_len(0)?;
+                            file.sync_all()?;
+                        }
+                        if s_now.is_none() {
+                            at::linkat(
+                                &v.revisions,
+                                id.as_str(),
+                                &v.staging,
+                                id.as_str(),
+                                AtFlags::empty(),
+                            )?;
+                            if v.inode(&v.staging, &id)? != Some(ino) {
+                                return Err(Error::Io);
+                            }
+                            at::fsync(&v.staging)?;
+                        }
+                        if r_now.is_some() {
+                            v.unlink(&v.revisions, &id, ino)?;
+                            at::fsync(&v.revisions)?;
+                        }
+                        at::fsync(&v.staging)?;
+
+                        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+                        let updated = sqlx::query(
+                            "UPDATE openmettle.storage_reservations
+                                SET publish_pending = false
+                              WHERE id = $1::uuid AND state = 'reserved'
+                                AND NOT adoption_unverified AND reclaim_state = 'none'
+                                AND payload_ino = $2::text::numeric",
+                        )
+                        .bind(&id)
+                        .bind(ino.to_string())
+                        .execute(tx.connection()?)
+                        .await?
+                        .rows_affected();
+                        if updated != 1 {
+                            return Err(Error::Io);
+                        }
+                        lock_pin(&mut tx, &pin).await?;
+                        tx.commit().await?;
+                        scrubbed += 1;
+                    }
+                    drop(file);
+                }
+            }
+
+            // Fail closed if ANY reserved row (including quarantined, unbound or mid-reclaim rows)
+            // still has a published name or non-zero staged bytes on disk.
+            let r_after = v.stat(&v.revisions, &id)?;
+            let s_after = v.stat(&v.staging, &id)?;
+            if r_after.is_some() || s_after.is_some_and(|st| st.st_size != 0) {
+                return Err(Error::Io);
+            }
+        }
+    }
+    Ok(scrubbed)
+}

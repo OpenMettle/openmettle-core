@@ -8,9 +8,10 @@ use openmettle_core::{
         gateway::family,
         store::{StoreError, WriteOutcome},
     },
+    restore,
 };
-use sqlx::{Connection, PgConnection};
-use std::{env, path::Path, process::ExitCode};
+use sqlx::{Connection, PgConnection, PgPool};
+use std::{env, fs, path::Path, process::ExitCode};
 
 const REBIND_FIRST: &str = "the artifact volume was restored by file copy and is not rebound; run `openmettle-admin storage rebind` first";
 
@@ -24,9 +25,242 @@ async fn main() -> ExitCode {
         }
     }
 }
+
+async fn pool(connections: u32) -> Result<PgPool, &'static str> {
+    let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+        .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(connections)
+        .connect(&url)
+        .await
+        .map_err(|_| "database connection failed")
+}
+
+/// Reports a journal or restore step's failure by kind and SQLSTATE only, never record contents
+/// or digests, and returns the step's own message.
+fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
+    move |e| {
+        match e {
+            restore::Error::Export(why) => eprintln!("{step}: invalid export: {why}"),
+            restore::Error::Invalid(why) => eprintln!("{step}: invalid argument: {why}"),
+            restore::Error::Database(sqlx::Error::Database(d)) => {
+                eprintln!("{step}: SQLSTATE {}", d.code().unwrap_or_default())
+            }
+            restore::Error::Drift => eprintln!("{step}: accounting drift detected"),
+            restore::Error::ArtifactRootRequired => {
+                eprintln!("{step}: the volume is pinned; pass its artifact root")
+            }
+            restore::Error::RebindRequired => return REBIND_FIRST,
+            _ => eprintln!("{step}: database or volume failure"),
+        }
+        match step {
+            "journal export" => "journal export failed",
+            "restore lock" => "restore lock failed; the gate state is unchanged",
+            "restore accept-coverage-gap" => {
+                "restore accept-coverage-gap failed; the gate state is unchanged"
+            }
+            _ => "restore replay failed; the restore gate was not opened",
+        }
+    }
+}
+
+fn parse_restore_lock_args(args: &[String]) -> Result<(i64, String, bool), &'static str> {
+    let mut required_seq = None;
+    let mut required_digest = None;
+    let mut export_complete = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--required-seq" => {
+                if required_seq.is_some() {
+                    return Err("duplicate --required-seq");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --required-seq value")?;
+                let seq: i64 = raw.parse().map_err(|_| "invalid sequence")?;
+                if seq < 0 {
+                    return Err("invalid sequence");
+                }
+                required_seq = Some(seq);
+            }
+            "--required-digest" => {
+                if required_digest.is_some() {
+                    return Err("duplicate --required-digest");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --required-digest value")?;
+                if !restore::is_valid_digest(raw) {
+                    return Err("invalid chain digest");
+                }
+                required_digest = Some(raw.clone());
+            }
+            "--export-complete" => {
+                if export_complete {
+                    return Err("duplicate --export-complete");
+                }
+                export_complete = true;
+            }
+            _ => return Err("unknown restore lock option"),
+        }
+        i += 1;
+    }
+    let seq = required_seq.ok_or(
+        "usage: openmettle-admin restore lock --required-seq N --required-digest HEX [--export-complete]",
+    )?;
+    let digest = required_digest.ok_or(
+        "usage: openmettle-admin restore lock --required-seq N --required-digest HEX [--export-complete]",
+    )?;
+    Ok((seq, digest, export_complete))
+}
+
+fn parse_accept_gap_args(args: &[String]) -> Result<(String, String, String), &'static str> {
+    let mut operator_id = None;
+    let mut request_key = None;
+    let mut reason = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--operator-id" => {
+                if operator_id.is_some() {
+                    return Err("duplicate --operator-id");
+                }
+                i += 1;
+                operator_id = Some(args.get(i).ok_or("missing --operator-id value")?.clone());
+            }
+            "--request-key" => {
+                if request_key.is_some() {
+                    return Err("duplicate --request-key");
+                }
+                i += 1;
+                request_key = Some(args.get(i).ok_or("missing --request-key value")?.clone());
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err("duplicate --reason");
+                }
+                i += 1;
+                reason = Some(args.get(i).ok_or("missing --reason value")?.clone());
+            }
+            _ => return Err("unknown restore accept-coverage-gap option"),
+        }
+        i += 1;
+    }
+    let usage = "usage: openmettle-admin restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON";
+    Ok((
+        operator_id.ok_or(usage)?,
+        request_key.ok_or(usage)?,
+        reason.ok_or(usage)?,
+    ))
+}
+
+/// ADR 0041: `journal export FILE`, `restore lock --required-seq N --required-digest HEX [--export-complete]`,
+/// `restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON`,
+/// `restore replay FILE [ROOT]`.
+async fn journal(
+    command: (Option<String>, Option<String>),
+    args: &[String],
+) -> Result<(), &'static str> {
+    match (command.0.as_deref(), command.1.as_deref()) {
+        (Some("journal"), Some("export")) => {
+            let [file] = args else {
+                return Err("usage: openmettle-admin journal export FILE");
+            };
+            let text = restore::export(&pool(1).await?)
+                .await
+                .map_err(failed("journal export"))?;
+            // Never overwrite an earlier export, and sync both the file and its parent directory
+            // before acknowledging the watermark.
+            let path = Path::new(file);
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::File::create_new(path)
+                .and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, text.as_bytes())?;
+                    f.sync_all()?;
+                    fs::File::open(parent)?.sync_all()
+                })
+                .map_err(|_| "export file could not be created")?;
+            println!("{}", text.lines().rev().nth(1).unwrap_or_default());
+        }
+        (Some("restore"), Some("lock")) => {
+            let (required_seq, required_digest, export_complete) = parse_restore_lock_args(args)?;
+            let (snapshot, required, complete) = restore::lock(
+                &pool(1).await?,
+                required_seq,
+                &required_digest,
+                export_complete,
+            )
+            .await
+            .map_err(failed("restore lock"))?;
+            println!(
+                "restore gate closed: snapshot {snapshot}, required {required}, coverage_complete {complete}"
+            );
+        }
+        (Some("restore"), Some("accept-coverage-gap")) => {
+            let (operator_id, request_key, reason) = parse_accept_gap_args(args)?;
+            let applied =
+                restore::accept_coverage_gap(&pool(1).await?, &operator_id, &request_key, &reason)
+                    .await
+                    .map_err(failed("restore accept-coverage-gap"))?;
+            if applied {
+                println!("applied restore.accept_coverage_gap");
+            } else {
+                println!("replayed restore.accept_coverage_gap");
+            }
+        }
+        (Some("restore"), Some("replay")) if matches!(args.len(), 1 | 2) => {
+            let file = &args[0];
+            let store = args
+                .get(1)
+                .map(|root| openmettle_core::artifact_fs::Store::open_existing(Path::new(root)))
+                .transpose()
+                .map_err(|_| "volume unavailable")?;
+            let text = fs::read_to_string(file).map_err(|_| "export file unreadable")?;
+            let export = restore::Export::parse(&text).map_err(failed("restore replay"))?;
+            let pool = pool(2).await?;
+            if let Some(store) = store.as_ref() {
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| failed("restore replay")(e.into()))?;
+                let open = restore::gate_open(&mut conn)
+                    .await
+                    .map_err(|e| failed("restore replay")(e.into()))?;
+                drop(conn);
+                if !open {
+                    restore::check_rebind(&pool, store)
+                        .await
+                        .map_err(failed("restore replay"))?;
+                }
+            }
+            let applied = restore::apply(&pool, &export)
+                .await
+                .map_err(failed("restore replay"))?;
+            restore::finish(&pool, store.as_ref(), &export)
+                .await
+                .map_err(failed("restore replay"))?;
+            println!(
+                "replayed {applied} records through {}; restore gate open",
+                export.seq
+            );
+        }
+        _ => {
+            return Err(
+                "usage: openmettle-admin journal export FILE | restore lock --required-seq N --required-digest HEX [--export-complete] | restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), &'static str> {
     let mut args = env::args().skip(1);
     let command = (args.next(), args.next());
+    if matches!(command.0.as_deref(), Some("journal" | "restore")) {
+        return journal(command, &args.collect::<Vec<_>>()).await;
+    }
     if command.0.as_deref() == Some("family") {
         let mut family_args = Vec::new();
         if let Some(sub) = command.1 {
@@ -87,13 +321,7 @@ async fn run() -> Result<(), &'static str> {
         {
             return Err("unexpected quota command argument");
         }
-        let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
-            .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .map_err(|_| "database connection failed")?;
+        let pool = pool(1).await?;
         match command.1.as_deref() {
             Some("drain-orphans") => {
                 let released = openmettle_core::quotas::drain_gateway_orphans(&pool)

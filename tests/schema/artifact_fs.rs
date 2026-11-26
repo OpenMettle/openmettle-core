@@ -93,7 +93,7 @@ fn form(boundary: &str, parts: &[Part<'_>], close: bool) -> Vec<u8> {
     out
 }
 
-async fn pool(db: &TestDb, role: &str) -> PgPool {
+pub(super) async fn pool(db: &TestDb, role: &str) -> PgPool {
     PgPoolOptions::new()
         .max_connections(2)
         .connect(&db.url(role))
@@ -101,17 +101,17 @@ async fn pool(db: &TestDb, role: &str) -> PgPool {
         .unwrap()
 }
 
-struct Fixture {
-    db: TestDb,
-    c: Context,
-    api: PgPool,
-    store: Store,
-    root: PathBuf,
+pub(super) struct Fixture {
+    pub(super) db: TestDb,
+    pub(super) c: Context,
+    pub(super) api: PgPool,
+    pub(super) store: Store,
+    pub(super) root: PathBuf,
     _dir: Dir,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let db = TestDb::migrated().await;
         configure(&db, Some(10_000), Some(10_000), Some(10_000)).await;
         // Removed revisions become due after one second.
@@ -157,7 +157,15 @@ impl Fixture {
         .await
     }
 
-    fn files(&self, sub: &str) -> Vec<String> {
+    pub(super) async fn payload(&self, key: &str, body: &[u8]) -> Stored {
+        let doc = new_uuid(&self.db).await;
+        let form = form("x", &[METADATA, file(None, body)], true);
+        self.upload(key, &doc, 100, "x", chunked(&form, 16), true)
+            .await
+            .unwrap()
+    }
+
+    pub(super) fn files(&self, sub: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(self.root.join(sub))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -179,7 +187,7 @@ impl Fixture {
         .unwrap()
     }
 
-    async fn reserve(&self, key: &str, artifact: &str, max: i64) -> String {
+    pub(super) async fn reserve(&self, key: &str, artifact: &str, max: i64) -> String {
         let mut cn = connect(&self.db.0, API).await;
         let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
         let reservation = storage::reserve(
@@ -1039,6 +1047,111 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
             .unwrap(),
         1
     );
+    assert_totals(&f.db).await;
+}
+
+/// A retained revision that is due once its one-second grace elapses.
+async fn due(f: &Fixture, key: &str) -> Stored {
+    let s = f.payload(key, key.as_bytes()).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    storage::retain_revision(&mut tx, &f.c.scope, &s.revision)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    s
+}
+
+async fn wait_until(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done().await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect(what);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
+    let f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("SELECT openmettle.restore_gate_lock(0, decode(repeat('00', 32), 'hex'), true)")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let s = due(&f, "gated").await;
+    let mut seed = WriteTransaction::begin(&mut owner).await.unwrap();
+    let ids = expired_runs(&f, &mut seed, "gated").await;
+    seed.commit().await.unwrap();
+    let mut process = sweep_process(&f, true);
+    // Maintenance ticks run (the run deadlines are swept) but skip the purge sweep.
+    assert_swept(&f, &ids).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(f.files("revisions"), [s.reservation.as_str()]);
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 5, 0));
+    sqlx::query("SELECT openmettle.restore_gate_open(0, decode(repeat('00', 32), 'hex'))")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    wait_until(
+        "the revision was not purged after the gate opened",
+        async || account(&f.db, &f.c.scope).await == (0, 0, 0) && f.files("revisions").is_empty(),
+    )
+    .await;
+    assert!(stop_process(&mut process, "-TERM", "restore-gated worker shutdown").success());
+    let logs = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "restore-gated worker stderr",
+    );
+    // A closed gate is a deferral, not a sweep failure.
+    assert!(!logs.contains("worker.sweep.failed"), "{logs}");
+    assert_eq!(journaled(&f.db).await, [s.revision]);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_worker_killed_inside_a_scheduled_purge_is_resumed_and_releases_once() {
+    let f = Fixture::new().await;
+    let s = due(&f, "killed").await;
+    let anchor = format!(".purge.{}", s.reservation);
+    // Holding the instance counters stops the scheduled purge in its confirmation, after Stage A
+    // anchored, truncated and unlinked the payload.
+    let mut owner = f.db.admin().await;
+    let mut lock = WriteTransaction::begin(&mut owner).await.unwrap();
+    lock.connection()
+        .unwrap()
+        .execute("LOCK openmettle.storage_instance IN EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let mut process = sweep_process(&f, true);
+    wait_until("the purge did not reach its confirmation", async || {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity p JOIN pg_locks l ON l.pid = p.pid
+              WHERE p.datname = current_database() AND p.usename = 'openmettle_worker'
+                AND NOT l.granted AND l.relation = 'openmettle.storage_instance'::regclass)",
+        )
+        .fetch_one(&mut f.db.admin().await)
+        .await
+        .unwrap();
+        waiting && f.files("revisions") == [anchor.as_str()]
+    })
+    .await;
+    let _ = stop_process(&mut process, "-KILL", "killed purge worker");
+    lock.rollback().await.unwrap();
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 6, 0));
+    assert!(journaled(&f.db).await.is_empty());
+    let mut replacement = sweep_process(&f, true);
+    wait_until("the replacement did not finish the purge", async || {
+        account(&f.db, &f.c.scope).await == (0, 0, 0) && f.files("revisions").is_empty()
+    })
+    .await;
+    assert!(stop_process(&mut replacement, "-TERM", "replacement purge worker").success());
+    assert_eq!(journaled(&f.db).await, [s.revision]);
     assert_totals(&f.db).await;
 }
 

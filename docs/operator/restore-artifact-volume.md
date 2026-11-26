@@ -39,13 +39,13 @@ Rebind is a post-restore command. Do not run it on a volume in service. It alway
 
    A run can also exit with status 0 and report states it did not change (see [Quarantines and accounting drift](#quarantines-and-accounting-drift)).
 
-3. Run the filesystem drift check. It is the required post-restore check.
+3. Replay the deletion journal export (`openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"`, [Restore the deletion journal](storage-adoption-and-quota-upgrade.md#restore-the-deletion-journal-after-a-database-restore)), which purges resurrected payloads, scrubs any remaining unsettled `revisions/<id>` links, verifies drift and opens `restore_reconciliation_gate`. Then run the filesystem drift check. It is the required post-restore check.
 
    ```sh
    openmettle-admin quota verify "$ARTIFACT_ROOT"
    ```
 
-   Run it after rebind, not before. Before rebind it is normally refused on a copied volume, with a message that names `storage rebind`; where the copy check misses the copy (for example a volume that holds only interrupted uploads), it runs and reports file mismatches instead. After rebind it must report `file mismatches 0`. Rebind makes the same verification as its last step and opens the volume only when there is no file mismatch, so a file mismatch here means the volume changed after rebind. The SQL function `openmettle.quota_verify_accounting_drift()` is not sufficient on its own. It compares no file and reports a copied volume as healthy.
+   Run it after rebind and replay, not before. Before rebind it is normally refused on a copied volume, with a message that names `storage rebind`; where the copy check misses the copy (for example a volume that holds only interrupted uploads), it runs and reports file mismatches instead. After rebind and replay it must report `file mismatches 0` and `unsettled payloads 0`. Rebind makes the same verification as its last step and opens the volume only when there is no file mismatch, so a file mismatch here means the volume changed after rebind. The SQL function `openmettle.quota_verify_accounting_drift()` is not sufficient on its own. It compares no file and reports a copied volume as healthy.
 
 4. Continue with the rest of the restore checklist, then start the API and worker.
 
