@@ -393,7 +393,7 @@ DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
     v_volume_id uuid;
     v_adoption_run_id uuid;
-    v_head_seq bigint;
+    v_head_lifecycle_origin_us bigint;
     head openmettle.deletion_journal_head%ROWTYPE;
     e openmettle.deletion_journal%ROWTYPE;
     v_existing record;
@@ -462,10 +462,27 @@ BEGIN
         RAISE EXCEPTION 'restore volume phase is active' USING ERRCODE = 'OMR02';
     END IF;
     IF NOT g.open THEN
-        SELECT djh.journal_seq INTO STRICT v_head_seq FROM openmettle.deletion_journal_head djh WHERE djh.id;
-        IF v_head_seq < g.required_journal_seq THEN
+        SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id;
+        IF head.journal_seq < g.required_journal_seq
+           OR (head.journal_seq = g.required_journal_seq
+               AND head.chain_digest IS DISTINCT FROM g.required_chain_digest) THEN
             RAISE EXCEPTION 'replay the deletion journal before declaring payloads lost'
                 USING ERRCODE = 'OMR04';
+        END IF;
+        IF g.required_lifecycle_origin_us IS NOT NULL THEN
+            v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+            IF g.required_lifecycle_origin_us = g.snapshot_lifecycle_origin_us THEN
+                IF g.required_lifecycle_baseline_digest IS DISTINCT FROM g.snapshot_lifecycle_baseline_digest
+                   OR g.required_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+                    RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                        USING ERRCODE = 'OMR04';
+                END IF;
+            ELSIF g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
+                  OR v_head_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us
+                  OR head.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+                RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                    USING ERRCODE = 'OMR04';
+            END IF;
         END IF;
     END IF;
 
@@ -567,9 +584,35 @@ BEGIN
     END IF;
 
     SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR UPDATE;
-    IF NOT g.open AND head.journal_seq < g.required_journal_seq THEN
-        RAISE EXCEPTION 'replay the deletion journal before declaring payloads lost'
-            USING ERRCODE = 'OMR04';
+    IF NOT g.open THEN
+        IF head.journal_seq < g.required_journal_seq
+           OR (head.journal_seq = g.required_journal_seq
+               AND head.chain_digest IS DISTINCT FROM g.required_chain_digest) THEN
+            RAISE EXCEPTION 'replay the deletion journal before declaring payloads lost'
+                USING ERRCODE = 'OMR04';
+        END IF;
+        IF head.journal_seq > g.required_journal_seq THEN
+            PERFORM openmettle.restore_verify_lost_journal_tail(
+                g.required_journal_seq,
+                g.required_chain_digest,
+                g.restore_run_id
+            );
+        END IF;
+        IF g.required_lifecycle_origin_us IS NOT NULL THEN
+            v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+            IF g.required_lifecycle_origin_us = g.snapshot_lifecycle_origin_us THEN
+                IF g.required_lifecycle_baseline_digest IS DISTINCT FROM g.snapshot_lifecycle_baseline_digest
+                   OR g.required_lifecycle_baseline_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+                    RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                        USING ERRCODE = 'OMR04';
+                END IF;
+            ELSIF g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
+                  OR v_head_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us
+                  OR head.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+                RAISE EXCEPTION 'replay the deletion journal and lifecycle baseline before declaring payloads lost'
+                    USING ERRCODE = 'OMR04';
+            END IF;
+        END IF;
     END IF;
 
     v_lost_at := clock_timestamp();

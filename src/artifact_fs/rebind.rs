@@ -78,6 +78,14 @@ pub enum Barrier {
 
 pub(super) const CHANGED: &str = "volume changed during rebind";
 const INACCESSIBLE: &str = "payload is not accessible";
+const FENCE_EXPIRED: &str = "transaction fence expired";
+
+fn check_fence(deadline: Instant) -> Result<(), Failure> {
+    if Instant::now() >= deadline {
+        return Err(Failure(FENCE_EXPIRED));
+    }
+    Ok(())
+}
 
 const INVENTORY: &str =
     "SELECT s.id::text,s.scope_id::text,s.state,s.reclaim_state,s.payload_ino::text,
@@ -513,7 +521,12 @@ impl Binding {
     /// that changes the volume after this check is not detected.
     /// `modified` is set immediately before the first byte is discarded. `false`: the file
     /// could not be opened and nothing was discarded.
-    fn truncate(&self, v: &Volume, modified: &mut bool) -> Result<bool, Failure> {
+    fn truncate(
+        &self,
+        v: &Volume,
+        modified: &mut bool,
+        deadline: Instant,
+    ) -> Result<bool, Failure> {
         let Some(file) = self.open(v)? else {
             return Ok(false);
         };
@@ -521,6 +534,7 @@ impl Binding {
         if file.metadata()?.nlink() != own {
             return Err(Failure(CHANGED));
         }
+        check_fence(deadline)?;
         // From here a failing run keeps the barrier.
         *modified = true;
         file.set_len(0)?;
@@ -870,6 +884,7 @@ async fn scan_and_apply(
     let mut report = scan.report;
     let mut accepted = Vec::with_capacity(scan.bindings.len());
     for b in &scan.bindings {
+        check_fence(tx_deadline)?;
         // A file that cannot be reopened fails its reservation, as in the scan.
         let Some(mut file) = b.open(v)? else {
             report.failures.push((b.id.clone(), INACCESSIBLE));
@@ -884,6 +899,7 @@ async fn scan_and_apply(
             }
             Evidence::Empty { .. } => {}
         }
+        check_fence(tx_deadline)?;
         // Whatever its inode number: an equal number does not show that the data is durable.
         file.sync_all()?;
         accepted.push(b);
@@ -891,7 +907,7 @@ async fn scan_and_apply(
     let mut bound = Vec::with_capacity(accepted.len());
     for b in accepted {
         if matches!(b.evidence, Evidence::Empty { truncate: true }) {
-            if !b.truncate(v, modified)? {
+            if !b.truncate(v, modified, tx_deadline)? {
                 report.failures.push((b.id.clone(), INACCESSIBLE));
                 continue;
             }
@@ -901,6 +917,7 @@ async fn scan_and_apply(
     }
     let mut cleared_lost = Vec::with_capacity(scan.lost_cleanups.len());
     for lost in &scan.lost_cleanups {
+        check_fence(tx_deadline)?;
         let locked = match lock_reservation_files(v, &lost.names, &lost.entries, true) {
             Ok(locked) => locked,
             Err(Failure(reason @ (INACCESSIBLE | "foreign hard link"))) => {
@@ -910,6 +927,7 @@ async fn scan_and_apply(
             Err(err) => return Err(err),
         };
         if lost.entries.iter().any(Option::is_some) {
+            check_fence(tx_deadline)?;
             *modified = true;
             unlink_reservation_files(v, &lost.names, &lost.entries, Some(tx_deadline))?;
         }
@@ -918,6 +936,7 @@ async fn scan_and_apply(
     }
     let mut completed_purges = Vec::with_capacity(scan.journal_purges.len());
     for jp in &scan.journal_purges {
+        check_fence(tx_deadline)?;
         let locked = match lock_reservation_files(v, &jp.names, &jp.entries, true) {
             Ok(locked) => locked,
             Err(Failure(reason @ (INACCESSIBLE | "foreign hard link"))) => {
@@ -927,12 +946,14 @@ async fn scan_and_apply(
             Err(err) => return Err(err),
         };
         if jp.entries.iter().any(Option::is_some) {
+            check_fence(tx_deadline)?;
             *modified = true;
             unlink_reservation_files(v, &jp.names, &jp.entries, Some(tx_deadline))?;
         }
         drop(locked);
         completed_purges.push(jp);
     }
+    check_fence(tx_deadline)?;
     // The directory entries behind every recorded inode are durable before the commit.
     for dir in [&v.root, &v.staging, &v.revisions] {
         at::fsync(dir)?;
@@ -1038,9 +1059,11 @@ async fn scan_and_apply(
             .map_err(|_| Failure("drift verification failed"))?;
         report.drift = Some(drift);
     }
+    check_fence(tx_deadline)?;
     if report.complete() {
         adoption::restore_barrier(&mut tx, run, None).await?;
     }
+    check_fence(tx_deadline)?;
     tx.commit().await.map_err(|_| Failure(COMMIT_UNKNOWN))?;
     report.run = run.to_owned();
     Ok(report)
@@ -1367,7 +1390,8 @@ mod tests {
         let dir = Dir::new();
         let (v, binding) = two_name_upload(&dir);
         let mut modified = false;
-        assert!(binding.truncate(&v, &mut modified).unwrap());
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert!(binding.truncate(&v, &mut modified, valid).unwrap());
         assert!(modified);
         let staged = Path::new(&dir.path("volume"))
             .join("staging")
@@ -1385,7 +1409,11 @@ mod tests {
         let foreign = root.join("foreign");
         std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
         let mut modified = false;
-        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, valid).unwrap_err().0,
+            CHANGED
+        );
         assert!(!modified);
         assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
     }
@@ -1416,9 +1444,30 @@ mod tests {
         let foreign = root.join("foreign");
         std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
         let mut modified = false;
-        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, valid).unwrap_err().0,
+            CHANGED
+        );
         // A refused check modified nothing, so it must not keep a barrier that was clear.
         assert!(!modified);
         assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
+    }
+
+    #[test]
+    fn truncation_refuses_expired_fence_deadline_without_modifying_file() {
+        let dir = Dir::new();
+        let (v, binding) = two_name_upload(&dir);
+        let staged = Path::new(&dir.path("volume"))
+            .join("staging")
+            .join(&binding.id);
+        let mut modified = false;
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, expired).unwrap_err().0,
+            FENCE_EXPIRED
+        );
+        assert!(!modified);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unsettled");
     }
 }

@@ -1776,8 +1776,26 @@ async fn declare_lost_split_purging_layout_recovers_leftover_anchor_on_retry_or_
             .await
             .unwrap();
 
-    // 2. Simulate post-commit interruption leaving `.purge.<id>` on disk for `split_retry`, and
-    //    verify exact `--request-key` retry cleans the leftover anchor idempotently.
+    // 2a. Exact `--request-key` retry when all four reservation names are already absent still
+    //     syncs both directories cleanly and returns `replayed ... unlinked=0` with no drift.
+    let (ok, out, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &split_retry.revision,
+        OPERATOR_1,
+        "p2-6-retry",
+        "split purging payload corrupt",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("replayed storage.declare_payload_lost") && out.contains("unlinked=0"),
+        "{out}"
+    );
+    assert_eq!(storage_account(&f.db, &f.c.scope).await, acct_after_lost);
+
+    // 2b. Simulate post-commit interruption leaving `.purge.<id>` on disk for `split_retry`, and
+    //     verify exact `--request-key` retry cleans the leftover anchor idempotently.
     let retry_anchor = copy
         .join("revisions")
         .join(format!(".purge.{}", split_retry.reservation));
@@ -1831,4 +1849,424 @@ async fn declare_lost_split_purging_layout_recovers_leftover_anchor_on_retry_or_
         out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
         "{out}"
     );
+}
+
+/// Review #2 P1 regression: when a journaled purge on a restored volume has `revisions/<id>` at
+/// the bound inode AND a separate regular file at `staging/<id>`, `purge_journaled` / `purge_one`
+/// MUST fail closed before truncating or confirming `'purged'` (leaving the revision `'purging'`),
+/// so `restore replay --db-only` -> `storage rebind` -> `restore replay` cleans both files,
+/// completes `'purged'`, passes drift verification, and reopens the gate.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn purge_journaled_refuses_split_staging_inode_so_rebind_cleans_all_names_and_reopens_gate() {
+    let f = Fixture::new().await;
+    let keep = f.payload("keep", b"keep-bytes").await;
+    let target = f.payload("split-j", b"journaled-purge-payload").await;
+    retention_grace(&f.db, 0).await;
+
+    let dir = Dir::new();
+    f.api.close().await;
+    let snap_db = backup_db(&f.db).await;
+
+    // Commit `artifact_revision.purged` on live DB while leaving `f.root`'s bound inodes intact.
+    for s in [Step::Retain, Step::Claim, Step::Confirm] {
+        step(&f.db.0, &f.c.scope, &target.revision, s)
+            .await
+            .unwrap();
+    }
+    let export_path = dir.path("r2-p1.export");
+    let (ok, _, err) = cli(&f.db, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export = Export::parse(&fs::read_to_string(&export_path).unwrap()).unwrap();
+
+    // Place a distinct-inode regular file at `staging/<id>` alongside bound `revisions/<id>`.
+    let rev_path = f.root.join("revisions").join(&target.reservation);
+    let staging_path = f.root.join("staging").join(&target.reservation);
+    fs::write(&staging_path, b"stray-split-staging-file").unwrap();
+
+    // 1. Lock gate on `snap_db` and attempt full `restore replay`: `purge_journaled` must refuse
+    //    without truncating `revisions/<id>` or marking the revision `'purged'`.
+    let mut lock_args = vec![
+        "restore".to_owned(),
+        "lock".to_owned(),
+        "--required-origin".to_owned(),
+        export.origin_us.to_string(),
+        "--required-lifecycle-origin".to_owned(),
+        export.lifecycle_origin_us.unwrap().to_string(),
+        "--required-lifecycle-baseline-digest".to_owned(),
+        export.lifecycle_baseline_digest.clone().unwrap(),
+        "--required-seq".to_owned(),
+        export.seq.to_string(),
+        "--required-digest".to_owned(),
+        export.digest.clone(),
+        "--export-complete".to_owned(),
+    ];
+    if let Some(co) = export.connection_origin_us {
+        lock_args.push("--required-connection-origin".to_owned());
+        lock_args.push(co.to_string());
+    }
+    let lock_refs: Vec<&str> = lock_args.iter().map(String::as_str).collect();
+    let (ok, _, err) = cli(&snap_db, &lock_refs);
+    assert!(ok, "{err}");
+
+    let (ok, _, _) = cli(
+        &snap_db,
+        &["restore", "replay", &export_path, f.root.to_str().unwrap()],
+    );
+    assert!(
+        !ok,
+        "restore replay must refuse split staging inode instead of confirming purged"
+    );
+    assert!(!gate_open_of(&snap_db).await);
+    assert_eq!(revision_row(&snap_db, &target.revision).await.0, "purging");
+    assert_eq!(fs::read(&rev_path).unwrap(), b"journaled-purge-payload");
+    assert_eq!(
+        fs::read(&staging_path).unwrap(),
+        b"stray-split-staging-file"
+    );
+
+    // 2. Recover cleanly via `restore replay --db-only` -> `storage rebind` -> `restore replay`:
+    //    `rebind` cleans BOTH names under locks and completes `'purged'`, and `restore replay`
+    //    passes drift verification and opens the gate.
+    let (ok, out, err) = cli(&snap_db, &["restore", "replay", "--db-only", &export_path]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = cli(&snap_db, &["storage", "rebind", f.root.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("failed 0"), "{out}");
+    assert_eq!(barrier_of(&snap_db).await, None);
+    assert!(!rev_path.exists());
+    assert!(!staging_path.exists());
+    assert_eq!(revision_row(&snap_db, &target.revision).await.0, "purged");
+    assert_eq!(
+        storage_account(&snap_db, &f.c.scope).await,
+        (keep.size_bytes, 0, 0)
+    );
+
+    let (ok, out, err) = cli(
+        &snap_db,
+        &["restore", "replay", &export_path, f.root.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("restore gate open"), "{out}");
+    assert!(gate_open_of(&snap_db).await);
+    let (ok, out, err) = cli(&snap_db, &["quota", "verify", f.root.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+}
+
+/// Review #2 P2 regression: an active 0-byte revision (`SHA-256("")`) surviving only at
+/// `.purge.<id>` MUST still be hashed and refused as intact by `storage declare-lost` without
+/// unlinking the file or mutating DB state.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_refuses_zero_byte_revision_surviving_only_at_purge_anchor() {
+    let f = Fixture::new().await;
+    let empty_rev = f.payload("empty-rev", b"").await;
+    assert_eq!(empty_rev.size_bytes, 0);
+
+    let dir = Dir::new();
+    let copy = tar_copy(&f.root, &dir, "copy-zero-byte");
+    let rev_path = copy.join("revisions").join(&empty_rev.reservation);
+    let purge_path = copy
+        .join("revisions")
+        .join(format!(".purge.{}", empty_rev.reservation));
+    fs::remove_file(&rev_path).unwrap();
+    fs::write(&purge_path, b"").unwrap();
+
+    let (ok, out, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok, "{out}");
+    assert!(barrier_of(&f.db).await.is_some());
+
+    let before_seq: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+
+    let (ok, _, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &empty_rev.revision,
+        OPERATOR_1,
+        "r2-zero-byte",
+        "must refuse 0-byte revision surviving at purge anchor",
+    );
+    assert!(!ok);
+    assert!(err.contains("payload verifies intact"), "{err}");
+    assert!(purge_path.exists());
+    assert_eq!(revision_row(&f.db, &empty_rev.revision).await.0, "active");
+    assert!(!revision_row(&f.db, &empty_rev.revision).await.1);
+    let after_seq: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+    assert_eq!(after_seq, before_seq);
+}
+
+/// Review #2 P2 regression: on a restored pre-42 backup with `head.journal_seq == required_seq == 0`
+/// and an unapplied `required_lifecycle_origin_us` / `required_lifecycle_baseline_digest`,
+/// `storage declare-lost` (both CLI preflight and SQL function) MUST refuse (`OMR04`) until
+/// `openmettle-admin restore replay --db-only FILE` applies the lifecycle baseline, after which
+/// `declare-lost`, resumed `storage rebind`, and `restore replay` succeed cleanly.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_refuses_unapplied_lifecycle_baseline_when_journal_seq_matches_until_db_only_replay()
+ {
+    use openmettle_core::runs::WriteTransaction;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = Dir::new();
+    let store_root = PathBuf::from(dir.path("pre42-store"));
+    fs::create_dir(&store_root).unwrap();
+    let store = Store::open(&store_root).unwrap();
+
+    // 1. Seed a schema-41 database with one active settled revision `rev_id` on a pinned volume.
+    let live = TestDb::new().await;
+    migrate::apply(&live.settings(Duration::from_secs(10)), &MIGRATIONS[..41])
+        .await
+        .unwrap();
+    super::storage::configure_limits(&live, Some(1000), Some(1000), Some(1000)).await;
+    retention_grace(&live, 86_400).await;
+    let live_api_pool = pool(&live, API).await;
+    store.initialize_api(&live_api_pool).await.unwrap();
+    live_api_pool.close().await;
+
+    let c = super::Context::new(&live).await;
+    let doc = super::storage::new_uuid(&live).await;
+    let payload_bytes = b"pre42-damaged-after-restore";
+    let res = super::storage::reserve(
+        &live,
+        OWNER,
+        &super::storage::input(
+            &c.scope,
+            &c.actor,
+            "r2-p2-baseline",
+            &doc,
+            payload_bytes.len() as i64,
+        ),
+    )
+    .await
+    .unwrap();
+    let rev_path = store_root.join("revisions").join(&res.id);
+    fs::write(&rev_path, payload_bytes).unwrap();
+    let ino = fs::metadata(&rev_path).unwrap().ino().to_string();
+    let rev_id = {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.storage_reservations
+                SET stage_claimed = true, payload_ino = $2::text::numeric, publish_pending = true
+              WHERE id = $1::uuid",
+        )
+        .bind(&res.id)
+        .bind(&ino)
+        .execute(&mut live_owner)
+        .await
+        .unwrap();
+        let mut settle_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        let digest = Sha256::digest(payload_bytes).to_vec();
+        let rev = openmettle_core::storage::settle(
+            &mut settle_tx,
+            &openmettle_core::storage::Settlement {
+                scope: &c.scope,
+                reservation: &res.id,
+                size_bytes: payload_bytes.len() as i64,
+                content_digest: &digest,
+                media_type: "text/plain",
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle_tx.commit().await.unwrap();
+        rev
+    };
+
+    // 2. Capture schema-41 backup (before `rev_id` is retained) and volume copy.
+    let copy_vol = tar_copy(&store_root, &dir, "pre42-copy");
+    let restored_db = backup_db(&live).await;
+
+    // 3. On `live`, retain `rev_id` at schema 41, then upgrade to full schema 44 so migration 42
+    //    snapshots `rev_id` in `retention_upgrade_baseline` while `journal_seq` stays `0`.
+    {
+        let mut live_owner = connect(&live.0, OWNER).await;
+        let mut ret_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
+        openmettle_core::storage::retain_revision(&mut ret_tx, &c.scope, &rev_id)
+            .await
+            .unwrap();
+        ret_tx.commit().await.unwrap();
+    }
+    migrate::apply(&live.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    let export_path = dir.path("r2-baseline.export");
+    let (ok, _, err) = cli(&live, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export_text = fs::read_to_string(&export_path).unwrap();
+    let export = Export::parse(&export_text).unwrap();
+    assert_eq!(export.seq, 0);
+    assert_eq!(
+        export_text
+            .lines()
+            .filter(|line| line.starts_with("baseline "))
+            .count(),
+        1
+    );
+    assert!(export_text.contains(&format!("baseline {rev_id} ")));
+
+    // 4. Upgrade `restored_db` to schema 44 (gets its own distinct lifecycle_origin_us and empty
+    //    baseline, while `journal_seq == 0 == export.seq`), and damage `rev_id` on `copy_vol`.
+    migrate::apply(&restored_db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    fs::write(copy_vol.join("revisions").join(&res.id), b"corrupt!").unwrap();
+
+    // 5. Lock restore gate (without `--export-complete` because backup predates schema 42) and
+    //    run `storage rebind` so it fails on `rev_id` and holds `adoption_run_id`.
+    let mut lock_args = vec![
+        "restore".to_owned(),
+        "lock".to_owned(),
+        "--required-origin".to_owned(),
+        export.origin_us.to_string(),
+        "--required-lifecycle-origin".to_owned(),
+        export.lifecycle_origin_us.unwrap().to_string(),
+        "--required-lifecycle-baseline-digest".to_owned(),
+        export.lifecycle_baseline_digest.clone().unwrap(),
+        "--required-seq".to_owned(),
+        export.seq.to_string(),
+        "--required-digest".to_owned(),
+        export.digest.clone(),
+    ];
+    if let Some(co) = export.connection_origin_us {
+        lock_args.push("--required-connection-origin".to_owned());
+        lock_args.push(co.to_string());
+    }
+    let lock_refs: Vec<&str> = lock_args.iter().map(String::as_str).collect();
+    let (ok, _, err) = cli(&restored_db, &lock_refs);
+    assert!(ok, "{err}");
+    let restore_run_id: String = sqlx::query_scalar(
+        "SELECT restore_run_id::text FROM openmettle.restore_reconciliation_gate WHERE id",
+    )
+    .fetch_one(&mut restored_db.admin().await)
+    .await
+    .unwrap();
+
+    let (ok, out, _) = cli(
+        &restored_db,
+        &["storage", "rebind", copy_vol.to_str().unwrap()],
+    );
+    assert!(!ok, "{out}");
+    let held_barrier = barrier_of(&restored_db).await.unwrap();
+
+    // 6. Even though `head.journal_seq == required_journal_seq == 0`, `storage declare-lost`
+    //    MUST refuse until the pending lifecycle baseline is applied.
+    let (ok, _, err) = declare_lost_cli(
+        &restored_db,
+        OWNER,
+        &copy_vol,
+        &rev_id,
+        OPERATOR_1,
+        "r2-baseline-too-early",
+        "before lifecycle baseline replay",
+    );
+    assert!(!ok);
+    assert!(err.contains("lifecycle baseline"), "{err}");
+
+    let sql_res = sqlx::query(
+        "SELECT * FROM openmettle.storage_declare_payload_lost($1::uuid, $2::uuid, $3, $4)",
+    )
+    .bind(&rev_id)
+    .bind(OPERATOR_1)
+    .bind("r2-baseline-sql-early")
+    .bind("direct sql before baseline replay")
+    .execute(&mut connect(&restored_db.0, OWNER).await)
+    .await;
+    assert_eq!(sqlstate(sql_res), "OMR04");
+    assert_eq!(revision_row(&restored_db, &rev_id).await.0, "active");
+
+    // 7. `restore replay --db-only` applies the pre-42 lifecycle baseline under the held barrier
+    //    (`rev_id` moves `'active'` -> `'retained'`), then `declare-lost`, resumed `storage rebind`,
+    //    `restore accept-coverage-gap`, and full `restore replay` succeed with zero drift.
+    let (ok, out, err) = cli(
+        &restored_db,
+        &["restore", "replay", "--db-only", &export_path],
+    );
+    assert!(ok, "{out}{err}");
+    assert_eq!(revision_row(&restored_db, &rev_id).await.0, "retained");
+
+    let (ok, out, err) = declare_lost_cli(
+        &restored_db,
+        OWNER,
+        &copy_vol,
+        &rev_id,
+        OPERATOR_1,
+        "r2-baseline-lost",
+        "corrupt payload declared lost after lifecycle baseline replay",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("applied storage.declare_payload_lost")
+            && out.contains("previous_state=retained"),
+        "{out}"
+    );
+    assert_eq!(revision_row(&restored_db, &rev_id).await.0, "lost");
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &[
+            "storage",
+            "rebind",
+            copy_vol.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(ok, "{out}{err}");
+    assert_eq!(barrier_of(&restored_db).await, None);
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &[
+            "restore",
+            "accept-coverage-gap",
+            "--restore-run",
+            &restore_run_id,
+            "--operator-id",
+            OPERATOR_1,
+            "--request-key",
+            "r2-baseline-gap",
+            "--reason",
+            "pre-42 backup verified after baseline replay and lost declaration",
+        ],
+    );
+    assert!(ok, "{out}{err}");
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &[
+            "restore",
+            "replay",
+            &export_path,
+            copy_vol.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("restore gate open"), "{out}");
+    assert!(gate_open_of(&restored_db).await);
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &["quota", "verify", copy_vol.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+    assert_eq!(storage_account(&restored_db, &c.scope).await, (0, 0, 0));
 }

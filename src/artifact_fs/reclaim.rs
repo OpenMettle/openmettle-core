@@ -448,15 +448,27 @@ async fn purge_one(
     check_fence(fence_deadline)?;
     v.verify(pin)?;
     v.matches(&f, &v.revisions, src, ino)?;
+    let reclaim_name = format!(".reclaim.{reservation}");
     let a_now = v.inode(&v.revisions, &name)?;
     let r_now = v.inode(&v.revisions, reservation)?;
     let s_now = v.inode(&v.staging, reservation)?;
+    let rec_now = v.inode(&v.staging, &reclaim_name)?;
     if a_now.is_some_and(|other| other != ino) || r_now.is_some_and(|other| other != ino) {
+        return Err(Error::Io);
+    }
+    // During restore reconciliation (`phase.is_some()`), a distinct inode at `staging/<id>` or
+    // `staging/.reclaim.<id>` would survive after `confirm_purge` and permanently fail drift
+    // verification; fail closed BEFORE mutating disk or confirming `purged` so `storage rebind`
+    // can clean all four names safely under locks.
+    if phase.is_some()
+        && (s_now.is_some_and(|other| other != ino) || rec_now.is_some_and(|other| other != ino))
+    {
         return Err(Error::Io);
     }
     let own = u64::from(a_now == Some(ino))
         + u64::from(r_now == Some(ino))
-        + u64::from(s_now == Some(ino));
+        + u64::from(s_now == Some(ino))
+        + u64::from(rec_now == Some(ino));
     if f.metadata()?.nlink() != own {
         return Err(Error::Io);
     }
@@ -477,6 +489,9 @@ async fn purge_one(
     }
     if s_now == Some(ino) {
         v.unlink_before(&v.staging, reservation, ino, fence_deadline)?;
+    }
+    if rec_now == Some(ino) {
+        v.unlink_before(&v.staging, &reclaim_name, ino, fence_deadline)?;
     }
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;
@@ -929,6 +944,9 @@ pub async fn purge_journaled(
             let Some(ino) = bound else {
                 return Err(Error::Io);
             };
+            if entries.iter().flatten().any(|e| e.ino != ino) {
+                return Err(Error::Io);
+            }
             purge_one(pool, store, pin, &scope, &id, &res, ino, phase).await
         })
         .await?;

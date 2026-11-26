@@ -16,6 +16,7 @@ use super::{
     volume::Volume,
 };
 use crate::runs::is_canonical_uuid;
+use rustix::fs as at;
 use sqlx::{Connection, PgConnection, Row};
 use std::{
     collections::HashMap,
@@ -64,7 +65,15 @@ fn map_sql_error(err: sqlx::Error) -> Failure {
             Some("23505") => Failure("request key already used with different parameters"),
             Some("22023") => Failure("invalid declare-lost parameters"),
             Some("P0002") => Failure("artifact revision not found"),
-            Some("OMR04") => Failure("replay the deletion journal before declaring payloads lost"),
+            Some("OMR04") => {
+                if db.message().contains("lifecycle baseline") {
+                    Failure(
+                        "replay the deletion journal and lifecycle baseline before declaring payloads lost",
+                    )
+                } else {
+                    Failure("replay the deletion journal before declaring payloads lost")
+                }
+            }
             Some("OMR02") => Failure("restore volume phase is active"),
             Some("OMQ03") => {
                 let msg = db.message();
@@ -117,13 +126,12 @@ fn check_unrecoverable_and_no_foreign_links(
         revision,
         purge,
     };
-    // Verify candidate payload files BEFORE `rebind::classify` so an unexpected anchor or split
-    // layout can never bypass SHA-256 verification and unlink intact payload bytes.
+    // Verify candidate payload files across ALL four reservation names BEFORE `rebind::classify`
+    // so an unexpected anchor or split layout (including a 0-byte revision surviving at an anchor)
+    // can never bypass SHA-256 verification and unlink intact payload bytes.
     let mut checked_inos: Vec<u64> = Vec::with_capacity(4);
-    for (slot, maybe) in entries.iter().enumerate() {
-        let Some(e) = maybe else { continue };
-        let is_payload_slot = matches!(slot, 0 | 2);
-        if e.len != size_bytes || (!is_payload_slot && size_bytes == 0) {
+    for e in entries.iter().flatten() {
+        if e.len != size_bytes {
             continue;
         }
         if checked_inos.contains(&e.ino) {
@@ -232,6 +240,9 @@ fn snapshot_mtimes(locked: &LockedFiles) -> Result<Vec<(i64, i64)>, Failure> {
 }
 
 /// Post-commit unlink under continuously-held exclusive file locks and bounded by `deadline`.
+/// Always syncs both reservation directories (`revisions` and `staging`) even when `entries` is
+/// empty so an idempotent retry after a crash between `unlinkat` and `fsync` still establishes
+/// directory durability.
 fn unlink_after_commit(
     v: &Volume,
     pin: &str,
@@ -244,11 +255,15 @@ fn unlink_after_commit(
     check_fence(deadline)?;
     v.verify(pin)?;
     verify_locked_reservation(v, names, entries, locked, mtimes)?;
-    if entries.iter().any(Option::is_some) {
-        unlink_reservation_files(v, names, entries, Some(deadline))
+    let unlinked = if entries.iter().any(Option::is_some) {
+        unlink_reservation_files(v, names, entries, Some(deadline))?
     } else {
-        Ok(0)
-    }
+        0
+    };
+    check_fence(deadline)?;
+    at::fsync(&v.revisions)?;
+    at::fsync(&v.staging)?;
+    Ok(unlinked)
 }
 
 /// Declare one settled artifact revision's unrecoverable payload permanently lost.
@@ -272,20 +287,40 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     // Read-only preflight outside the write transaction so hashing a large intact payload never
     // holds PostgreSQL row locks across disk I/O. Exclusive file locks acquired here are held
     // continuously across the locked READ COMMITTED transaction and post-commit unlink.
-    let (pin, adopting, gate_open, volume_active, required_seq, head_seq): (
+    let (pin, adopting, gate_open, volume_active, journal_pending, baseline_pending): (
         Option<String>,
         bool,
         bool,
         bool,
-        Option<i64>,
-        i64,
+        bool,
+        bool,
     ) = sqlx::query_as(
         "SELECT svc.volume_id::text,
                 svc.adoption_run_id IS NOT NULL,
                 g.open,
                 (NOT g.open AND g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp()),
-                g.required_journal_seq,
-                h.journal_seq
+                (
+                    NOT g.open
+                    AND (
+                        h.journal_seq < g.required_journal_seq
+                        OR (h.journal_seq = g.required_journal_seq
+                            AND h.chain_digest IS DISTINCT FROM g.required_chain_digest)
+                    )
+                ),
+                (
+                    NOT g.open
+                    AND g.required_lifecycle_origin_us IS NOT NULL
+                    AND CASE
+                        WHEN g.required_lifecycle_origin_us = g.snapshot_lifecycle_origin_us THEN
+                            g.required_lifecycle_baseline_digest IS DISTINCT FROM g.snapshot_lifecycle_baseline_digest
+                            OR g.required_lifecycle_baseline_digest IS DISTINCT FROM h.lifecycle_baseline_digest
+                        ELSE
+                            g.replayed_lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
+                            OR (extract(epoch FROM h.lifecycle_coverage_started_at) * 1000000)::bigint
+                                IS DISTINCT FROM g.required_lifecycle_origin_us
+                            OR h.lifecycle_baseline_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest
+                    END
+                )
            FROM openmettle.storage_volume_control svc
            JOIN openmettle.restore_reconciliation_gate g ON g.id
            JOIN openmettle.deletion_journal_head h ON h.id
@@ -304,9 +339,14 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     if volume_active {
         return Err(Failure("restore volume phase is active"));
     }
-    if !gate_open && required_seq.is_some_and(|req| head_seq < req) {
+    if journal_pending {
         return Err(Failure(
             "replay the deletion journal before declaring payloads lost",
+        ));
+    }
+    if baseline_pending {
+        return Err(Failure(
+            "replay the deletion journal and lifecycle baseline before declaring payloads lost",
         ));
     }
 
@@ -708,5 +748,78 @@ mod tests {
             unlink_after_commit(&v, &pin, &names, &entries, &locked, &mtimes, valid).unwrap();
         assert_eq!(unlinked, 1);
         assert!(!rev_path.exists());
+        drop(locked);
+
+        // Even when all four reservation names are already absent, `unlink_after_commit` still
+        // checks the fence budget and syncs both directories cleanly on retry.
+        let (empty_entries, empty_locked) = inspect_and_lock(&v, &names, true).unwrap();
+        assert!(empty_entries.iter().all(Option::is_none));
+        let err = unlink_after_commit(
+            &v,
+            &pin,
+            &names,
+            &empty_entries,
+            &empty_locked,
+            &[],
+            expired,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, FENCE_EXPIRED);
+        assert_eq!(
+            unlink_after_commit(&v, &pin, &names, &empty_entries, &empty_locked, &[], valid)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn zero_byte_revision_surviving_at_anchor_is_refused_as_intact() {
+        let dir = Dir::new();
+        let root = dir.path("vol");
+        std::fs::create_dir(&root).unwrap();
+        let v = Volume::open(Path::new(&root), true).unwrap();
+        let res_id = "66666666-6666-4666-8666-666666666666";
+        let digest = Sha256::digest(b"").to_vec();
+        let names = reservation_names(res_id);
+
+        for (anchor_path, state) in [
+            (
+                Path::new(&root)
+                    .join("revisions")
+                    .join(format!(".purge.{res_id}")),
+                "active",
+            ),
+            (
+                Path::new(&root)
+                    .join("staging")
+                    .join(format!(".reclaim.{res_id}")),
+                "retained",
+            ),
+        ] {
+            std::fs::write(&anchor_path, b"").unwrap();
+            let (entries, mut locked) = inspect_and_lock(&v, &names, false).unwrap();
+            let ledger = Ledger {
+                state: "settled",
+                reclaim: "none",
+                revision: Some(state),
+                purge: Some("none"),
+            };
+            let err = check_unrecoverable_and_no_foreign_links(
+                &ledger,
+                &entries,
+                &mut locked,
+                res_id,
+                0,
+                &digest,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.0,
+                "payload verifies intact; resolve layout mismatch or run storage rebind instead"
+            );
+            drop(locked);
+            assert!(anchor_path.exists());
+            std::fs::remove_file(&anchor_path).unwrap();
+        }
     }
 }
