@@ -156,20 +156,34 @@ pub(super) async fn verify_volume(
     v: &Volume,
     pin: &str,
 ) -> Result<Drift, Error> {
-    verify_volume_inner(c, v, pin, None).await
+    verify_volume_inner(c, v, pin, None, None).await
 }
 
 /// Restore-phase volume and ledger drift verification on a connection holding
-/// `storage_volume_control FOR SHARE`. Yields cooperatively whenever synchronous per-row or
-/// directory-entry checks run for `yield_interval` so a concurrent lease-renewal heartbeat on a
-/// second connection can extend the restore volume-phase lease on time.
+/// `storage_volume_control FOR SHARE`. At elapsed-time `yield_interval` checkpoints during
+/// synchronous per-row or directory-entry checks, runs a lightweight `SELECT 1` on `c` (keeping
+/// `tx_pin` non-idle against `idle_in_transaction_session_timeout`) and yields cooperatively so
+/// the concurrent lease-renewal heartbeat on Connection 2 can extend the volume-phase lease.
 pub(crate) async fn verify_volume_on(
     c: &mut PgConnection,
     store: &Store,
     pin: &str,
     yield_interval: Duration,
 ) -> Result<Drift, Error> {
-    verify_volume_inner(c, &store.volume, pin, Some(yield_interval)).await
+    verify_volume_inner(c, &store.volume, pin, Some(yield_interval), None).await
+}
+
+/// Test hook exercising `verify_volume_inner` with a controlled synchronous per-item filesystem
+/// delay to verify `SELECT 1` idle-in-transaction keepalive behavior on PostgreSQL 18.
+#[doc(hidden)]
+pub async fn verify_volume_for_test(
+    c: &mut PgConnection,
+    store: &Store,
+    pin: &str,
+    yield_interval: Option<Duration>,
+    per_item_delay: Option<Duration>,
+) -> Result<Drift, Error> {
+    verify_volume_inner(c, &store.volume, pin, yield_interval, per_item_delay).await
 }
 
 async fn verify_volume_inner(
@@ -177,9 +191,10 @@ async fn verify_volume_inner(
     v: &Volume,
     pin: &str,
     yield_interval: Option<Duration>,
+    per_item_delay: Option<Duration>,
 ) -> Result<Drift, Error> {
-    let mut last_yield = Instant::now();
     let mut report = ledgers(c).await?;
+    let mut last_yield;
     let by_id = sqlx::AssertSqlSafe(format!("{INVENTORY} WHERE s.id=$1::uuid"));
     let paged = sqlx::AssertSqlSafe(format!(
         "{INVENTORY} WHERE ($1::uuid IS NULL OR s.id>$1::uuid) ORDER BY s.id LIMIT 100"
@@ -190,6 +205,7 @@ async fn verify_volume_inner(
             .bind(&cursor)
             .fetch_all(&mut *c)
             .await?;
+        last_yield = Instant::now();
         if page.is_empty() {
             break;
         }
@@ -197,8 +213,9 @@ async fn verify_volume_inner(
             if let Some(interval) = yield_interval
                 && last_yield.elapsed() >= interval
             {
-                last_yield = Instant::now();
+                sqlx::query("SELECT 1").execute(&mut *c).await?;
                 tokio::task::yield_now().await;
+                last_yield = Instant::now();
             }
             let id: String = row.get("id");
             cursor = Some(id.clone());
@@ -207,12 +224,16 @@ async fn verify_volume_inner(
                 continue;
             }
             let mut result = check(v, &row);
+            if let Some(delay) = per_item_delay {
+                std::thread::sleep(delay);
+            }
             if result.is_err() {
                 // A retained row may have finished purging since the original inventory snapshot.
                 let updated = sqlx::query(sqlx::AssertSqlSafe(by_id.0.as_str()))
                     .bind(&id)
                     .fetch_one(&mut *c)
                     .await?;
+                last_yield = Instant::now();
                 if updated.get::<bool, _>("adoption_unverified") {
                     report.quarantined += 1;
                     continue;
@@ -231,10 +252,14 @@ async fn verify_volume_inner(
             if let Some(interval) = yield_interval
                 && last_yield.elapsed() >= interval
             {
-                last_yield = Instant::now();
+                sqlx::query("SELECT 1").execute(&mut *c).await?;
                 tokio::task::yield_now().await;
+                last_yield = Instant::now();
             }
             let entry = entry?;
+            if let Some(delay) = per_item_delay {
+                std::thread::sleep(delay);
+            }
             let Ok(name) = entry.file_name().to_str() else {
                 report.files += 1;
                 continue;
@@ -253,6 +278,7 @@ async fn verify_volume_inner(
                 .bind(id)
                 .fetch_optional(&mut *c)
                 .await?;
+            last_yield = Instant::now();
             if row.is_none() && !matches!(v.inode(dir, name), Ok(None)) {
                 report.files += 1;
             }

@@ -3013,3 +3013,159 @@ async fn fs_io_transactions_override_short_session_idle_in_transaction_timeout()
     assert!(gate(&restored).await.0);
     assert_eq!(state(&restored, &p).await.0, "purged");
 }
+
+/// Review #4 P2 #1 regression: `verify_volume_on` runs `SELECT 1` on `tx_pin` at elapsed-time
+/// checkpoints during synchronous per-row and directory-entry scans, keeping Backend 1 non-idle
+/// across a scan longer than `idle_in_transaction_session_timeout` with zero `by_id` fallbacks.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn verify_volume_keepalive_prevents_idle_in_transaction_timeout_during_slow_fs_scan() {
+    let f = Fixture::new().await;
+    for i in 0..8usize {
+        f.payload(&format!("keepalive-{i}"), b"ok").await;
+    }
+    // Add skipped `.openmettle-volume-id.tmp.*` entries so the directory-entry scan loop also
+    // runs >250 ms synchronously without issuing `by_id` SQL queries.
+    for i in 0..10usize {
+        let tmp = f
+            .root
+            .join("revisions")
+            .join(format!(".openmettle-volume-id.tmp.{i:032x}"));
+        fs::write(&tmp, b"").unwrap();
+    }
+    let pin: String = sqlx::query_scalar(
+        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(&mut f.db.admin().await)
+    .await
+    .unwrap();
+
+    // Negative control: with `yield_interval = None` (no `SELECT 1` keepalive), a 35 ms/item
+    // synchronous FS scan (~600+ ms total) exceeds the 250 ms `idle_in_transaction_session_timeout`
+    // and PostgreSQL terminates the transaction.
+    let mut conn_no_keepalive = connect(&f.db.0, OWNER).await;
+    let mut tx_no_keepalive = conn_no_keepalive.begin().await.unwrap();
+    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '250ms'")
+        .execute(&mut *tx_no_keepalive)
+        .await
+        .unwrap();
+    let failed = artifact_fs::verify_volume_for_test(
+        &mut tx_no_keepalive,
+        &f.store,
+        &pin,
+        None,
+        Some(Duration::from_millis(35)),
+    )
+    .await;
+    let commit_after_fail = if failed.is_ok() {
+        tx_no_keepalive.commit().await.err()
+    } else {
+        None
+    };
+    assert!(
+        failed.is_err() || commit_after_fail.is_some(),
+        "expected 250ms idle_in_transaction_session_timeout to abort slow scan without keepalive"
+    );
+
+    // Positive check: with `yield_interval = Some(40ms)`, `SELECT 1` runs every ~70 ms during both
+    // the row scan and the directory scan (>600 ms total), keeping `tx_pin` alive and healthy.
+    let mut conn_keepalive = connect(&f.db.0, OWNER).await;
+    let mut tx_keepalive = conn_keepalive.begin().await.unwrap();
+    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '250ms'")
+        .execute(&mut *tx_keepalive)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let drift = artifact_fs::verify_volume_for_test(
+        &mut tx_keepalive,
+        &f.store,
+        &pin,
+        Some(Duration::from_millis(40)),
+        Some(Duration::from_millis(35)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "expected scan to span >400 ms, took {:?}",
+        started.elapsed()
+    );
+    assert!(drift.healthy() && drift.unsettled_payloads == 0);
+    tx_keepalive.commit().await.unwrap();
+}
+
+/// Review #4 P2 #2 regression: if heartbeat renewal fails (`OMR02`) while `tx_pin` is blocked in
+/// `verify_ledgers_on`, `with_volume_phase_heartbeat` cancels Backend 1's query and `finish`
+/// synchronously rolls back `tx_pin` BEFORE returning so `storage_volume_control FOR SHARE` is
+/// already released even while the external table lock remains held.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn heartbeat_renewal_failure_cancels_tx_pin_and_releases_volume_lock_synchronously() {
+    let db = TestDb::migrated().await;
+    let owner = pool(&db, OWNER).await;
+    let export = Export::parse(&restore::export(&owner).await.unwrap()).unwrap();
+    restore::lock(&owner, export.origin_us, 0, GENESIS, true, None, true)
+        .await
+        .unwrap();
+
+    let mut blocker = connect(&db.0, OWNER).await;
+    let blocker_pid = pid(&mut blocker).await;
+    let mut blocker_tx = blocker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.storage_accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker_tx)
+        .await
+        .unwrap();
+
+    let finishing = tokio::spawn({
+        let owner = owner.clone();
+        let export = export.clone();
+        async move {
+            restore::finish_with_heartbeat(&owner, None, &export, Duration::from_millis(60)).await
+        }
+    });
+    wait_for_blocked_peer(&db, blocker_pid).await;
+
+    // Confirm `tx_pin` is actively holding `storage_volume_control FOR SHARE` right now.
+    let mut probe = connect(&db.0, OWNER).await;
+    let mut probe_tx = probe.begin().await.unwrap();
+    let blocked_rebind = sqlx::query(
+        "SELECT volume_id FROM openmettle.storage_volume_control WHERE id FOR UPDATE NOWAIT",
+    )
+    .execute(&mut *probe_tx)
+    .await;
+    assert_eq!(sqlstate(blocked_rebind), "55P03");
+    probe_tx.rollback().await.unwrap();
+
+    // Expire the volume-phase lease on an external connection so the next 60 ms heartbeat tick
+    // fails with `OMR02`.
+    sqlx::query(
+        "UPDATE openmettle.restore_reconciliation_gate
+            SET volume_lease_until = clock_timestamp() - interval '1 second'
+          WHERE id",
+    )
+    .execute(&mut db.admin().await)
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), finishing)
+        .await
+        .expect("finish_with_heartbeat must abort promptly on heartbeat failure")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(sqlstate_of(err), "OMR02");
+
+    // IMMEDIATELY — while `blocker_tx` STILL holds `ACCESS EXCLUSIVE` on `storage_accounts` —
+    // `storage_volume_control FOR UPDATE NOWAIT` must succeed without waiting!
+    let mut rebind_probe_tx = probe.begin().await.unwrap();
+    let vol: Option<String> = sqlx::query_scalar(
+        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id FOR UPDATE NOWAIT",
+    )
+    .fetch_one(&mut *rebind_probe_tx)
+    .await
+    .expect("tx_pin must have released storage_volume_control FOR SHARE before finish returned");
+    assert!(vol.is_none());
+    rebind_probe_tx.rollback().await.unwrap();
+    assert!(!gate(&db).await.0);
+
+    blocker_tx.rollback().await.unwrap();
+}

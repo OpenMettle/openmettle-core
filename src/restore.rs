@@ -501,12 +501,17 @@ async fn release_volume_phase(
     tx.commit().await
 }
 
-/// Runs `fut` (which must use only Connection 1 and filesystem I/O, never `pool`) while renewing
-/// the restore volume-phase lease on `pool` (Connection 2) up front, on every elapsed
-/// `renew_interval` tick, and once on completion. Because `fut` never borrows from `pool`, a
-/// 2-connection pool never contends with itself even while long SQL queries run on Connection 1.
+/// Runs `fut` (which must use only Connection 1 (`tx_pin`, backend `tx_pin_pid`) and filesystem
+/// I/O, never `pool`) while renewing the restore volume-phase lease on `pool` (Connection 2) up
+/// front, on every elapsed `renew_interval` tick, and once on completion. Because `fut` never
+/// borrows from `pool`, a 2-connection pool never contends with itself even while long SQL queries
+/// run on Connection 1. If a heartbeat renewal fails while `fut` is blocked on Backend 1, cancels
+/// (and if needed terminates) `tx_pin_pid` and awaits `fut` unwinding so the caller can
+/// synchronously roll back `tx_pin` and release `storage_volume_control FOR SHARE` before
+/// returning.
 async fn with_volume_phase_heartbeat<T, F>(
     pool: &PgPool,
+    tx_pin_pid: i32,
     restore_run_id: &str,
     claim_token: &str,
     renew_interval: Duration,
@@ -524,7 +529,23 @@ where
         tokio::select! {
             biased;
             _ = ticker.tick() => {
-                renew_volume_phase(pool, restore_run_id, claim_token).await?;
+                if let Err(renew_err) = renew_volume_phase(pool, restore_run_id, claim_token).await {
+                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                        .bind(tx_pin_pid)
+                        .execute(pool)
+                        .await;
+                    if tokio::time::timeout(Duration::from_secs(5), &mut fut)
+                        .await
+                        .is_err()
+                    {
+                        let _ = sqlx::query("SELECT pg_terminate_backend($1)")
+                            .bind(tx_pin_pid)
+                            .execute(pool)
+                            .await;
+                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut fut).await;
+                    }
+                    return Err(renew_err.into());
+                }
             }
             res = &mut fut => {
                 let out = res?;
@@ -577,81 +598,114 @@ async fn finish_claimed(
     // itself locks `restore_reconciliation_gate FOR UPDATE` and `storage_volume_control FOR
     // SHARE`). Commit `tx_pin` BEFORE committing `open_tx` so if `tx_pin`'s backend died after
     // verification (releasing its share lock early), `tx_pin.commit()` fails and `open_tx` rolls
-    // back leaving the restore gate closed.
+    // back leaving the restore gate closed. On every error path after opening `tx_pin`, explicitly
+    // await `tx_pin.rollback()` before returning so `storage_volume_control FOR SHARE` is released
+    // synchronously before `finish` returns.
     let mut tx_pin = read_committed(pool).await?;
-    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
-        .execute(&mut *tx_pin)
+    let outcome: Result<Option<String>, Error> = async {
+        sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+            .execute(&mut *tx_pin)
+            .await?;
+        let tx_pin_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx_pin)
+            .await?;
+        let (vol, adopting_now, has_rows): (Option<String>, bool, bool) = sqlx::query_as(
+            "SELECT volume_id::text, adoption_run_id IS NOT NULL,
+                    EXISTS (SELECT FROM openmettle.storage_reservations)
+                    OR EXISTS (SELECT FROM openmettle.artifact_revisions)
+               FROM openmettle.storage_volume_control
+              WHERE id
+                FOR SHARE",
+        )
+        .fetch_one(&mut *tx_pin)
         .await?;
-    let (vol, adopting_now, has_rows): (Option<String>, bool, bool) = sqlx::query_as(
-        "SELECT volume_id::text, adoption_run_id IS NOT NULL,
-                EXISTS (SELECT FROM openmettle.storage_reservations)
-                OR EXISTS (SELECT FROM openmettle.artifact_revisions)
-           FROM openmettle.storage_volume_control
-          WHERE id
-            FOR SHARE",
-    )
-    .fetch_one(&mut *tx_pin)
-    .await?;
-    let yield_interval = (renew_interval / 2).max(Duration::from_millis(1));
-    let expected_volume_id: Option<String> = if let Some(store) = store {
-        if adopting_now {
-            sqlx::query("SELECT openmettle.storage_lock_pinned_volume()")
-                .execute(&mut *tx_pin)
-                .await?;
-            return Err(Error::Storage(artifact_fs::Error::Io));
-        }
-        let pin = match store.prepare_pin_on(&mut tx_pin).await {
-            Ok(Some(pin)) => pin,
-            Ok(None) => return Err(Error::Storage(artifact_fs::Error::Io)),
-            Err(err) => {
-                return Err(if store.awaits_rebind() {
-                    Error::RebindRequired
-                } else {
-                    err.into()
-                });
+        let yield_interval = (renew_interval / 2).max(Duration::from_millis(1));
+        if let Some(store) = store {
+            if adopting_now {
+                sqlx::query("SELECT openmettle.storage_lock_pinned_volume()")
+                    .execute(&mut *tx_pin)
+                    .await?;
+                return Err(Error::Storage(artifact_fs::Error::Io));
             }
-        };
-        if vol.as_deref() != Some(pin.as_str()) {
-            return Err(Error::Storage(artifact_fs::Error::Io));
-        }
-        let drift =
-            with_volume_phase_heartbeat(pool, restore_run_id, claim_token, renew_interval, async {
-                artifact_fs::verify_volume_on(&mut tx_pin, store, &pin, yield_interval)
-                    .await
-                    .map_err(|err| {
-                        if store.awaits_rebind() {
-                            Error::RebindRequired
-                        } else {
-                            err.into()
-                        }
-                    })
-            })
+            let pin = match store.prepare_pin_on(&mut tx_pin).await {
+                Ok(Some(pin)) => pin,
+                Ok(None) => return Err(Error::Storage(artifact_fs::Error::Io)),
+                Err(err) => {
+                    return Err(if store.awaits_rebind() {
+                        Error::RebindRequired
+                    } else {
+                        err.into()
+                    });
+                }
+            };
+            if vol.as_deref() != Some(pin.as_str()) {
+                return Err(Error::Storage(artifact_fs::Error::Io));
+            }
+            let drift = with_volume_phase_heartbeat(
+                pool,
+                tx_pin_pid,
+                restore_run_id,
+                claim_token,
+                renew_interval,
+                async {
+                    artifact_fs::verify_volume_on(&mut tx_pin, store, &pin, yield_interval)
+                        .await
+                        .map_err(|err| {
+                            if store.awaits_rebind() {
+                                Error::RebindRequired
+                            } else {
+                                err.into()
+                            }
+                        })
+                },
+            )
             .await?;
-        if !drift.healthy() || drift.unsettled_payloads != 0 {
-            return Err(Error::Drift);
-        }
-        Some(pin)
-    } else {
-        if vol.is_some() || adopting_now {
-            return Err(Error::ArtifactRootRequired);
-        }
-        if has_rows {
-            return Err(Error::Storage(artifact_fs::Error::Io));
-        }
-        let drift =
-            with_volume_phase_heartbeat(pool, restore_run_id, claim_token, renew_interval, async {
-                artifact_fs::verify_ledgers_on(&mut tx_pin)
-                    .await
-                    .map_err(Error::from)
-            })
+            if !drift.healthy() || drift.unsettled_payloads != 0 {
+                return Err(Error::Drift);
+            }
+            Ok(Some(pin))
+        } else {
+            if vol.is_some() || adopting_now {
+                return Err(Error::ArtifactRootRequired);
+            }
+            if has_rows {
+                return Err(Error::Storage(artifact_fs::Error::Io));
+            }
+            let drift = with_volume_phase_heartbeat(
+                pool,
+                tx_pin_pid,
+                restore_run_id,
+                claim_token,
+                renew_interval,
+                async {
+                    artifact_fs::verify_ledgers_on(&mut tx_pin)
+                        .await
+                        .map_err(Error::from)
+                },
+            )
             .await?;
-        if !drift.healthy() {
-            return Err(Error::Drift);
+            if !drift.healthy() {
+                return Err(Error::Drift);
+            }
+            Ok(None)
         }
-        None
+    }
+    .await;
+    let expected_volume_id = match outcome {
+        Ok(expected_volume_id) => expected_volume_id,
+        Err(err) => {
+            let _ = tx_pin.rollback().await;
+            return Err(err);
+        }
     };
-    let mut open_tx = read_committed(pool).await?;
-    sqlx::query(
+    let mut open_tx = match read_committed(pool).await {
+        Ok(tx) => tx,
+        Err(err) => {
+            let _ = tx_pin.rollback().await;
+            return Err(err.into());
+        }
+    };
+    if let Err(err) = sqlx::query(
         "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid)",
     )
     .bind(restore_run_id)
@@ -661,8 +715,16 @@ async fn finish_claimed(
     .bind(&export.digest)
     .bind(expected_volume_id.as_deref())
     .execute(&mut *open_tx)
-    .await?;
-    tx_pin.commit().await?;
+    .await
+    {
+        let _ = open_tx.rollback().await;
+        let _ = tx_pin.rollback().await;
+        return Err(err.into());
+    }
+    if let Err(err) = tx_pin.commit().await {
+        let _ = open_tx.rollback().await;
+        return Err(err.into());
+    }
     open_tx.commit().await?;
     Ok(())
 }

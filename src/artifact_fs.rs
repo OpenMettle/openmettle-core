@@ -2,6 +2,8 @@
 //! An open regular file and a durable hard link preserve payload identity across commits.
 pub mod adoption;
 mod drift;
+#[doc(hidden)]
+pub use drift::verify_volume_for_test;
 pub use drift::{Drift, verify_accounting_drift};
 pub(crate) use drift::{verify_ledgers_on, verify_volume_on};
 pub mod rebind;
