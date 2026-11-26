@@ -175,23 +175,87 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
     let f = Fixture::new().await;
     let id = f.admit("restore-gate").await;
     let mut owner = connect(&f.db.0, OWNER).await;
-    sqlx::query("SELECT openmettle.restore_gate_lock(0, decode(repeat('00', 32), 'hex'), true)")
-        .execute(&mut owner)
-        .await
-        .unwrap();
+    let origin_us: i64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true)",
+    )
+    .bind(origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let mut w = Worker::start(&f.db).await;
     // Fifteen claim polls (POLL_MS 100) pass without a claim while journal replay is pending.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(w.steps.try_recv().is_err());
-    sqlx::query("SELECT openmettle.restore_gate_open(0, decode(repeat('00', 32), 'hex'))")
-        .execute(&mut owner)
-        .await
-        .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open(c.restore_run_id, c.volume_claim_token, $1, 0, decode(repeat('00', 32), 'hex'))
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex')) AS c",
+    )
+    .bind(origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let step = w.step().await;
     step.reply.send(StepResult::Finished).ok().unwrap();
     wait_terminal(&f, &id, "openmettle.run-succeeded", b"{}").await;
     w.shutdown.send(()).unwrap();
     bounded(w.task).await.unwrap();
+}
+
+/// P2 #11 regression: `claim_next` holds `restore_reconciliation_gate FOR SHARE` inside its own
+/// transaction after acquiring `run_dispatch_lock`, so a claim waiting on `run_dispatch_lock`
+/// returns `None` once `restore_gate_lock` closes the gate.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn claim_next_waiting_on_dispatch_lock_returns_none_after_gate_closes() {
+    let f = Fixture::new().await;
+    let _id = f.admit("gated-race").await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let origin_us: i64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    // Hold run_dispatch_lock so `claim_next` enters its transaction and blocks before checking
+    // the restore gate.
+    let mut blocker = connect(&f.db.0, OWNER).await;
+    let mut hold = blocker.begin().await.unwrap();
+    let holder: i32 = sqlx::query_scalar(
+        "SELECT pg_backend_pid() FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *hold)
+    .await
+    .unwrap();
+    let claiming = tokio::spawn({
+        let db = f.db.0.clone();
+        async move {
+            let mut w = connect(&db, WORKER).await;
+            let limits = openmettle_core::authz::runs::ClaimLimits {
+                executing_per_actor: 4,
+                executing_per_scope: 4,
+            };
+            openmettle_core::authz::runs::claim_next(&mut w, &limits, &LEASES).await
+        }
+    });
+    wait_for_blocked_peer(&f.db, holder).await;
+    // Close the gate while `claim_next` is blocked on `run_dispatch_lock`, then release the lock.
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true)",
+    )
+    .bind(origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    hold.rollback().await.unwrap();
+    assert!(claiming.await.unwrap().unwrap().is_none());
 }
 
 #[tokio::test]

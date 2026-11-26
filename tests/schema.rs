@@ -499,7 +499,7 @@ struct AdditiveTable {
 const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
 const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
-const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"coverage_complete":true,"locked_at":null,"opened_at":null}"#;
+const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -1358,7 +1358,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
         "49a30070ef07ae4471f0e7d2035c54a605a15e4abab24f2e6bff69953ee4f3ff",
-        "cb2c1d5cc79e12a433350cd61e9cd784233f17721725c0a22a85940a9a7e7bcf",
+        "78688f8303d6d195503ac1affe4ac9ae4830b357d3cdf0c05179f84ad1cd1eb5",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

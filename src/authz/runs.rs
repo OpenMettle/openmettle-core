@@ -1764,6 +1764,11 @@ pub async fn claim_next(
         sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
             .execute(&mut *c)
             .await?;
+        // ADR 0041: lock the restore reconciliation gate FOR SHARE inside the claim transaction so
+        // no run can be claimed once a restore closes the gate, even after waiting above.
+        if !crate::restore::lock_open_gate(&mut *c).await? {
+            return Ok(None);
+        }
         let has_quota_rules: bool = if has_quota_schema(c).await? {
             sqlx::query_scalar(HAS_EXECUTING_QUOTA_RULES)
                 .fetch_one(&mut *c)

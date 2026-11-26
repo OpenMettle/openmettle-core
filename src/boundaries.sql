@@ -55,8 +55,9 @@
 -- `capacity_group_observations()` (`openmettle_api` only) so `/v1` capacity endpoints never hold
 -- table or column privileges on `capacity_groups` or `capacity_grants` (ADR 0042, V1-18 PR3).
 -- Version 41 adds `deletion_journal_head.coverage_started_at`, `restore_reconciliation_gate`
--- (`SELECT` only for `openmettle_worker`), and owner-only restore gate, export verification,
--- journal replay and coverage-gap break-glass functions (ADR 0041, V1-16 PR2b).
+-- (`SELECT` only for `openmettle_worker`), the worker-only `restore_gate_lock_open()` helper, and
+-- owner-only restore gate, export/checkpoint verification, volume-phase lease, journal replay and
+-- coverage-gap break-glass functions (ADR 0041, V1-16 PR2b).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -301,13 +302,19 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 40
     UNION ALL SELECT * FROM (VALUES
+        ('openmettle.restore_gate_lock_open()',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.restore_gate_guard_purge()',true,ARRAY[]::text[]),
         ('openmettle.deletion_journal_digest(bytea,openmettle.deletion_journal)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_lock(bigint,bytea,boolean)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean)',false,ARRAY[]::text[]),
         ('openmettle.restore_verify_export(bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_checkpoints()',false,ARRAY[]::text[]),
+        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_renew_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.restore_assert_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.restore_release_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_open(bigint,bytea)',false,ARRAY[]::text[]),
-        ('openmettle.restore_accept_coverage_gap(uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 41
+        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_accept_coverage_gap(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 41
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES

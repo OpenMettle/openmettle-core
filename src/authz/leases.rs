@@ -745,6 +745,11 @@ pub async fn reclaim_next(
 ) -> Result<Option<Reclaimed>, StoreError> {
     settings.validate()?;
     transaction(c, async |c| {
+        // ADR 0041: lock the restore reconciliation gate FOR SHARE inside the reclaim transaction
+        // so no run can be reclaimed while a restore gate is closed or closing.
+        if !crate::restore::lock_open_gate(&mut *c).await? {
+            return Ok(None);
+        }
         let Some(row) = sqlx::query(RECLAIM)
             .bind(settings.lease.as_millis() as i64)
             .fetch_optional(&mut *c)

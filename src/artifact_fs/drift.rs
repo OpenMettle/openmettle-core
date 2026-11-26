@@ -154,9 +154,9 @@ pub(super) async fn verify_volume(
     let mut report = ledgers(c).await?;
     let by_id = sqlx::AssertSqlSafe(format!("{INVENTORY} WHERE s.id=$1::uuid"));
     let paged = sqlx::AssertSqlSafe(format!(
-        "{INVENTORY} WHERE s.id>$1::uuid ORDER BY s.id LIMIT 100"
+        "{INVENTORY} WHERE ($1::uuid IS NULL OR s.id>$1::uuid) ORDER BY s.id LIMIT 100"
     ));
-    let mut cursor = "00000000-0000-0000-0000-000000000000".to_owned();
+    let mut cursor: Option<String> = None;
     loop {
         let page = sqlx::query(sqlx::AssertSqlSafe(paged.0.as_str()))
             .bind(&cursor)
@@ -166,7 +166,8 @@ pub(super) async fn verify_volume(
             break;
         }
         for row in page {
-            cursor = row.get("id");
+            let id: String = row.get("id");
+            cursor = Some(id.clone());
             if row.get::<bool, _>("adoption_unverified") {
                 report.quarantined += 1;
                 continue;
@@ -175,7 +176,7 @@ pub(super) async fn verify_volume(
             if result.is_err() {
                 // A retained row may have finished purging since the original inventory snapshot.
                 let updated = sqlx::query(sqlx::AssertSqlSafe(by_id.0.as_str()))
-                    .bind(&cursor)
+                    .bind(&id)
                     .fetch_one(&mut *c)
                     .await?;
                 if updated.get::<bool, _>("adoption_unverified") {

@@ -64,13 +64,34 @@ fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
     }
 }
 
-fn parse_restore_lock_args(args: &[String]) -> Result<(i64, String, bool), &'static str> {
+struct RestoreLockArgs {
+    origin_us: i64,
+    required_seq: i64,
+    required_digest: String,
+    export_complete: bool,
+    replace_restore_run: Option<String>,
+    new_restore: bool,
+}
+
+fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static str> {
+    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
+    let mut origin_us = None;
     let mut required_seq = None;
     let mut required_digest = None;
     let mut export_complete = false;
+    let mut replace_restore_run = None;
+    let mut new_restore_flag = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--required-origin" => {
+                if origin_us.is_some() {
+                    return Err("duplicate --required-origin");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --required-origin value")?;
+                origin_us = Some(raw.parse().map_err(|_| "invalid origin")?);
+            }
             "--required-seq" => {
                 if required_seq.is_some() {
                     return Err("duplicate --required-seq");
@@ -100,26 +121,61 @@ fn parse_restore_lock_args(args: &[String]) -> Result<(i64, String, bool), &'sta
                 }
                 export_complete = true;
             }
+            "--replace-restore-run" => {
+                if replace_restore_run.is_some() {
+                    return Err("duplicate --replace-restore-run");
+                }
+                i += 1;
+                replace_restore_run = Some(
+                    args.get(i)
+                        .ok_or("missing --replace-restore-run value")?
+                        .clone(),
+                );
+            }
+            "--new-restore" => {
+                if new_restore_flag {
+                    return Err("duplicate --new-restore");
+                }
+                new_restore_flag = true;
+            }
             _ => return Err("unknown restore lock option"),
         }
         i += 1;
     }
-    let seq = required_seq.ok_or(
-        "usage: openmettle-admin restore lock --required-seq N --required-digest HEX [--export-complete]",
-    )?;
-    let digest = required_digest.ok_or(
-        "usage: openmettle-admin restore lock --required-seq N --required-digest HEX [--export-complete]",
-    )?;
-    Ok((seq, digest, export_complete))
+    if new_restore_flag && replace_restore_run.is_none() {
+        return Err("--new-restore requires --replace-restore-run");
+    }
+    let origin_us = origin_us.ok_or(usage)?;
+    let required_seq = required_seq.ok_or(usage)?;
+    let required_digest = required_digest.ok_or(usage)?;
+    let new_restore = replace_restore_run.is_none() || new_restore_flag;
+    Ok(RestoreLockArgs {
+        origin_us,
+        required_seq,
+        required_digest,
+        export_complete,
+        replace_restore_run,
+        new_restore,
+    })
 }
 
-fn parse_accept_gap_args(args: &[String]) -> Result<(String, String, String), &'static str> {
+fn parse_accept_gap_args(
+    args: &[String],
+) -> Result<(String, String, String, String), &'static str> {
+    let mut restore_run_id = None;
     let mut operator_id = None;
     let mut request_key = None;
     let mut reason = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--restore-run" => {
+                if restore_run_id.is_some() {
+                    return Err("duplicate --restore-run");
+                }
+                i += 1;
+                restore_run_id = Some(args.get(i).ok_or("missing --restore-run value")?.clone());
+            }
             "--operator-id" => {
                 if operator_id.is_some() {
                     return Err("duplicate --operator-id");
@@ -145,16 +201,18 @@ fn parse_accept_gap_args(args: &[String]) -> Result<(String, String, String), &'
         }
         i += 1;
     }
-    let usage = "usage: openmettle-admin restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON";
+    let usage = "usage: openmettle-admin restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON";
     Ok((
+        restore_run_id.ok_or(usage)?,
         operator_id.ok_or(usage)?,
         request_key.ok_or(usage)?,
         reason.ok_or(usage)?,
     ))
 }
 
-/// ADR 0041: `journal export FILE`, `restore lock --required-seq N --required-digest HEX [--export-complete]`,
-/// `restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON`,
+/// ADR 0041: `journal export FILE`,
+/// `restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]`,
+/// `restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON`,
 /// `restore replay FILE [ROOT]`.
 async fn journal(
     command: (Option<String>, Option<String>),
@@ -185,25 +243,38 @@ async fn journal(
             println!("{}", text.lines().rev().nth(1).unwrap_or_default());
         }
         (Some("restore"), Some("lock")) => {
-            let (required_seq, required_digest, export_complete) = parse_restore_lock_args(args)?;
-            let (snapshot, required, complete) = restore::lock(
+            let lock_args = parse_restore_lock_args(args)?;
+            let locked = restore::lock(
                 &pool(1).await?,
-                required_seq,
-                &required_digest,
-                export_complete,
+                lock_args.origin_us,
+                lock_args.required_seq,
+                &lock_args.required_digest,
+                lock_args.export_complete,
+                lock_args.replace_restore_run.as_deref(),
+                lock_args.new_restore,
             )
             .await
             .map_err(failed("restore lock"))?;
             println!(
-                "restore gate closed: snapshot {snapshot}, required {required}, coverage_complete {complete}"
+                "restore gate closed: restore_run {}, origin {}, snapshot {}, required {}, coverage_complete {}",
+                locked.restore_run_id,
+                locked.origin_us,
+                locked.snapshot_seq,
+                locked.required_seq,
+                locked.coverage_complete
             );
         }
         (Some("restore"), Some("accept-coverage-gap")) => {
-            let (operator_id, request_key, reason) = parse_accept_gap_args(args)?;
-            let applied =
-                restore::accept_coverage_gap(&pool(1).await?, &operator_id, &request_key, &reason)
-                    .await
-                    .map_err(failed("restore accept-coverage-gap"))?;
+            let (restore_run_id, operator_id, request_key, reason) = parse_accept_gap_args(args)?;
+            let applied = restore::accept_coverage_gap(
+                &pool(1).await?,
+                &restore_run_id,
+                &operator_id,
+                &request_key,
+                &reason,
+            )
+            .await
+            .map_err(failed("restore accept-coverage-gap"))?;
             if applied {
                 println!("applied restore.accept_coverage_gap");
             } else {
@@ -248,7 +319,7 @@ async fn journal(
         }
         _ => {
             return Err(
-                "usage: openmettle-admin journal export FILE | restore lock --required-seq N --required-digest HEX [--export-complete] | restore accept-coverage-gap --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
+                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
             );
         }
     }

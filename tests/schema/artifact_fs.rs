@@ -1078,10 +1078,20 @@ async fn wait_until(what: &str, mut done: impl AsyncFnMut() -> bool) {
 async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
     let f = Fixture::new().await;
     let mut owner = connect(&f.db.0, OWNER).await;
-    sqlx::query("SELECT openmettle.restore_gate_lock(0, decode(repeat('00', 32), 'hex'), true)")
-        .execute(&mut owner)
-        .await
-        .unwrap();
+    let origin_us: i64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint
+           FROM openmettle.deletion_journal_head WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true)",
+    )
+    .bind(origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let s = due(&f, "gated").await;
     let mut seed = WriteTransaction::begin(&mut owner).await.unwrap();
     let ids = expired_runs(&f, &mut seed, "gated").await;
@@ -1092,10 +1102,14 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(f.files("revisions"), [s.reservation.as_str()]);
     assert_eq!(account(&f.db, &f.c.scope).await, (0, 5, 0));
-    sqlx::query("SELECT openmettle.restore_gate_open(0, decode(repeat('00', 32), 'hex'))")
-        .execute(&mut owner)
-        .await
-        .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open(c.restore_run_id, c.volume_claim_token, $1, 0, decode(repeat('00', 32), 'hex'))
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex')) AS c",
+    )
+    .bind(origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     wait_until(
         "the revision was not purged after the gate opened",
         async || account(&f.db, &f.c.scope).await == (0, 0, 0) && f.files("revisions").is_empty(),

@@ -226,37 +226,50 @@ export/replay gate with origin, watermark, lag, tamper and unsettled-upload chec
 PR2b (migration 41, 26 November 2026) settles the restore barrier contract on top of ADR 0040's file-copy `storage rebind`:
 
 - **Installation origin and schema-27 cutoff.** `deletion_journal_head.coverage_started_at` is
-  backfilled from migration 28's `_sqlx_migrations.installed_on` timestamp and exported as
-  `origin <unix_us>`. A backup taken at schema 28 or later preserves the exact timestamp after
-  migrating to 41, whereas a backup taken at schema 27 or earlier (predating the journal) or from
-  another installation gets a distinct timestamp and fails closed (`OMR04`) before replay writes
-  any row.
-- **Closing and coverage completeness.** Because a restored backup carries the gate open, the
-  restore procedure closes it before any API or worker starts via
-  `openmettle-admin restore lock --required-seq N --required-digest HEX [--export-complete]`.
-  The gate pins `(required_journal_seq, required_chain_digest)` from an independently recorded
-  watermark (verifying against stored rows when `required_seq <= head`, else `OMR03`) and defaults
-  `coverage_complete = false` unless `--export-complete` asserts a post-quiesce export. Re-locking
-  preserves `snapshot_journal_seq` and never lowers the requirement.
+  backfilled from migration 28's `_sqlx_migrations.installed_on` timestamp (when `_sqlx_migrations`
+  is present, falling back to `clock_timestamp()` in raw-SQL bootstrap harnesses) and exported as
+  both `origin <unix_us>` and in the `watermark <origin_us> <seq> <chain_digest> <exported_us>`
+  line. A backup taken at schema 28 or later preserves the exact timestamp after migrating to 41,
+  whereas a backup taken at schema 27 or earlier (predating the journal) or from another
+  installation gets a distinct timestamp and fails closed (`OMR04`) at `restore lock` (even at
+  `seq = 0`) and on replay before any row is written.
+- **Closing, restore runs, checkpoints and coverage completeness.** Because a restored backup may
+  carry the gate open (or closed from an earlier restore), the restore procedure closes or resets
+  it before any API or worker starts via
+  `openmettle-admin restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]`.
+  Each restore mints a unique `restore_run_id`, authenticates `required_origin_us`, pins
+  `(required_journal_seq, required_chain_digest)` and accumulates every pinned `(seq, digest)`
+  checkpoint in `checkpoints` (verifying against stored rows when `required_seq <= head`, else
+  `OMR03`), and defaults `coverage_complete = false` unless `--export-complete` asserts a
+  post-quiesce export. Re-locking an already-closed gate requires `--replace-restore-run` matching
+  the current `restore_run_id` and no active volume-phase lease (`OMR02`); passing `--new-restore`
+  starts a fresh restore over a closed-gate backup without inheriting `coverage_complete = true`.
 - **While closed.** Trigger `artifact_revisions_restore_gate` (`BEFORE UPDATE OF state`) refuses
   every application role's move into `purging` or `purged` (`OMR02`), ordered before
-  `artifact_revisions_runtime_volume_pin_guard`. The worker binary claims no run and skips
-  `purge_due` (without treating a closed gate as a sweep error). The API's `503` is PR3, so keep
-  the API stopped until the gate opens.
-- **Replay, unsettled-upload scrub and break-glass.** `restore_verify_export` checks the locked
-  `(required_journal_seq, required_chain_digest)` and installation `origin` before
-  `deletion_journal_replay` writes any row in one `READ COMMITTED` transaction. Replay strips
-  resurrected mutable rows in `artifact_retention_holds` (immutable `message_parts` remain until
-  conversation/project tombstones exist) and advances `retention_policy.revision` to at least each
-  replayed `policy_revision` so post-restore policy edits never reuse a replayed revision number.
-  `restore replay` then refuses unrebound file-copy volumes (`REBIND_FIRST`) and active adoption
-  barriers (`OMQ03`), purges resurrected payloads via the volume-pinned path, scrubs every
-  `state = 'reserved'` unsettled upload (`revisions/<id>` unlinked, `staging/<id>` truncated to 0
-  bytes, `publish_pending = false`, refusing foreign hard links and any remaining unsettled bytes
-  on quarantined or unbound rows), requires `verify_accounting_drift` healthy with zero unsettled
-  payloads, and opens the gate only when `coverage_complete = true` (`OMR04` otherwise, cleared
-  only by an audited `'operator'` `restore.accept_coverage_gap` entry via
-  `openmettle-admin restore accept-coverage-gap`).
+  `artifact_revisions_runtime_volume_pin_guard`. Worker `claim_next` and `reclaim_next` acquire
+  `restore_reconciliation_gate FOR SHARE` inside their transactions via `restore_gate_lock_open()`,
+  and the worker binary skips `purge_due` (without treating a closed gate as a sweep error). The
+  API's `503` is PR3, so keep the API stopped until the gate opens.
+- **Replay, volume-phase lease, unsettled-upload scrub and break-glass.** `restore_verify_export`
+  checks `required_origin_us`, `(required_journal_seq, required_chain_digest)` and absence of an
+  active volume-phase lease before `deletion_journal_replay` writes any row, and
+  `restore_verify_checkpoints` checks every pinned `(seq, digest)` checkpoint in the same
+  `READ COMMITTED` transaction. Replay strips resurrected mutable rows in
+  `artifact_retention_holds` (immutable `message_parts` remain until conversation/project
+  tombstones exist) and advances `retention_policy.revision` strictly past each replayed
+  `policy_revision` (`policy_revision + 1`) so immediate post-restore removals and later edits
+  never reuse a replayed revision number. `restore replay` then acquires an exclusive
+  `volume_claim_token` lease (`restore_claim_volume_phase`), refuses unrebound file-copy volumes
+  (`REBIND_FIRST`) and active adoption barriers (`OMQ03`), purges resurrected payloads via the
+  volume-pinned path (refusing foreign hard links before truncation), scrubs every
+  `state = 'reserved'` unsettled upload (`reclaim_state IN ('none', 'claiming', 'truncated')`,
+  holding `storage_volume_control FOR SHARE` and the volume-phase assertion across truncation,
+  unconditional `file.sync_all()`, link/unlink/anchor cleanup and directory `fsync`s, refusing
+  foreign hard links and any remaining unsettled bytes on quarantined or unbound rows), requires
+  `verify_accounting_drift` healthy with zero unsettled payloads, and opens the gate only under
+  the active `(restore_run_id, volume_claim_token)` lease when `coverage_complete = true` (`OMR04`
+  otherwise, cleared only by an audited `'operator'` `restore.accept_coverage_gap` entry bound to
+  `restore_run_id` via `openmettle-admin restore accept-coverage-gap`).
 - **Durability and limits.** `openmettle-admin journal export FILE` creates the file exclusively and
   `fsync`s both the file and its parent directory before printing the `watermark` line. The export
   is checksummed, not signed (signing belongs to V1-30). Only confirmed purges are journaled;

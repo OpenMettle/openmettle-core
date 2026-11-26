@@ -1,9 +1,11 @@
 //! Restore reconciliation (ADR 0041): deletion journal export, the owner's verification and
-//! replay of an export into a restored database, unsettled-upload scrub, audited break-glass
-//! coverage-gap acceptance, and the gate the worker reads before claiming runs or purging.
-//! Migration 41 makes every database decision: origin, watermark, chain and record checks, lag
-//! against the restored snapshot and locked requirement, coverage completeness, and whether the
-//! gate may open. This module moves the records and drives the volume-pinned purge and scrub.
+//! replay of an export into a restored database, exclusive restore volume-phase leasing,
+//! unsettled-upload scrub, audited break-glass coverage-gap acceptance, and the gate the worker
+//! reads and locks `FOR SHARE` before claiming runs or purging.
+//! Migration 41 makes every database decision: origin, watermark, pinned checkpoints, chain and
+//! record checks, lag against the restored snapshot and locked requirement, coverage completeness,
+//! volume-phase lease ownership, and whether the gate may open. This module moves the records and
+//! drives the volume-pinned purge and scrub.
 //!
 //! Export format, one line each, `\n` terminated:
 //! - header `openmettle.deletion_journal.export/1`
@@ -11,11 +13,12 @@
 //! - zero or more record lines:
 //!   `seq recorded_us event_kind entity_id scope_id original_purge_after_us purged_us content_digest policy_revision chain_digest`
 //!   (times in Unix microseconds, digests in 64-character lowercase hex, canonical UUIDs, `-` for NULL policy revision)
-//! - `watermark <seq> <chain_digest> <exported_us>`
+//! - `watermark <origin_us> <seq> <chain_digest> <exported_us>`
 //! - `sha256 <hex>` over every preceding byte.
 //!
-//! The checksum detects damage, not forgery: the chain and origin are verified against the
-//! restored database and the independently recorded `(required_seq, required_digest)` watermark.
+//! The checksum detects damage, not forgery: the chain, pinned checkpoints, and installation
+//! origin are verified against the restored database and the independently recorded
+//! `(required_origin_us, required_seq, required_digest)` watermark.
 use crate::{
     artifact_fs::{self, Store},
     authz::projects::hex,
@@ -40,7 +43,7 @@ fn valid_trimmed_text(s: &str, max_bytes: usize) -> bool {
 pub enum Error {
     /// The export is truncated, fails its checksum, is malformed or out of sequence.
     Export(&'static str),
-    /// A caller-supplied argument (digest, sequence, operator ID, request key or reason) is invalid.
+    /// A caller-supplied argument (origin, digest, sequence, UUID, request key or reason) is invalid.
     Invalid(&'static str),
     /// A migration 41 check refused (OMR02 to OMR05, OMQ03, 25000, 22023, 23505) or the database
     /// failed. Every refusal rolled its transaction back.
@@ -63,7 +66,10 @@ impl From<sqlx::Error> for Error {
 
 impl From<artifact_fs::Error> for Error {
     fn from(e: artifact_fs::Error) -> Self {
-        Self::Storage(e)
+        match e {
+            artifact_fs::Error::Storage(runs::Error::Database(db)) => Self::Database(db),
+            other => Self::Storage(other),
+        }
     }
 }
 
@@ -91,6 +97,16 @@ pub struct Export {
     pub digest: String,
 }
 
+/// Result of closing or updating the restore reconciliation gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateLock {
+    pub restore_run_id: String,
+    pub origin_us: i64,
+    pub snapshot_seq: i64,
+    pub required_seq: i64,
+    pub coverage_complete: bool,
+}
+
 async fn read_committed(pool: &PgPool) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -116,6 +132,22 @@ pub async fn gate_open(c: &mut PgConnection) -> Result<bool, sqlx::Error> {
             .await?
             .unwrap_or(false),
     )
+}
+
+/// Lock the restore reconciliation gate `FOR SHARE` inside the caller's transaction, returning
+/// `true` only when it is open (or on pre-41 schemas where the gate helper does not exist yet).
+pub(crate) async fn lock_open_gate(c: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    let gated: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.restore_gate_lock_open()') IS NOT NULL",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if !gated {
+        return Ok(true);
+    }
+    sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open()")
+        .fetch_one(c)
+        .await
 }
 
 /// Exports the whole journal and its installation origin from one snapshot, as the owner.
@@ -160,7 +192,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
     if (seq, chain.as_str()) != records.last().map_or((0, GENESIS), |r| (r.0, r.9.as_str())) {
         return Err(Error::Export("journal head does not match its last record"));
     }
-    let _ = writeln!(text, "watermark {seq} {chain} {at}");
+    let _ = writeln!(text, "watermark {origin_us} {seq} {chain} {at}");
     let sum = hex(&digest(text.as_bytes()));
     let _ = writeln!(text, "sha256 {sum}");
     Ok(text)
@@ -168,8 +200,9 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
 
 impl Export {
     /// Checks the checksum, format, origin, strict 64-char lowercase hex digests, canonical UUIDs,
-    /// record order (1, 2, 3, ... with no gap), and that the watermark names the last record.
-    /// The database verifies origin, locked watermark, and hash chain during replay.
+    /// record order (1, 2, 3, ... with no gap), and that the watermark names the same origin and
+    /// the last record. The database verifies origin, locked watermark, pinned checkpoints, and
+    /// hash chain during replay.
     pub fn parse(text: &str) -> Result<Self, Error> {
         let split = text
             .rfind("\nsha256 ")
@@ -201,7 +234,13 @@ impl Export {
         let mut watermark = None;
         for line in lines {
             match line.split(' ').collect::<Vec<_>>()[..] {
-                ["watermark", seq, chain, at] if watermark.is_none() => {
+                ["watermark", wm_origin, seq, chain, at] if watermark.is_none() => {
+                    let wm_origin = number(wm_origin)?;
+                    if wm_origin != origin_us {
+                        return Err(Error::Export(
+                            "watermark origin does not match export origin",
+                        ));
+                    }
                     let seq = number(seq)?;
                     if seq < 0 {
                         return Err(Error::Export("malformed number"));
@@ -276,44 +315,72 @@ impl Export {
     }
 }
 
-/// Closes the gate after a restore (migration 41's `restore_gate_lock`) with the independently
-/// recorded target watermark `(required_seq, required_digest)` and `coverage_complete` flag,
-/// returning `(snapshot_journal_seq, required_journal_seq, coverage_complete)`.
+/// Closes or updates the gate after a restore (migration 41's `restore_gate_lock`) with the
+/// independently recorded installation `origin_us`, target watermark `(required_seq,
+/// required_digest)`, `coverage_complete` flag, optional `replace_restore_run`, and `new_restore`.
 pub async fn lock(
     pool: &PgPool,
+    origin_us: i64,
     required_seq: i64,
     required_digest: &str,
     coverage_complete: bool,
-) -> Result<(i64, i64, bool), Error> {
+    replace_restore_run: Option<&str>,
+    new_restore: bool,
+) -> Result<GateLock, Error> {
     if required_seq < 0 {
         return Err(Error::Invalid("invalid sequence"));
     }
     if !is_valid_digest(required_digest) {
         return Err(Error::Invalid("invalid chain digest"));
     }
+    if let Some(run_id) = replace_restore_run
+        && !runs::is_canonical_uuid(run_id)
+    {
+        return Err(Error::Invalid("invalid restore run id"));
+    }
     let mut tx = read_committed(pool).await?;
-    let state = sqlx::query_as(
-        "SELECT snapshot_journal_seq, required_journal_seq, coverage_complete
-           FROM openmettle.restore_gate_lock($1, decode($2, 'hex'), $3)",
+    let (restore_run_id, required_origin_us, snapshot_seq, required_seq, coverage_complete): (
+        String,
+        i64,
+        i64,
+        i64,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT restore_run_id::text, required_origin_us, snapshot_journal_seq,
+                required_journal_seq, coverage_complete
+           FROM openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), $4, $5::uuid, $6)",
     )
+    .bind(origin_us)
     .bind(required_seq)
     .bind(required_digest)
     .bind(coverage_complete)
+    .bind(replace_restore_run)
+    .bind(new_restore)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(state)
+    Ok(GateLock {
+        restore_run_id,
+        origin_us: required_origin_us,
+        snapshot_seq,
+        required_seq,
+        coverage_complete,
+    })
 }
 
 /// Audited operator break-glass acceptance of an unexported purge window after the last surviving
-/// export (`restore_accept_coverage_gap`). Returns `true` when freshly applied and `false` on an
-/// exact idempotent replay.
+/// export (`restore_accept_coverage_gap`), bound to the active `restore_run_id`. Returns `true`
+/// when freshly applied and `false` on an exact idempotent replay.
 pub async fn accept_coverage_gap(
     pool: &PgPool,
+    restore_run_id: &str,
     operator_id: &str,
     request_key: &str,
     reason: &str,
 ) -> Result<bool, Error> {
+    if !runs::is_canonical_uuid(restore_run_id) {
+        return Err(Error::Invalid("invalid restore run id"));
+    }
     if !runs::is_canonical_uuid(operator_id) {
         return Err(Error::Invalid("invalid operator id"));
     }
@@ -324,13 +391,15 @@ pub async fn accept_coverage_gap(
         return Err(Error::Invalid("invalid reason"));
     }
     let mut tx = read_committed(pool).await?;
-    let applied: bool =
-        sqlx::query_scalar("SELECT openmettle.restore_accept_coverage_gap($1::uuid, $2, $3)")
-            .bind(operator_id)
-            .bind(request_key)
-            .bind(reason)
-            .fetch_one(&mut *tx)
-            .await?;
+    let applied: bool = sqlx::query_scalar(
+        "SELECT openmettle.restore_accept_coverage_gap($1::uuid, $2::uuid, $3, $4)",
+    )
+    .bind(restore_run_id)
+    .bind(operator_id)
+    .bind(request_key)
+    .bind(reason)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(applied)
 }
@@ -349,8 +418,9 @@ pub async fn check_rebind(pool: &PgPool, store: &Store) -> Result<(), Error> {
 }
 
 /// The database phase: verifies installation origin and locked watermark via
-/// `restore_verify_export` and replays every record in ONE `READ COMMITTED` transaction, rolling
-/// everything back on any mismatch. Returns how many records were new to the restored journal.
+/// `restore_verify_export`, replays every record, and verifies all pinned checkpoints via
+/// `restore_verify_checkpoints` in ONE `READ COMMITTED` transaction, rolling everything back on
+/// any mismatch. Returns how many records were new to the restored journal.
 pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
     let mut tx = read_committed(pool).await?;
     sqlx::query("SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'))")
@@ -379,24 +449,50 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
         .await?;
         applied += u64::from(new);
     }
+    sqlx::query("SELECT openmettle.restore_verify_checkpoints()")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(applied)
 }
 
-/// The volume phase, rerunnable after `apply` committed: refuses unrebound copied volumes and
-/// active adoption/rebind barriers, purges resurrected payloads of replayed revisions, scrubs
-/// unsettled uploads that cannot survive a restore, verifies the volume and ledgers with zero
-/// unsettled payloads, and opens the gate if migration 41's checks pass.
-pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Result<(), Error> {
-    let (pinned, adopting): (bool, bool) = sqlx::query_as(
-        "SELECT volume_id IS NOT NULL, adoption_run_id IS NOT NULL
-           FROM openmettle.storage_volume_control WHERE id",
+async fn claim_volume_phase(pool: &PgPool, export: &Export) -> Result<(String, String), Error> {
+    let mut tx = read_committed(pool).await?;
+    let lease: (String, String) = sqlx::query_as(
+        "SELECT restore_run_id::text, volume_claim_token::text
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'))",
     )
-    .fetch_one(pool)
+    .bind(export.origin_us)
+    .bind(export.seq)
+    .bind(&export.digest)
+    .fetch_one(&mut *tx)
     .await?;
-    if (pinned || adopting) && store.is_none() {
-        return Err(Error::ArtifactRootRequired);
-    }
+    tx.commit().await?;
+    Ok(lease)
+}
+
+async fn release_volume_phase(
+    pool: &PgPool,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = read_committed(pool).await?;
+    sqlx::query("SELECT openmettle.restore_release_volume_phase($1::uuid, $2::uuid)")
+        .bind(restore_run_id)
+        .bind(claim_token)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+async fn finish_claimed(
+    pool: &PgPool,
+    store: Option<&Store>,
+    export: &Export,
+    adopting: bool,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<(), Error> {
     if let Some(store) = store {
         if store.awaits_rebind() {
             return Err(Error::RebindRequired);
@@ -406,14 +502,18 @@ pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Re
                 .execute(pool)
                 .await?;
         }
-        if let Err(err) = artifact_fs::purge_journaled(pool, store).await {
+        if let Err(err) =
+            artifact_fs::purge_journaled(pool, store, restore_run_id, claim_token).await
+        {
             return Err(if store.awaits_rebind() {
                 Error::RebindRequired
             } else {
                 err.into()
             });
         }
-        if let Err(err) = artifact_fs::scrub_unsettled_on_restore(pool, store).await {
+        if let Err(err) =
+            artifact_fs::scrub_unsettled_on_restore(pool, store, restore_run_id, claim_token).await
+        {
             return Err(if store.awaits_rebind() {
                 Error::RebindRequired
             } else {
@@ -435,13 +535,43 @@ pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Re
         return Err(Error::Drift);
     }
     let mut tx = read_committed(pool).await?;
-    sqlx::query("SELECT openmettle.restore_gate_open($1, decode($2, 'hex'))")
-        .bind(export.seq)
-        .bind(&export.digest)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'))",
+    )
+    .bind(restore_run_id)
+    .bind(claim_token)
+    .bind(export.origin_us)
+    .bind(export.seq)
+    .bind(&export.digest)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// The volume phase, serialized via `restore_claim_volume_phase` and rerunnable after `apply`
+/// committed: refuses concurrent volume phases (`OMR02`), unrebound copied volumes
+/// (`RebindRequired`), and active adoption/rebind barriers (`OMQ03`), purges resurrected payloads
+/// of replayed revisions, scrubs unsettled uploads that cannot survive a restore, verifies the
+/// volume and ledgers with zero unsettled payloads, and opens the gate if migration 41's checks
+/// pass. On any clean error after claiming the lease, releases the caller's own lease before
+/// returning so operator repair and retry proceed immediately.
+pub async fn finish(pool: &PgPool, store: Option<&Store>, export: &Export) -> Result<(), Error> {
+    let (pinned, adopting): (bool, bool) = sqlx::query_as(
+        "SELECT volume_id IS NOT NULL, adoption_run_id IS NOT NULL
+           FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(pool)
+    .await?;
+    if (pinned || adopting) && store.is_none() {
+        return Err(Error::ArtifactRootRequired);
+    }
+    let (restore_run_id, claim_token) = claim_volume_phase(pool, export).await?;
+    let result = finish_claimed(pool, store, export, adopting, &restore_run_id, &claim_token).await;
+    if result.is_err() {
+        let _ = release_volume_phase(pool, &restore_run_id, &claim_token).await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -456,7 +586,7 @@ mod tests {
     #[test]
     fn parse_validates_origin_hex_and_uuids() {
         let valid_empty = seal(&format!(
-            "{HEADER}\norigin 1700000000000000\nwatermark 0 {GENESIS} 1700000000000001\n"
+            "{HEADER}\norigin 1700000000000000\nwatermark 1700000000000000 0 {GENESIS} 1700000000000001\n"
         ));
         let parsed = Export::parse(&valid_empty).unwrap();
         assert_eq!(parsed.origin_us, 1_700_000_000_000_000);
@@ -464,22 +594,38 @@ mod tests {
         assert_eq!(parsed.digest, GENESIS);
 
         // Missing origin line is refused.
-        let missing_origin = seal(&format!("{HEADER}\nwatermark 0 {GENESIS} 1\n"));
+        let missing_origin = seal(&format!("{HEADER}\nwatermark 1 0 {GENESIS} 2\n"));
         assert!(matches!(
             Export::parse(&missing_origin),
             Err(Error::Export("missing or malformed origin"))
         ));
 
+        // Mismatched origin between header and watermark line is refused.
+        let mismatched_origin = seal(&format!("{HEADER}\norigin 1\nwatermark 2 0 {GENESIS} 3\n"));
+        assert!(matches!(
+            Export::parse(&mismatched_origin),
+            Err(Error::Export(
+                "watermark origin does not match export origin"
+            ))
+        ));
+
+        // Legacy watermark without origin_us is refused as malformed line.
+        let legacy_wm = seal(&format!("{HEADER}\norigin 1\nwatermark 0 {GENESIS} 2\n"));
+        assert!(matches!(
+            Export::parse(&legacy_wm),
+            Err(Error::Export("malformed line"))
+        ));
+
         // Uppercase or truncated hex digests are refused before SQL decode().
         let upper = "A".repeat(64);
-        let bad_wm = seal(&format!("{HEADER}\norigin 1\nwatermark 0 {upper} 2\n"));
+        let bad_wm = seal(&format!("{HEADER}\norigin 1\nwatermark 1 0 {upper} 2\n"));
         assert!(matches!(
             Export::parse(&bad_wm),
             Err(Error::Export("malformed digest"))
         ));
 
         let short = "0".repeat(62);
-        let bad_len = seal(&format!("{HEADER}\norigin 1\nwatermark 0 {short} 2\n"));
+        let bad_len = seal(&format!("{HEADER}\norigin 1\nwatermark 1 0 {short} 2\n"));
         assert!(matches!(
             Export::parse(&bad_len),
             Err(Error::Export("malformed digest"))
@@ -490,7 +636,7 @@ mod tests {
         let scope = "00000000-0000-4000-8000-000000000002";
         let d = "a".repeat(64);
         let bad_uuid = seal(&format!(
-            "{HEADER}\norigin 1\n1 10 artifact_revision.purged NOT-A-UUID {scope} 5 10 {d} 1 {d}\nwatermark 1 {d} 11\n"
+            "{HEADER}\norigin 1\n1 10 artifact_revision.purged NOT-A-UUID {scope} 5 10 {d} 1 {d}\nwatermark 1 1 {d} 11\n"
         ));
         assert!(matches!(
             Export::parse(&bad_uuid),
@@ -498,7 +644,7 @@ mod tests {
         ));
 
         let bad_content = seal(&format!(
-            "{HEADER}\norigin 1\n1 10 artifact_revision.purged {entity} {scope} 5 10 zzz 1 {d}\nwatermark 1 {d} 11\n"
+            "{HEADER}\norigin 1\n1 10 artifact_revision.purged {entity} {scope} 5 10 zzz 1 {d}\nwatermark 1 1 {d} 11\n"
         ));
         assert!(matches!(
             Export::parse(&bad_content),
@@ -506,7 +652,7 @@ mod tests {
         ));
 
         let valid_one = seal(&format!(
-            "{HEADER}\norigin 1\n1 10 artifact_revision.purged {entity} {scope} 5 10 {d} - {d}\nwatermark 1 {d} 11\n"
+            "{HEADER}\norigin 1\n1 10 artifact_revision.purged {entity} {scope} 5 10 {d} - {d}\nwatermark 1 1 {d} 11\n"
         ));
         let parsed = Export::parse(&valid_one).unwrap();
         assert_eq!(parsed.seq, 1);
