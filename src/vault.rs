@@ -88,7 +88,9 @@ const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum HTTP response body accepted from an upstream OAuth token refresh endpoint.
 const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
 /// Maximum HTTP request body sent to an upstream OAuth token refresh endpoint.
-const MAX_REFRESH_REQUEST_BYTES: usize = 32 * 1024;
+/// Sized for worst-case `%XX` percent-encoding of a 16 KiB refresh token, up to 64 scopes,
+/// and form framing.
+const MAX_REFRESH_REQUEST_BYTES: usize = 96 * 1024;
 /// Maximum `expires_in` seconds accepted from an upstream refresh response (1 year).
 const MAX_EXPIRES_IN_SECS: u64 = 31_536_000;
 
@@ -461,7 +463,7 @@ impl VaultKeyRing {
 
     /// Derive a keyed HMAC-SHA256 digest binding secret authorization inputs for
     /// `authorizeConnection` idempotency replay detection without storing plaintext or
-    /// reversible token material in `authorization_audit`.
+    /// reversible token material in `authorization_audit`, using the ring's `active_key_id`.
     pub fn idempotency_mac_hex(
         &self,
         connection_id: &str,
@@ -471,7 +473,31 @@ impl VaultKeyRing {
         granted_scopes: &[String],
         expires_at: Option<&str>,
     ) -> Result<String, VaultError> {
-        let master = self.key_bytes(&self.active_key_id)?;
+        self.idempotency_mac_hex_with_key(
+            &self.active_key_id,
+            connection_id,
+            scope_id,
+            access_token,
+            refresh_token,
+            granted_scopes,
+            expires_at,
+        )
+    }
+
+    /// Derive a keyed HMAC-SHA256 digest binding secret authorization inputs under an explicit
+    /// `key_id` in this ring (returning [`VaultError::UnknownKey`] if `key_id` is not mounted).
+    #[allow(clippy::too_many_arguments)]
+    pub fn idempotency_mac_hex_with_key(
+        &self,
+        key_id: &str,
+        connection_id: &str,
+        scope_id: &str,
+        access_token: &SecretText,
+        refresh_token: Option<&SecretText>,
+        granted_scopes: &[String],
+        expires_at: Option<&str>,
+    ) -> Result<String, VaultError> {
+        let master = self.key_bytes(key_id)?;
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, IDEMPOTENCY_SALT).extract(master);
         let okm = prk
             .expand(&[IDEMPOTENCY_INFO], hmac::HMAC_SHA256)
@@ -1255,14 +1281,64 @@ pub async fn authorize_connection(
             if !scopes_are_subset(&granted_scopes, &allowed_scopes) {
                 return Err(VaultError::ScopeWidening);
             }
-            let credentials_mac = keyring.idempotency_mac_hex(
-                connection_id,
-                &located.scope_id,
-                &access_secret,
-                refresh_secret.as_ref(),
-                &granted_scopes,
-                input.expires_at,
-            )?;
+            // If an audit row already exists for `(actor, request_key)` on this connection,
+            // verify the candidate MAC under the stored `mac_key_id` in constant time so
+            // retries remain idempotent across `active_key_id` rotations while failing closed
+            // (`VaultError::UnknownKey` -> `503 provisioning`) if that historical key was retired.
+            let existing_audit: Option<(String, String, String, String)> = sqlx::query_as(
+                "SELECT action, target_kind, target_id, details::text
+                   FROM openmettle.authorization_audit
+                  WHERE actor_user_id = $1::uuid AND request_key = $2",
+            )
+            .bind(post_lock_ctx.actor_user_id)
+            .bind(post_lock_ctx.request_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(StoreError::from)?;
+            let (mac_key_id, credentials_mac) = match existing_audit {
+                Some((action, target_kind, target_id, details_raw))
+                    if action == "connection.authorized"
+                        && target_kind == "external_connection"
+                        && target_id == connection_id =>
+                {
+                    let existing_details: Value =
+                        serde_json::from_str(&details_raw).unwrap_or(Value::Null);
+                    let stored_key_id = existing_details
+                        .get("mac_key_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| keyring.active_key_id());
+                    let stored_mac = existing_details
+                        .get("credentials_mac")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let candidate_mac = keyring.idempotency_mac_hex_with_key(
+                        stored_key_id,
+                        connection_id,
+                        &located.scope_id,
+                        &access_secret,
+                        refresh_secret.as_ref(),
+                        &granted_scopes,
+                        input.expires_at,
+                    )?;
+                    if !bool::from(candidate_mac.as_bytes().ct_eq(stored_mac.as_bytes())) {
+                        return Err(StoreError::Conflict(store::KEY_REUSED).into());
+                    }
+                    (stored_key_id.to_owned(), candidate_mac)
+                }
+                _ => {
+                    let active_key_id = keyring.active_key_id().to_owned();
+                    let mac = keyring.idempotency_mac_hex_with_key(
+                        &active_key_id,
+                        connection_id,
+                        &located.scope_id,
+                        &access_secret,
+                        refresh_secret.as_ref(),
+                        &granted_scopes,
+                        input.expires_at,
+                    )?;
+                    (active_key_id, mac)
+                }
+            };
             let change = Change {
                 action: "connection.authorized",
                 target_kind: "external_connection",
@@ -1272,6 +1348,7 @@ pub async fn authorize_connection(
                     "granted_scopes_sha256": scopes_sha256_hex(&granted_scopes),
                     "has_refresh": refresh_secret.is_some(),
                     "expires_at": input.expires_at,
+                    "mac_key_id": mac_key_id,
                     "credentials_mac": credentials_mac,
                 }),
             };
@@ -1942,14 +2019,17 @@ pub async fn vault_rotate_with_wait(
                 (None, None, None) => None,
                 _ => return Err(VaultError::Crypto),
             };
-            let next_gen = old_gen + 1;
+            // Re-wrap the existing upstream credential under `target_key_id` without advancing
+            // `credential_generation` so online key rotation does not emit false
+            // `external_connection.credential_superseded` journal events against pre-rotation
+            // backups (AAD already binds `key_id` alongside `credential_generation`).
             let new_access = keyring.seal(
                 &SecretBinding {
                     connection_id: &conn_id,
                     scope_id: &scope_id,
                     account_id: &account_id,
                     secret_kind: SecretKind::Access,
-                    credential_generation: next_gen,
+                    credential_generation: old_gen,
                     allowed_scopes: &allowed_scopes,
                 },
                 &access_plain,
@@ -1963,7 +2043,7 @@ pub async fn vault_rotate_with_wait(
                             scope_id: &scope_id,
                             account_id: &account_id,
                             secret_kind: SecretKind::Refresh,
-                            credential_generation: next_gen,
+                            credential_generation: old_gen,
                             allowed_scopes: &allowed_scopes,
                         },
                         plain,
@@ -1979,12 +2059,11 @@ pub async fn vault_rotate_with_wait(
                         refresh_salt = $6,
                         refresh_nonce = $7,
                         refresh_ciphertext = $8,
-                        credential_generation = $9,
                         updated_at = clock_timestamp()
                   WHERE id = $1::uuid
                     AND state = 'authorized'
-                    AND encryption_key_id = $10
-                    AND credential_generation = $11
+                    AND encryption_key_id = $9
+                    AND credential_generation = $10
                     AND (refresh_claim_token IS NULL OR refresh_lease_until <= clock_timestamp())",
             )
             .bind(&conn_id)
@@ -1995,7 +2074,6 @@ pub async fn vault_rotate_with_wait(
             .bind(new_refresh.as_ref().map(|s| s.salt.as_slice()))
             .bind(new_refresh.as_ref().map(|s| s.nonce.as_slice()))
             .bind(new_refresh.as_ref().map(|s| s.ciphertext.as_slice()))
-            .bind(next_gen)
             .bind(&old_key_id)
             .bind(old_gen)
             .execute(&mut *tx)
@@ -2529,6 +2607,95 @@ async fn load_worker_scope_and_actor(
     Ok(actor.filter(Principal::is_active).map(|p| (scope, p)))
 }
 
+/// Verify worker-side execution authority across the run's scope (`run_scope_id`) and the target
+/// connection's owning scope (`conn_scope_id`, `conn_scope_kind`, `conn_owner_user_id`):
+/// - `actor` must be active and authorized to execute in `run_scope_id` (personal owner, or
+///   project `Owner`/`Editor` on a non-archived, non-deleted project).
+/// - `project` connections require exact scope equality (`conn_scope_id == run_scope_id`) and
+///   [`can_execute_connection`] (`Owner` or `Editor` with active matching share).
+/// - `personal` connections may only be used from a `personal` run scope (never from a project
+///   run scope): either by the personal owner in their own personal scope, or by an active
+///   recipient in their own personal scope via a live active share while the owner remains active.
+#[allow(clippy::too_many_arguments)]
+async fn verify_worker_connection_authority(
+    c: &mut PgConnection,
+    run_scope_id: &str,
+    conn_scope_id: &str,
+    conn_scope_kind: &str,
+    conn_owner_user_id: &str,
+    connection_id: &str,
+    actor_user_id: &str,
+    actor_approval_id: Option<&str>,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let Some((run_scope, actor)) =
+        load_worker_scope_and_actor(c, run_scope_id, actor_user_id, actor_approval_id, now_ms)
+            .await?
+    else {
+        return Ok(false);
+    };
+    let can_act_in_run_scope = match &run_scope {
+        Scope::Personal {
+            scope_id,
+            owner_user_id,
+        } => *scope_id == actor.personal_scope_id && *owner_user_id == actor.user_id,
+        Scope::Project(project) => matches!(
+            project.role_of(&actor),
+            Some(ProjectRole::Owner | ProjectRole::Editor)
+        ),
+    };
+    if !can_act_in_run_scope {
+        return Ok(false);
+    }
+    match conn_scope_kind {
+        "project" => {
+            if conn_scope_id != run_scope_id || !matches!(run_scope, Scope::Project(_)) {
+                return Ok(false);
+            }
+            let shares = load_active_shares(c, connection_id).await?;
+            Ok(can_execute_connection(&actor, &run_scope, &shares))
+        }
+        "personal" => {
+            if !matches!(run_scope, Scope::Personal { .. }) {
+                return Ok(false);
+            }
+            if conn_scope_id == run_scope_id {
+                return Ok(conn_owner_user_id == actor.user_id);
+            }
+            let conn_lifecycle: Option<ScopeLifecycleRow> = sqlx::query_as(
+                "SELECT scope_kind, project_id::text, personal_user_id::text, archived, deleted
+                   FROM openmettle.external_connection_scope_lifecycle($1::uuid)",
+            )
+            .bind(conn_scope_id)
+            .fetch_optional(&mut *c)
+            .await?;
+            let Some((kind, None, Some(owner), false, false)) = conn_lifecycle else {
+                return Ok(false);
+            };
+            if kind != "personal" || owner != conn_owner_user_id {
+                return Ok(false);
+            }
+            let owner_active: bool = sqlx::query_scalar(
+                "SELECT disabled_at IS NULL FROM openmettle.users WHERE id = $1::uuid",
+            )
+            .bind(&owner)
+            .fetch_optional(&mut *c)
+            .await?
+            .unwrap_or(false);
+            if !owner_active {
+                return Ok(false);
+            }
+            let conn_scope = Scope::Personal {
+                scope_id: conn_scope_id.to_owned(),
+                owner_user_id: owner,
+            };
+            let shares = load_active_shares(c, connection_id).await?;
+            Ok(can_execute_connection(&actor, &conn_scope, &shares))
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn hydrate_any_active_worker_principal(
     c: &mut PgConnection,
     user_id: &str,
@@ -2655,39 +2822,18 @@ impl VaultCredentialProvider {
                 let _ = tx.rollback().await;
                 return CredentialOutcome::Unavailable;
             };
-            let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
-                &mut tx,
-                request.scope_id,
-                request.actor_user_id,
-                request.actor_approval_id,
-                now_ms,
-            )
-            .await
-            else {
-                let _ = tx.rollback().await;
-                return CredentialOutcome::Unavailable;
-            };
-            let Ok(shares) = load_active_shares(&mut tx, request.connection_id).await else {
-                let _ = tx.rollback().await;
-                return CredentialOutcome::Unavailable;
-            };
-            if !can_execute_connection(&actor, &scope, &shares) {
-                let _ = tx.rollback().await;
-                return CredentialOutcome::Unavailable;
-            }
-
             let row = sqlx::query(
-                "SELECT provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
+                "SELECT scope_id::text, scope_kind, owner_user_id::text,
+                        provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
                         CASE WHEN expires_at IS NOT NULL
                              THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
                         encryption_key_id,
                         access_salt, access_nonce, access_ciphertext,
                         has_refresh, credential_generation, revocation_generation
                    FROM openmettle.external_connections
-                  WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3",
+                  WHERE id = $1::uuid AND account_id = $2",
             )
             .bind(request.connection_id)
-            .bind(request.scope_id)
             .bind(request.account_id)
             .fetch_optional(&mut *tx)
             .await;
@@ -2696,19 +2842,49 @@ impl VaultCredentialProvider {
                 return CredentialOutcome::Unavailable;
             };
 
-            let state: String = match row.try_get(4) {
+            let conn_scope_id: String = match row.try_get(0) {
                 Ok(v) => v,
                 Err(_) => return CredentialOutcome::Unavailable,
             };
-            let origin: String = match row.try_get(1) {
+            let conn_scope_kind: String = match row.try_get(1) {
                 Ok(v) => v,
                 Err(_) => return CredentialOutcome::Unavailable,
             };
-            let allowed_scopes: Vec<String> = match row.try_get(2) {
+            let conn_owner_user_id: String = match row.try_get(2) {
                 Ok(v) => v,
                 Err(_) => return CredentialOutcome::Unavailable,
             };
-            let granted_scopes: Vec<String> = match row.try_get(3) {
+            let authorized = verify_worker_connection_authority(
+                &mut tx,
+                request.scope_id,
+                &conn_scope_id,
+                &conn_scope_kind,
+                &conn_owner_user_id,
+                request.connection_id,
+                request.actor_user_id,
+                request.actor_approval_id,
+                now_ms,
+            )
+            .await
+            .unwrap_or(false);
+            if !authorized {
+                let _ = tx.rollback().await;
+                return CredentialOutcome::Unavailable;
+            }
+
+            let state: String = match row.try_get(7) {
+                Ok(v) => v,
+                Err(_) => return CredentialOutcome::Unavailable,
+            };
+            let origin: String = match row.try_get(4) {
+                Ok(v) => v,
+                Err(_) => return CredentialOutcome::Unavailable,
+            };
+            let allowed_scopes: Vec<String> = match row.try_get(5) {
+                Ok(v) => v,
+                Err(_) => return CredentialOutcome::Unavailable,
+            };
+            let granted_scopes: Vec<String> = match row.try_get(6) {
                 Ok(v) => v,
                 Err(_) => return CredentialOutcome::Unavailable,
             };
@@ -2723,17 +2899,17 @@ impl VaultCredentialProvider {
                 return CredentialOutcome::Unavailable;
             }
 
-            let expires_ms: Option<i64> = row.try_get(5).unwrap_or(None);
-            let has_refresh: bool = row.try_get(10).unwrap_or(false);
-            let cred_gen: i64 = row.try_get(11).unwrap_or(0);
+            let expires_ms: Option<i64> = row.try_get(8).unwrap_or(None);
+            let has_refresh: bool = row.try_get(13).unwrap_or(false);
+            let cred_gen: i64 = row.try_get(14).unwrap_or(0);
             let expired = expires_ms.is_some_and(|exp| exp <= now_ms);
             let needs_refresh = expires_ms.is_some_and(|exp| exp <= now_ms.saturating_add(skew_ms));
 
             if !needs_refresh || (!expired && (!has_refresh || self.refresher.is_none())) {
-                let key_id: Option<String> = row.try_get(6).unwrap_or(None);
-                let salt: Option<Vec<u8>> = row.try_get(7).unwrap_or(None);
-                let nonce: Option<Vec<u8>> = row.try_get(8).unwrap_or(None);
-                let ct: Option<Vec<u8>> = row.try_get(9).unwrap_or(None);
+                let key_id: Option<String> = row.try_get(9).unwrap_or(None);
+                let salt: Option<Vec<u8>> = row.try_get(10).unwrap_or(None);
+                let nonce: Option<Vec<u8>> = row.try_get(11).unwrap_or(None);
+                let ct: Option<Vec<u8>> = row.try_get(12).unwrap_or(None);
                 let _ = tx.rollback().await;
                 let (Some(key_id), Some(salt), Some(nonce), Some(ct)) = (key_id, salt, nonce, ct)
                 else {
@@ -2744,7 +2920,7 @@ impl VaultCredentialProvider {
                 };
                 let binding = SecretBinding {
                     connection_id: request.connection_id,
-                    scope_id: request.scope_id,
+                    scope_id: &conn_scope_id,
                     account_id: request.account_id,
                     secret_kind: SecretKind::Access,
                     credential_generation: cred_gen,
@@ -2803,16 +2979,16 @@ impl VaultCredentialProvider {
             return;
         }
         let row = sqlx::query(
-            "SELECT state, revocation_generation,
+            "SELECT scope_id::text, scope_kind, owner_user_id::text,
+                    state, revocation_generation,
                     CASE WHEN expires_at IS NOT NULL
                          THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
                     has_refresh, endpoint_origin, allowed_scopes, granted_scopes
                FROM openmettle.external_connections
-              WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
+              WHERE id = $1::uuid AND account_id = $2
                 FOR UPDATE",
         )
         .bind(request.connection_id)
-        .bind(request.scope_id)
         .bind(request.account_id)
         .fetch_optional(&mut *tx)
         .await;
@@ -2820,38 +2996,38 @@ impl VaultCredentialProvider {
             let _ = tx.rollback().await;
             return;
         };
+        let conn_scope_id: String = row.try_get(0).unwrap_or_default();
+        let conn_scope_kind: String = row.try_get(1).unwrap_or_default();
+        let conn_owner_user_id: String = row.try_get(2).unwrap_or_default();
         // Re-verify live caller authority AFTER holding the connection row lock.
         let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
             let _ = tx.rollback().await;
             return;
         };
-        let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
+        if !verify_worker_connection_authority(
             &mut tx,
             request.scope_id,
+            &conn_scope_id,
+            &conn_scope_kind,
+            &conn_owner_user_id,
+            request.connection_id,
             request.actor_user_id,
             request.actor_approval_id,
             now_ms,
         )
         .await
-        else {
-            let _ = tx.rollback().await;
-            return;
-        };
-        let Ok(shares) = load_active_shares(&mut tx, request.connection_id).await else {
-            let _ = tx.rollback().await;
-            return;
-        };
-        if !can_execute_connection(&actor, &scope, &shares) {
+        .unwrap_or(false)
+        {
             let _ = tx.rollback().await;
             return;
         }
-        let state: String = row.try_get(0).unwrap_or_default();
-        let rev_gen: i64 = row.try_get(1).unwrap_or(0);
-        let exp_ms: Option<i64> = row.try_get(2).unwrap_or(None);
-        let has_refresh: bool = row.try_get(3).unwrap_or(false);
-        let endpoint_origin: String = row.try_get(4).unwrap_or_default();
-        let allowed_scopes: Vec<String> = row.try_get(5).unwrap_or_default();
-        let granted_scopes: Vec<String> = row.try_get(6).unwrap_or_default();
+        let state: String = row.try_get(3).unwrap_or_default();
+        let rev_gen: i64 = row.try_get(4).unwrap_or(0);
+        let exp_ms: Option<i64> = row.try_get(5).unwrap_or(None);
+        let has_refresh: bool = row.try_get(6).unwrap_or(false);
+        let endpoint_origin: String = row.try_get(7).unwrap_or_default();
+        let allowed_scopes: Vec<String> = row.try_get(8).unwrap_or_default();
+        let granted_scopes: Vec<String> = row.try_get(9).unwrap_or_default();
         if state != ConnectionState::Authorized.as_str()
             || !exp_ms.is_some_and(|exp| exp <= now_ms)
             || has_refresh
@@ -2938,7 +3114,8 @@ impl VaultCredentialProvider {
                 return RefreshStep::Unavailable;
             }
             let row = sqlx::query(
-                "SELECT provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
+                "SELECT scope_id::text, scope_kind, owner_user_id::text,
+                        provider_kind, endpoint_origin, allowed_scopes, granted_scopes, state,
                         CASE WHEN expires_at IS NOT NULL
                              THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
                         encryption_key_id,
@@ -2948,11 +3125,10 @@ impl VaultCredentialProvider {
                         CASE WHEN refresh_lease_until IS NOT NULL
                              THEN floor(extract(epoch FROM refresh_lease_until) * 1000)::bigint END
                    FROM openmettle.external_connections
-                  WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3
+                  WHERE id = $1::uuid AND account_id = $2
                     FOR UPDATE",
             )
             .bind(request.connection_id)
-            .bind(request.scope_id)
             .bind(request.account_id)
             .fetch_optional(&mut *tx)
             .await;
@@ -2960,52 +3136,61 @@ impl VaultCredentialProvider {
                 let _ = tx.rollback().await;
                 return RefreshStep::Unavailable;
             };
+            let conn_scope_id: String = match row.try_get(0) {
+                Ok(v) => v,
+                Err(_) => return RefreshStep::Unavailable,
+            };
+            let conn_scope_kind: String = match row.try_get(1) {
+                Ok(v) => v,
+                Err(_) => return RefreshStep::Unavailable,
+            };
+            let conn_owner_user_id: String = match row.try_get(2) {
+                Ok(v) => v,
+                Err(_) => return RefreshStep::Unavailable,
+            };
             let Ok(now_ms) = post_lock_clock_ms(&mut tx, 0).await else {
                 let _ = tx.rollback().await;
                 return RefreshStep::Unavailable;
             };
-            let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
+            if !verify_worker_connection_authority(
                 &mut tx,
                 request.scope_id,
+                &conn_scope_id,
+                &conn_scope_kind,
+                &conn_owner_user_id,
+                request.connection_id,
                 request.actor_user_id,
                 request.actor_approval_id,
                 now_ms,
             )
             .await
-            else {
-                let _ = tx.rollback().await;
-                return RefreshStep::Unavailable;
-            };
-            let Ok(shares) = load_active_shares(&mut tx, request.connection_id).await else {
-                let _ = tx.rollback().await;
-                return RefreshStep::Unavailable;
-            };
-            if !can_execute_connection(&actor, &scope, &shares) {
+            .unwrap_or(false)
+            {
                 let _ = tx.rollback().await;
                 return RefreshStep::Unavailable;
             }
 
-            let provider_kind: String = match row.try_get(0) {
+            let provider_kind: String = match row.try_get(3) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
             };
-            let endpoint_origin: String = match row.try_get(1) {
+            let endpoint_origin: String = match row.try_get(4) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
             };
-            let allowed_scopes: Vec<String> = match row.try_get(2) {
+            let allowed_scopes: Vec<String> = match row.try_get(5) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
             };
-            let granted_scopes: Vec<String> = match row.try_get(3) {
+            let granted_scopes: Vec<String> = match row.try_get(6) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
             };
-            let state: String = match row.try_get(4) {
+            let state: String = match row.try_get(7) {
                 Ok(v) => v,
                 Err(_) => return RefreshStep::Unavailable,
             };
-            let expires_ms: Option<i64> = row.try_get(5).unwrap_or(None);
+            let expires_ms: Option<i64> = row.try_get(8).unwrap_or(None);
             if state != ConnectionState::Authorized.as_str()
                 || request
                     .expected_origin
@@ -3023,18 +3208,18 @@ impl VaultCredentialProvider {
                 let _ = tx.rollback().await;
                 return RefreshStep::RetryRead;
             }
-            let existing_claim: Option<String> = row.try_get(12).unwrap_or(None);
-            let existing_lease_ms: Option<i64> = row.try_get(13).unwrap_or(None);
+            let existing_claim: Option<String> = row.try_get(15).unwrap_or(None);
+            let existing_lease_ms: Option<i64> = row.try_get(16).unwrap_or(None);
             if existing_claim.is_some() && existing_lease_ms.is_some_and(|until| until > now_ms) {
                 let _ = tx.rollback().await;
                 return RefreshStep::Wait;
             }
-            let key_id: Option<String> = row.try_get(6).unwrap_or(None);
-            let r_salt: Option<Vec<u8>> = row.try_get(7).unwrap_or(None);
-            let r_nonce: Option<Vec<u8>> = row.try_get(8).unwrap_or(None);
-            let r_ct: Option<Vec<u8>> = row.try_get(9).unwrap_or(None);
-            let cred_gen: i64 = row.try_get(10).unwrap_or(0);
-            let rev_gen: i64 = row.try_get(11).unwrap_or(0);
+            let key_id: Option<String> = row.try_get(9).unwrap_or(None);
+            let r_salt: Option<Vec<u8>> = row.try_get(10).unwrap_or(None);
+            let r_nonce: Option<Vec<u8>> = row.try_get(11).unwrap_or(None);
+            let r_ct: Option<Vec<u8>> = row.try_get(12).unwrap_or(None);
+            let cred_gen: i64 = row.try_get(13).unwrap_or(0);
+            let rev_gen: i64 = row.try_get(14).unwrap_or(0);
             let (Some(key_id), Some(r_salt), Some(r_nonce), Some(r_ct)) =
                 (key_id, r_salt, r_nonce, r_ct)
             else {
@@ -3048,7 +3233,7 @@ impl VaultCredentialProvider {
             let Ok(refresh_secret) = self.keyring.open(
                 &SecretBinding {
                     connection_id: request.connection_id,
-                    scope_id: request.scope_id,
+                    scope_id: &conn_scope_id,
                     account_id: request.account_id,
                     secret_kind: SecretKind::Refresh,
                     credential_generation: cred_gen,
@@ -3084,6 +3269,9 @@ impl VaultCredentialProvider {
                 return RefreshStep::Unavailable;
             }
             ClaimedRefresh {
+                conn_scope_id,
+                conn_scope_kind,
+                conn_owner_user_id,
                 claim_token,
                 cred_gen,
                 rev_gen,
@@ -3134,7 +3322,7 @@ impl VaultCredentialProvider {
                 FOR UPDATE",
         )
         .bind(request.connection_id)
-        .bind(request.scope_id)
+        .bind(&claim.conn_scope_id)
         .bind(request.account_id)
         .fetch_optional(&mut *tx)
         .await;
@@ -3207,7 +3395,7 @@ impl VaultCredentialProvider {
                 let Ok(new_access) = self.keyring.seal(
                     &SecretBinding {
                         connection_id: request.connection_id,
-                        scope_id: request.scope_id,
+                        scope_id: &claim.conn_scope_id,
                         account_id: request.account_id,
                         secret_kind: SecretKind::Access,
                         credential_generation: next_gen,
@@ -3225,7 +3413,7 @@ impl VaultCredentialProvider {
                 let Ok(new_refresh) = self.keyring.seal(
                     &SecretBinding {
                         connection_id: request.connection_id,
-                        scope_id: request.scope_id,
+                        scope_id: &claim.conn_scope_id,
                         account_id: request.account_id,
                         secret_kind: SecretKind::Refresh,
                         credential_generation: next_gen,
@@ -3308,23 +3496,19 @@ impl VaultCredentialProvider {
                     let _ = tx.rollback().await;
                     return RefreshStep::Unavailable;
                 };
-                let live_ok = match load_worker_scope_and_actor(
+                let live_ok = verify_worker_connection_authority(
                     &mut tx,
                     request.scope_id,
+                    &claim.conn_scope_id,
+                    &claim.conn_scope_kind,
+                    &claim.conn_owner_user_id,
+                    request.connection_id,
                     request.actor_user_id,
                     request.actor_approval_id,
                     now_ms,
                 )
                 .await
-                {
-                    Ok(Some((scope, actor))) => {
-                        match load_active_shares(&mut tx, request.connection_id).await {
-                            Ok(shares) => can_execute_connection(&actor, &scope, &shares),
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                };
+                .unwrap_or(false);
                 if tx.commit().await.is_err() || !live_ok {
                     return RefreshStep::Unavailable;
                 }
@@ -3355,23 +3539,19 @@ impl VaultCredentialProvider {
                 .await;
                 let now_ms = post_lock_clock_ms(&mut tx, 0).await.ok();
                 let live_ok = match now_ms {
-                    Some(ms) => match load_worker_scope_and_actor(
+                    Some(ms) => verify_worker_connection_authority(
                         &mut tx,
                         request.scope_id,
+                        &claim.conn_scope_id,
+                        &claim.conn_scope_kind,
+                        &claim.conn_owner_user_id,
+                        request.connection_id,
                         request.actor_user_id,
                         request.actor_approval_id,
                         ms,
                     )
                     .await
-                    {
-                        Ok(Some((scope, actor))) => {
-                            match load_active_shares(&mut tx, request.connection_id).await {
-                                Ok(shares) => can_execute_connection(&actor, &scope, &shares),
-                                Err(_) => false,
-                            }
-                        }
-                        _ => false,
-                    },
+                    .unwrap_or(false),
                     None => false,
                 };
                 let _ = tx.commit().await;
@@ -3394,7 +3574,7 @@ impl VaultCredentialProvider {
                         && let Ok(plain) = self.keyring.open(
                             &SecretBinding {
                                 connection_id: request.connection_id,
-                                scope_id: request.scope_id,
+                                scope_id: &claim.conn_scope_id,
                                 account_id: request.account_id,
                                 secret_kind: SecretKind::Access,
                                 credential_generation: claim.cred_gen,
@@ -3476,6 +3656,9 @@ impl VaultCredentialProvider {
 }
 
 struct ClaimedRefresh {
+    conn_scope_id: String,
+    conn_scope_kind: String,
+    conn_owner_user_id: String,
     claim_token: String,
     cred_gen: i64,
     rev_gen: i64,
@@ -3540,45 +3723,47 @@ impl VaultDestinationAuthorizer {
         let Ok(now_ms) = post_lock_clock_ms(&mut *conn, 0).await else {
             return false;
         };
-        let Ok(Some((scope, actor))) = load_worker_scope_and_actor(
-            &mut *conn,
-            target.scope_id,
-            target.actor_user_id,
-            target.actor_approval_id,
-            now_ms,
-        )
-        .await
-        else {
-            return false;
-        };
-        let Ok(shares) = load_active_shares(&mut *conn, target.connection_id).await else {
-            return false;
-        };
-        if !can_execute_connection(&actor, &scope, &shares) {
-            return false;
-        }
         let row = sqlx::query(
-            "SELECT endpoint_origin, allowed_scopes, granted_scopes, state,
+            "SELECT scope_id::text, scope_kind, owner_user_id::text,
+                    endpoint_origin, allowed_scopes, granted_scopes, state,
                     CASE WHEN expires_at IS NOT NULL
                          THEN floor(extract(epoch FROM expires_at) * 1000)::bigint END,
                     has_refresh
                FROM openmettle.external_connections
-              WHERE id = $1::uuid AND scope_id = $2::uuid AND account_id = $3",
+              WHERE id = $1::uuid AND account_id = $2",
         )
         .bind(target.connection_id)
-        .bind(target.scope_id)
         .bind(target.account_id)
         .fetch_optional(&mut *conn)
         .await;
         let Ok(Some(row)) = row else {
             return false;
         };
-        let origin: String = row.try_get(0).unwrap_or_default();
-        let allowed_scopes: Vec<String> = row.try_get(1).unwrap_or_default();
-        let granted_scopes: Vec<String> = row.try_get(2).unwrap_or_default();
-        let state: String = row.try_get(3).unwrap_or_default();
-        let expires_ms: Option<i64> = row.try_get(4).unwrap_or(None);
-        let has_refresh: bool = row.try_get(5).unwrap_or(false);
+        let conn_scope_id: String = row.try_get(0).unwrap_or_default();
+        let conn_scope_kind: String = row.try_get(1).unwrap_or_default();
+        let conn_owner_user_id: String = row.try_get(2).unwrap_or_default();
+        if !verify_worker_connection_authority(
+            &mut *conn,
+            target.scope_id,
+            &conn_scope_id,
+            &conn_scope_kind,
+            &conn_owner_user_id,
+            target.connection_id,
+            target.actor_user_id,
+            target.actor_approval_id,
+            now_ms,
+        )
+        .await
+        .unwrap_or(false)
+        {
+            return false;
+        }
+        let origin: String = row.try_get(3).unwrap_or_default();
+        let allowed_scopes: Vec<String> = row.try_get(4).unwrap_or_default();
+        let granted_scopes: Vec<String> = row.try_get(5).unwrap_or_default();
+        let state: String = row.try_get(6).unwrap_or_default();
+        let expires_ms: Option<i64> = row.try_get(7).unwrap_or(None);
+        let has_refresh: bool = row.try_get(8).unwrap_or(false);
         if state != ConnectionState::Authorized.as_str() {
             return false;
         }

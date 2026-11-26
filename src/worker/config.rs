@@ -106,68 +106,112 @@ pub struct InferenceConfig {
 /// Metered routes for one gateway installation, plus optional reviewed external MCP declarations.
 pub struct GatewayRoutes {
     installation: String,
+    catalog: Arc<Catalog>,
     models: BTreeMap<String, (Arc<Gateway>, bool)>,
     registry: Option<Arc<ExternalRegistry>>,
 }
 
-fn conservative_tool_prompt_bound(request: &inference::Request) -> u64 {
-    let mut total = 0u64;
+/// Qualified upper-bound token estimate for a complete worker inference round, matching
+/// admission's [`crate::model_config::PromptBound`] accounting across `effective.instructions`,
+/// conversation history, structured reasoning replay, tool declarations, calls, and tool results.
+/// Returns `None` (fail closed) if the profile lacks a qualified `prompt_bound` or overflows.
+fn qualified_tool_prompt_bound(
+    catalog: &Catalog,
+    effective: &Effective,
+    request: &inference::Request,
+) -> Option<u64> {
+    let profile = catalog.target(effective).ok()?;
+    let b = profile.prompt_bound.as_ref()?;
+    let mut total = u64::from(b.fixed_tokens);
+    let charge = |total: &mut u64, bytes: usize, framing: u64| -> Option<()> {
+        let byte_cost = u64::try_from(bytes)
+            .ok()?
+            .checked_mul(u64::from(b.tokens_per_byte))?;
+        *total = total.checked_add(framing)?.checked_add(byte_cost)?;
+        Some(())
+    };
+    let turn_tokens = u64::from(b.tokens_per_turn);
+    let part_tokens = u64::from(b.tokens_per_part);
+    let item_framing = turn_tokens.checked_add(part_tokens)?;
+
+    for instr in &effective.instructions {
+        charge(&mut total, instr.text.len(), turn_tokens)?;
+    }
+
     for item in &request.history {
-        let delta = match item {
-            History::User(text) => (text.len() as u64).saturating_add(16),
-            History::UserImage { text, bytes, .. } => (text.len() as u64)
-                .saturating_add((bytes.len() as u64) / 3)
-                .saturating_add(256),
+        match item {
+            History::User(text) => {
+                charge(&mut total, text.len(), item_framing)?;
+            }
+            History::UserImage { text, .. } => {
+                let attachment_tokens = u64::from(b.tokens_per_attachment?);
+                charge(&mut total, text.len(), item_framing)?;
+                total = total
+                    .checked_add(part_tokens)?
+                    .checked_add(attachment_tokens)?;
+            }
             History::Assistant {
                 parts,
                 reasoning,
                 calls,
             } => {
-                let mut n = 32u64;
+                total = total.checked_add(turn_tokens)?;
                 for part in parts {
-                    n = n.saturating_add(part.len() as u64);
+                    charge(&mut total, part.len(), part_tokens)?;
                 }
-                if let Some(r) = reasoning {
-                    n = n.saturating_add(r.storage_bytes as u64);
+                if let Some(r) = reasoning
+                    && let Some(rule) = profile.replay_rule(Some(&r.source))
+                {
+                    let replay_cost = u64::try_from(r.storage_bytes)
+                        .ok()?
+                        .checked_mul(u64::from(rule.max_tokens_per_byte))?
+                        .checked_add(u64::from(rule.fixed_tokens))?;
+                    total = total.checked_add(replay_cost)?;
                 }
                 for call in calls {
-                    let args_len = serde_json::to_vec(&call.arguments)
-                        .map(|v| v.len() as u64)
-                        .unwrap_or(64);
-                    n = n
-                        .saturating_add(call.id.len() as u64)
-                        .saturating_add(call.name.len() as u64)
-                        .saturating_add(args_len)
-                        .saturating_add(32);
+                    let args_len = serde_json::to_vec(&call.arguments).ok()?.len();
+                    let bytes = call
+                        .id
+                        .len()
+                        .checked_add(call.name.len())?
+                        .checked_add(args_len)?;
+                    charge(&mut total, bytes, item_framing)?;
                 }
-                n
             }
-            History::ToolResult { id, output } => (id.len() as u64)
-                .saturating_add(output.len() as u64)
-                .saturating_add(32),
+            History::ToolResult { id, output } => {
+                let bytes = id.len().checked_add(output.len())?;
+                charge(&mut total, bytes, item_framing)?;
+            }
             History::RejectedGroup(errors) => {
-                let mut n = 32u64;
+                total = total.checked_add(turn_tokens)?;
                 for err in errors {
-                    n = n
-                        .saturating_add(err.call_id.len() as u64)
-                        .saturating_add(64);
+                    let call_bytes = err
+                        .call_id
+                        .len()
+                        .checked_add(err.name.len())?
+                        .checked_add(err.arguments.len())?;
+                    charge(&mut total, call_bytes, item_framing)?;
+                    let model_output = err.model_output().to_string();
+                    let result_bytes = err.call_id.len().checked_add(model_output.len())?;
+                    charge(&mut total, result_bytes, item_framing)?;
                 }
-                n
             }
-        };
-        total = total.saturating_add(delta);
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            let schema_len = tool.parameters.to_string().len() as u64;
-            total = total
-                .saturating_add(tool.name.len() as u64)
-                .saturating_add(tool.description.len() as u64)
-                .saturating_add(schema_len)
-                .saturating_add(64);
         }
     }
-    total
+
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            let schema_len = serde_json::to_vec(&tool.parameters).ok()?.len();
+            let bytes = tool
+                .name
+                .len()
+                .checked_add(tool.description.len())?
+                .checked_add(schema_len)?;
+            charge(&mut total, bytes, item_framing)?;
+        }
+    }
+
+    Some(total)
 }
 
 impl TurnRoutes for GatewayRoutes {
@@ -212,10 +256,29 @@ impl TurnRoutes for GatewayRoutes {
             .unwrap_or_default()
     }
 
-    fn tool_prompt_bound(&self, _: &Effective, request: &inference::Request) -> Option<u64> {
-        self.registry
-            .as_ref()
-            .map(|_| conservative_tool_prompt_bound(request))
+    fn declared_tools_for_model(&self, _: &ClaimedRun, model: &Effective) -> Vec<DeclaredTool> {
+        let Some(registry) = self.registry.as_deref() else {
+            return Vec::new();
+        };
+        let Some((gateway, _)) = self.models.get(&model.model) else {
+            return Vec::new();
+        };
+        if gateway.qualification().functions.is_none() {
+            return Vec::new();
+        }
+        registry
+            .contracts()
+            .map(ExternalToolContract::declared_tool)
+            .filter(|dt| gateway.accepts_tool(&dt.tool))
+            .collect()
+    }
+
+    fn tool_prompt_bound(
+        &self,
+        effective: &Effective,
+        request: &inference::Request,
+    ) -> Option<u64> {
+        qualified_tool_prompt_bound(&self.catalog, effective, request)
     }
 
     fn proposal(&self, _: &ClaimedRun, call: &Call) -> Option<Proposal> {
@@ -738,10 +801,12 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
     }
     let external_mcp = external_mcp_file.map(ExternalMcpFile::build).transpose()?;
     let registry = external_mcp.as_ref().map(|ext| Arc::clone(&ext.registry));
+    let catalog = Arc::new(catalog);
     Ok(InferenceConfig {
-        catalog: Arc::new(catalog),
+        catalog: Arc::clone(&catalog),
         routes: GatewayRoutes {
             installation,
+            catalog,
             models,
             registry,
         },

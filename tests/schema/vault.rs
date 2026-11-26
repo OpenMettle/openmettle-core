@@ -890,12 +890,16 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
     }
 
     let alice_scope = personal_of(&db, &alice).await;
+    let bob_scope = personal_of(&db, &bob).await;
+    let dave_scope = personal_of(&db, &dave).await;
+    let eve_scope = personal_of(&db, &eve).await;
     let dest = json!(["v1", conn_id, "acct-alice", "issues.read", "repo/1"]).to_string();
-    // Bob, Dave (via local_group), and Eve (via oidc_group) can read metadata & execute, but cannot manage.
-    for (label, who, acct) in [
-        ("bob", As::Native(&bob_s), &bob),
-        ("dave", As::Native(&dave_s), &dave),
-        ("eve", As::Native(&eve_s), &eve),
+    // Bob, Dave (via local_group), and Eve (via oidc_group) can read metadata & execute from their
+    // own personal scopes, cannot execute from Alice's personal scope, and cannot manage.
+    for (label, who, acct, actor_scope) in [
+        ("bob", As::Native(&bob_s), &bob, &bob_scope),
+        ("dave", As::Native(&dave_s), &dave, &dave_scope),
+        ("eve", As::Native(&eve_s), &eve, &eve_scope),
     ] {
         let (st, meta) = api.call(
             who,
@@ -915,11 +919,27 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
         );
         assert_eq!(st, 403, "{label}");
 
+        // Recipient cannot impersonate Alice's personal run scope.
+        assert!(matches!(
+            provider
+                .resolve(CredentialRequest {
+                    connection_id: &conn_id,
+                    account_id: "acct-alice",
+                    scope_id: &alice_scope,
+                    actor_user_id: &acct.user,
+                    actor_approval_id: Some(&acct.approval),
+                    expected_origin: Some("https://api.example.test"),
+                    required_scope: Some("issues.read"),
+                })
+                .await,
+            CredentialOutcome::Unavailable
+        ));
+
         let resolved = provider
             .resolve(CredentialRequest {
                 connection_id: &conn_id,
                 account_id: "acct-alice",
-                scope_id: &alice_scope,
+                scope_id: actor_scope,
                 actor_user_id: &acct.user,
                 actor_approval_id: Some(&acct.approval),
                 expected_origin: Some("https://api.example.test"),
@@ -935,7 +955,7 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
                 .authorize_reconcile(
                     &mut worker_conn,
                     ReconcileTarget {
-                        scope_id: &alice_scope,
+                        scope_id: actor_scope,
                         run_id: "00000000-0000-4000-8000-000000000001",
                         actor_user_id: &acct.user,
                         actor_approval_id: Some(&acct.approval),
@@ -976,7 +996,7 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
             .resolve(CredentialRequest {
                 connection_id: &conn_id,
                 account_id: "acct-alice",
-                scope_id: &alice_scope,
+                scope_id: &bob_scope,
                 actor_user_id: &bob.user,
                 actor_approval_id: Some(&bob.approval),
                 expected_origin: Some("https://api.example.test"),
@@ -990,7 +1010,7 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
             .authorize_reconcile(
                 &mut worker_conn,
                 ReconcileTarget {
-                    scope_id: &alice_scope,
+                    scope_id: &bob_scope,
                     run_id: "00000000-0000-4000-8000-000000000001",
                     actor_user_id: &bob.user,
                     actor_approval_id: Some(&bob.approval),
@@ -1030,7 +1050,7 @@ async fn vault_personal_project_ownership_sharing_revocation_and_http_routes() {
             .resolve(CredentialRequest {
                 connection_id: &conn_id,
                 account_id: "acct-alice",
-                scope_id: &alice_scope,
+                scope_id: &eve_scope,
                 actor_user_id: &eve.user,
                 actor_approval_id: Some(&eve.approval),
                 expected_origin: Some("https://api.example.test"),
@@ -3109,17 +3129,36 @@ async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "tools": [{
-                            "name": "list_issues",
-                            "inputSchema": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["repo"],
-                                "properties": {
-                                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                        "tools": [
+                            {
+                                "name": "list_issues",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["repo"],
+                                    "properties": {
+                                        "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "nested_search",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["filter"],
+                                    "properties": {
+                                        "filter": {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "properties": {
+                                                "tag": {"type": "string", "maxLength": 32}
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }]
+                        ]
                     }
                 }),
             )
@@ -3231,7 +3270,16 @@ async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
     // Write a real OPENMETTLE_WORKER_INFERENCE_CONFIG file referencing gw_srv + mcp_srv!
     let dir = auth_config_support::Dir::new();
     let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
-    let catalog_val: Value = serde_json::from_slice(catalog_bytes).unwrap();
+    let mut catalog_val: Value = serde_json::from_slice(catalog_bytes).unwrap();
+    for model_key in ["a", "b"] {
+        catalog_val["models"][model_key]["prompt_bound"] = json!({
+            "fixed_tokens": 100,
+            "tokens_per_turn": 20,
+            "tokens_per_part": 10,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 500
+        });
+    }
     let mut inf_doc = auth_config_support::inference_document(
         &dir,
         &catalog_val,
@@ -3243,8 +3291,13 @@ async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
     let mcp_ca = dir.write("mcp-ca.pem", &mcp_srv.ca_pem);
     for model_key in ["a", "b"] {
         inf_doc["routes"][model_key]["private_cidrs"] = json!([gw_cidr]);
-        inf_doc["routes"][model_key]["functions"] = json!("flat");
     }
+    // P2 #6: single worker config serves both a flat-tool route ("a") and a text-only route ("b").
+    inf_doc["routes"]["a"]["functions"] = json!("flat");
+    inf_doc["routes"]["b"]
+        .as_object_mut()
+        .unwrap()
+        .remove("functions");
     inf_doc["external_mcp"] = json!({
         "connections": {
             &conn_id: {
@@ -3256,35 +3309,71 @@ async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
                 "call_timeout_milliseconds": 10000
             }
         },
-        "tools": [{
-            "tool_id": "gh_list_issues",
-            "remote_name": "list_issues",
-            "version": "1",
-            "description": "List repository issues",
-            "input_schema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["repo"],
-                "properties": {
-                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
-                }
+        "tools": [
+            {
+                "tool_id": "gh_list_issues",
+                "remote_name": "list_issues",
+                "version": "1",
+                "description": "List repository issues",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["repo"],
+                    "properties": {
+                        "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                    }
+                },
+                "connection_id": &conn_id,
+                "account_id": "acct-pkg",
+                "action": "issues.read",
+                "resource_field": "repo",
+                "fixed_resource": "default",
+                "class": "read",
+                "capability": "tool.github",
+                "gate": "on_by_default",
+                "tool_policy": "mcp.v1",
+                "destination_policy": "synth.v1",
+                "endpoint_id": "gh-mcp",
+                "endpoint_version": "1",
+                "authoritative_lookup": false,
+                "semantic_errors_are_side_effect_free": true,
+                "call_timeout_milliseconds": 10000
             },
-            "connection_id": &conn_id,
-            "account_id": "acct-pkg",
-            "action": "issues.read",
-            "resource_field": "repo",
-            "fixed_resource": "default",
-            "class": "read",
-            "capability": "tool.github",
-            "gate": "on_by_default",
-            "tool_policy": "mcp.v1",
-            "destination_policy": "synth.v1",
-            "endpoint_id": "gh-mcp",
-            "endpoint_version": "1",
-            "authoritative_lookup": false,
-            "semantic_errors_are_side_effect_free": true,
-            "call_timeout_milliseconds": 10000
-        }]
+            {
+                "tool_id": "gh_nested_search",
+                "remote_name": "nested_search",
+                "version": "1",
+                "description": "Nested search excluded on flat routes",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["filter"],
+                    "properties": {
+                        "filter": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "tag": {"type": "string", "maxLength": 32}
+                            }
+                        }
+                    }
+                },
+                "connection_id": &conn_id,
+                "account_id": "acct-pkg",
+                "action": "issues.read",
+                "fixed_resource": "default",
+                "class": "read",
+                "capability": "tool.github",
+                "gate": "on_by_default",
+                "tool_policy": "mcp.v1",
+                "destination_policy": "synth.v1",
+                "endpoint_id": "gh-mcp",
+                "endpoint_version": "1",
+                "authoritative_lookup": false,
+                "semantic_errors_are_side_effect_free": true,
+                "call_timeout_milliseconds": 10000
+            }
+        ]
     });
     let inf_path = dir.write("worker-inference.json", inf_doc.to_string().as_bytes());
     let loaded = worker_config::load(std::path::Path::new(&inf_path)).unwrap();
@@ -3442,6 +3531,285 @@ async fn vault_packaged_worker_startup_wiring_executes_credentialed_mcp_tool() {
             .iter()
             .any(|(head, _)| head.contains(&format!("Bearer {bearer_secret}"))),
         "packaged worker must inject vaulted bearer token into outbound MCP requests"
+    );
+    let gw_first_body = gw_srv.captured.lock().unwrap()[0].1.clone();
+    assert!(
+        gw_first_body.contains("gh_list_issues") && !gw_first_body.contains("gh_nested_search"),
+        "flat route 'a' must advertise gh_list_issues and exclude nested gh_nested_search: {gw_first_body}"
+    );
+
+    // P2 #6: On the SAME worker config, a run targeting text-only route "b" (`functions: None`)
+    // succeeds with zero MCP catalog verification calls and sends no `tools` field.
+    let reqs_before_text_only = mcp_srv.requests.load(Ordering::SeqCst);
+    let conv_b = match branches::create_conversation(
+        &mut api_conn,
+        &ctx(&alice, "pkg-conv-b"),
+        &alice_scope,
+    )
+    .await
+    .unwrap()
+    {
+        store::WriteOutcome::Applied { target_id }
+        | store::WriteOutcome::Replayed { target_id } => target_id,
+    };
+    let chat_b = Conversation {
+        scope: &alice_scope,
+        id: &conv_b.conversation_id,
+    };
+    let msg_id_b = "00000000-0000-4000-8000-000000004561";
+    let parts_b = [Part::Text("plain text turn on model b".into())];
+    let turn_op_b = Operation::Append(UserInput {
+        id: msg_id_b,
+        parts: &parts_b,
+    });
+    let selection_b: Selection = serde_json::from_value(
+        json!({"model": "b", "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let snapshot_b = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection_b, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("b").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("b").unwrap().cost_bound,
+    };
+    let turn_intent_b = TurnIntent {
+        source_branch_id: &conv_b.branch_id,
+        expected_head_message_id: None,
+        operation: turn_op_b,
+        selection: &selection_b,
+        requested_rounds: Some(2),
+    };
+    let mut tx_b = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    branches::prepare_turn(
+        &mut tx_b,
+        &ctx(&alice, "pkg-msg-b"),
+        chat_b,
+        &conv_b.branch_id,
+        None,
+        turn_op_b,
+    )
+    .await
+    .unwrap();
+    let history_b = branches::history(
+        tx_b.connection().unwrap(),
+        &actor_principal,
+        chat_b,
+        &conv_b.branch_id,
+        effect_session.context().observed_ms(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pins_b = Snapshots::encode(&turn_intent_b, &history_b, &catalog, &snapshot_b).unwrap();
+    let admitted_b = run_queue::admit_run_with_mode(
+        &mut tx_b,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &conv_b.conversation_id,
+                branch: &conv_b.branch_id,
+                message: msg_id_b,
+                key: "pkg-turn-run-b",
+                format: SNAPSHOT_FORMAT,
+                version: SNAPSHOT_VERSION,
+                input: &pins_b.input,
+                config: &pins_b.config,
+            },
+            actor_approval_id: &alice.approval,
+            now_ms: effect_session.context().observed_ms(),
+            capabilities: &[],
+            requested_rounds: Some(2),
+            cost_qualified: None,
+        },
+        &limits,
+        &effect_session,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(admitted_b, Admission::Admitted { .. }));
+    tx_b.commit().await.unwrap();
+    let claimed_b = run_queue::claim_next(
+        &mut worker_conn,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 4,
+        },
+        &leases,
+    )
+    .await
+    .unwrap()
+    .expect("claimed text-only run on model b");
+    let (_stop_tx_b, stop_rx_b) = watch::channel(None::<Stop>);
+    let step_b = StepContext {
+        stop: stop_rx_b,
+        deadline: Instant::now() + Duration::from_secs(20),
+        tasks: StepTasks::default().handle(),
+    };
+    let active_b = ActiveRun {
+        claim: claimed_b,
+        state: leases::ExecState::Running,
+        execution_deadline: step_b.deadline,
+    };
+    let result_b = executor.step(&active_b, step_b).await;
+    assert!(
+        matches!(result_b, StepResult::Answer(_)),
+        "text-only route 'b' must succeed on a worker with external_mcp configured"
+    );
+    assert_eq!(
+        mcp_srv.requests.load(Ordering::SeqCst),
+        reqs_before_text_only,
+        "text-only route 'b' must trigger 0 MCP catalog verification requests"
+    );
+    let gw_b_body = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+    assert!(
+        !gw_b_body.contains("\"tools\""),
+        "text-only route 'b' must omit tools from gateway payload: {gw_b_body}"
+    );
+
+    // P2 #7: Run on model "a" where instructions + history alone fit `usable_input()`
+    // (`8192 - 4096 = 4096`), while adding the declared MCP tool schema pushes
+    // `tool_prompt_bound` past `usable_input()` and stops BEFORE any gateway call.
+    let gw_reqs_before_bound = gw_srv.requests.load(Ordering::SeqCst);
+    let conv_bound = match branches::create_conversation(
+        &mut api_conn,
+        &ctx(&alice, "pkg-conv-bound"),
+        &alice_scope,
+    )
+    .await
+    .unwrap()
+    {
+        store::WriteOutcome::Applied { target_id }
+        | store::WriteOutcome::Replayed { target_id } => target_id,
+    };
+    let chat_bound = Conversation {
+        scope: &alice_scope,
+        id: &conv_bound.conversation_id,
+    };
+    let msg_id_bound = "00000000-0000-4000-8000-000000004562";
+    // Model "a": context_window=8192, output_reserve=4096 -> usable_input=4096.
+    // PromptBound: fixed=100, Base guidance=20+14=34, layer instructions=20+3800=3820,
+    // user msg=30+10=40 -> history+instructions = 3994 <= 4096,
+    // adding gh_list_issues declaration (~200+ bytes) pushes bound > 4096!
+    let tight_instructions = "S".repeat(3800);
+    let parts_bound = [Part::Text("0123456789".into())];
+    let turn_op_bound = Operation::Append(UserInput {
+        id: msg_id_bound,
+        parts: &parts_bound,
+    });
+    let selection_bound: Selection = serde_json::from_value(json!({
+        "model": "a",
+        "layer": {
+            "instructions": tight_instructions,
+            "controls": { "output_reserve": 4096 }
+        }
+    }))
+    .unwrap();
+    let snapshot_bound = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection_bound, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("a").unwrap().cost_bound,
+    };
+    assert_eq!(snapshot_bound.effective.usable_input(), Some(4096));
+    let turn_intent_bound = TurnIntent {
+        source_branch_id: &conv_bound.branch_id,
+        expected_head_message_id: None,
+        operation: turn_op_bound,
+        selection: &selection_bound,
+        requested_rounds: Some(2),
+    };
+    let mut tx_bound = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    branches::prepare_turn(
+        &mut tx_bound,
+        &ctx(&alice, "pkg-msg-bound"),
+        chat_bound,
+        &conv_bound.branch_id,
+        None,
+        turn_op_bound,
+    )
+    .await
+    .unwrap();
+    let history_bound = branches::history(
+        tx_bound.connection().unwrap(),
+        &actor_principal,
+        chat_bound,
+        &conv_bound.branch_id,
+        effect_session.context().observed_ms(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pins_bound = Snapshots::encode(
+        &turn_intent_bound,
+        &history_bound,
+        &catalog,
+        &snapshot_bound,
+    )
+    .unwrap();
+    let admitted_bound = run_queue::admit_run_with_mode(
+        &mut tx_bound,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &conv_bound.conversation_id,
+                branch: &conv_bound.branch_id,
+                message: msg_id_bound,
+                key: "pkg-turn-run-bound",
+                format: SNAPSHOT_FORMAT,
+                version: SNAPSHOT_VERSION,
+                input: &pins_bound.input,
+                config: &pins_bound.config,
+            },
+            actor_approval_id: &alice.approval,
+            now_ms: effect_session.context().observed_ms(),
+            capabilities: &[],
+            requested_rounds: Some(2),
+            cost_qualified: None,
+        },
+        &limits,
+        &effect_session,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(admitted_bound, Admission::Admitted { .. }));
+    tx_bound.commit().await.unwrap();
+    let claimed_bound = run_queue::claim_next(
+        &mut worker_conn,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 4,
+        },
+        &leases,
+    )
+    .await
+    .unwrap()
+    .expect("claimed tight-bound run");
+    let (_stop_tx_bd, stop_rx_bd) = watch::channel(None::<Stop>);
+    let step_bd = StepContext {
+        stop: stop_rx_bd,
+        deadline: Instant::now() + Duration::from_secs(20),
+        tasks: StepTasks::default().handle(),
+    };
+    let active_bd = ActiveRun {
+        claim: claimed_bound,
+        state: leases::ExecState::Running,
+        execution_deadline: step_bd.deadline,
+    };
+    let result_bd = executor.step(&active_bd, step_bd).await;
+    assert!(
+        matches!(result_bd, StepResult::Failed(_)),
+        "tool_prompt_bound overflow must fail closed before gateway dispatch"
+    );
+    assert_eq!(
+        gw_srv.requests.load(Ordering::SeqCst),
+        gw_reqs_before_bound,
+        "overflowing tool_prompt_bound must send 0 requests to gateway"
     );
 
     // Without VAULT_KEYS_CONFIG (`vault_keys = None`), packaged worker wiring stays fail-closed
@@ -3851,5 +4219,1374 @@ async fn vault_restore_journal_replay_and_coverage_gap_reconciliation() {
             "all active shares must be deactivated"
         );
         assert!(gate_open, "gate must open after accept-coverage-gap");
+    }
+}
+
+// ============================================================================================
+// 7. Review #2 P2 #4 + P2 #8: Cross-rotation authorize idempotency & 16 KiB percent-encoded refresh
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and TEST_GATEWAY_HOST"]
+async fn vault_authorize_idempotency_across_key_rotation_and_large_refresh_body() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_scope = personal_of(&db, &alice).await;
+    let alice_s = seeded_session(&db, &alice, 10, None).await;
+
+    let k1 = [0x19u8; 32];
+    let k2 = [0x2au8; 32];
+
+    // (a) P2 #4: Authorize with Idempotency-Key under active_key_id = k1.
+    let dir1 = auth_config_support::Dir::new();
+    let keys_v1 = write_keyring_files(&dir1, "v1", "k1", &[("k1", k1)]);
+    let api_v1 = VaultApi::start(&db, dir1, Some(&keys_v1));
+    let (st, created) = api_v1.call(
+        As::Browser(&alice_s),
+        "POST",
+        "/v1/connections",
+        Some("idem-rot-create"),
+        Some(&json!({
+            "provider_kind": "github",
+            "account_id": "acct-idem-rot",
+            "origin": "https://api.example.test",
+            "allowed_scopes": ["issues.read"]
+        })),
+    );
+    assert_eq!(st, 201, "{created}");
+    let conn_id = created["connection_id"].as_str().unwrap().to_owned();
+    let auth_body = json!({
+        "access_token": "CANARY-IDEM-ROT-ACCESS",
+        "refresh_token": "CANARY-IDEM-ROT-REFRESH",
+        "granted_scopes": ["issues.read"],
+        "expires_at": "2030-01-01T00:00:00.000000Z",
+        "reason": "initial authorize under k1"
+    });
+    let (st, auth_res) = api_v1.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{conn_id}/authorize"),
+        Some("idem-rot-auth-1"),
+        Some(&auth_body),
+    );
+    assert_eq!(st, 200, "{auth_res}");
+    assert_eq!(
+        consumer::decode_connection(&auth_res).unwrap().generation,
+        1
+    );
+    let stored_mac_key: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'mac_key_id'
+           FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid
+            AND action = 'connection.authorized'
+            AND target_id = $2",
+    )
+    .bind(&alice.user)
+    .bind(&conn_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(stored_mac_key.as_deref(), Some("k1"));
+    drop(api_v1);
+
+    // Rotate API active_key_id to k2 (keeping k1 mounted for decrypt/MAC verification).
+    let dir2 = auth_config_support::Dir::new();
+    let keys_v2 = write_keyring_files(&dir2, "v2", "k2", &[("k1", k1), ("k2", k2)]);
+    let api_v2 = VaultApi::start(&db, dir2, Some(&keys_v2));
+
+    // Identical retry under active_key_id = k2 replays cleanly (200 OK) without bumping generation!
+    let (st, replay_v2) = api_v2.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{conn_id}/authorize"),
+        Some("idem-rot-auth-1"),
+        Some(&auth_body),
+    );
+    assert_eq!(st, 200, "{replay_v2}");
+    assert_eq!(
+        consumer::decode_connection(&replay_v2).unwrap().generation,
+        1
+    );
+
+    // Changed access_token with same Idempotency-Key returns 409 idempotency_conflict!
+    let mut changed_body = auth_body.clone();
+    changed_body["access_token"] = json!("CANARY-IDEM-ROT-DIFFERENT");
+    let (st, conflict_v2) = api_v2.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{conn_id}/authorize"),
+        Some("idem-rot-auth-1"),
+        Some(&changed_body),
+    );
+    assert_eq!(st, 409, "{conflict_v2}");
+    assert_eq!(conflict_v2["code"], "idempotency_conflict");
+    drop(api_v2);
+
+    // If k1 was unmounted from the keyring, retrying fails closed with 503 provisioning (not 409).
+    let dir3 = auth_config_support::Dir::new();
+    let keys_k2_only = write_keyring_files(&dir3, "k2-only", "k2", &[("k2", k2)]);
+    let api_k2_only = VaultApi::start(&db, dir3, Some(&keys_k2_only));
+    let (st, unmounted_err) = api_k2_only.call(
+        As::Browser(&alice_s),
+        "POST",
+        &format!("/v1/connections/{conn_id}/authorize"),
+        Some("idem-rot-auth-1"),
+        Some(&auth_body),
+    );
+    assert_eq!(st, 503, "{unmounted_err}");
+    assert_eq!(unmounted_err["code"], "provisioning");
+    drop(api_k2_only);
+
+    // (b) P2 #8: Refresh a max-size 16,384-byte refresh token packed with `%XX`-escaped characters
+    // (`&`, `=`, `+`, `/`, `:`) over synthetic TLS (>49 KiB encoded body, exceeding old 32 KiB cap).
+    let large_refresh: String = "&=+/:".chars().cycle().take(16 * 1024).collect();
+    assert_eq!(large_refresh.len(), 16 * 1024);
+    let captured_body_len = Arc::new(AtomicUsize::new(0));
+    let captured_len_srv = captured_body_len.clone();
+    let oauth_srv = SyntheticTlsServer::start(move |_head, body| {
+        captured_len_srv.store(body.len(), Ordering::SeqCst);
+        assert!(
+            body.len() > 48 * 1024,
+            "expected >48 KiB percent-encoded refresh body, got {}",
+            body.len()
+        );
+        assert!(
+            body.contains("refresh_token=%26%3D%2B%2F%3A"),
+            "missing encoded token"
+        );
+        http_json(
+            200,
+            &json!({
+                "access_token": "CANARY-LARGE-REFRESH-NEW-ACCESS",
+                "refresh_token": "CANARY-LARGE-REFRESH-NEXT",
+                "scope": "issues.read",
+                "expires_in": 3600
+            }),
+        )
+    })
+    .await;
+
+    let mut api_conn = connect(&db.0, API).await;
+    let ring = Arc::new(VaultKeyRing::new("k2".into(), vec![("k2".into(), k2)]).unwrap());
+    let mcp_origin = "https://large-refresh-mcp.example.test";
+    let large_conn_id = vault::create_connection(
+        &mut api_conn,
+        &ctx(&alice, "large-ref-c1"),
+        &CreateConnectionInput {
+            scope_id: &alice_scope,
+            provider_kind: "github",
+            account_id: "acct-large-ref",
+            origin: mcp_origin,
+            allowed_scopes: &["issues.read".into()],
+        },
+    )
+    .await
+    .unwrap()
+    .target_id()
+    .to_owned();
+    vault::authorize_connection(
+        &mut api_conn,
+        &ctx(&alice, "large-ref-a1"),
+        &ring,
+        &large_conn_id,
+        &AuthorizeConnectionInput {
+            access_token: "CANARY-EXPIRED-ACCESS",
+            refresh_token: Some(&large_refresh),
+            granted_scopes: &["issues.read".into()],
+            expires_at: Some("2020-01-01T00:00:00.000000Z"),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut refresh_registry = VaultRefreshRegistry::new();
+    refresh_registry
+        .register(oauth_srv.refresh_client("github", &[mcp_origin]))
+        .unwrap();
+    let worker_pool = make_pool(&db, WORKER).await;
+    let provider = VaultCredentialProvider::new(
+        worker_pool,
+        ring,
+        Some(Arc::new(refresh_registry)),
+        VaultConfig::default(),
+    );
+    let outcome = provider
+        .resolve(CredentialRequest {
+            connection_id: &large_conn_id,
+            account_id: "acct-large-ref",
+            scope_id: &alice_scope,
+            actor_user_id: &alice.user,
+            actor_approval_id: Some(&alice.approval),
+            expected_origin: Some(mcp_origin),
+            required_scope: Some("issues.read"),
+        })
+        .await;
+    match outcome {
+        CredentialOutcome::Ready(cred) => {
+            assert_eq!(cred.bearer_token(), Some("CANARY-LARGE-REFRESH-NEW-ACCESS"));
+        }
+        other => panic!("expected refreshed credential for 16 KiB token, got {other:?}"),
+    }
+    assert!(captured_body_len.load(Ordering::SeqCst) > 48 * 1024);
+}
+
+// ============================================================================================
+// 8. Review #2 P2 #3 + P1 #2: Personal execution shares in recipient personal scope +
+//    all-digit bearer redaction in JSON numeric fields (inline & >16 KiB spilled artifact)
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL and TEST_GATEWAY_HOST"]
+async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
+    let db = TestDb::migrated().await;
+    super::run_admission::seed_token_budget(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_scope = personal_of(&db, &alice).await;
+    let bob_scope = personal_of(&db, &bob).await;
+    let mut api_conn = connect(&db.0, API).await;
+    let bob_proj_defaults = json!({});
+    let bob_proj_id = projects::create_project(
+        &mut api_conn,
+        &ctx(&bob, "bob-proj-create"),
+        &ProjectSettingsInput {
+            name: "Bob Isolation Project",
+            instructions: "",
+            defaults: &bob_proj_defaults,
+        },
+    )
+    .await
+    .unwrap()
+    .target_id()
+    .to_owned();
+    let bob_proj_scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&bob_proj_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+
+    let act = admin_cli(&db.url(OWNER), &["runtime", "activate-two-phase-intents"]);
+    assert!(act.status.success(), "{}", stderr(&act));
+
+    // Configure an adopted artifact store so >16 KiB responses spill to disk.
+    let art_dir = auth_config_support::Dir::new();
+    let art_root = PathBuf::from(art_dir.path("artifacts"));
+    fs::create_dir_all(&art_root).unwrap();
+    let art_store = artifact_fs::Store::open(&art_root).unwrap();
+    let adopt = admin_cli(
+        &db.url(OWNER),
+        &["storage", "adopt", art_root.to_str().unwrap()],
+    );
+    assert!(adopt.status.success(), "{}", stderr(&adopt));
+    let api_pool = make_pool(&db, API).await;
+    art_store.initialize_api(&api_pool).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_instance
+            SET personal_limit_bytes = 4000000,
+                instance_budget_bytes = 4000000",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let numeric_bearer = "9876543210123456";
+    let mcp_mode = Arc::new(Mutex::new("inline_num"));
+    let mcp_mode_srv = mcp_mode.clone();
+    let mcp_srv = SyntheticTlsServer::start(move |head, body| {
+        let req: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let id = req["id"].as_str().unwrap_or("1");
+        let method = req["method"].as_str().unwrap_or("");
+        assert!(
+            head.contains(&format!("Bearer {numeric_bearer}")),
+            "expected numeric bearer in MCP Authorization header"
+        );
+        if method == "tools/list" {
+            http_json(
+                200,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "echo_num",
+                            "inputSchema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["repo"],
+                                "properties": {
+                                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                                }
+                            }
+                        }]
+                    }
+                }),
+            )
+        } else {
+            let mode = *mcp_mode_srv.lock().unwrap();
+            let payload = match mode {
+                "inline_num" => {
+                    json!({"echo_num": 9876543210123456u64, "label": "inline"}).to_string()
+                }
+                "spill_num" => json!({
+                    "echo_num": 9876543210123456u64,
+                    "pad": "p".repeat(20 * 1024)
+                })
+                .to_string(),
+                _ => unreachable!(),
+            };
+            http_json(
+                200,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": payload}]
+                    }
+                }),
+            )
+        }
+    })
+    .await;
+
+    let gw_call_tool = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gw_call_srv = gw_call_tool.clone();
+    let gw_srv = SyntheticTlsServer::start(move |_head, body| {
+        let want_call = gw_call_srv.swap(false, Ordering::SeqCst);
+        if want_call && body.contains("gh_echo_num") {
+            http_json(
+                200,
+                &json!({
+                    "id": "chatcmpl-ps1",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_ps_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "gh_echo_num",
+                                    "arguments": "{\"repo\":\"openmettle-core\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 6}
+                }),
+            )
+        } else {
+            http_json(
+                200,
+                &json!({
+                    "id": "chatcmpl-ps2",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Shared personal turn completed."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 6}
+                }),
+            )
+        }
+    })
+    .await;
+
+    // Alice creates and authorizes a personal connection with an all-digit bearer token,
+    // and shares it explicitly with Bob.
+    let ring = Arc::new(VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x6bu8; 32])]).unwrap());
+    let conn_id = vault::create_connection(
+        &mut api_conn,
+        &ctx(&alice, "ps-c1"),
+        &CreateConnectionInput {
+            scope_id: &alice_scope,
+            provider_kind: "github",
+            account_id: "acct-ps",
+            origin: &mcp_srv.origin(),
+            allowed_scopes: &["issues.read".into()],
+        },
+    )
+    .await
+    .unwrap()
+    .target_id()
+    .to_owned();
+    vault::authorize_connection(
+        &mut api_conn,
+        &ctx(&alice, "ps-a1"),
+        &ring,
+        &conn_id,
+        &AuthorizeConnectionInput {
+            access_token: numeric_bearer,
+            refresh_token: None,
+            granted_scopes: &["issues.read".into()],
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    vault::share_connection(
+        &mut api_conn,
+        &ctx(&alice, "ps-share-bob"),
+        &conn_id,
+        &Grantee::User(bob.user.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Build packaged worker executor wired to gw_srv, mcp_srv, art_store, and ring.
+    let dir = auth_config_support::Dir::new();
+    let catalog_bytes = include_bytes!("../fixtures/conversation-catalog-v1.json");
+    let mut catalog_val: Value = serde_json::from_slice(catalog_bytes).unwrap();
+    catalog_val["models"]["a"]["context_window"] = json!(32768);
+    catalog_val["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 100,
+        "tokens_per_turn": 20,
+        "tokens_per_part": 10,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 500
+    });
+    let mut inf_doc = auth_config_support::inference_document(
+        &dir,
+        &catalog_val,
+        &gw_srv.ca_pem,
+        &format!("{}:{}", gw_srv.host, gw_srv.port),
+    );
+    let gw_cidr = gw_srv.private_cidr();
+    let mcp_cidr = mcp_srv.private_cidr();
+    let mcp_ca = dir.write("mcp-ca.pem", &mcp_srv.ca_pem);
+    for model_key in ["a", "b"] {
+        inf_doc["routes"][model_key]["private_cidrs"] = json!([gw_cidr]);
+    }
+    inf_doc["routes"]["a"]["functions"] = json!("flat");
+    inf_doc["external_mcp"] = json!({
+        "connections": {
+            &conn_id: {
+                "endpoint": mcp_srv.url("/mcp"),
+                "trust": { "roots": "bundle", "bundle_path": mcp_ca },
+                "private_cidrs": [mcp_cidr],
+                "setup_timeout_milliseconds": 5000,
+                "idle_read_timeout_milliseconds": 5000,
+                "call_timeout_milliseconds": 10000
+            }
+        },
+        "tools": [{
+            "tool_id": "gh_echo_num",
+            "remote_name": "echo_num",
+            "version": "1",
+            "description": "Echo numeric JSON response",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["repo"],
+                "properties": {
+                    "repo": {"type": "string", "minLength": 1, "maxLength": 64}
+                }
+            },
+            "connection_id": &conn_id,
+            "account_id": "acct-ps",
+            "action": "issues.read",
+            "resource_field": "repo",
+            "fixed_resource": "default",
+            "class": "read",
+            "capability": "tool.github",
+            "gate": "on_by_default",
+            "tool_policy": "mcp.v1",
+            "destination_policy": "synth.v1",
+            "endpoint_id": "gh-mcp",
+            "endpoint_version": "1",
+            "authoritative_lookup": false,
+            "semantic_errors_are_side_effect_free": true,
+            "call_timeout_milliseconds": 10000
+        }]
+    });
+    let inf_path = dir.write("ps-inference.json", inf_doc.to_string().as_bytes());
+    let loaded = worker_config::load(std::path::Path::new(&inf_path)).unwrap();
+    let catalog = loaded.catalog.clone();
+    let leases = LeaseSettings {
+        lease: Duration::from_secs(30),
+        execution_timeout: Duration::from_secs(120),
+    };
+    let worker_pool = make_pool(&db, WORKER).await;
+    let executor = build_worker_turn_executor(
+        worker_pool.clone(),
+        loaded,
+        leases,
+        Some(art_store.clone()),
+        Some(ring.clone()),
+    );
+
+    let bob_sess = seeded_session(&db, &bob, 10, None).await;
+    let sess_policy =
+        openmettle_core::sessions::Policy::new(Duration::from_secs(60), 10, Duration::from_secs(3))
+            .unwrap();
+    let bob_effect_session =
+        approvals::EffectSession::validate(&mut api_conn, &bob_sess, &sess_policy, None)
+            .await
+            .unwrap();
+    let bob_principal = super::authz_store::principal(&db, &bob).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(600),
+        round_cap: 10,
+    };
+    let selection: Selection = serde_json::from_value(
+        json!({"model": "a", "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let snapshot = ConfigSnapshot {
+        effective: catalog
+            .resolve(&Selection::default(), &selection, None, |_, _| true)
+            .unwrap(),
+        required_capabilities: catalog.model("a").unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model("a").unwrap().cost_bound,
+    };
+    let mut worker_conn = connect(&db.0, WORKER).await;
+
+    // Helper to admit and execute one TurnExecutor run for Bob in `scope_id`.
+    let run_bob_turn = |scope_id: String, key: String, msg_id: String| {
+        let api_c = connect(&db.0, API);
+        let bob_clone = Account {
+            user: bob.user.clone(),
+            approval: bob.approval.clone(),
+        };
+        let bob_principal = bob_principal.clone();
+        let catalog = catalog.clone();
+        let selection = selection.clone();
+        let snapshot_eff = snapshot.effective.clone();
+        let snapshot_caps = snapshot.required_capabilities.clone();
+        let snapshot_cb = snapshot.cost_bound;
+        let db_name = db.0.clone();
+        let executor = executor.clone();
+        let sess_tok = bob_sess.clone();
+        async move {
+            let mut api_conn = api_c.await;
+            let sess_policy = openmettle_core::sessions::Policy::new(
+                Duration::from_secs(60),
+                10,
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            let eff_sess =
+                approvals::EffectSession::validate(&mut api_conn, &sess_tok, &sess_policy, None)
+                    .await
+                    .unwrap();
+            let conv = match branches::create_conversation(
+                &mut api_conn,
+                &ctx(&bob_clone, &format!("{key}-conv")),
+                &scope_id,
+            )
+            .await
+            .unwrap()
+            {
+                store::WriteOutcome::Applied { target_id }
+                | store::WriteOutcome::Replayed { target_id } => target_id,
+            };
+            let chat = Conversation {
+                scope: &scope_id,
+                id: &conv.conversation_id,
+            };
+            let parts = [Part::Text("invoke shared personal tool".into())];
+            let turn_op = Operation::Append(UserInput {
+                id: &msg_id,
+                parts: &parts,
+            });
+            let snap = ConfigSnapshot {
+                effective: snapshot_eff,
+                required_capabilities: snapshot_caps,
+                policy_revision: "openmettle.authz/1".into(),
+                cost_bound: snapshot_cb,
+            };
+            let intent = TurnIntent {
+                source_branch_id: &conv.branch_id,
+                expected_head_message_id: None,
+                operation: turn_op,
+                selection: &selection,
+                requested_rounds: Some(3),
+            };
+            let mut tx = WriteTransaction::begin(&mut api_conn).await.unwrap();
+            branches::prepare_turn(
+                &mut tx,
+                &ctx(&bob_clone, &format!("{key}-msg")),
+                chat,
+                &conv.branch_id,
+                None,
+                turn_op,
+            )
+            .await
+            .unwrap();
+            let history = branches::history(
+                tx.connection().unwrap(),
+                &bob_principal,
+                chat,
+                &conv.branch_id,
+                eff_sess.context().observed_ms(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let pins = Snapshots::encode(&intent, &history, &catalog, &snap).unwrap();
+            let adm = run_queue::admit_run_with_mode(
+                &mut tx,
+                &RunAdmission {
+                    input: RunInput {
+                        scope: &scope_id,
+                        actor: &bob_clone.user,
+                        conversation: &conv.conversation_id,
+                        branch: &conv.branch_id,
+                        message: &msg_id,
+                        key: &key,
+                        format: SNAPSHOT_FORMAT,
+                        version: SNAPSHOT_VERSION,
+                        input: &pins.input,
+                        config: &pins.config,
+                    },
+                    actor_approval_id: &bob_clone.approval,
+                    now_ms: eff_sess.context().observed_ms(),
+                    capabilities: &[],
+                    requested_rounds: Some(3),
+                    cost_qualified: None,
+                },
+                &limits,
+                &eff_sess,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(adm, Admission::Admitted { .. }));
+            tx.commit().await.unwrap();
+            let mut w = connect(&db_name, WORKER).await;
+            let claimed = run_queue::claim_next(
+                &mut w,
+                &ClaimLimits {
+                    executing_per_actor: 8,
+                    executing_per_scope: 8,
+                },
+                &leases,
+            )
+            .await
+            .unwrap()
+            .expect("claimed bob run");
+            let (_stop_tx, stop_rx) = watch::channel(None::<Stop>);
+            let step = StepContext {
+                stop: stop_rx,
+                deadline: Instant::now() + Duration::from_secs(20),
+                tasks: StepTasks::default().handle(),
+            };
+            let active = ActiveRun {
+                claim: claimed,
+                state: leases::ExecState::Running,
+                execution_deadline: step.deadline,
+            };
+            executor.step(&active, step).await
+        }
+    };
+    let _ = (&bob_effect_session, &mut worker_conn);
+
+    // 1) Inline numeric reflection in Bob's personal scope using Alice's shared personal connection:
+    //    succeeds AND redacts the all-digit bearer token!
+    *mcp_mode.lock().unwrap() = "inline_num";
+    gw_call_tool.store(true, Ordering::SeqCst);
+    let r1 = run_bob_turn(
+        bob_scope.clone(),
+        "bob-ps-inline".into(),
+        "00000000-0000-4000-8000-000000004601".into(),
+    )
+    .await;
+    assert!(matches!(r1, StepResult::Answer(_)));
+    let gw_inline_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+    assert!(
+        gw_inline_round2.contains("[REDACTED_CREDENTIAL]")
+            && !gw_inline_round2.contains(numeric_bearer),
+        "inline JSON numeric bearer must be redacted: {gw_inline_round2}"
+    );
+
+    // 2) >16 KiB spilled numeric reflection in Bob's personal scope: spills to disk AND redacts
+    //    the all-digit bearer token from BOTH the spilled artifact file and the model summary!
+    *mcp_mode.lock().unwrap() = "spill_num";
+    gw_call_tool.store(true, Ordering::SeqCst);
+    let r2 = run_bob_turn(
+        bob_scope.clone(),
+        "bob-ps-spill".into(),
+        "00000000-0000-4000-8000-000000004602".into(),
+    )
+    .await;
+    assert!(matches!(r2, StepResult::Answer(_)));
+    let gw_spill_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+    assert!(
+        gw_spill_round2.contains("\"storage\":\"spilled\"")
+            || gw_spill_round2.contains("\\\"storage\\\":\\\"spilled\\\""),
+        "expected spilled artifact envelope: {gw_spill_round2}"
+    );
+    assert!(
+        !gw_spill_round2.contains(numeric_bearer),
+        "spilled tool summary leaked numeric bearer: {gw_spill_round2}"
+    );
+    // Inspect EVERY file written under `art_root/revisions` to prove zero leaked digits on disk.
+    let mut found_spill_file = false;
+    for entry in fs::read_dir(art_root.join("revisions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            if text.len() > 16 * 1024 {
+                found_spill_file = true;
+                assert!(
+                    text.contains("[REDACTED_CREDENTIAL]"),
+                    "spilled artifact missing redaction marker"
+                );
+                assert!(
+                    !text.contains(numeric_bearer),
+                    "spilled artifact file leaked all-digit bearer token"
+                );
+            }
+        }
+    }
+    assert!(
+        found_spill_file,
+        "expected >16 KiB spilled artifact file on disk"
+    );
+
+    // 3) Strict project isolation: Bob running in his OWN project scope CANNOT use Alice's
+    //    shared personal connection (tool is not offered; 0 MCP HTTP requests; provider returns Unavailable).
+    let mcp_reqs_before_proj = mcp_srv.requests.load(Ordering::SeqCst);
+    gw_call_tool.store(true, Ordering::SeqCst);
+    let r3 = run_bob_turn(
+        bob_proj_scope.clone(),
+        "bob-ps-project-refused".into(),
+        "00000000-0000-4000-8000-000000004603".into(),
+    )
+    .await;
+    assert!(matches!(r3, StepResult::Answer(_)));
+    assert_eq!(
+        mcp_srv.requests.load(Ordering::SeqCst),
+        mcp_reqs_before_proj,
+        "personal connection must never be invoked from a project run scope"
+    );
+    let gw_proj_body = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+    assert!(
+        !gw_proj_body.contains("gh_echo_num"),
+        "project run must not advertise shared personal connection tool: {gw_proj_body}"
+    );
+    let cred_provider = VaultCredentialProvider::new(
+        worker_pool.clone(),
+        ring.clone(),
+        None,
+        VaultConfig::default(),
+    );
+    assert!(matches!(
+        cred_provider
+            .resolve(CredentialRequest {
+                connection_id: &conn_id,
+                account_id: "acct-ps",
+                scope_id: &bob_proj_scope,
+                actor_user_id: &bob.user,
+                actor_approval_id: Some(&bob.approval),
+                expected_origin: Some(&mcp_srv.origin()),
+                required_scope: Some("issues.read"),
+            })
+            .await,
+        CredentialOutcome::Unavailable
+    ));
+
+    // 4) After Alice revokes Bob's share, Bob's personal run immediately loses access (0 MCP calls).
+    vault::revoke_connection_share(
+        &mut api_conn,
+        &ctx(&alice, "ps-revoke-bob"),
+        &conn_id,
+        &Grantee::User(bob.user.clone()),
+    )
+    .await
+    .unwrap();
+    let mcp_reqs_before_revoked = mcp_srv.requests.load(Ordering::SeqCst);
+    gw_call_tool.store(true, Ordering::SeqCst);
+    let r4 = run_bob_turn(
+        bob_scope.clone(),
+        "bob-ps-after-revoke".into(),
+        "00000000-0000-4000-8000-000000004604".into(),
+    )
+    .await;
+    assert!(matches!(r4, StepResult::Answer(_)));
+    assert_eq!(
+        mcp_srv.requests.load(Ordering::SeqCst),
+        mcp_reqs_before_revoked,
+        "revoked share must trigger 0 MCP calls"
+    );
+    assert!(matches!(
+        cred_provider
+            .resolve(CredentialRequest {
+                connection_id: &conn_id,
+                account_id: "acct-ps",
+                scope_id: &bob_scope,
+                actor_user_id: &bob.user,
+                actor_approval_id: Some(&bob.approval),
+                expected_origin: Some(&mcp_srv.origin()),
+                required_scope: Some("issues.read"),
+            })
+            .await,
+        CredentialOutcome::Unavailable
+    ));
+}
+
+// ============================================================================================
+// 9. Review #2 P1 #1 + P2 #5 + P2 #9:
+//    - Two-restore coverage-gap advancement of `connection_coverage_started_at`
+//    - Online `vault rotate` preserving `credential_generation` vs `authorizeConnection` supersession
+//    - Documented CLI recovery sequence for schema-42->43 upgraded backup and schema-43 backup
+// ============================================================================================
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn vault_two_restore_gap_origin_rotation_replay_and_schema42_upgrade_recovery() {
+    // --- (a) P1 #1: Two-restore gap acceptance advances `connection_coverage_started_at` ---
+    {
+        let db = TestDb::migrated().await;
+        let (conn_id, bob_user) = {
+            let mut owner = connect(&db.0, OWNER).await;
+            providers(&mut owner).await;
+            let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+            let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+            let alice_scope = personal_of(&db, &alice).await;
+            let mut api_conn = connect(&db.0, API).await;
+            let ring = VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x51u8; 32])]).unwrap();
+            let cid = vault::create_connection(
+                &mut api_conn,
+                &ctx(&alice, "tr-c1"),
+                &CreateConnectionInput {
+                    scope_id: &alice_scope,
+                    provider_kind: "github",
+                    account_id: "acct-tr",
+                    origin: "https://api.example.test",
+                    allowed_scopes: &["issues.read".into()],
+                },
+            )
+            .await
+            .unwrap()
+            .target_id()
+            .to_owned();
+            vault::authorize_connection(
+                &mut api_conn,
+                &ctx(&alice, "tr-a1"),
+                &ring,
+                &cid,
+                &AuthorizeConnectionInput {
+                    access_token: "CANARY-TWORESTORE-ACCESS",
+                    refresh_token: Some("CANARY-TWORESTORE-REFRESH"),
+                    granted_scopes: &["issues.read".into()],
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            vault::share_connection(
+                &mut api_conn,
+                &ctx(&alice, "tr-s1"),
+                &cid,
+                &Grantee::User(bob.user.clone()),
+            )
+            .await
+            .unwrap();
+            drop(api_conn);
+            drop(owner);
+            (cid, bob.user)
+        };
+
+        // Two copies of the same pre-gap backup B0 (both at connection_origin = T0).
+        let b0_first = backup_db(&db).await;
+        let b0_second = backup_db(&db).await;
+
+        let pool_first = make_pool(&b0_first, OWNER).await;
+        let e1_text = restore::export(&pool_first).await.unwrap();
+        let e1 = restore::Export::parse(&e1_text).unwrap();
+        let t0 = e1.connection_origin_us.expect("T0 connection_origin");
+
+        // Restore #1 onto b0_first via accept-coverage-gap.
+        let lock1 = restore::lock_gate_with_connection_origin(
+            &pool_first,
+            &GateLockRequest {
+                origin_us: e1.origin_us,
+                lifecycle_origin_us: e1.lifecycle_origin_us,
+                lifecycle_baseline_digest: e1.lifecycle_baseline_digest.as_deref(),
+                required_seq: e1.seq,
+                required_digest: &e1.digest,
+                coverage_complete: false,
+                replace_restore_run: None,
+                new_restore: true,
+            },
+            Some(t0),
+        )
+        .await
+        .unwrap();
+        let gap1 = admin_cli(
+            &b0_first.url(OWNER),
+            &[
+                "restore",
+                "accept-coverage-gap",
+                "--restore-run",
+                &lock1.restore_run_id,
+                "--operator-id",
+                "00000000-0000-4000-8000-000000000910",
+                "--request-key",
+                "two-restore-gap-1",
+                "--reason",
+                "first gap restore",
+            ],
+        );
+        assert!(gap1.status.success(), "{}", stderr(&gap1));
+        restore::apply(&pool_first, &e1).await.unwrap();
+        restore::finish(&pool_first, None, &e1).await.unwrap();
+
+        // Post-gap journal export E2 MUST emit a strictly newer connection_origin T1 > T0.
+        let e2_text = restore::export(&pool_first).await.unwrap();
+        let e2 = restore::Export::parse(&e2_text).unwrap();
+        let t1 = e2.connection_origin_us.expect("T1 connection_origin");
+        assert!(
+            t1 > t0,
+            "accept-coverage-gap must advance connection_coverage_started_at: t0={t0}, t1={t1}"
+        );
+
+        // Restore #2 onto second copy of B0 using post-gap export E2:
+        // `--export-complete` MUST fail closed with OMR04!
+        let pool_second = make_pool(&b0_second, OWNER).await;
+        let refused_complete = restore::lock_gate_with_connection_origin(
+            &pool_second,
+            &GateLockRequest {
+                origin_us: e2.origin_us,
+                lifecycle_origin_us: e2.lifecycle_origin_us,
+                lifecycle_baseline_digest: e2.lifecycle_baseline_digest.as_deref(),
+                required_seq: e2.seq,
+                required_digest: &e2.digest,
+                coverage_complete: true,
+                replace_restore_run: None,
+                new_restore: true,
+            },
+            Some(t1),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused_complete,
+                Err(restore::Error::Database(sqlx::Error::Database(ref d)))
+                    if d.code().as_deref() == Some("OMR04")
+            ),
+            "restore #2 onto pre-gap backup with post-gap export must refuse --export-complete (OMR04), got {refused_complete:?}"
+        );
+
+        // Locking without `--export-complete` + running `accept-coverage-gap` reconciles b0_second!
+        let lock2 = restore::lock_gate_with_connection_origin(
+            &pool_second,
+            &GateLockRequest {
+                origin_us: e2.origin_us,
+                lifecycle_origin_us: e2.lifecycle_origin_us,
+                lifecycle_baseline_digest: e2.lifecycle_baseline_digest.as_deref(),
+                required_seq: e2.seq,
+                required_digest: &e2.digest,
+                coverage_complete: false,
+                replace_restore_run: None,
+                new_restore: true,
+            },
+            Some(t1),
+        )
+        .await
+        .unwrap();
+        let gap2 = admin_cli(
+            &b0_second.url(OWNER),
+            &[
+                "restore",
+                "accept-coverage-gap",
+                "--restore-run",
+                &lock2.restore_run_id,
+                "--operator-id",
+                "00000000-0000-4000-8000-000000000910",
+                "--request-key",
+                "two-restore-gap-2",
+                "--reason",
+                "second gap restore",
+            ],
+        );
+        assert!(gap2.status.success(), "{}", stderr(&gap2));
+        restore::apply(&pool_second, &e2).await.unwrap();
+        restore::finish(&pool_second, None, &e2).await.unwrap();
+
+        let mut owner2 = connect(&b0_second.0, OWNER).await;
+        let (st2, ct_null2, share_active2): (String, bool, bool) = sqlx::query_as(
+            "SELECT c.state,
+                    c.access_ciphertext IS NULL AND c.refresh_ciphertext IS NULL,
+                    EXISTS(SELECT 1 FROM openmettle.external_connection_shares s
+                            WHERE s.connection_id = c.id AND s.grantee_user_id = $2::uuid AND s.active)
+               FROM openmettle.external_connections c
+              WHERE c.id = $1::uuid",
+        )
+        .bind(&conn_id)
+        .bind(&bob_user)
+        .fetch_one(&mut owner2)
+        .await
+        .unwrap();
+        assert_eq!(
+            (st2.as_str(), ct_null2, share_active2),
+            ("reauth_required", true, false)
+        );
+    }
+
+    // --- (b) P2 #5: Online `vault rotate` preserves `credential_generation` and emits zero
+    //         `credential_superseded` rows; `authorizeConnection` replacement DOES supersede ---
+    {
+        let db = TestDb::migrated().await;
+        let k1 = [0x61u8; 32];
+        let k2 = [0x62u8; 32];
+        let ring_k1 = VaultKeyRing::new("k1".into(), vec![("k1".into(), k1)]).unwrap();
+        let ring_k1_k2 = Arc::new(
+            VaultKeyRing::new("k2".into(), vec![("k1".into(), k1), ("k2".into(), k2)]).unwrap(),
+        );
+        let (alice, alice_scope, conn_rot, conn_rep) = {
+            let mut owner = connect(&db.0, OWNER).await;
+            providers(&mut owner).await;
+            let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+            let alice_scope = personal_of(&db, &alice).await;
+            let mut api_conn = connect(&db.0, API).await;
+            let mut ids = Vec::new();
+            for suffix in ["rot-keep", "rep-super"] {
+                let cid = vault::create_connection(
+                    &mut api_conn,
+                    &ctx(&alice, &format!("p5-c-{suffix}")),
+                    &CreateConnectionInput {
+                        scope_id: &alice_scope,
+                        provider_kind: "github",
+                        account_id: &format!("acct-{suffix}"),
+                        origin: "https://api.example.test",
+                        allowed_scopes: &["issues.read".into()],
+                    },
+                )
+                .await
+                .unwrap()
+                .target_id()
+                .to_owned();
+                vault::authorize_connection(
+                    &mut api_conn,
+                    &ctx(&alice, &format!("p5-a-{suffix}")),
+                    &ring_k1,
+                    &cid,
+                    &AuthorizeConnectionInput {
+                        access_token: &format!("CANARY-P5-ORIG-{suffix}"),
+                        refresh_token: Some(&format!("CANARY-P5-ORIG-REF-{suffix}")),
+                        granted_scopes: &["issues.read".into()],
+                        expires_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+                ids.push(cid);
+            }
+            drop(api_conn);
+            drop(owner);
+            (alice, alice_scope, ids[0].clone(), ids[1].clone())
+        };
+
+        // Pre-rotation backup B_prerot (both rows encrypted under k1 at generation 1).
+        let b_prerot = backup_db(&db).await;
+
+        // On LIVE: rotate k1 -> k2! Must NOT bump credential_generation or journal supersession!
+        let dir = auth_config_support::Dir::new();
+        let cfg_k1_k2 = write_keyring_files(&dir, "p5-k1k2", "k2", &[("k1", k1), ("k2", k2)]);
+        let rot_out = admin_cli(
+            &db.url(OWNER),
+            &[
+                "vault",
+                "rotate",
+                "--vault-keys",
+                &cfg_k1_k2,
+                "--operator-id",
+                "00000000-0000-4000-8000-000000000911",
+                "--request-key",
+                "p5-rot-k2",
+                "--reason",
+                "rotate without supersession",
+            ],
+        );
+        assert!(rot_out.status.success(), "{}", stderr(&rot_out));
+        let mut live_owner = connect(&db.0, OWNER).await;
+        let (rot_key, rot_gen): (String, i64) = sqlx::query_as(
+            "SELECT encryption_key_id, credential_generation
+               FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_rot)
+        .fetch_one(&mut live_owner)
+        .await
+        .unwrap();
+        assert_eq!((rot_key.as_str(), rot_gen), ("k2", 1));
+        let superseded_after_rotate: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.deletion_journal
+              WHERE event_kind = 'external_connection.credential_superseded'",
+        )
+        .fetch_one(&mut live_owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded_after_rotate, 0,
+            "key rotation must emit zero credential_superseded journal rows"
+        );
+
+        // Now perform an ACTUAL upstream credential replacement on conn_rep -> MUST journal supersession!
+        let mut live_api = connect(&db.0, API).await;
+        vault::authorize_connection(
+            &mut live_api,
+            &ctx(&alice, "p5-replace-rep"),
+            &ring_k1_k2,
+            &conn_rep,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-P5-REPLACED",
+                refresh_token: Some("CANARY-P5-REPLACED-REF"),
+                granted_scopes: &["issues.read".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let superseded_after_replace: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.deletion_journal
+              WHERE event_kind = 'external_connection.credential_superseded'
+                AND entity_id = $1::uuid",
+        )
+        .bind(&conn_rep)
+        .fetch_one(&mut live_owner)
+        .await
+        .unwrap();
+        assert_eq!(superseded_after_replace, 1);
+
+        // Export journal from LIVE and replay onto pre-rotation backup `b_prerot` using the
+        // documented CLI `--export-complete --required-connection-origin` flags!
+        let export_file = dir.path("p5-live.export");
+        let exp_out = admin_cli(&db.url(OWNER), &["journal", "export", &export_file]);
+        assert!(exp_out.status.success(), "{}", stderr(&exp_out));
+        let exp_text = fs::read_to_string(&export_file).unwrap();
+        let parsed = restore::Export::parse(&exp_text).unwrap();
+        let conn_origin = parsed.connection_origin_us.unwrap().to_string();
+        let orig_s = parsed.origin_us.to_string();
+        let lc_orig_s = parsed.lifecycle_origin_us.unwrap().to_string();
+        let lc_base_s = parsed.lifecycle_baseline_digest.as_deref().unwrap();
+        let seq_s = parsed.seq.to_string();
+
+        let cli_lock = admin_cli(
+            &b_prerot.url(OWNER),
+            &[
+                "restore",
+                "lock",
+                "--required-origin",
+                &orig_s,
+                "--required-lifecycle-origin",
+                &lc_orig_s,
+                "--required-lifecycle-baseline-digest",
+                lc_base_s,
+                "--required-connection-origin",
+                &conn_origin,
+                "--required-seq",
+                &seq_s,
+                "--required-digest",
+                &parsed.digest,
+                "--export-complete",
+            ],
+        );
+        assert!(cli_lock.status.success(), "{}", stderr(&cli_lock));
+        let cli_replay = admin_cli(&b_prerot.url(OWNER), &["restore", "replay", &export_file]);
+        assert!(cli_replay.status.success(), "{}", stderr(&cli_replay));
+
+        // On b_prerot: conn_rot MUST stay authorized & decryptable with k1+k2 mounted,
+        // while conn_rep MUST be reauth_required with NULL ciphertexts!
+        let restored_worker_pool = make_pool(&b_prerot, WORKER).await;
+        let prov = VaultCredentialProvider::new(
+            restored_worker_pool,
+            ring_k1_k2,
+            None,
+            VaultConfig::default(),
+        );
+        match prov
+            .resolve(CredentialRequest {
+                connection_id: &conn_rot,
+                account_id: "acct-rot-keep",
+                scope_id: &alice_scope,
+                actor_user_id: &alice.user,
+                actor_approval_id: Some(&alice.approval),
+                expected_origin: Some("https://api.example.test"),
+                required_scope: Some("issues.read"),
+            })
+            .await
+        {
+            CredentialOutcome::Ready(c) => {
+                assert_eq!(c.bearer_token(), Some("CANARY-P5-ORIG-rot-keep"));
+            }
+            other => {
+                panic!("rotated-only backup row must stay authorized/decryptable, got {other:?}")
+            }
+        }
+        let mut prerot_owner = connect(&b_prerot.0, OWNER).await;
+        let (rep_state, rep_null): (String, bool) = sqlx::query_as(
+            "SELECT state, access_ciphertext IS NULL AND refresh_ciphertext IS NULL
+               FROM openmettle.external_connections WHERE id = $1::uuid",
+        )
+        .bind(&conn_rep)
+        .fetch_one(&mut prerot_owner)
+        .await
+        .unwrap();
+        assert_eq!((rep_state.as_str(), rep_null), ("reauth_required", true));
+    }
+
+    // --- (c) P2 #9: Documented recovery sequence for a schema-42 backup migrated to 43 ---
+    {
+        let live_s42 = TestDb::new().await;
+        let settings_42 = live_s42.settings(Duration::from_secs(30));
+        migrate::apply(&settings_42, &MIGRATIONS[..42])
+            .await
+            .unwrap();
+        let b_s42 = backup_db(&live_s42).await;
+
+        // Upgrade live to schema 43, create & authorize a connection, and export schema-43 journal.
+        let mig_live = run_cli(
+            &mut migrate_command(&live_s42.url(OWNER), &[]),
+            "openmettle-migrate live 42->43",
+        );
+        assert!(mig_live.status.success(), "{}", stderr(&mig_live));
+        let mut live_owner = connect(&live_s42.0, OWNER).await;
+        providers(&mut live_owner).await;
+        let alice = account(&mut live_owner, PROVIDER, true, FUTURE).await;
+        let alice_scope = personal_of(&live_s42, &alice).await;
+        let mut live_api = connect(&live_s42.0, API).await;
+        let ring = VaultKeyRing::new("k1".into(), vec![("k1".into(), [0x71u8; 32])]).unwrap();
+        let cid = vault::create_connection(
+            &mut live_api,
+            &ctx(&alice, "s42-c1"),
+            &CreateConnectionInput {
+                scope_id: &alice_scope,
+                provider_kind: "github",
+                account_id: "acct-s42",
+                origin: "https://api.example.test",
+                allowed_scopes: &["issues.read".into()],
+            },
+        )
+        .await
+        .unwrap()
+        .target_id()
+        .to_owned();
+        vault::authorize_connection(
+            &mut live_api,
+            &ctx(&alice, "s42-a1"),
+            &ring,
+            &cid,
+            &AuthorizeConnectionInput {
+                access_token: "CANARY-S42-LIVE",
+                refresh_token: None,
+                granted_scopes: &["issues.read".into()],
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let dir = auth_config_support::Dir::new();
+        let export_file = dir.path("s43-live.export");
+        let exp_out = admin_cli(&live_s42.url(OWNER), &["journal", "export", &export_file]);
+        assert!(exp_out.status.success(), "{}", stderr(&exp_out));
+        let exp_text = fs::read_to_string(&export_file).unwrap();
+        let parsed = restore::Export::parse(&exp_text).unwrap();
+        let orig_s = parsed.origin_us.to_string();
+        let lc_orig_s = parsed.lifecycle_origin_us.unwrap().to_string();
+        let lc_base_s = parsed.lifecycle_baseline_digest.as_deref().unwrap();
+        let conn_orig_s = parsed.connection_origin_us.unwrap().to_string();
+        let seq_s = parsed.seq.to_string();
+
+        // Step 1 on schema-42 backup: migrate 42 -> 43 during recovery (gets newer connection_origin).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mig_bak = run_cli(
+            &mut migrate_command(&b_s42.url(OWNER), &[]),
+            "openmettle-migrate backup 42->43",
+        );
+        assert!(mig_bak.status.success(), "{}", stderr(&mig_bak));
+
+        // Step 2 with `--export-complete`: MUST fail closed (OMR04) because backup predated 43!
+        let bad_lock = admin_cli(
+            &b_s42.url(OWNER),
+            &[
+                "restore",
+                "lock",
+                "--required-origin",
+                &orig_s,
+                "--required-lifecycle-origin",
+                &lc_orig_s,
+                "--required-lifecycle-baseline-digest",
+                lc_base_s,
+                "--required-connection-origin",
+                &conn_orig_s,
+                "--required-seq",
+                &seq_s,
+                "--required-digest",
+                &parsed.digest,
+                "--export-complete",
+            ],
+        );
+        assert!(
+            !bad_lock.status.success() && stderr(&bad_lock).contains("OMR04"),
+            "schema-42 backup upgraded during recovery must fail --export-complete with OMR04: {}",
+            stderr(&bad_lock)
+        );
+
+        // Step 2 without `--export-complete` + Step 4 `accept-coverage-gap` + Step 5 `restore replay`.
+        let ok_lock = admin_cli(
+            &b_s42.url(OWNER),
+            &[
+                "restore",
+                "lock",
+                "--required-origin",
+                &orig_s,
+                "--required-lifecycle-origin",
+                &lc_orig_s,
+                "--required-lifecycle-baseline-digest",
+                lc_base_s,
+                "--required-connection-origin",
+                &conn_orig_s,
+                "--required-seq",
+                &seq_s,
+                "--required-digest",
+                &parsed.digest,
+            ],
+        );
+        assert!(ok_lock.status.success(), "{}", stderr(&ok_lock));
+        let mut bak_owner = connect(&b_s42.0, OWNER).await;
+        let run_id: String = sqlx::query_scalar(
+            "SELECT restore_run_id::text FROM openmettle.restore_reconciliation_gate WHERE id",
+        )
+        .fetch_one(&mut bak_owner)
+        .await
+        .unwrap();
+        let gap = admin_cli(
+            &b_s42.url(OWNER),
+            &[
+                "restore",
+                "accept-coverage-gap",
+                "--restore-run",
+                &run_id,
+                "--operator-id",
+                "00000000-0000-4000-8000-000000000912",
+                "--request-key",
+                "s42-upgrade-gap-1",
+                "--reason",
+                "schema-42 backup migrated to 43 during recovery",
+            ],
+        );
+        assert!(gap.status.success(), "{}", stderr(&gap));
+        let replay = admin_cli(&b_s42.url(OWNER), &["restore", "replay", &export_file]);
+        assert!(replay.status.success(), "{}", stderr(&replay));
+        assert!(restore::gate_open(&mut bak_owner).await.unwrap());
     }
 }

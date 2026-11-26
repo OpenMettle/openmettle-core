@@ -328,8 +328,24 @@ BEGIN
         IF v_secrets_changed
            AND NEW.access_ciphertext IS NOT NULL
            AND NEW.credential_generation <= OLD.credential_generation THEN
-            RAISE EXCEPTION 'secret writes must advance credential_generation'
-                USING ERRCODE = '23514';
+            IF NOT (
+                v_is_owner
+                AND OLD.state = 'authorized'
+                AND NEW.state = 'authorized'
+                AND NEW.credential_generation = OLD.credential_generation
+                AND NEW.encryption_key_id IS DISTINCT FROM OLD.encryption_key_id
+                AND NEW.granted_scopes IS NOT DISTINCT FROM OLD.granted_scopes
+                AND NEW.expires_at IS NOT DISTINCT FROM OLD.expires_at
+                AND (NEW.refresh_ciphertext IS NOT NULL) = (OLD.refresh_ciphertext IS NOT NULL)
+                AND NEW.revocation_generation = OLD.revocation_generation
+                AND NEW.share_revision = OLD.share_revision
+                AND NEW.refresh_claim_token IS NOT DISTINCT FROM OLD.refresh_claim_token
+                AND NEW.refresh_lease_until IS NOT DISTINCT FROM OLD.refresh_lease_until
+                AND NEW.disconnected_at IS NOT DISTINCT FROM OLD.disconnected_at
+            ) THEN
+                RAISE EXCEPTION 'secret writes must advance credential_generation'
+                    USING ERRCODE = '23514';
+            END IF;
         END IF;
 
         IF NEW.state IN ('disconnected', 'reauth_required')
@@ -1951,6 +1967,18 @@ BEGIN
     UPDATE openmettle.restore_reconciliation_gate
        SET coverage_complete = true,
            connection_gap_reconciled = true
+     WHERE id;
+    UPDATE openmettle.deletion_journal_head
+       SET connection_coverage_started_at = greatest(
+               clock_timestamp(),
+               connection_coverage_started_at + interval '1 microsecond',
+               CASE
+                   WHEN g.required_connection_origin_us IS NOT NULL
+                        AND g.required_connection_origin_us < 9223372036854775807
+                   THEN timestamptz 'epoch' + (g.required_connection_origin_us + 1) * interval '1 microsecond'
+                   ELSE NULL
+               END
+           )
      WHERE id;
     RETURN true;
 END

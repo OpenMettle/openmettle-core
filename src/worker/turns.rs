@@ -77,6 +77,15 @@ pub trait TurnRoutes: Send + Sync + 'static {
             .map(DeclaredTool::internal)
             .collect()
     }
+    /// Server-owned declarations qualified for `model`, carrying pinned external contract
+    /// versions when applicable. Defaults to [`Self::declared_tools`].
+    fn declared_tools_for_model(
+        &self,
+        claim: &ClaimedRun,
+        _model: &Effective,
+    ) -> Vec<DeclaredTool> {
+        self.declared_tools(claim)
+    }
     /// A profile-qualified upper bound for the complete prompt with server tools and their
     /// results. The admission estimate covers the original conversation without these items.
     fn tool_prompt_bound(&self, _model: &Effective, _request: &Request) -> Option<u64> {
@@ -775,8 +784,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .map_err(lease_step)?
             };
             if has_pending_auto || has_turn_handoff {
-                let route_declared =
-                    Self::declared_tool_map(&self.routes.declared_tools(&run.claim))?;
+                let route_declared = Self::declared_tool_map(
+                    &self
+                        .routes
+                        .declared_tools_for_model(&run.claim, &config.effective),
+                )?;
                 let (used, expected_rounds, saved_rounds, saved_results, ops_by_key) = {
                     let mut c = self
                         .pool
@@ -1121,7 +1133,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
         loop {
             let (tools, offered_declarations) = if let Some(effects) = self.effects.as_deref() {
-                let raw = self.routes.declared_tools(&run.claim);
+                let raw = self
+                    .routes
+                    .declared_tools_for_model(&run.claim, &config.effective);
                 let raw_map = Self::declared_tool_map(&raw)?;
                 if raw.is_empty() {
                     (None, std::collections::BTreeMap::new())

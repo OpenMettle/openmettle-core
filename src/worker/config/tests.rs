@@ -559,3 +559,266 @@ fn external_mcp_configuration_validates_transports_refresh_routes_and_contracts(
         Error::ExternalMcp
     );
 }
+
+#[test]
+fn external_mcp_filters_declared_tools_by_route_functions_subset() {
+    use crate::{authz::runs::ClaimedRun, model_config::Selection};
+
+    let mut fixture = Fixture::new();
+    let ca_path = fixture.dir.write("mcp-ca.pem", &Ca::new().pem());
+    let conn_id = "00000000-0000-4000-8000-000000004552";
+    // Model "a" supports only flat tool schemas; model "b" is text-only (`functions: None`).
+    fixture.document["routes"]["a"]["functions"] = json!("flat");
+    fixture.document["routes"]["b"]
+        .as_object_mut()
+        .unwrap()
+        .remove("functions");
+    let make_tool = |tool_id: &str, schema: Value| {
+        json!({
+            "tool_id": tool_id,
+            "remote_name": tool_id,
+            "version": "1",
+            "description": "Synthetic MCP tool",
+            "input_schema": schema,
+            "connection_id": conn_id,
+            "account_id": "acct-1",
+            "action": "issues.read",
+            "fixed_resource": "default",
+            "class": "read",
+            "capability": "tool.github",
+            "gate": "on_by_default",
+            "tool_policy": "mcp.v1",
+            "destination_policy": "synth.v1",
+            "endpoint_id": "gh-mcp",
+            "endpoint_version": "1",
+            "authoritative_lookup": false,
+            "semantic_errors_are_side_effect_free": true,
+            "call_timeout_milliseconds": 5000
+        })
+    };
+    fixture.document["external_mcp"] = json!({
+        "connections": {
+            conn_id: {
+                "endpoint": "https://mcp.vendor.example.test/mcp",
+                "trust": { "roots": "bundle", "bundle_path": ca_path },
+                "private_cidrs": ["10.20.0.0/16"],
+                "setup_timeout_milliseconds": 2000,
+                "idle_read_timeout_milliseconds": 5000,
+                "call_timeout_milliseconds": 10000
+            }
+        },
+        "tools": [
+            make_tool(
+                "gh_flat",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["repo"],
+                    "properties": {
+                        "repo": { "type": "string", "minLength": 1, "maxLength": 64 }
+                    }
+                })
+            ),
+            make_tool(
+                "gh_nested",
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["filter"],
+                    "properties": {
+                        "filter": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "tag": { "type": "string", "maxLength": 32 }
+                            }
+                        }
+                    }
+                })
+            )
+        ]
+    });
+
+    let loaded = fixture.load().unwrap();
+    let dummy_claim = ClaimedRun {
+        scope_id: "00000000-0000-4000-8000-000000000001".into(),
+        run_id: "00000000-0000-4000-8000-000000000002".into(),
+        claim_token: "00000000-0000-4000-8000-000000000003".into(),
+        actor_approval_id: "00000000-0000-4000-8000-000000000004".into(),
+        round_limit: 5,
+        lease_remaining: Duration::from_secs(30),
+        execution_remaining: Duration::from_secs(30),
+    };
+    let eff_a = loaded
+        .catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({"model": "a"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let eff_b = loaded
+        .catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({"model": "b"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+
+    // Text-only route "b" receives zero tool declarations.
+    assert!(
+        loaded
+            .routes
+            .declared_tools_for_model(&dummy_claim, &eff_b)
+            .is_empty(),
+        "text-only route must receive zero tool declarations"
+    );
+    // Flat route "a" receives only `gh_flat` and excludes `gh_nested`.
+    let flat_names: Vec<String> = loaded
+        .routes
+        .declared_tools_for_model(&dummy_claim, &eff_a)
+        .into_iter()
+        .map(|dt| dt.tool.name)
+        .collect();
+    assert_eq!(flat_names, vec!["gh_flat".to_owned()]);
+
+    // Nested route receives both `gh_flat` and `gh_nested`.
+    fixture.document["routes"]["a"]["functions"] = json!("nested");
+    let loaded_nested = fixture.load().unwrap();
+    let nested_names: Vec<String> = loaded_nested
+        .routes
+        .declared_tools_for_model(&dummy_claim, &eff_a)
+        .into_iter()
+        .map(|dt| dt.tool.name)
+        .collect();
+    assert_eq!(
+        nested_names,
+        vec!["gh_flat".to_owned(), "gh_nested".to_owned()]
+    );
+}
+
+#[test]
+fn tool_prompt_bound_accounts_for_instructions_history_tools_and_results() {
+    use crate::model_config::Selection;
+
+    let mut fixture = Fixture::new();
+    let long_instructions = "I".repeat(220);
+    fixture.catalog(|c| {
+        c["models"]["a"]["context_window"] = json!(1600);
+        c["models"]["a"]["output_limit"] = json!(1024);
+        c["models"]["a"]["defaults"]["instructions"] = json!(long_instructions);
+        c["models"]["a"]["prompt_bound"] = json!({
+            "fixed_tokens": 100,
+            "tokens_per_turn": 20,
+            "tokens_per_part": 10,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 500
+        });
+    });
+    let loaded = fixture.load().unwrap();
+    let effective = loaded
+        .catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({
+                "model": "a",
+                "layer": { "controls": { "output_reserve": 1000 } }
+            }))
+            .unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let usable = effective.usable_input().expect("usable input");
+    assert_eq!(usable, 600);
+
+    // History + system instructions alone fit within usable_input (100 + 20+220 + 30+5 = 375 <= 600).
+    let history_only = inference::Request {
+        history: vec![History::User("hello".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let bound_base = loaded
+        .routes
+        .tool_prompt_bound(&effective, &history_only)
+        .expect("qualified bound");
+    assert_eq!(bound_base, 375);
+    assert!(bound_base <= usable);
+
+    // Adding tool declarations pushes the bound past usable_input (caught deterministically).
+    let with_tools = inference::Request {
+        history: vec![History::User("hello".into())],
+        tools: Some(vec![Tool {
+            name: "gh_list_issues".into(),
+            description: "D".repeat(220),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "repo": { "type": "string" } }
+            }),
+        }]),
+        parallel: None,
+        stream: false,
+    };
+    let bound_tools = loaded
+        .routes
+        .tool_prompt_bound(&effective, &with_tools)
+        .expect("qualified bound with tools");
+    assert!(
+        bound_tools > usable,
+        "tool declarations must push total bound ({bound_tools}) past usable_input ({usable})"
+    );
+
+    // Tool call + tool result continuation pushes the bound past usable_input.
+    let with_result = inference::Request {
+        history: vec![
+            History::User("hello".into()),
+            History::Assistant {
+                parts: vec![],
+                reasoning: None,
+                calls: vec![Call {
+                    id: "call_1".into(),
+                    name: "gh_list_issues".into(),
+                    arguments: json!({"repo": "openmettle-core"}),
+                }],
+            },
+            History::ToolResult {
+                id: "call_1".into(),
+                output: "R".repeat(220),
+            },
+        ],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let bound_result = loaded
+        .routes
+        .tool_prompt_bound(&effective, &with_result)
+        .expect("qualified bound with tool result");
+    assert!(
+        bound_result > usable,
+        "tool call and result must push total bound ({bound_result}) past usable_input ({usable})"
+    );
+
+    // A profile lacking `prompt_bound` fails closed (`None`), matching admission.
+    let eff_unqualified = loaded
+        .catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({"model": "b"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    assert!(
+        loaded
+            .routes
+            .tool_prompt_bound(&eff_unqualified, &history_only)
+            .is_none(),
+        "profile without qualified prompt_bound must fail closed"
+    );
+}

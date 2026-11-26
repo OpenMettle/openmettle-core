@@ -918,7 +918,12 @@ fn disambiguate_redacted_key(
     unreachable!("pigeonhole bound guarantees an unused key in 1..=max_probe")
 }
 
-fn redact_value_strings_with(value: &mut Value, needle: &str, marker: &str) {
+fn redact_value_strings_with(
+    value: &mut Value,
+    needle: &str,
+    marker: &str,
+    redact_primitives: bool,
+) {
     if needle.is_empty() {
         return;
     }
@@ -928,9 +933,21 @@ fn redact_value_strings_with(value: &mut Value, needle: &str, marker: &str) {
                 *s = redact_plain_str_with(s, needle, marker);
             }
         }
+        Value::Number(n) if redact_primitives => {
+            let raw = n.to_string();
+            if raw.contains(needle) {
+                *value = Value::String(redact_plain_str_with(&raw, needle, marker));
+            }
+        }
+        Value::Bool(b) if redact_primitives => {
+            let raw = if *b { "true" } else { "false" };
+            if raw.contains(needle) {
+                *value = Value::String(redact_plain_str_with(raw, needle, marker));
+            }
+        }
         Value::Array(items) => {
             for item in items {
-                redact_value_strings_with(item, needle, marker);
+                redact_value_strings_with(item, needle, marker, redact_primitives);
             }
         }
         Value::Object(map) => {
@@ -939,7 +956,7 @@ fn redact_value_strings_with(value: &mut Value, needle: &str, marker: &str) {
             let mut cursors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
             let mut out = Map::with_capacity(entries.len());
             for (k, mut v) in entries {
-                redact_value_strings_with(&mut v, needle, marker);
+                redact_value_strings_with(&mut v, needle, marker, redact_primitives);
                 let new_key = if k.contains(needle) {
                     let base = redact_plain_str_with(&k, needle, marker);
                     disambiguate_redacted_key(base, needle, &out, &original_keys, &mut cursors)
@@ -956,7 +973,7 @@ fn redact_value_strings_with(value: &mut Value, needle: &str, marker: &str) {
 
 fn redact_value_strings(value: &mut Value, handle: &str) {
     let marker = choose_safe_marker(handle);
-    redact_value_strings_with(value, handle, &marker);
+    redact_value_strings_with(value, handle, &marker, false);
 }
 
 fn has_json_escape_sequence(s: &str) -> bool {
@@ -1040,10 +1057,16 @@ fn sanitize_text_block(
         return choose_safe_marker(h);
     }
     // Preserve standalone RFC 8259 JSON number literals (trimmed only of RFC 8259 whitespace,
-    // never form-feed/vertical-tab) verbatim so integers exceeding `u64::MAX`
+    // never form-feed/vertical-tab) verbatim for handle redaction so integers exceeding `u64::MAX`
     // (e.g. `18446744073709551617`) never lose precision through `serde_json` `f64` conversion
-    // while short handles (e.g. `"1"`) still do not corrupt numeric tokens.
+    // while short handles (e.g. `"1"`) still do not corrupt numeric tokens. Reflected bearer
+    // credentials are always redacted even inside numeric literals.
     if is_json_number_literal(json_trimmed) {
+        if let Some(s) = secret
+            && block.contains(s)
+        {
+            return redact_plain_str_with(block, s, &choose_credential_marker(s));
+        }
         return block.to_owned();
     }
     if let Ok(mut parsed) = serde_json::from_str::<Value>(block) {
@@ -1055,7 +1078,7 @@ fn sanitize_text_block(
         }
         if let Some(s) = secret {
             let marker = choose_credential_marker(s);
-            redact_value_strings_with(&mut parsed, s, &marker);
+            redact_value_strings_with(&mut parsed, s, &marker, true);
         }
         parsed.sort_all_objects();
         return parsed.to_string();
@@ -1103,7 +1126,7 @@ fn sanitize_tool_success(
     // Valid handles reject control characters (`'\n'`), so joining sanitized blocks with `"\n"`
     // cannot form a handle across a block boundary, while per-block JSON sanitization preserves
     // numeric/boolean JSON tokens (e.g. `"count": 1` when `handle == "1"`).
-    let text = if !success.content_blocks.is_empty() {
+    let mut text = if !success.content_blocks.is_empty() {
         let mut sanitized_blocks = Vec::with_capacity(success.content_blocks.len());
         for block in &success.content_blocks {
             sanitized_blocks.push(sanitize_text_block(
@@ -1124,7 +1147,7 @@ fn sanitize_tool_success(
         }
         if let Some(s) = secret {
             let marker = choose_credential_marker(s);
-            redact_value_strings_with(&mut sanitized, s, &marker);
+            redact_value_strings_with(&mut sanitized, s, &marker, true);
         }
         sanitized.sort_all_objects();
         sanitized.to_string()
@@ -1139,6 +1162,19 @@ fn sanitize_tool_success(
         }
         plain
     };
+    if let Some(s) = secret {
+        let marker = choose_credential_marker(s);
+        if text.contains(s) {
+            text = redact_plain_str_with(&text, s, &marker);
+        }
+        if text.contains(s) {
+            text = marker;
+        }
+        assert!(
+            !text.contains(s),
+            "credential secret survived tool output sanitization"
+        );
+    }
     Ok((text, handle))
 }
 
@@ -2169,5 +2205,59 @@ mod tests {
             sanitize_tool_success(&poisoned_handle, Some("handle"), Some(secret)),
             Err(ToolFault::TerminalRefusal)
         );
+    }
+
+    #[test]
+    fn sanitize_tool_success_redacts_numeric_and_bool_reflected_bearer() {
+        let numeric_bearer = "9876543210123456";
+        let in_json_number = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![
+                json!({"echo_num": 9876543210123456u64, "nested": [9876543210123456u64]})
+                    .to_string(),
+                "9876543210123456".into(),
+                "198765432101234569".into(),
+            ],
+            structured: None,
+            meta: None,
+        };
+        let (num_out, _) =
+            sanitize_tool_success(&in_json_number, None, Some(numeric_bearer)).unwrap();
+        assert!(
+            !num_out.contains(numeric_bearer),
+            "numeric bearer leaked in content_blocks: {num_out}"
+        );
+        assert!(num_out.contains("[REDACTED_CREDENTIAL]"), "{num_out}");
+
+        let in_structured_number = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(json!({"echo_num": 9876543210123456u64, "ok": true})),
+            meta: None,
+        };
+        let (s_num_out, _) =
+            sanitize_tool_success(&in_structured_number, None, Some(numeric_bearer)).unwrap();
+        assert!(
+            !s_num_out.contains(numeric_bearer),
+            "numeric bearer leaked in structured: {s_num_out}"
+        );
+        let parsed: Value = serde_json::from_str(&s_num_out).expect("valid JSON");
+        assert_eq!(parsed["echo_num"], "[REDACTED_CREDENTIAL]");
+        assert_eq!(parsed["ok"], true);
+
+        let in_bool = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(json!({"flag": true, "other": false})),
+            meta: None,
+        };
+        let (bool_out, _) = sanitize_tool_success(&in_bool, None, Some("true")).unwrap();
+        assert!(
+            !bool_out.contains("true"),
+            "boolean bearer leaked: {bool_out}"
+        );
+        let parsed_bool: Value = serde_json::from_str(&bool_out).expect("valid JSON");
+        assert_eq!(parsed_bool["flag"], "[REDACTED_CREDENTIAL]");
+        assert_eq!(parsed_bool["other"], false);
     }
 }
