@@ -518,6 +518,51 @@ impl CapacityWaitOutcome {
     }
 }
 
+/// Closed outcome set for periodic storage and quota accounting drift verification (ADR 0040).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaDriftOutcome {
+    Healthy,
+    StorageAccounts,
+    Budgets,
+    Settlements,
+    Files,
+    Quarantined,
+    Error,
+    Timeout,
+}
+
+impl QuotaDriftOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Healthy,
+        Self::StorageAccounts,
+        Self::Budgets,
+        Self::Settlements,
+        Self::Files,
+        Self::Quarantined,
+        Self::Error,
+        Self::Timeout,
+    ];
+    pub const NAMES: &'static [&'static str] = &[
+        "healthy",
+        "storage_accounts",
+        "budgets",
+        "settlements",
+        "files",
+        "quarantined",
+        "error",
+        "timeout",
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Instrument kind recorded in telemetry contract v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -802,6 +847,18 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: Some(&DURATION_BUCKETS),
     },
+    MetricDescriptor {
+        name: "openmettle.storage.quota.drift",
+        prometheus_name: "openmettle_storage_quota_drift_total",
+        kind: InstrumentKind::Counter,
+        unit: "{observation}",
+        description: "Periodic storage and quota accounting drift verification observations.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: QuotaDriftOutcome::NAMES,
+        }],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -836,6 +893,7 @@ const DROPPED_SLOTS: usize = DroppedSignal::NAMES.len();
 const CAPACITY_GRANT_SLOTS: usize = CapacityOperation::NAMES.len() * CapacityOutcome::NAMES.len();
 const CAPACITY_STALE_SLOTS: usize = CapacityStaleSurface::NAMES.len();
 const CAPACITY_WAIT_SLOTS: usize = CapacityWaitOutcome::NAMES.len();
+const QUOTA_DRIFT_SLOTS: usize = QuotaDriftOutcome::NAMES.len();
 
 struct HistogramSlot {
     buckets: [AtomicU64; BUCKET_SLOTS],
@@ -894,6 +952,7 @@ pub struct Metrics {
     capacity_grants: [AtomicU64; CAPACITY_GRANT_SLOTS],
     capacity_stale_observations: [AtomicU64; CAPACITY_STALE_SLOTS],
     capacity_wait_duration: [HistogramSlot; CAPACITY_WAIT_SLOTS],
+    quota_drift: [AtomicU64; QUOTA_DRIFT_SLOTS],
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -935,6 +994,7 @@ impl Metrics {
             capacity_grants: std::array::from_fn(|_| AtomicU64::new(0)),
             capacity_stale_observations: std::array::from_fn(|_| AtomicU64::new(0)),
             capacity_wait_duration: std::array::from_fn(|_| HistogramSlot::new()),
+            quota_drift: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -1016,6 +1076,12 @@ impl Metrics {
 
     pub fn record_capacity_wait(&self, outcome: CapacityWaitOutcome, elapsed: Duration) {
         self.capacity_wait_duration[outcome.index()].observe(elapsed);
+    }
+
+    pub fn record_quota_drift(&self, outcome: QuotaDriftOutcome, count: u64) {
+        if count > 0 {
+            self.quota_drift[outcome.index()].fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
@@ -1267,6 +1333,25 @@ impl Metrics {
             }
         }
         push_histogram(&mut metrics, &DESCRIPTORS[14], wait_hpoints);
+
+        // 15: openmettle.storage.quota.drift
+        // Always emit all 8 closed outcome series (including 0) on `openmettle-worker` from startup
+        // so Prometheus records a zero baseline before the first hourly drift, error or timeout
+        // observation; otherwise `increase(...[3h])` treats a first mismatch as a series
+        // appearance with zero increase. These 8 streams are already counted in `max_series: 8`.
+        let mut drift_points = Vec::new();
+        for &outcome in QuotaDriftOutcome::ALL {
+            let value = self.quota_drift[outcome.index()].load(Ordering::Relaxed);
+            if value > 0 || role == Process::Worker {
+                drift_points.push(counter_point(
+                    start,
+                    now,
+                    value,
+                    &[("outcome", outcome.as_str())],
+                ));
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
 
         if metrics.is_empty() {
             return None;

@@ -4,6 +4,10 @@ Status: accepted with its implementation; V1-02 implementation contract, 17 Nove
 #3 and sprint #34. Independent review and qualification remain required. This increment
 adds migration 5 without changing released migrations 1–4. It exposes no product API.
 
+> *Status update (26 November 2026):* `#3` (V1-02) was completed and closed on 17 November 2026
+> following final-head verification and review. Historical notes below retain their 17 November
+> 2026 context.
+
 ## Scope and storage vocabulary
 
 Four tables store project assignments and resource assignments for existing conversations
@@ -184,3 +188,5 @@ V1-02 remains open until final-head evidence and independent review reconcile al
 V1-04 owns issuer validation, provider configuration and bounded membership reconciliation;
 V1-05 owns authorization and effective-access invalidation; V1-15/16/17 own artifact delivery,
 retention execution and quota services. None is claimed complete by this schema increment.
+
+*(Update, 26 November 2026: `#3` / V1-02 was completed and closed on 17 November 2026.)*

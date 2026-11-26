@@ -1,8 +1,9 @@
 # 0039 — Scoped MCP adapter, reviewed tool contracts and bounded spill artifacts
 
-Status: proposed V1-14 design (PR1), 21 November 2026. Refs #14. The base is `main` at
-`45df33c60e7a84fe8a2db0a8e2d9b93a8d29e5a5` (schema 22). PR2 and PR3 own implementation and
-qualification. Dependencies: [V1-03](https://github.com/OpenMettle/openmettle-core/issues/4),
+Status: accepted with its implementation (updated 26 November 2026; originally proposed for
+V1-14 PR1 on 21 November 2026 against `main` `45df33c60e7a84fe8a2db0a8e2d9b93a8d29e5a5`,
+schema 22; implementation merged in PR #139 and PR #182). Refs #14. Dependencies:
+[V1-03](https://github.com/OpenMettle/openmettle-core/issues/4),
 [V1-05](https://github.com/OpenMettle/openmettle-core/issues/6),
 [V1-13](https://github.com/OpenMettle/openmettle-core/issues/13),
 [V1-17](https://github.com/OpenMettle/openmettle-core/issues/17) (PR2) and

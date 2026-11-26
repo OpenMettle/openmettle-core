@@ -5,8 +5,8 @@ use openmettle_core::telemetry::{
     metrics::{
         self, CONTRACT_VERSION, CapacityOperation, CapacityOutcome, CapacityStaleSurface,
         CapacityWaitOutcome, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind, Metrics,
-        ProviderOperation, ProviderOutcome, ReadinessOutcome, RouteClass, StatusClass,
-        StorageOperation, StorageOutcome,
+        ProviderOperation, ProviderOutcome, QuotaDriftOutcome, ReadinessOutcome, RouteClass,
+        StatusClass, StorageOperation, StorageOutcome,
     },
 };
 use opentelemetry_proto::tonic::metrics::v1::metric;
@@ -225,8 +225,8 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         Some(total_prom_series as u64)
     );
 
-    // Reserved signals reconcile the V1-18 / V1-17 ownership split: capacity.grants is now
-    // implemented in `metrics`, and storage.quota.drift belongs to V1-17.
+    // Both capacity.grants (V1-18) and storage.quota.drift (V1-17) are now implemented in
+    // `metrics`; only V1-10 queue age and V1-30 backup runs remain reserved.
     let reserved = contract["reserved_signals"].as_array().unwrap();
     let mut reserved_by_name = BTreeMap::new();
     for entry in reserved {
@@ -242,18 +242,25 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         );
     }
     assert_eq!(
-        reserved_by_name.get("openmettle.storage.quota.drift"),
-        Some(&"V1-17")
+        reserved_by_name.get("openmettle.runs.queue.age"),
+        Some(&"V1-10")
     );
+    assert_eq!(
+        reserved_by_name.get("openmettle.backup.runs"),
+        Some(&"V1-30")
+    );
+    assert_eq!(reserved_by_name.len(), 2);
+    assert!(!reserved_by_name.contains_key("openmettle.storage.quota.drift"));
     assert!(!reserved_by_name.contains_key("openmettle.capacity.grants"));
     for implemented in [
         "openmettle.capacity.grants",
         "openmettle.capacity.observations.stale",
         "openmettle.capacity.wait.duration",
+        "openmettle.storage.quota.drift",
     ] {
         assert!(
             seen_otel.contains(implemented),
-            "missing V1-18 metric {implemented}"
+            "missing implemented v1 metric {implemented}"
         );
     }
 }
@@ -281,6 +288,35 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             }));
         }
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
+    }
+
+    // Worker baseline additionally emits zero-initialized overdue handoffs and all 8 quota drift outcomes.
+    let worker_baseline = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("fresh worker registry emits zero-initialized baseline series");
+    let worker_metrics = &worker_baseline.resource_metrics[0].scope_metrics[0].metrics;
+    let worker_names: Vec<&str> = worker_metrics.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        worker_names,
+        [
+            "openmettle.telemetry.dropped",
+            "openmettle.quota.overdue.handoffs",
+            "openmettle.storage.quota.drift",
+        ]
+    );
+    match worker_metrics[2].data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), QuotaDriftOutcome::ALL.len());
+            assert!(sum.data_points.iter().all(|dp| {
+                matches!(
+                    dp.value,
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+                    )
+                )
+            }));
+        }
+        other => panic!("expected Sum for openmettle.storage.quota.drift, got {other:?}"),
     }
 
     // An overdue handoff can be observed again on a later sweep.
@@ -333,6 +369,9 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
     for &outcome in CapacityWaitOutcome::ALL {
         store.record_capacity_wait(outcome, Duration::from_millis(25));
+    }
+    for &outcome in QuotaDriftOutcome::ALL {
+        store.record_quota_drift(outcome, 1);
     }
 
     let request = store
@@ -473,7 +512,7 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         .lines()
         .filter(|line| line.trim_start().starts_with("- alert:"))
         .count();
-    assert!(alert_count >= 4, "expected at least 4 v1 alert rules");
+    assert!(alert_count >= 5, "expected at least 5 v1 alert rules");
     assert!(yaml.contains("signal_contract: v1"));
 
     let exprs = extract_alert_exprs(&yaml);
@@ -571,7 +610,11 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         }
     }
     assert!(
-        found_metrics.len() >= 4,
-        "expected alerts covering HTTP, DB readiness, telemetry drops and provider transport; got {found_metrics:?}"
+        found_metrics.len() >= 5,
+        "expected alerts covering HTTP, DB readiness, telemetry drops, provider transport and quota drift; got {found_metrics:?}"
+    );
+    assert!(
+        found_metrics.contains("openmettle_storage_quota_drift_total"),
+        "expected alert covering openmettle_storage_quota_drift_total; got {found_metrics:?}"
     );
 }
