@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 412,
-    "max_prometheus_series_per_process": 1075,
+    "max_data_point_streams": 468,
+    "max_prometheus_series_per_process": 1196,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -310,12 +310,56 @@
       "unit": "{observation}",
       "max_series": 3,
       "labels": {"lag": ["under_minute", "under_hour", "hour_or_more"]}
+    },
+    {
+      "name": "openmettle.capacity.grants",
+      "prometheus_name": "openmettle_capacity_grants_total",
+      "kind": "counter",
+      "unit": "{decision}",
+      "max_series": 48,
+      "labels": {
+        "operation": ["grant", "reconcile", "reclaim", "resume"],
+        "outcome": [
+          "granted",
+          "insufficient",
+          "unavailable",
+          "released",
+          "not_allocated",
+          "releasing",
+          "unknown_allocation",
+          "resumed",
+          "fenced",
+          "expired",
+          "refused",
+          "error"
+        ]
+      }
+    },
+    {
+      "name": "openmettle.capacity.observations.stale",
+      "prometheus_name": "openmettle_capacity_observations_stale_total",
+      "kind": "counter",
+      "unit": "{observation}",
+      "max_series": 3,
+      "labels": {
+        "surface": ["controller", "v1_user", "v1_admin"]
+      }
+    },
+    {
+      "name": "openmettle.capacity.wait.duration",
+      "prometheus_name": "openmettle_capacity_wait_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "max_series": 5,
+      "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+      "labels": {
+        "outcome": ["granted", "busy", "unavailable", "timeout", "cancelled"]
+      }
     }
   ],
   "reserved_signals": [
     {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"},
-    {"name": "openmettle.capacity.grants", "owner_ticket": "V1-17", "status": "planned"},
-    {"name": "openmettle.storage.quota.drift", "owner_ticket": "V1-18", "status": "planned"},
+    {"name": "openmettle.storage.quota.drift", "owner_ticket": "V1-17", "status": "planned"},
     {"name": "openmettle.backup.runs", "owner_ticket": "V1-30", "status": "planned"}
   ]
 }

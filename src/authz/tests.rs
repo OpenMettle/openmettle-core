@@ -94,7 +94,7 @@ const READS: [Action; 4] = [
     Action::Search,
     Action::Download,
 ];
-const ALL: [Action; 18] = [
+const ALL: [Action; 19] = [
     Action::Read,
     Action::Write,
     Action::Stream,
@@ -111,6 +111,7 @@ const ALL: [Action; 18] = [
     Action::ManageUserCapabilityDenies,
     Action::ManageQuotas,
     Action::ManageFamilyPolicies,
+    Action::InspectCapacity,
     Action::ManageAccountAdmin,
     Action::ManageAccounts,
 ];
@@ -322,6 +323,7 @@ fn scope_rejects_actions_outside_its_domain() {
         Action::ManageUserCapabilityDenies,
         Action::ManageQuotas,
         Action::ManageFamilyPolicies,
+        Action::InspectCapacity,
         Action::ManageAccountAdmin,
         Action::ManageAccounts,
     ] {
@@ -986,6 +988,7 @@ fn account_admin_manages_accounts_groups_denies_quotas_and_admins() {
         Action::ManageUserCapabilityDenies,
         Action::ManageQuotas,
         Action::ManageFamilyPolicies,
+        Action::InspectCapacity,
         Action::ManageAccountAdmin,
     ] {
         assert_eq!(
@@ -1040,12 +1043,87 @@ fn admin_rejects_content_and_project_actions() {
         );
     }
     // Only lifecycle actions can remove an admin.
-    for a in [Action::ManageQuotas, Action::ManageFamilyPolicies] {
+    for a in [
+        Action::ManageQuotas,
+        Action::ManageFamilyPolicies,
+        Action::InspectCapacity,
+    ] {
         assert_eq!(
             authorize_admin(&admin("adm"), admin_change(a, true, 3)),
             refused(PolicyReason::NotApplicable)
         );
     }
+}
+
+#[test]
+fn capacity_inspection_requires_admin_or_opt_in_capability_and_grants_no_content_access() {
+    let platform = PlatformPolicy::default();
+    assert_eq!(
+        authorize_capacity_inspection(&admin("adm"), &platform),
+        ALLOW
+    );
+    assert_eq!(
+        authorize_capacity_inspection(&user("plain"), &platform),
+        refused(PolicyReason::CapabilityNotGranted)
+    );
+
+    let mut operator = user("op");
+    operator
+        .granted_capabilities
+        .insert(CAPABILITY_INSPECT_CAPACITY.into());
+    assert_eq!(authorize_capacity_inspection(&operator, &platform), ALLOW);
+    // Administrative inspection grants no content or project access.
+    assert_eq!(
+        authorize_scope(&operator, &Scope::Project(project()), Action::Read),
+        HIDDEN
+    );
+    assert_eq!(
+        authorize_resource(&operator, &conversation("ed"), Action::Read),
+        HIDDEN
+    );
+
+    // User-level and platform-level denies block both opt-in operators AND account_admins (ADR 0027).
+    let mut denied_op = operator.clone();
+    denied_op
+        .denied_capabilities
+        .insert(CAPABILITY_INSPECT_CAPACITY.into());
+    assert_eq!(
+        authorize_capacity_inspection(&denied_op, &platform),
+        refused(PolicyReason::CapabilityDenied)
+    );
+    let mut denied_admin = admin("adm");
+    denied_admin
+        .denied_capabilities
+        .insert(CAPABILITY_INSPECT_CAPACITY.into());
+    assert_eq!(
+        authorize_capacity_inspection(&denied_admin, &platform),
+        refused(PolicyReason::CapabilityDenied)
+    );
+    let platform_denied = PlatformPolicy {
+        denied_capabilities: [CAPABILITY_INSPECT_CAPACITY.to_owned()].into(),
+    };
+    assert_eq!(
+        authorize_capacity_inspection(&operator, &platform_denied),
+        refused(PolicyReason::CapabilityDenied)
+    );
+    assert_eq!(
+        authorize_capacity_inspection(&admin("adm"), &platform_denied),
+        refused(PolicyReason::CapabilityDenied)
+    );
+
+    // Inactive admin or operator fails closed as unauthenticated/inactive.
+    let mut inactive_admin = admin("adm");
+    inactive_admin.approval_active = false;
+    assert_eq!(
+        authorize_capacity_inspection(&inactive_admin, &platform),
+        INACTIVE
+    );
+    let mut inactive_op = operator;
+    inactive_op.account_active = false;
+    assert_eq!(
+        authorize_capacity_inspection(&inactive_op, &platform),
+        INACTIVE
+    );
 }
 
 // --- Capabilities ---------------------------------------------------------------------------

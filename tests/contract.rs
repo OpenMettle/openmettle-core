@@ -714,8 +714,9 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 
 type Decode = fn(&Value) -> Result<(), String>;
 
-/// The consumer's decoders of the V1-05 project, conversation, artifact and V1-17 quota responses.
-fn v1_decoders() -> [(&'static str, Decode); 10] {
+/// The consumer's decoders of the V1-05 project, conversation, artifact, V1-17 quota and V1-18
+/// capacity responses.
+fn v1_decoders() -> [(&'static str, Decode); 12] {
     [
         ("#/components/schemas/Run", |v| {
             consumer::decode_run(v).map(drop)
@@ -746,6 +747,12 @@ fn v1_decoders() -> [(&'static str, Decode); 10] {
         }),
         ("#/components/schemas/QuotaOverride", |v| {
             consumer::decode_quota_override(v).map(drop)
+        }),
+        ("#/components/schemas/CapacitySummary", |v| {
+            consumer::decode_capacity_summary(v).map(drop)
+        }),
+        ("#/components/schemas/AdminCapacityGroupList", |v| {
+            consumer::decode_admin_capacity_groups(v).map(drop)
         }),
     ]
 }
@@ -1462,6 +1469,18 @@ fn mounted_api_problems_conform_to_the_contract() {
             Validation,
         ),
         (format!("GET /v1/quotas/personal HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
+        // Capacity routes: query rejection before DB, wrong method 404, unreachable primary 503.
+        (format!("GET /v1/capacity?extra=1 HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        (
+            format!("GET /v1/admin/capacity/groups?extra=1 HTTP/1.1\r\n{bearer}\r\n"),
+            Validation,
+        ),
+        (format!("GET /v1/capacity HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
+        (
+            format!("GET /v1/admin/capacity/groups HTTP/1.1\r\n{bearer}\r\n"),
+            Unavailable,
+        ),
+        ("POST /v1/capacity HTTP/1.1\r\n\r\n".into(), NotFound),
         // Paths and methods the contract does not define.
         ("GET /v1/CANARY-path HTTP/1.1\r\n\r\n".into(), NotFound),
         ("DELETE /v1/capabilities HTTP/1.1\r\n\r\n".into(), NotFound),
@@ -1830,4 +1849,102 @@ fn consumer_decodes_wide_quota_counters_overrides_and_closed_problem_quota() {
     );
     assert!(consumer::decode_problem(&fixture("ProblemQuota--quota-unknown-field")).is_err());
     assert!(consumer::decode_problem(&fixture("ProblemQuota--quota-bad-scope-kind")).is_err());
+}
+
+#[test]
+fn consumer_decodes_capacity_visibility_and_admin_group_observations() {
+    use consumer::CapacityAvailability as A;
+
+    let mixed = consumer::decode_capacity_summary(&fixture("CapacitySummaryMixed")).unwrap();
+    assert_eq!(mixed.len(), 4);
+    assert_eq!(
+        (
+            mixed[0].profile.as_str(),
+            &mixed[0].availability,
+            mixed[0].estimated_wait_seconds
+        ),
+        ("chat.base", &A::Ready, None)
+    );
+    assert!(mixed[0].availability.ready_now());
+    assert_eq!(
+        (
+            mixed[1].profile.as_str(),
+            &mixed[1].availability,
+            mixed[1].estimated_wait_seconds
+        ),
+        ("media.image", &A::Busy, None)
+    );
+    assert_eq!(
+        (
+            mixed[2].profile.as_str(),
+            &mixed[2].availability,
+            mixed[2].estimated_wait_seconds
+        ),
+        ("media.video", &A::QueuedEstimate, Some(30))
+    );
+    assert_eq!(
+        (
+            mixed[3].profile.as_str(),
+            &mixed[3].availability,
+            mixed[3].estimated_wait_seconds
+        ),
+        ("eval.large", &A::Unavailable, None)
+    );
+
+    assert!(
+        consumer::decode_capacity_summary(&fixture("CapacitySummaryEmpty"))
+            .unwrap()
+            .is_empty()
+    );
+    let compat = consumer::decode_capacity_summary(&fixture(
+        "CapacitySummaryMixed--unrecognized-availability",
+    ))
+    .unwrap();
+    assert_eq!(compat[0].availability, A::Unrecognized("warming".into()));
+    assert!(!compat[0].availability.ready_now());
+
+    for invalid in [
+        "CapacitySummaryMixed--queued-estimate-missing-wait",
+        "CapacitySummaryMixed--ready-with-wait",
+        "CapacitySummaryMixed--zero-wait",
+    ] {
+        assert!(
+            consumer::decode_capacity_summary(&fixture(invalid)).is_err(),
+            "{invalid}"
+        );
+    }
+
+    let groups =
+        consumer::decode_admin_capacity_groups(&fixture("AdminCapacityGroupListTypical")).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups[0].admits_bursts);
+    assert_eq!(
+        (groups[0].controller_epoch, groups[0].observation_revision),
+        (3, 12)
+    );
+    assert_eq!(
+        groups[0].observed_at.as_deref(),
+        Some("2026-11-25T12:00:00.123456Z")
+    );
+    assert_eq!(groups[0].totals.effective_grantable_bytes, 8_589_934_592);
+    assert_eq!(groups[0].devices.len(), 2);
+    assert_eq!(
+        groups[0].devices[0].effective_grantable_bytes,
+        1_073_741_824
+    );
+    assert!(!groups[1].admits_bursts);
+    assert!(groups[1].observed_at.is_none());
+    assert!(groups[1].devices.is_empty());
+
+    let wide = consumer::decode_admin_capacity_groups(&fixture(
+        "AdminCapacityGroupListTypical--wide-group-totals",
+    ))
+    .unwrap();
+    assert_eq!(wide[0].totals.total_bytes, 27_670_116_110_564_327_421u128);
+    assert!(
+        consumer::decode_admin_capacity_groups(&fixture(
+            "AdminCapacityGroupListTypical--device-bytes-above-signed-64"
+        ))
+        .is_err()
+    );
 }
