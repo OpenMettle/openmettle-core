@@ -6057,7 +6057,7 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
         let mut live_owner = connect(&live.0, OWNER).await;
         sqlx::query(
             "UPDATE openmettle.retention_policy
-                SET min_grace_seconds = 0, max_grace_seconds = 86400, grace_seconds = 1
+                SET min_grace_seconds = 0, max_grace_seconds = 86400, grace_seconds = 3600
               WHERE id",
         )
         .execute(&mut live_owner)
@@ -6138,15 +6138,16 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
     let (ok, _, err) = cli(&live, &["storage", "adopt", store_root.to_str().unwrap()]);
     assert!(ok, "storage adopt failed: {err}");
 
-    // Capture backups at schema 41 while both revisions are 'retained' with 1s grace.
+    // Capture backups at schema 41 while both revisions are 'retained' with a generous 3600s grace
+    // window so setup time on slow CI runners can never expire `rev_keep` before primary restore.
     let pre42_backup = backup(&live).await;
     let spoof_backup = backup(&live).await;
     let conflict_purging_backup = backup(&live).await;
     let conflict_future_backup = backup(&live).await;
     let conflict_unverified_backup = backup(&live).await;
 
-    // On primary (still schema 41): restore `rev_keep` back to 'active', wait past 1s grace so
-    // the backup's old deadline on `rev_keep` is strictly expired, and purge `rev_purge`.
+    // On primary (still schema 41): restore `rev_keep` back to 'active', then backdate `rev_purge`
+    // into the past and purge it cleanly without wall-clock sleeps.
     {
         let mut live_owner = connect(&live.0, OWNER).await;
         let mut restore_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
@@ -6154,11 +6155,16 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
             .await
             .unwrap();
         restore_tx.commit().await.unwrap();
-        live_owner.close().await.unwrap();
-    }
-    sleep_past_grace().await;
-    {
-        let mut live_owner = connect(&live.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.artifact_revisions
+                SET retained_at = clock_timestamp() - interval '10 seconds',
+                    purge_after = clock_timestamp() - interval '5 seconds'
+              WHERE id = $1::uuid",
+        )
+        .bind(&rev_purge)
+        .execute(&mut live_owner)
+        .await
+        .unwrap();
         let mut claim_tx = WriteTransaction::begin(&mut live_owner).await.unwrap();
         openmettle_core::storage::begin_purge(&mut claim_tx, &scope, &rev_purge)
             .await
@@ -6170,6 +6176,23 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
             .unwrap();
         confirm_tx.commit().await.unwrap();
         live_owner.close().await.unwrap();
+    }
+
+    // Backdate `rev_keep` on `pre42_backup` (still schema 41) before upgrading primary/backup to 42
+    // so `rev_keep`'s backup deadline IS already strictly expired if replay failed to restore it.
+    {
+        let mut b_owner = connect(&pre42_backup.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.artifact_revisions
+                SET retained_at = clock_timestamp() - interval '10 seconds',
+                    purge_after = clock_timestamp() - interval '5 seconds'
+              WHERE id = $1::uuid",
+        )
+        .bind(&rev_keep)
+        .execute(&mut b_owner)
+        .await
+        .unwrap();
+        b_owner.close().await.unwrap();
     }
 
     // Upgrade primary to 42: baseline is EMPTY (rev_keep is active, rev_purge is purged), seq = 1.
@@ -6376,6 +6399,16 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
     // --- Part D1: Unresolved orphaned 'purging' row absent from baseline & journal -> OMR04 ---
     {
         let mut o = connect(&conflict_purging_backup.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.artifact_revisions
+                SET retained_at = clock_timestamp() - interval '10 seconds',
+                    purge_after = clock_timestamp() - interval '5 seconds'
+              WHERE id = $1::uuid",
+        )
+        .bind(&rev_keep)
+        .execute(&mut o)
+        .await
+        .unwrap();
         let mut tx = WriteTransaction::begin(&mut o).await.unwrap();
         openmettle_core::storage::begin_purge(&mut tx, &scope, &rev_keep)
             .await
@@ -6391,7 +6424,7 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
     .await
     .unwrap();
     let cp_owner = pool(&conflict_purging_backup, OWNER).await;
-    restore::lock_gate(
+    let cp_locked = restore::lock_gate(
         &cp_owner,
         &restore::GateLockRequest {
             origin_us: export.origin_us,
@@ -6498,31 +6531,364 @@ async fn baseline_replay_reconciles_pre42_restored_revision_to_active_and_reject
     );
     assert!(!gate(&conflict_unverified_backup).await.0);
 
-    // --- Part E: Stray post-snapshot `restored` / `deadline_adjusted` absent from baseline -> OMR03 ---
+    // --- Part E (Review #5 P2 #2): Valid-digest invalid-first-event `restored` /
+    // `deadline_adjusted` for an entity absent from both `retention_upgrade_baseline` and
+    // `deletion_journal` MUST trigger the transition guard (not chain-digest mismatch). ---
+    let hex_bytes = |bytes: &[u8]| -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    };
+    let stray_db = TestDb::new().await;
+    migrate::apply(&stray_db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    super::storage::configure_limits(&stray_db, Some(1000), Some(1000), Some(1000)).await;
+    let stray_ctx = Context::new(&stray_db).await;
+    let post_cutoff_bytes = b"post-cutoff-active-payload";
+    let rev_active = {
+        let doc = new_uuid(&stray_db).await;
+        let r = reserve(
+            &stray_db,
+            OWNER,
+            &input(
+                &stray_ctx.scope,
+                &stray_ctx.actor,
+                "p2-1-post-cutoff-active",
+                &doc,
+                post_cutoff_bytes.len() as i64,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut o = connect(&stray_db.0, OWNER).await;
+        sqlx::query(
+            "UPDATE openmettle.storage_reservations
+                SET stage_claimed = true, payload_ino = 1, publish_pending = true
+              WHERE id = $1::uuid",
+        )
+        .bind(&r.id)
+        .execute(&mut o)
+        .await
+        .unwrap();
+        let mut settle_tx = WriteTransaction::begin(&mut o).await.unwrap();
+        let digest = Sha256::digest(post_cutoff_bytes).to_vec();
+        let rev = openmettle_core::storage::settle(
+            &mut settle_tx,
+            &openmettle_core::storage::Settlement {
+                scope: &stray_ctx.scope,
+                reservation: &r.id,
+                size_bytes: post_cutoff_bytes.len() as i64,
+                content_digest: &digest,
+                media_type: "text/plain",
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle_tx.commit().await.unwrap();
+        o.close().await.unwrap();
+        rev
+    };
+    let rev_absent = new_uuid(&stray_db).await;
+    let stray_owner = pool(&stray_db, OWNER).await;
+    for entity in [&rev_absent, &rev_active] {
+        let (baseline_cnt, journal_cnt): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(*) FROM openmettle.retention_upgrade_baseline WHERE artifact_revision_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.deletion_journal WHERE entity_id = $1::uuid)",
+        )
+        .bind(entity)
+        .fetch_one(&stray_owner)
+        .await
+        .unwrap();
+        assert_eq!((baseline_cnt, journal_cnt), (0, 0));
+    }
+    let (stray_origin_us, stray_lc_origin_us, stray_lc_baseline_hex): (i64, i64, String) =
+        sqlx::query_as(
+            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    encode(lifecycle_baseline_digest, 'hex')
+               FROM openmettle.deletion_journal_head
+              WHERE id",
+        )
+        .fetch_one(&stray_owner)
+        .await
+        .unwrap();
+    let stray_locked = restore::lock_gate(
+        &stray_owner,
+        &restore::GateLockRequest {
+            origin_us: stray_origin_us,
+            lifecycle_origin_us: Some(stray_lc_origin_us),
+            lifecycle_baseline_digest: Some(&stray_lc_baseline_hex),
+            required_seq: 0,
+            required_digest: restore::GENESIS,
+            coverage_complete: true,
+            replace_restore_run: None,
+            new_restore: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    #[allow(clippy::too_many_arguments)]
+    async fn valid_chain_digest(
+        pool: &sqlx::PgPool,
+        seq: i64,
+        recorded_us: i64,
+        kind: &str,
+        entity_id: &str,
+        scope_id: &str,
+        after_us: Option<i64>,
+        purged_us: Option<i64>,
+        content_digest: &[u8],
+        policy_revision: Option<i64>,
+        retained_us: Option<i64>,
+    ) -> Vec<u8> {
+        sqlx::query_scalar(
+            "SELECT openmettle.deletion_journal_digest(
+                        (SELECT chain_digest FROM openmettle.deletion_journal_head WHERE id),
+                        ROW(
+                            $1::bigint,
+                            timestamptz 'epoch' + $2::bigint * interval '1 microsecond',
+                            $3::text,
+                            $4::uuid,
+                            $5::uuid,
+                            CASE WHEN $6::bigint IS NOT NULL
+                                 THEN timestamptz 'epoch' + $6::bigint * interval '1 microsecond' END,
+                            CASE WHEN $7::bigint IS NOT NULL
+                                 THEN timestamptz 'epoch' + $7::bigint * interval '1 microsecond' END,
+                            $8::bytea,
+                            $9::bigint,
+                            decode(repeat('00', 32), 'hex'),
+                            CASE WHEN $10::bigint IS NOT NULL
+                                 THEN timestamptz 'epoch' + $10::bigint * interval '1 microsecond' END
+                        )::openmettle.deletion_journal
+                    )",
+        )
+        .bind(seq)
+        .bind(recorded_us)
+        .bind(kind)
+        .bind(entity_id)
+        .bind(scope_id)
+        .bind(after_us)
+        .bind(purged_us)
+        .bind(content_digest)
+        .bind(policy_revision)
+        .bind(retained_us)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    let absent_digest = Sha256::digest(b"absent-revision-bytes").to_vec();
+    let stray_rec_us = stray_lc_origin_us + 1_000_000;
+    let valid_restore_chain = valid_chain_digest(
+        &stray_owner,
+        1,
+        stray_rec_us,
+        "artifact_revision.restored",
+        &rev_absent,
+        &stray_ctx.scope,
+        None,
+        None,
+        &absent_digest,
+        None,
+        None,
+    )
+    .await;
     let stray_res = sqlx::query(
         "SELECT openmettle.deletion_journal_replay(
-                    1, 100, 'artifact_revision.restored', $1::uuid, $2::uuid,
-                    NULL, NULL, $3, NULL, decode(repeat('11', 32), 'hex'), NULL
+                    1, $1, 'artifact_revision.restored', $2::uuid, $3::uuid,
+                    NULL, NULL, $4, NULL, $5, NULL
                 )",
     )
-    .bind(&rev_keep)
-    .bind(&scope)
-    .bind(Sha256::digest(restored_bytes).as_slice())
-    .execute(&cu_owner)
+    .bind(stray_rec_us)
+    .bind(&rev_absent)
+    .bind(&stray_ctx.scope)
+    .bind(&absent_digest)
+    .bind(&valid_restore_chain)
+    .execute(&stray_owner)
     .await;
-    assert_eq!(sqlstate(stray_res), "OMR03");
+    let stray_res_err = stray_res.unwrap_err();
+    assert_eq!(
+        stray_res_err.as_database_error().unwrap().code().as_deref(),
+        Some("OMR03")
+    );
+    assert!(
+        stray_res_err
+            .to_string()
+            .contains("requires a retained revision for restore"),
+        "expected transition guard error, got: {stray_res_err}"
+    );
+
+    let stray_ret_us = stray_lc_origin_us + 500_000;
+    let stray_after_us = stray_lc_origin_us + 1_500_000;
+    let valid_adj_chain = valid_chain_digest(
+        &stray_owner,
+        1,
+        stray_rec_us,
+        "artifact_revision.deadline_adjusted",
+        &rev_absent,
+        &stray_ctx.scope,
+        Some(stray_after_us),
+        None,
+        &absent_digest,
+        Some(1),
+        Some(stray_ret_us),
+    )
+    .await;
     let stray_adj = sqlx::query(
         "SELECT openmettle.deletion_journal_replay(
-                    1, 100, 'artifact_revision.deadline_adjusted', $1::uuid, $2::uuid,
-                    200, NULL, $3, 1, decode(repeat('11', 32), 'hex'), 100
+                    1, $1, 'artifact_revision.deadline_adjusted', $2::uuid, $3::uuid,
+                    $4, NULL, $5, 1, $6, $7
                 )",
     )
-    .bind(&rev_keep)
-    .bind(&scope)
-    .bind(Sha256::digest(restored_bytes).as_slice())
-    .execute(&cu_owner)
+    .bind(stray_rec_us)
+    .bind(&rev_absent)
+    .bind(&stray_ctx.scope)
+    .bind(stray_after_us)
+    .bind(&absent_digest)
+    .bind(&valid_adj_chain)
+    .bind(stray_ret_us)
+    .execute(&stray_owner)
     .await;
-    assert_eq!(sqlstate(stray_adj), "OMR03");
+    let stray_adj_err = stray_adj.unwrap_err();
+    assert_eq!(
+        stray_adj_err.as_database_error().unwrap().code().as_deref(),
+        Some("OMR03")
+    );
+    assert!(
+        stray_adj_err
+            .to_string()
+            .contains("requires a retained revision for deadline adjustment"),
+        "expected transition guard error, got: {stray_adj_err}"
+    );
+
+    // --- Part F (Review #5 P2 #1): Post-cutoff `artifact_revision.purged` (`recorded_us >
+    // lifecycle_origin_us`) absent from both `retention_upgrade_baseline` and prior
+    // `artifact_revision.retained` records MUST be rejected before the volume phase, and
+    // `restore::apply` MUST NOT classify it as `prebaseline_purged_ids`. ---
+    let post_content = Sha256::digest(post_cutoff_bytes).to_vec();
+    let post_after_us = stray_lc_origin_us + 500_000;
+    let post_purged_us = stray_lc_origin_us + 1_000_000;
+    let post_chain = valid_chain_digest(
+        &stray_owner,
+        1,
+        post_purged_us,
+        "artifact_revision.purged",
+        &rev_active,
+        &stray_ctx.scope,
+        Some(post_after_us),
+        Some(post_purged_us),
+        &post_content,
+        Some(1),
+        None,
+    )
+    .await;
+    let post_chain_hex = hex_bytes(&post_chain);
+    let post_content_hex = hex_bytes(&post_content);
+    let forged_body = format!(
+        "openmettle.deletion_journal.export/1\n\
+         origin {stray_origin_us}\n\
+         lifecycle_origin {stray_lc_origin_us}\n\
+         lifecycle_baseline {stray_lc_baseline_hex}\n\
+         1 {post_purged_us} artifact_revision.purged {rev_active} {} {post_after_us} {post_purged_us} {post_content_hex} 1 {post_chain_hex}\n\
+         watermark {stray_origin_us} 1 {post_chain_hex} {post_purged_us}\n",
+        stray_ctx.scope
+    );
+    let forged_sum = hex_bytes(Sha256::digest(forged_body.as_bytes()).as_slice());
+    let forged_export = Export::parse(&format!("{forged_body}sha256 {forged_sum}\n")).unwrap();
+    restore::lock_gate(
+        &stray_owner,
+        &restore::GateLockRequest {
+            origin_us: forged_export.origin_us,
+            lifecycle_origin_us: forged_export.lifecycle_origin_us,
+            lifecycle_baseline_digest: forged_export.lifecycle_baseline_digest.as_deref(),
+            required_seq: forged_export.seq,
+            required_digest: &forged_export.digest,
+            coverage_complete: true,
+            replace_restore_run: Some(&stray_locked.restore_run_id),
+            new_restore: true,
+        },
+    )
+    .await
+    .unwrap();
+    let post_purge_err = restore::apply(&stray_owner, &forged_export)
+        .await
+        .unwrap_err();
+    let post_purge_msg = format!("{post_purge_err:?}");
+    assert_eq!(sqlstate_of(post_purge_err), "OMR03");
+    assert!(
+        post_purge_msg
+            .contains("post-upgrade purge record 1 lacks baseline or prior retained commitment"),
+        "expected post-upgrade purge commitment error, got: {post_purge_msg}"
+    );
+    assert_eq!(state(&stray_db, &rev_active).await.0, "active");
+    assert!(!gate(&stray_db).await.0);
+
+    // Also verify Rust's `prebaseline_purged_ids` filter excludes `recorded_us > lifecycle_origin_us`
+    // so `restore_replay_baseline` does NOT skip local conflict checks on `conflict_purging_backup`.
+    let cp_lc_origin = export.lifecycle_origin_us.unwrap();
+    let cp_lc_baseline = export.lifecycle_baseline_digest.as_deref().unwrap();
+    let cp_post_after = cp_lc_origin + 500_000;
+    let cp_post_rec = cp_lc_origin + 1_000_000;
+    let cp_keep_digest = Sha256::digest(restored_bytes).to_vec();
+    let cp_post_chain = valid_chain_digest(
+        &cp_owner,
+        1,
+        cp_post_rec,
+        "artifact_revision.purged",
+        &rev_keep,
+        &scope,
+        Some(cp_post_after),
+        Some(cp_post_rec),
+        &cp_keep_digest,
+        Some(1),
+        None,
+    )
+    .await;
+    let cp_post_chain_hex = hex_bytes(&cp_post_chain);
+    let cp_keep_digest_hex = hex_bytes(&cp_keep_digest);
+    let cp_forged_body = format!(
+        "openmettle.deletion_journal.export/1\n\
+         origin {}\n\
+         lifecycle_origin {cp_lc_origin}\n\
+         lifecycle_baseline {cp_lc_baseline}\n\
+         1 {cp_post_rec} artifact_revision.purged {rev_keep} {scope} {cp_post_after} {cp_post_rec} {cp_keep_digest_hex} 1 {cp_post_chain_hex}\n\
+         watermark {} 1 {cp_post_chain_hex} {cp_post_rec}\n",
+        export.origin_us, export.origin_us
+    );
+    let cp_forged_sum = hex_bytes(Sha256::digest(cp_forged_body.as_bytes()).as_slice());
+    let cp_forged_export =
+        Export::parse(&format!("{cp_forged_body}sha256 {cp_forged_sum}\n")).unwrap();
+    restore::lock_gate(
+        &cp_owner,
+        &restore::GateLockRequest {
+            origin_us: cp_forged_export.origin_us,
+            lifecycle_origin_us: cp_forged_export.lifecycle_origin_us,
+            lifecycle_baseline_digest: cp_forged_export.lifecycle_baseline_digest.as_deref(),
+            required_seq: cp_forged_export.seq,
+            required_digest: &cp_forged_export.digest,
+            coverage_complete: false,
+            replace_restore_run: Some(&cp_locked.restore_run_id),
+            new_restore: true,
+        },
+    )
+    .await
+    .unwrap();
+    let cp_post_err = restore::apply(&cp_owner, &cp_forged_export)
+        .await
+        .unwrap_err();
+    let cp_post_msg = format!("{cp_post_err:?}");
+    assert_eq!(sqlstate_of(cp_post_err), "OMR04");
+    assert!(
+        cp_post_msg.contains("local purging revision"),
+        "expected restore_replay_baseline conflict check (not skipped via prebaseline_purged_ids), got: {cp_post_msg}"
+    );
 }
 
 /// Review #4 P2 #2 regression: `restore_verify_export` locks the full union of baseline, journal,

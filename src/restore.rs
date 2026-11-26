@@ -985,7 +985,10 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
                 "artifact_revision.retained" => {
                     seen_retained.insert(r.entity_id.as_str());
                 }
-                "artifact_revision.purged" if !seen_retained.contains(r.entity_id.as_str()) => {
+                "artifact_revision.purged"
+                    if r.recorded_us <= lc_origin
+                        && !seen_retained.contains(r.entity_id.as_str()) =>
+                {
                     prebaseline_purged.insert(r.entity_id.as_str());
                 }
                 _ => {}

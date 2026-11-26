@@ -1075,6 +1075,7 @@ BEGIN
                      FROM openmettle.deletion_journal j
                     WHERE j.event_kind = 'artifact_revision.purged'
                       AND j.entity_id = v_local.id
+                      AND j.recorded_at <= v_baseline_origin
                ) THEN
                 CONTINUE;
             END IF;
@@ -1283,6 +1284,7 @@ CREATE FUNCTION openmettle.deletion_journal_replay(
 RETURNS boolean LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     e openmettle.deletion_journal%ROWTYPE;
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
     head openmettle.deletion_journal_head%ROWTYPE;
     v_state text;
     v_size bigint;
@@ -1347,7 +1349,7 @@ BEGIN
 
     SELECT state, size_bytes, content_digest INTO v_state, v_size, v_content
       FROM openmettle.artifact_revisions WHERE scope_id = p_scope_id AND id = p_entity_id FOR UPDATE;
-    PERFORM FROM openmettle.restore_reconciliation_gate WHERE id AND NOT open FOR SHARE;
+    SELECT * INTO g FROM openmettle.restore_reconciliation_gate WHERE id AND NOT open FOR SHARE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'journal replay requires a closed restore gate' USING ERRCODE = 'OMR02';
     END IF;
@@ -1364,6 +1366,23 @@ BEGIN
         IF EXISTS (SELECT FROM openmettle.deletion_journal
                     WHERE event_kind = 'artifact_revision.purged' AND entity_id = e.entity_id) THEN
             RAISE EXCEPTION 'journal record % duplicates an existing purged entity', p_seq
+                USING ERRCODE = 'OMR03';
+        END IF;
+        IF g.required_lifecycle_origin_us IS NOT NULL
+           AND p_recorded_us > g.required_lifecycle_origin_us
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM openmettle.retention_upgrade_baseline b
+                WHERE b.artifact_revision_id = p_entity_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM openmettle.deletion_journal j
+                WHERE j.entity_id = p_entity_id
+                  AND j.event_kind = 'artifact_revision.retained'
+                  AND j.journal_seq < p_seq
+           ) THEN
+            RAISE EXCEPTION 'post-upgrade purge record % lacks baseline or prior retained commitment', p_seq
                 USING ERRCODE = 'OMR03';
         END IF;
         DELETE FROM openmettle.artifact_retention_holds
@@ -1428,6 +1447,7 @@ BEGIN
                    SELECT 1 FROM openmettle.deletion_journal j
                     WHERE j.entity_id = p_entity_id
                       AND j.event_kind = 'artifact_revision.retained'
+                      AND j.journal_seq < p_seq
                )) THEN
             RAISE EXCEPTION 'journal record % requires a retained revision for deadline adjustment', p_seq
                 USING ERRCODE = 'OMR03';
@@ -1451,6 +1471,7 @@ BEGIN
                    SELECT 1 FROM openmettle.deletion_journal j
                     WHERE j.entity_id = p_entity_id
                       AND j.event_kind = 'artifact_revision.retained'
+                      AND j.journal_seq < p_seq
                )) THEN
             RAISE EXCEPTION 'journal record % requires a retained revision for restore', p_seq
                 USING ERRCODE = 'OMR03';
