@@ -4604,19 +4604,26 @@ subsequent restore to an older backup.
 **Decision.** Add a separate owner-only maintenance command and schema increment (migration 44,
 keeping `storage rebind` strictly non-destructive on settled revisions):
 
-- **Separate command and barrier preconditions.** `openmettle-admin storage declare-lost ROOT
+- **Separate command, DB-only replay catch-up and barrier preconditions.** `openmettle-admin storage declare-lost ROOT
   --revision UUID --operator-id UUID --request-key KEY --reason REASON` runs exclusively as
   `openmettle_owner` in `READ COMMITTED`, requires matching volume sentinels, refuses live open
   volumes (`adoption_run_id IS NULL AND restore_reconciliation_gate.open`), refuses active restore
   volume-phase leases (`OMR02`), and refuses closed restore gates whose `deletion_journal_head` has
   not caught up to `required_journal_seq` (`OMR04`) so legitimately purged revisions are replayed
-  first.
-- **Refuse verifiable payloads and foreign hard links.** Using `rebind::classify` and SHA-256
-  verification under exclusive `flock`, the command refuses any payload whose bytes verify intact
-  against `(size_bytes, content_digest)`, refuses already-truncated `purging` layouts that
-  `storage rebind` accepts, and refuses any reservation file with a foreign hard link or active
-  lock. For genuinely missing or unrecoverable payloads, it unlinks leftover reservation files and
-  `fsync`s touched directories inside the locked transaction before commit.
+  first. `openmettle-admin restore replay --db-only FILE` runs the database replay phase
+  (`restore_replay_baseline` and `deletion_journal_replay`, taking `storage_volume_control FOR SHARE`
+  so it succeeds even while a failed `storage rebind` holds `adoption_run_id`) without opening the
+  gate.
+- **Refuse verifiable payloads, terminal purge commitments and foreign hard links.** Under
+  continuously-held exclusive `flock` descriptors and `TX_FENCE_BUDGET`, `storage declare-lost`
+  verifies candidate reservation files by SHA-256 independently of `rebind::classify` layout/anchor
+  errors so intact bytes are never unlinked, refuses already-truncated `purging` layouts accepted by
+  `storage rebind`, refuses revisions that already carry an `artifact_revision.purged` commitment in
+  `deletion_journal` (instead `storage rebind` and `purge_journaled` complete already-journaled
+  purges whose payloads are missing or unrecoverable), and refuses any foreign hard link or active
+  lock. For genuinely unrecoverable payloads, it commits durable `'lost'` DB state first while still
+  holding the exclusive locks, then unlinks leftover reservation files with deadline-fenced
+  `unlink_before` and `fsync`s touched directories.
 - **State, role boundary, accounting, audit and deletion journal.** Migration 44 adds nullable
   `artifact_revisions.lost_at`, widens `artifact_revisions_state_check` and
   `artifact_revisions_lifecycle_check` with terminal state `'lost'`, and adds owner-only trigger
@@ -4627,8 +4634,9 @@ keeping `storage rebind` strictly non-destructive on settled revisions):
   `storage_instance` -> `deletion_journal_head`), enforces idempotency on `request_key` (`23505`
   on mismatch), deletes `artifact_retention_holds`, clears `storage_reservations.payload_ino`,
   decrements `active_bytes` or `retained_bytes` once, records `'storage.declare_payload_lost'` in
-  `authorization_audit`, and appends `'artifact_revision.lost'` to `deletion_journal` (unique per
-  entity; `openmettle.deletion_journal/2` digest).
+  `authorization_audit`, and appends `'artifact_revision.lost'` to `deletion_journal` (mutually
+  exclusive per entity with `'artifact_revision.purged'` via unique partial index
+  `deletion_journal_terminal_revision_idx`; `openmettle.deletion_journal/2` digest).
 - **Restore gate and re-restore consistency.** `restore_verify_checkpoints`,
   `restore_verify_export`, `restore_claim_volume_phase`, and `restore_gate_open` accept a
   post-replay journal tail strictly composed of valid-chain `'artifact_revision.lost'` entries

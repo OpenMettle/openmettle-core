@@ -1303,3 +1303,532 @@ async fn v1_api_surfaces_lost_metadata_returns_410_conceals_unauthorized_and_kee
     assert_eq!(final_run_state, "failed");
     worker_pool.close().await;
 }
+
+/// Review #1 P1 #1 regression: an intact payload paired with a stale `.purge.<id>` hard link
+/// causes `rebind::classify` to fail with a layout error, yet `storage declare-lost` MUST still
+/// verify SHA-256 independently, refuse the declaration, and leave both files and DB untouched.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_refuses_intact_payload_with_stale_purge_anchor_leaving_files_and_db_untouched()
+ {
+    let f = Fixture::new().await;
+    let payload = b"intact-active-with-stale-purge-anchor";
+    let intact = f.payload("intact-anchor", payload).await;
+
+    let dir = Dir::new();
+    let copy = tar_copy(&f.root, &dir, "copy-stale-anchor");
+    let rev_path = copy.join("revisions").join(&intact.reservation);
+    let purge_path = copy
+        .join("revisions")
+        .join(format!(".purge.{}", intact.reservation));
+    fs::hard_link(&rev_path, &purge_path).unwrap();
+
+    let (ok, out, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok, "rebind must refuse unexpected purge anchor: {out}");
+    assert!(out.contains("unexpected purge anchor"), "{out}");
+    assert!(barrier_of(&f.db).await.is_some());
+
+    let before_acct = storage_account(&f.db, &f.c.scope).await;
+    let before_inst = instance_totals(&f.db).await;
+    let before_seq: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+
+    let (ok, _, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &intact.revision,
+        OPERATOR_1,
+        "p1-1-stale-anchor",
+        "must not unlink intact payload with stray purge anchor",
+    );
+    assert!(!ok);
+    assert!(err.contains("payload verifies intact"), "{err}");
+    assert_eq!(fs::read(&rev_path).unwrap(), payload);
+    assert_eq!(fs::read(&purge_path).unwrap(), payload);
+    assert_eq!(revision_row(&f.db, &intact.revision).await.0, "active");
+    assert!(!revision_row(&f.db, &intact.revision).await.1);
+    assert_eq!(storage_account(&f.db, &f.c.scope).await, before_acct);
+    assert_eq!(instance_totals(&f.db).await, before_inst);
+    let after_seq: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+    assert_eq!(after_seq, before_seq);
+}
+
+/// Review #1 P1 #2 regression: when `storage rebind` fails on a missing payload and holds
+/// `adoption_run_id` while `restore_reconciliation_gate` is closed behind a post-backup journal
+/// export, `openmettle-admin restore replay --db-only FILE` catches up the DB journal under the
+/// held barrier so `storage declare-lost`, resumed `storage rebind`, and final `restore replay`
+/// succeed with zero drift.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn restore_replay_db_only_catches_up_under_held_rebind_barrier_then_declare_lost_and_gate_open_succeed()
+ {
+    let f = Fixture::new().await;
+    let missing = f.payload("miss-a", b"missing-on-restored-copy").await;
+    let retained_after = f.payload("ret-b", b"retained-after-backup-123").await;
+    retention_grace(&f.db, 86_400).await;
+
+    let dir = Dir::new();
+    let copy = tar_copy(&f.root, &dir, "restored-p1-2");
+    f.api.close().await;
+    let restored_db = backup_db(&f.db).await;
+
+    // Post-backup lifecycle transition (`active` -> `retained`) creates a journal record whose
+    // replay adjusts `active_bytes`/`retained_bytes` and locks `storage_volume_control`.
+    step(&f.db.0, &f.c.scope, &retained_after.revision, Step::Retain)
+        .await
+        .unwrap();
+    let export_path = dir.path("p1-2.export");
+    let (ok, _, err) = cli(&f.db, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export = Export::parse(&fs::read_to_string(&export_path).unwrap()).unwrap();
+    assert!(export.seq >= 1);
+
+    // Simulate missing file for `missing` on the restored volume copy.
+    fs::remove_file(copy.join("revisions").join(&missing.reservation)).unwrap();
+
+    // 1. Lock restore gate on restored_db at the post-backup watermark.
+    let mut lock_args = vec![
+        "restore".to_owned(),
+        "lock".to_owned(),
+        "--required-origin".to_owned(),
+        export.origin_us.to_string(),
+        "--required-lifecycle-origin".to_owned(),
+        export.lifecycle_origin_us.unwrap().to_string(),
+        "--required-lifecycle-baseline-digest".to_owned(),
+        export.lifecycle_baseline_digest.clone().unwrap(),
+        "--required-seq".to_owned(),
+        export.seq.to_string(),
+        "--required-digest".to_owned(),
+        export.digest.clone(),
+        "--export-complete".to_owned(),
+    ];
+    if let Some(co) = export.connection_origin_us {
+        lock_args.push("--required-connection-origin".to_owned());
+        lock_args.push(co.to_string());
+    }
+    let lock_refs: Vec<&str> = lock_args.iter().map(String::as_str).collect();
+    let (ok, _, err) = cli(&restored_db, &lock_refs);
+    assert!(ok, "{err}");
+    assert!(!gate_open_of(&restored_db).await);
+
+    // 2. First `storage rebind` fails on `missing` and holds `adoption_run_id`.
+    let (ok, out, _) = cli(&restored_db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("failed 1"), "{out}");
+    let held_barrier = barrier_of(&restored_db)
+        .await
+        .expect("rebind barrier must be held");
+
+    // 3. `storage declare-lost` refuses while journal is still behind `required_journal_seq`.
+    let (ok, _, err) = declare_lost_cli(
+        &restored_db,
+        OWNER,
+        &copy,
+        &missing.revision,
+        OPERATOR_1,
+        "p1-2-too-early",
+        "before db-only replay",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("replay the deletion journal before declaring payloads lost"),
+        "{err}"
+    );
+
+    // 4. `restore replay --db-only FILE` succeeds even while `adoption_run_id` is held, catches up
+    //    the journal (`retained_after` -> `retained`), and keeps the gate and barrier closed.
+    let (ok, out, err) = cli(
+        &restored_db,
+        &["restore", "replay", "--db-only", &export_path],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("database journal caught up (restore gate remains closed)"),
+        "{out}"
+    );
+    assert!(!gate_open_of(&restored_db).await);
+    assert_eq!(
+        barrier_of(&restored_db).await.as_deref(),
+        Some(held_barrier.as_str())
+    );
+    assert_eq!(
+        revision_row(&restored_db, &retained_after.revision).await.0,
+        "retained"
+    );
+
+    // 5. Now `storage declare-lost` succeeds, resumed `storage rebind` clears the barrier, and full
+    //    `restore replay` opens the gate with zero accounting or file drift.
+    let (ok, out, err) = declare_lost_cli(
+        &restored_db,
+        OWNER,
+        &copy,
+        &missing.revision,
+        OPERATOR_1,
+        "p1-2-lost",
+        "payload missing from recovery copy after db-only replay",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("applied storage.declare_payload_lost"),
+        "{out}"
+    );
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &[
+            "storage",
+            "rebind",
+            copy.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(ok, "{out}{err}");
+    assert_eq!(barrier_of(&restored_db).await, None);
+
+    let (ok, out, err) = cli(
+        &restored_db,
+        &["restore", "replay", &export_path, copy.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("restore gate open"), "{out}");
+    assert!(gate_open_of(&restored_db).await);
+
+    let (ok, out, err) = cli(&restored_db, &["quota", "verify", copy.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+    assert_eq!(
+        storage_account(&restored_db, &f.c.scope).await,
+        (0, retained_after.size_bytes, 0)
+    );
+}
+
+/// Review #1 P1 #3 regression:
+/// 1. Replaying an `artifact_revision.purged` commitment leaves the revision `'purging'`;
+///    `storage declare-lost` (both CLI and SQL) MUST refuse it rather than creating a conflicting
+///    `artifact_revision.lost` commitment.
+/// 2. `storage rebind` completes already-journaled purges whose files are missing or corrupt on a
+///    copied volume (transitioning to `'purged'`, unlinking corrupt bytes, and decrementing
+///    `retained_bytes` once), allowing `restore replay` to open the gate with zero drift.
+/// 3. On an in-place snapshot restore (`purge_journaled`), an already-journaled purge whose files
+///    are absent on disk also completes cleanly so `restore replay` opens the gate with zero drift.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn already_journaled_purge_refuses_declare_lost_and_completes_via_rebind_and_snapshot_restore()
+ {
+    let f = Fixture::new().await;
+    let keep = f.payload("keep", b"kept-alive-bytes").await;
+    let purged_missing = f.payload("p-miss", b"purged-and-missing-file").await;
+    let purged_corrupt = f.payload("p-corr", b"purged-and-corrupt-file").await;
+    retention_grace(&f.db, 0).await;
+
+    let dir = Dir::new();
+    let copy_vol = tar_copy(&f.root, &dir, "copy-p1-3");
+    f.api.close().await;
+    let copy_db = backup_db(&f.db).await;
+    let snap_db = backup_db(&f.db).await;
+
+    // Purge both revisions on the live DB (recording `artifact_revision.purged` commitments) while
+    // keeping `f.root`'s original inodes intact for the snapshot-restore sub-test.
+    for rev in [&purged_missing, &purged_corrupt] {
+        for s in [Step::Retain, Step::Claim, Step::Confirm] {
+            step(&f.db.0, &f.c.scope, &rev.revision, s).await.unwrap();
+        }
+    }
+    let export_path = dir.path("p1-3.export");
+    let (ok, _, err) = cli(&f.db, &["journal", "export", &export_path]);
+    assert!(ok, "{err}");
+    let export = Export::parse(&fs::read_to_string(&export_path).unwrap()).unwrap();
+
+    let lock_for = |db: &TestDb| {
+        let mut args = vec![
+            "restore".to_owned(),
+            "lock".to_owned(),
+            "--required-origin".to_owned(),
+            export.origin_us.to_string(),
+            "--required-lifecycle-origin".to_owned(),
+            export.lifecycle_origin_us.unwrap().to_string(),
+            "--required-lifecycle-baseline-digest".to_owned(),
+            export.lifecycle_baseline_digest.clone().unwrap(),
+            "--required-seq".to_owned(),
+            export.seq.to_string(),
+            "--required-digest".to_owned(),
+            export.digest.clone(),
+            "--export-complete".to_owned(),
+        ];
+        if let Some(co) = export.connection_origin_us {
+            args.push("--required-connection-origin".to_owned());
+            args.push(co.to_string());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        cli(db, &refs)
+    };
+
+    // --- Sub-test A: file-copy restore with missing + corrupt files for journaled purges ---
+    fs::remove_file(copy_vol.join("revisions").join(&purged_missing.reservation)).unwrap();
+    fs::write(
+        copy_vol.join("revisions").join(&purged_corrupt.reservation),
+        b"corrupt!",
+    )
+    .unwrap();
+
+    let (ok, _, err) = lock_for(&copy_db);
+    assert!(ok, "{err}");
+    let (ok, out, err) = cli(&copy_db, &["restore", "replay", "--db-only", &export_path]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        revision_row(&copy_db, &purged_missing.revision).await.0,
+        "purging"
+    );
+    assert_eq!(
+        revision_row(&copy_db, &purged_corrupt.revision).await.0,
+        "purging"
+    );
+
+    // `storage declare-lost` refuses both revisions because they already carry terminal
+    // `artifact_revision.purged` commitments in `deletion_journal`.
+    for (rev, key) in [
+        (&purged_missing, "p1-3-miss"),
+        (&purged_corrupt, "p1-3-corr"),
+    ] {
+        let (ok, _, err) = declare_lost_cli(
+            &copy_db,
+            OWNER,
+            &copy_vol,
+            &rev.revision,
+            OPERATOR_1,
+            key,
+            "should refuse already-journaled purge",
+        );
+        assert!(!ok);
+        assert!(err.contains("terminal purge commitment"), "{err}");
+
+        let res = sqlx::query(
+            "SELECT * FROM openmettle.storage_declare_payload_lost($1::uuid, $2::uuid, $3, $4)",
+        )
+        .bind(&rev.revision)
+        .bind(OPERATOR_1)
+        .bind(format!("sql-{key}"))
+        .bind("direct sql attempt on journaled purge")
+        .execute(&mut connect(&copy_db.0, OWNER).await)
+        .await;
+        assert_eq!(sqlstate(res), "OMQ03");
+    }
+    let lost_journal_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.deletion_journal WHERE event_kind = 'artifact_revision.lost'",
+    )
+    .fetch_one(&mut copy_db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(lost_journal_rows, 0);
+
+    // `storage rebind` completes both already-journaled purges cleanly, removes corrupt bytes,
+    // decrements `retained_bytes` once, and releases the barrier.
+    let (ok, out, err) = cli(&copy_db, &["storage", "rebind", copy_vol.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("failed 0"), "{out}");
+    assert_eq!(barrier_of(&copy_db).await, None);
+    assert_eq!(
+        revision_row(&copy_db, &purged_missing.revision).await.0,
+        "purged"
+    );
+    assert_eq!(
+        revision_row(&copy_db, &purged_corrupt.revision).await.0,
+        "purged"
+    );
+    assert!(
+        !copy_vol
+            .join("revisions")
+            .join(&purged_corrupt.reservation)
+            .exists()
+    );
+    assert_eq!(
+        storage_account(&copy_db, &f.c.scope).await,
+        (keep.size_bytes, 0, 0)
+    );
+
+    // Full `restore replay` opens the gate and `quota verify` reports zero drift.
+    let (ok, out, err) = cli(
+        &copy_db,
+        &[
+            "restore",
+            "replay",
+            &export_path,
+            copy_vol.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(gate_open_of(&copy_db).await);
+    let (ok, out, err) = cli(&copy_db, &["quota", "verify", copy_vol.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+
+    // --- Sub-test B: in-place snapshot restore where one journaled purge file is missing ---
+    fs::remove_file(f.root.join("revisions").join(&purged_missing.reservation)).unwrap();
+    let (ok, _, err) = lock_for(&snap_db);
+    assert!(ok, "{err}");
+    let (ok, out, err) = cli(
+        &snap_db,
+        &["restore", "replay", &export_path, f.root.to_str().unwrap()],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("restore gate open"), "{out}");
+    assert!(gate_open_of(&snap_db).await);
+    assert_eq!(
+        revision_row(&snap_db, &purged_missing.revision).await.0,
+        "purged"
+    );
+    assert_eq!(
+        revision_row(&snap_db, &purged_corrupt.revision).await.0,
+        "purged"
+    );
+    assert!(
+        !f.root
+            .join("revisions")
+            .join(&purged_corrupt.reservation)
+            .exists()
+    );
+    assert_eq!(
+        storage_account(&snap_db, &f.c.scope).await,
+        (keep.size_bytes, 0, 0)
+    );
+    let (ok, out, err) = cli(&snap_db, &["quota", "verify", f.root.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+}
+
+/// Review #1 P2 #6 regression: on a split `purging` layout (corrupt `revisions/<id>` + separate-
+/// inode empty `.purge.<id>`), `storage declare-lost` commits durable `'lost'` DB state BEFORE
+/// unlinking files so an interruption leaving `.purge.<id>` on disk recovers cleanly on either an
+/// idempotent `--request-key` retry OR a resumed `storage rebind`.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn declare_lost_split_purging_layout_recovers_leftover_anchor_on_retry_or_rebind() {
+    let f = Fixture::new().await;
+    let split_retry = f.payload("split-retry", b"split-purging-retry-bytes").await;
+    let split_rebind = f
+        .payload("split-rebind", b"split-purging-rebind-bytes")
+        .await;
+    retention_grace(&f.db, 0).await;
+    for rev in [&split_retry, &split_rebind] {
+        step(&f.db.0, &f.c.scope, &rev.revision, Step::Retain)
+            .await
+            .unwrap();
+        step(&f.db.0, &f.c.scope, &rev.revision, Step::Claim)
+            .await
+            .unwrap();
+    }
+
+    let dir = Dir::new();
+    let copy = tar_copy(&f.root, &dir, "copy-split-p2-6");
+    for rev in [&split_retry, &split_rebind] {
+        fs::write(copy.join("revisions").join(&rev.reservation), b"corrupt!").unwrap();
+        fs::write(
+            copy.join("revisions")
+                .join(format!(".purge.{}", rev.reservation)),
+            b"",
+        )
+        .unwrap();
+    }
+
+    let (ok, out, _) = cli(&f.db, &["storage", "rebind", copy.to_str().unwrap()]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("intra_reservation_inode_mismatch"), "{out}");
+    let held_barrier = barrier_of(&f.db).await.unwrap();
+
+    // 1. Declare both split-purging revisions lost.
+    for (rev, key) in [(&split_retry, "p2-6-retry"), (&split_rebind, "p2-6-rebind")] {
+        let (ok, out, err) = declare_lost_cli(
+            &f.db,
+            OWNER,
+            &copy,
+            &rev.revision,
+            OPERATOR_1,
+            key,
+            "split purging payload corrupt",
+        );
+        assert!(ok, "{out}{err}");
+        assert!(out.contains("unlinked=2"), "{out}");
+        assert_eq!(revision_row(&f.db, &rev.revision).await.0, "lost");
+    }
+
+    let acct_after_lost = storage_account(&f.db, &f.c.scope).await;
+    let seq_after_lost: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+
+    // 2. Simulate post-commit interruption leaving `.purge.<id>` on disk for `split_retry`, and
+    //    verify exact `--request-key` retry cleans the leftover anchor idempotently.
+    let retry_anchor = copy
+        .join("revisions")
+        .join(format!(".purge.{}", split_retry.reservation));
+    fs::write(&retry_anchor, b"").unwrap();
+    let (ok, out, err) = declare_lost_cli(
+        &f.db,
+        OWNER,
+        &copy,
+        &split_retry.revision,
+        OPERATOR_1,
+        "p2-6-retry",
+        "split purging payload corrupt",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("replayed storage.declare_payload_lost") && out.contains("unlinked=1"),
+        "{out}"
+    );
+    assert!(!retry_anchor.exists());
+    assert_eq!(storage_account(&f.db, &f.c.scope).await, acct_after_lost);
+    let seq_after_retry: i64 =
+        sqlx::query_scalar("SELECT journal_seq FROM openmettle.deletion_journal_head WHERE id")
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+    assert_eq!(seq_after_retry, seq_after_lost);
+
+    // 3. Simulate post-commit interruption leaving `.purge.<id>` on disk for `split_rebind`, and
+    //    verify resumed `storage rebind` cleans the leftover anchor and passes drift checks.
+    let rebind_anchor = copy
+        .join("revisions")
+        .join(format!(".purge.{}", split_rebind.reservation));
+    fs::write(&rebind_anchor, b"").unwrap();
+    let (ok, out, err) = cli(
+        &f.db,
+        &[
+            "storage",
+            "rebind",
+            copy.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held_barrier,
+        ],
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("failed 0"), "{out}");
+    assert!(!rebind_anchor.exists());
+    assert_eq!(barrier_of(&f.db).await, None);
+    let (ok, out, err) = cli(&f.db, &["quota", "verify", copy.to_str().unwrap()]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("storage mismatches 0") && out.contains("file mismatches 0"),
+        "{out}"
+    );
+}

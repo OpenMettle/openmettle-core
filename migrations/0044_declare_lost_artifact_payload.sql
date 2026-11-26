@@ -4,10 +4,12 @@
 -- include 'lost' with an owner-only trigger guard (SQLSTATE 42501 for non-owners), widens
 -- authorization_audit for operator action 'storage.declare_payload_lost' on target_kind
 -- 'artifact_revision', widens deletion_journal for event_kind 'artifact_revision.lost' with a
--- unique partial entity index, adds owner-only storage_declare_payload_lost(...) and
--- restore_verify_lost_journal_tail(...), and updates restore_verify_checkpoints,
--- restore_verify_export, restore_claim_volume_phase, restore_gate_open, and
--- deletion_journal_replay so post-replay lost declarations keep restore reconciliation and
+-- unique partial index enforcing mutual exclusion across terminal 'artifact_revision.purged' and
+-- 'artifact_revision.lost' commitments, adds owner-only storage_declare_payload_lost(...) and
+-- restore_verify_lost_journal_tail(...), and updates restore_replay_baseline,
+-- restore_verify_checkpoints, restore_verify_export, restore_claim_volume_phase,
+-- restore_gate_open, and deletion_journal_replay so DB-only journal replay works under a held
+-- adoption_run_id barrier and post-replay lost declarations keep restore reconciliation and
 -- subsequent restores to older backups consistent.
 -- Released migrations are immutable. Runs once per release as openmettle_owner in one
 -- transaction with search_path pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
@@ -269,9 +271,9 @@ ALTER TABLE openmettle.deletion_journal
         )
     );
 
-CREATE UNIQUE INDEX deletion_journal_lost_entity_idx
-    ON openmettle.deletion_journal (event_kind, entity_id)
-    WHERE event_kind = 'artifact_revision.lost';
+CREATE UNIQUE INDEX deletion_journal_terminal_revision_idx
+    ON openmettle.deletion_journal (entity_id)
+    WHERE event_kind IN ('artifact_revision.purged', 'artifact_revision.lost');
 
 -- Owner only: verifies that deletion_journal_head either sits exactly at
 -- (p_required_seq, p_required_digest), OR extends strictly beyond p_required_seq solely via
@@ -521,6 +523,15 @@ BEGIN
            AND dj.entity_id = r.id
     ) THEN
         RAISE EXCEPTION 'artifact revision already has a lost commitment in deletion_journal'
+            USING ERRCODE = 'OMQ03';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM openmettle.deletion_journal dj
+         WHERE dj.event_kind = 'artifact_revision.purged'
+           AND dj.entity_id = r.id
+    ) THEN
+        RAISE EXCEPTION 'cannot declare lost: artifact revision already has a terminal purge commitment in deletion_journal'
             USING ERRCODE = 'OMQ03';
     END IF;
 
@@ -876,8 +887,367 @@ BEGIN
 END
 $$;
 
--- Owner only: extend deletion_journal_replay with 'artifact_revision.lost' handling and ensure
--- no other artifact lifecycle event can overwrite a 'lost' revision.
+-- Owner only: update restore_replay_baseline so DB-only journal/baseline catch-up works while a
+-- failed storage rebind holds adoption_run_id (locking storage_volume_control FOR SHARE instead
+-- of storage_lock_pinned_volume()), and refuse overwriting already lost revisions.
+CREATE OR REPLACE FUNCTION openmettle.restore_replay_baseline(
+    p_lifecycle_origin_us bigint,
+    p_expected_digest bytea,
+    p_entity_ids uuid[],
+    p_scope_ids uuid[],
+    p_states text[],
+    p_retained_us bigint[],
+    p_original_purge_after_us bigint[],
+    p_purging_us bigint[],
+    p_content_digests bytea[],
+    p_policy_revisions bigint[],
+    p_prebaseline_purged_ids uuid[] DEFAULT ARRAY[]::uuid[])
+RETURNS integer
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    head openmettle.deletion_journal_head%ROWTYPE;
+    v_len integer;
+    v_idx integer;
+    v_head_lifecycle_origin_us bigint;
+    v_baseline_origin timestamptz;
+    v_apply boolean;
+    v_digest bytea := decode(repeat('00', 32), 'hex');
+    v_prev_entity_id uuid;
+    v_entity_id uuid;
+    v_scope_id uuid;
+    v_target_state text;
+    v_retained_us bigint;
+    v_purge_after_us bigint;
+    v_purging_us bigint;
+    v_content_digest bytea;
+    v_policy_revision bigint;
+    v_rev_scope uuid;
+    v_state text;
+    v_size bigint;
+    v_content bytea;
+    v_cur_retained timestamptz;
+    v_cur_purge_after timestamptz;
+    v_cur_purging_at timestamptz;
+    v_cur_policy_rev bigint;
+    v_target_retained timestamptz;
+    v_target_purge_after timestamptz;
+    v_target_purging_at timestamptz;
+    v_local record;
+    v_applied integer := 0;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'baseline replay requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_lifecycle_origin_us IS NULL
+       OR p_expected_digest IS NULL OR octet_length(p_expected_digest) <> 32
+       OR p_entity_ids IS NULL OR p_scope_ids IS NULL
+       OR p_states IS NULL OR p_retained_us IS NULL
+       OR p_original_purge_after_us IS NULL OR p_purging_us IS NULL
+       OR p_content_digests IS NULL OR p_policy_revisions IS NULL
+       OR p_prebaseline_purged_ids IS NULL THEN
+        RAISE EXCEPTION 'invalid baseline replay parameters' USING ERRCODE = '22023';
+    END IF;
+    v_len := coalesce(array_length(p_entity_ids, 1), 0);
+    IF coalesce(array_length(p_scope_ids, 1), 0) <> v_len
+       OR coalesce(array_length(p_states, 1), 0) <> v_len
+       OR coalesce(array_length(p_retained_us, 1), 0) <> v_len
+       OR coalesce(array_length(p_original_purge_after_us, 1), 0) <> v_len
+       OR coalesce(array_length(p_purging_us, 1), 0) <> v_len
+       OR coalesce(array_length(p_content_digests, 1), 0) <> v_len
+       OR coalesce(array_length(p_policy_revisions, 1), 0) <> v_len THEN
+        RAISE EXCEPTION 'mismatched baseline replay array lengths' USING ERRCODE = 'OMR03';
+    END IF;
+    IF v_len > 0 AND (
+        array_lower(p_entity_ids, 1) <> 1
+        OR array_lower(p_scope_ids, 1) <> 1
+        OR array_lower(p_states, 1) <> 1
+        OR array_lower(p_retained_us, 1) <> 1
+        OR array_lower(p_original_purge_after_us, 1) <> 1
+        OR array_lower(p_purging_us, 1) <> 1
+        OR array_lower(p_content_digests, 1) <> 1
+        OR array_lower(p_policy_revisions, 1) <> 1
+    ) THEN
+        RAISE EXCEPTION 'baseline replay arrays must be 1-based' USING ERRCODE = '22023';
+    END IF;
+    IF coalesce(array_length(p_prebaseline_purged_ids, 1), 0) > 0
+       AND array_lower(p_prebaseline_purged_ids, 1) <> 1 THEN
+        RAISE EXCEPTION 'prebaseline purged array must be 1-based' USING ERRCODE = '22023';
+    END IF;
+
+    PERFORM pg_catalog.pg_advisory_xact_lock(1330467394, 42);
+    PERFORM 1
+       FROM openmettle.artifact_revisions
+      WHERE id = ANY(p_entity_ids)
+         OR state IN ('retained', 'purging')
+      ORDER BY id ASC
+        FOR UPDATE;
+    SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
+    IF g.open THEN
+        RAISE EXCEPTION 'baseline replay requires a closed restore gate' USING ERRCODE = 'OMR02';
+    END IF;
+    IF g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp() THEN
+        RAISE EXCEPTION 'restore volume phase is active' USING ERRCODE = 'OMR02';
+    END IF;
+    IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+        RAISE EXCEPTION 'baseline lifecycle origin % does not match locked requirement %',
+            p_lifecycle_origin_us, g.required_lifecycle_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_expected_digest IS DISTINCT FROM g.required_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'baseline digest does not match locked restore requirement'
+            USING ERRCODE = 'OMR03';
+    END IF;
+
+    SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR UPDATE;
+    v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+    v_baseline_origin := timestamptz 'epoch' + p_lifecycle_origin_us * interval '1 microsecond';
+    v_apply := (v_head_lifecycle_origin_us IS DISTINCT FROM p_lifecycle_origin_us)
+        AND (g.replayed_lifecycle_baseline_digest IS NULL);
+
+    FOR v_idx IN 1..v_len LOOP
+        v_entity_id := p_entity_ids[v_idx];
+        v_scope_id := p_scope_ids[v_idx];
+        v_target_state := p_states[v_idx];
+        v_retained_us := p_retained_us[v_idx];
+        v_purge_after_us := p_original_purge_after_us[v_idx];
+        v_purging_us := p_purging_us[v_idx];
+        v_content_digest := p_content_digests[v_idx];
+        v_policy_revision := p_policy_revisions[v_idx];
+
+        IF v_entity_id IS NULL OR v_scope_id IS NULL
+           OR v_target_state IS NULL OR v_target_state NOT IN ('retained', 'purging')
+           OR v_retained_us IS NULL OR v_purge_after_us IS NULL
+           OR v_purge_after_us < v_retained_us
+           OR (v_target_state = 'retained' AND v_purging_us IS NOT NULL)
+           OR (v_target_state = 'purging' AND (v_purging_us IS NULL OR v_purging_us < v_purge_after_us))
+           OR v_content_digest IS NULL OR octet_length(v_content_digest) <> 32
+           OR (v_policy_revision IS NOT NULL AND v_policy_revision <= 0) THEN
+            RAISE EXCEPTION 'invalid baseline entry at index %', v_idx USING ERRCODE = 'OMR03';
+        END IF;
+        IF v_prev_entity_id IS NOT NULL AND v_entity_id <= v_prev_entity_id THEN
+            RAISE EXCEPTION 'baseline entries must be strictly ordered by artifact_revision_id'
+                USING ERRCODE = 'OMR03';
+        END IF;
+        v_prev_entity_id := v_entity_id;
+
+        v_digest := openmettle.retention_baseline_step(
+            v_digest,
+            v_entity_id,
+            v_scope_id,
+            v_target_state,
+            v_retained_us,
+            v_purge_after_us,
+            v_purging_us,
+            v_content_digest,
+            v_policy_revision
+        );
+    END LOOP;
+
+    IF v_digest IS DISTINCT FROM p_expected_digest THEN
+        RAISE EXCEPTION 'computed lifecycle baseline digest does not match export header'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    IF v_head_lifecycle_origin_us = p_lifecycle_origin_us
+       AND v_digest IS DISTINCT FROM head.lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest does not match restored head'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    IF g.replayed_lifecycle_baseline_digest IS NOT NULL
+       AND v_digest IS DISTINCT FROM g.replayed_lifecycle_baseline_digest THEN
+        RAISE EXCEPTION 'lifecycle baseline digest conflicts with previously replayed baseline'
+            USING ERRCODE = 'OMR03';
+    END IF;
+
+    IF v_apply THEN
+        FOR v_idx IN 1..v_len LOOP
+            v_entity_id := p_entity_ids[v_idx];
+            v_scope_id := p_scope_ids[v_idx];
+            v_target_state := p_states[v_idx];
+            v_retained_us := p_retained_us[v_idx];
+            v_purge_after_us := p_original_purge_after_us[v_idx];
+            v_purging_us := p_purging_us[v_idx];
+            v_content_digest := p_content_digests[v_idx];
+            v_policy_revision := p_policy_revisions[v_idx];
+
+            SELECT scope_id, state, size_bytes, content_digest,
+                   retained_at, purge_after, purging_at, retention_policy_revision
+              INTO v_rev_scope, v_state, v_size, v_content,
+                   v_cur_retained, v_cur_purge_after, v_cur_purging_at, v_cur_policy_rev
+              FROM openmettle.artifact_revisions
+             WHERE id = v_entity_id;
+            IF FOUND THEN
+                IF v_rev_scope IS DISTINCT FROM v_scope_id
+                   OR v_content IS DISTINCT FROM v_content_digest THEN
+                    RAISE EXCEPTION 'baseline entry % does not match artifact revision scope or content',
+                        v_entity_id USING ERRCODE = 'OMR02';
+                END IF;
+                IF v_state IN ('purged', 'lost') THEN
+                    RAISE EXCEPTION 'baseline entry % cannot overwrite an already purged or lost revision',
+                        v_entity_id USING ERRCODE = 'OMR03';
+                END IF;
+                IF v_state = 'purging' AND v_target_state = 'retained' THEN
+                    RAISE EXCEPTION 'baseline entry % cannot downgrade a purging revision to retained',
+                        v_entity_id USING ERRCODE = 'OMR03';
+                END IF;
+                v_target_retained := timestamptz 'epoch' + v_retained_us * interval '1 microsecond';
+                v_target_purge_after := timestamptz 'epoch' + v_purge_after_us * interval '1 microsecond';
+                v_target_purging_at := CASE WHEN v_purging_us IS NOT NULL
+                    THEN timestamptz 'epoch' + v_purging_us * interval '1 microsecond' END;
+                IF v_target_state = 'purging' THEN
+                    DELETE FROM openmettle.artifact_retention_holds
+                     WHERE scope_id = v_scope_id AND artifact_revision_id = v_entity_id;
+                END IF;
+                IF v_state = 'active' THEN
+                    PERFORM 1 FROM openmettle.storage_volume_control WHERE id FOR SHARE;
+                    UPDATE openmettle.storage_accounts
+                       SET active_bytes = active_bytes - v_size,
+                           retained_bytes = retained_bytes + v_size
+                     WHERE scope_id = v_scope_id;
+                    IF NOT FOUND THEN
+                        RAISE EXCEPTION 'storage account missing' USING ERRCODE = 'P0002';
+                    END IF;
+                    UPDATE openmettle.storage_instance
+                       SET active_bytes = active_bytes - v_size,
+                           retained_bytes = retained_bytes + v_size;
+                END IF;
+                IF v_state IS DISTINCT FROM v_target_state
+                   OR v_cur_retained IS DISTINCT FROM v_target_retained
+                   OR v_cur_purge_after IS DISTINCT FROM v_target_purge_after
+                   OR v_cur_purging_at IS DISTINCT FROM v_target_purging_at
+                   OR v_cur_policy_rev IS DISTINCT FROM v_policy_revision THEN
+                    PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'on', true);
+                    UPDATE openmettle.artifact_revisions
+                       SET state = v_target_state,
+                           retained_at = v_target_retained,
+                           purge_after = v_target_purge_after,
+                           purging_at = v_target_purging_at,
+                           retention_policy_revision = v_policy_revision
+                     WHERE scope_id = v_scope_id AND id = v_entity_id;
+                    PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'off', true);
+                    v_applied := v_applied + 1;
+                END IF;
+            END IF;
+            IF v_policy_revision IS NOT NULL THEN
+                UPDATE openmettle.retention_policy
+                   SET revision = v_policy_revision + 1
+                 WHERE id AND revision <= v_policy_revision;
+            END IF;
+        END LOOP;
+
+        FOR v_local IN
+            SELECT ar.id,
+                   ar.scope_id,
+                   ar.reservation_id,
+                   ar.state,
+                   ar.size_bytes,
+                   ar.retained_at
+              FROM openmettle.artifact_revisions ar
+             WHERE ar.state IN ('retained', 'purging')
+               AND NOT (ar.id = ANY(p_entity_ids))
+             ORDER BY ar.id ASC
+        LOOP
+            IF v_local.id = ANY(p_prebaseline_purged_ids)
+               OR EXISTS (
+                   SELECT 1
+                     FROM openmettle.deletion_journal j
+                    WHERE j.event_kind = 'artifact_revision.purged'
+                      AND j.entity_id = v_local.id
+                      AND j.recorded_at <= v_baseline_origin
+               ) THEN
+                CONTINUE;
+            END IF;
+            IF v_local.state = 'purging' THEN
+                RAISE EXCEPTION 'local purging revision % is absent from lifecycle upgrade baseline and purge journal',
+                    v_local.id USING ERRCODE = 'OMR04';
+            END IF;
+            IF v_local.retained_at IS NULL OR v_local.retained_at > v_baseline_origin THEN
+                RAISE EXCEPTION 'local retained revision % postdates lifecycle upgrade baseline origin',
+                    v_local.id USING ERRCODE = 'OMR04';
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                  FROM openmettle.storage_reservations s
+                 WHERE s.scope_id = v_local.scope_id
+                   AND s.id = v_local.reservation_id
+                   AND (
+                       s.state <> 'settled'
+                       OR s.reclaim_state <> 'none'
+                       OR s.adoption_unverified
+                       OR (s.payload_ino IS NULL
+                           AND EXISTS (
+                               SELECT 1 FROM openmettle.storage_volume_control
+                                WHERE id AND volume_id IS NOT NULL
+                           ))
+                   )
+            ) THEN
+                RAISE EXCEPTION 'local retained revision % has unverified or reclaiming reservation',
+                    v_local.id USING ERRCODE = 'OMR04';
+            END IF;
+            PERFORM 1 FROM openmettle.storage_volume_control WHERE id FOR SHARE;
+            UPDATE openmettle.storage_accounts
+               SET retained_bytes = retained_bytes - v_local.size_bytes,
+                   active_bytes = active_bytes + v_local.size_bytes
+             WHERE scope_id = v_local.scope_id;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'storage account missing' USING ERRCODE = 'P0002';
+            END IF;
+            UPDATE openmettle.storage_instance
+               SET retained_bytes = retained_bytes - v_local.size_bytes,
+                   active_bytes = active_bytes + v_local.size_bytes;
+            PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'on', true);
+            UPDATE openmettle.artifact_revisions
+               SET state = 'active',
+                   retained_at = NULL,
+                   purge_after = NULL,
+                   purging_at = NULL,
+                   retention_policy_revision = NULL
+             WHERE scope_id = v_local.scope_id AND id = v_local.id;
+            PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'off', true);
+            v_applied := v_applied + 1;
+        END LOOP;
+
+        PERFORM pg_catalog.set_config('openmettle.replaying_upgrade_baseline', 'on', true);
+        DELETE FROM openmettle.retention_upgrade_baseline;
+        FOR v_idx IN 1..v_len LOOP
+            INSERT INTO openmettle.retention_upgrade_baseline (
+                artifact_revision_id,
+                scope_id,
+                state,
+                retained_at,
+                original_purge_after,
+                purging_at,
+                content_digest,
+                policy_revision
+            ) VALUES (
+                p_entity_ids[v_idx],
+                p_scope_ids[v_idx],
+                p_states[v_idx],
+                timestamptz 'epoch' + p_retained_us[v_idx] * interval '1 microsecond',
+                timestamptz 'epoch' + p_original_purge_after_us[v_idx] * interval '1 microsecond',
+                CASE WHEN p_purging_us[v_idx] IS NOT NULL
+                     THEN timestamptz 'epoch' + p_purging_us[v_idx] * interval '1 microsecond' END,
+                p_content_digests[v_idx],
+                p_policy_revisions[v_idx]
+            );
+        END LOOP;
+        PERFORM pg_catalog.set_config('openmettle.replaying_upgrade_baseline', 'off', true);
+        UPDATE openmettle.deletion_journal_head
+           SET lifecycle_coverage_started_at = v_baseline_origin,
+               lifecycle_baseline_digest = v_digest
+         WHERE id;
+    END IF;
+
+    UPDATE openmettle.restore_reconciliation_gate
+       SET replayed_lifecycle_baseline_digest = v_digest
+     WHERE id;
+    RETURN v_applied;
+END
+$$;
+
+-- Owner only: extend deletion_journal_replay with 'artifact_revision.lost' handling, allow
+-- DB-only journal replay under a held adoption_run_id barrier (storage_volume_control FOR SHARE),
+-- enforce mutual exclusion across terminal 'artifact_revision.purged' and 'artifact_revision.lost'
+-- commitments, and ensure no other artifact lifecycle event can overwrite a 'lost' revision.
 CREATE OR REPLACE FUNCTION openmettle.deletion_journal_replay(
     p_seq bigint, p_recorded_us bigint, p_event_kind text, p_entity_id uuid, p_scope_id uuid,
     p_original_purge_after_us bigint, p_purged_us bigint, p_content_digest bytea,
@@ -996,8 +1366,9 @@ BEGIN
                     USING ERRCODE = 'OMR03';
             END IF;
             IF EXISTS (SELECT FROM openmettle.deletion_journal
-                        WHERE event_kind = 'artifact_revision.purged' AND entity_id = e.entity_id) THEN
-                RAISE EXCEPTION 'journal record % duplicates an existing purged entity', p_seq
+                        WHERE event_kind IN ('artifact_revision.purged', 'artifact_revision.lost')
+                          AND entity_id = e.entity_id) THEN
+                RAISE EXCEPTION 'journal record % conflicts with an existing terminal revision commitment', p_seq
                     USING ERRCODE = 'OMR03';
             END IF;
             IF g.required_lifecycle_origin_us IS NOT NULL
@@ -1020,8 +1391,7 @@ BEGIN
             DELETE FROM openmettle.artifact_retention_holds
              WHERE scope_id = p_scope_id AND artifact_revision_id = p_entity_id;
             IF v_state = 'active' THEN
-                PERFORM openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
-                 WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL);
+                PERFORM 1 FROM openmettle.storage_volume_control WHERE id FOR SHARE;
                 UPDATE openmettle.storage_accounts
                    SET active_bytes = active_bytes - v_size, retained_bytes = retained_bytes + v_size
                  WHERE scope_id = p_scope_id;
@@ -1048,8 +1418,7 @@ BEGIN
                     USING ERRCODE = 'OMR03';
             END IF;
             IF v_state = 'active' THEN
-                PERFORM openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
-                 WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL);
+                PERFORM 1 FROM openmettle.storage_volume_control WHERE id FOR SHARE;
                 UPDATE openmettle.storage_accounts
                    SET active_bytes = active_bytes - v_size, retained_bytes = retained_bytes + v_size
                  WHERE scope_id = p_scope_id;
@@ -1109,8 +1478,7 @@ BEGIN
                     USING ERRCODE = 'OMR03';
             END IF;
             IF v_state = 'retained' THEN
-                PERFORM openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
-                 WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL);
+                PERFORM 1 FROM openmettle.storage_volume_control WHERE id FOR SHARE;
                 UPDATE openmettle.storage_accounts
                    SET retained_bytes = retained_bytes - v_size, active_bytes = active_bytes + v_size
                  WHERE scope_id = p_scope_id;
@@ -1134,8 +1502,9 @@ BEGIN
                     USING ERRCODE = 'OMR03';
             END IF;
             IF EXISTS (SELECT FROM openmettle.deletion_journal
-                        WHERE event_kind = 'artifact_revision.lost' AND entity_id = e.entity_id) THEN
-                RAISE EXCEPTION 'journal record % duplicates an existing lost entity', p_seq
+                        WHERE event_kind IN ('artifact_revision.purged', 'artifact_revision.lost')
+                          AND entity_id = e.entity_id) THEN
+                RAISE EXCEPTION 'journal record % conflicts with an existing terminal revision commitment', p_seq
                     USING ERRCODE = 'OMR03';
             END IF;
             IF v_state IN ('active', 'retained', 'purging') THEN

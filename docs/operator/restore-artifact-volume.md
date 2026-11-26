@@ -162,13 +162,21 @@ If `storage rebind` fails on one or more settled revisions (`missing revision`, 
 ### When NOT to use `storage declare-lost`
 
 - **Do not use it if an intact copy can be restored from another backup.** Declaring a payload lost is permanent: it unlinks any corrupt leftover bytes, transitions the revision to `lost`, and records an append-only `artifact_revision.lost` entry in `openmettle.deletion_journal`.
-- **Do not use it before replaying the deletion journal.** If the restore gate is closed and `deletion_journal_head.journal_seq < restore_reconciliation_gate.required_journal_seq`, `storage declare-lost` refuses the request. Replay the journal first: the missing revision may have been legitimately purged after the backup.
+- **Do not use it before replaying the deletion journal.** If the restore gate is closed and `deletion_journal_head.journal_seq < restore_reconciliation_gate.required_journal_seq`, `storage declare-lost` refuses the request. Run `openmettle-admin restore replay --db-only "$EXPORT_FILE"` first (which catches up the database journal even while a failed `storage rebind` already holds `adoption_run_id` and keeps `restore_reconciliation_gate` closed). If a missing revision already carries a terminal `artifact_revision.purged` commitment in `deletion_journal`, `storage declare-lost` refuses it and `storage rebind` (or `restore replay` on an in-place snapshot restore) completes the purge instead.
 - **Do not use it on a live open volume.** The command refuses when `storage_volume_control.adoption_run_id IS NULL` and `restore_reconciliation_gate.open = true`.
-- **Do not use it on an intact payload or an already-truncated `purging` payload.** The command verifies the reservation's files on disk and refuses any payload that `storage rebind` already accepts, as well as any file with a foreign hard link or an active lock.
+- **Do not use it on an intact payload or an already-truncated `purging` payload.** The command verifies every candidate reservation file on disk by SHA-256 (even if a stale anchor or layout mismatch is present) and refuses any intact payload, any already-truncated `purging` payload accepted by `storage rebind`, and any file with a foreign hard link or an active lock.
 
 ### Procedure
 
-1. Identify the failing `artifact_revisions.id` from the reservation ID reported by `storage rebind`:
+1. If `restore_reconciliation_gate` is closed and the database deletion journal has not yet caught up to `required_journal_seq`, run database-only journal replay first. This works even when a failed `storage rebind` already holds `adoption_run_id` and leaves `restore_reconciliation_gate` closed:
+
+   ```sh
+   openmettle-admin restore replay --db-only "$EXPORT_FILE"
+   ```
+
+   If a failing revision was already purged after the backup (it now has an `artifact_revision.purged` record in `openmettle.deletion_journal`), do not run `storage declare-lost` on it — step 4 (`storage rebind`) completes that already-journaled purge cleanly.
+
+2. Identify the failing `artifact_revisions.id` from the reservation ID reported by `storage rebind`:
 
    ```sql
    SELECT id AS revision_id, artifact_id, scope_id, state, size_bytes, encode(content_digest, 'hex') AS sha256
@@ -176,7 +184,7 @@ If `storage rebind` fails on one or more settled revisions (`missing revision`, 
     WHERE reservation_id = '<RESERVATION_UUID>'::uuid;
    ```
 
-2. Run `storage declare-lost` as `openmettle_owner` with a unique `--request-key` (idempotent on exact retry) and an audited `--reason`:
+3. Run `storage declare-lost` as `openmettle_owner` with a unique `--request-key` (idempotent on exact retry) and an audited `--reason`:
 
    ```sh
    openmettle-admin storage declare-lost "$ARTIFACT_ROOT" \
@@ -186,17 +194,17 @@ If `storage rebind` fails on one or more settled revisions (`missing revision`, 
      --reason "Payload missing from all recovery copies after disk failure"
    ```
 
-   A successful run prints `applied storage.declare_payload_lost ...` (or `replayed ...` on an exact retry). In one `READ COMMITTED` transaction it removes any operator retention hold, clears `storage_reservations.payload_ino`, decrements `active_bytes` or `retained_bytes` once, marks the revision `state = 'lost'` with `lost_at`, records `storage.declare_payload_lost` in `openmettle.authorization_audit`, appends `artifact_revision.lost` to `openmettle.deletion_journal`, and unlinks any corrupt leftover files under that reservation's names.
+   A successful run prints `applied storage.declare_payload_lost ...` (or `replayed ...` on an exact retry). Under continuously-held exclusive file locks and the filesystem fence budget, it commits one `READ COMMITTED` transaction that removes any operator retention hold, clears `storage_reservations.payload_ino`, decrements `active_bytes` or `retained_bytes` once, marks the revision `state = 'lost'` with `lost_at`, records `storage.declare_payload_lost` in `openmettle.authorization_audit`, and appends `artifact_revision.lost` to `openmettle.deletion_journal`, then unlinks any corrupt leftover files under that reservation's names and syncs the touched directories.
 
-3. Resume rebind using the latest barrier UUID reported by the previous `storage rebind` run:
+4. Resume rebind using the latest barrier UUID reported by the previous `storage rebind` run:
 
    ```sh
    openmettle-admin storage rebind "$ARTIFACT_ROOT" --replace-adoption-run "$ADOPTION_RUN_ID"
    ```
 
-4. If `restore_reconciliation_gate` is closed, re-run `openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"` with the same journal export file. The restore verifier validates the post-replay `artifact_revision.lost` tail against the active `restore_run_id` audit entries, runs drift verification (`file mismatches 0`, `storage mismatches 0`), and opens the gate.
+5. If `restore_reconciliation_gate` is closed, run full `openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"` with the same journal export file. The restore verifier validates the post-replay `artifact_revision.lost` tail against the active `restore_run_id` audit entries, runs drift verification (`file mismatches 0`, `storage mismatches 0`), and opens the gate.
 
-5. After services start, export a fresh deletion journal (`openmettle-admin journal export`) so the `artifact_revision.lost` entry is preserved for future restores. Replaying that export onto an older backup automatically transitions the revision to `lost`, releases its accounted bytes, and cleans its obsolete file.
+6. After services start, export a fresh deletion journal (`openmettle-admin journal export`) so the `artifact_revision.lost` entry is preserved for future restores. Replaying that export onto an older backup automatically transitions the revision to `lost`, releases its accounted bytes, and cleans its obsolete file.
 
 ### Audit and owner visibility
 

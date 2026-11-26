@@ -7,10 +7,10 @@
 //! deletion journal has not caught up to `required_journal_seq`, non-owner logins, active file
 //! locks, and any file with a foreign hard link outside this reservation's four names.
 use super::{
-    FS_TX_IDLE_TIMEOUT,
+    FS_TX_IDLE_TIMEOUT, TX_FENCE_BUDGET,
     adoption::{self, COMMIT_UNKNOWN, Failure, READ_FAILED, RevisionDigests},
     rebind::{
-        self, Entry, Ledger, Names, OwnedNames, Plan, has_foreign_hard_link,
+        self, CHANGED, Entry, Ledger, Names, OwnedNames, Plan, has_foreign_hard_link,
         lock_reservation_files, reservation_names, stat_reservation, unlink_reservation_files,
     },
     volume::Volume,
@@ -18,10 +18,16 @@ use super::{
 use crate::runs::is_canonical_uuid;
 use sqlx::{Connection, PgConnection, Row};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
     path::Path,
+    time::Instant,
 };
+
+const FENCE_EXPIRED: &str = "filesystem fence budget expired";
+const TERMINAL_PURGE_COMMITTED: &str = "artifact revision already has a terminal purge commitment; run storage rebind or restore replay to complete the purge";
 
 pub struct Options<'a> {
     pub root: &'a Path,
@@ -68,6 +74,8 @@ fn map_sql_error(err: sqlx::Error) -> Failure {
                     )
                 } else if msg.contains("already declared lost") {
                     Failure("artifact revision payload is already declared lost")
+                } else if msg.contains("terminal purge commitment") {
+                    Failure(TERMINAL_PURGE_COMMITTED)
                 } else if msg.contains("purged") {
                     Failure("cannot declare a purged artifact revision lost")
                 } else if msg.contains("not pinned") {
@@ -82,10 +90,18 @@ fn map_sql_error(err: sqlx::Error) -> Failure {
     Failure::from(err)
 }
 
-/// Checks whether the reservation's files on disk are ALREADY acceptable to `storage rebind`
-/// (either an intact verified published payload or an already-truncated `purging` layout).
-/// Returns `Err(...)` to refuse `declare-lost`, or `Ok(())` when the payload is genuinely
-/// missing/corrupt/unrecoverable and has no foreign hard links.
+fn check_fence(deadline: Instant) -> Result<(), Failure> {
+    if Instant::now() >= deadline {
+        return Err(Failure(FENCE_EXPIRED));
+    }
+    Ok(())
+}
+
+/// Checks whether ANY file under the reservation's names verifies intact against `(size_bytes,
+/// content_digest)` (independently of anchor or layout mismatches) or is an already-truncated
+/// `purging` layout accepted by `storage rebind`. Returns `Err(...)` to refuse `declare-lost`, or
+/// `Ok(())` when the payload is genuinely missing/corrupt/unrecoverable and has no foreign hard
+/// links.
 fn check_unrecoverable_and_no_foreign_links(
     ledger: &Ledger<'_>,
     entries: &[Option<Entry>; 4],
@@ -101,28 +117,44 @@ fn check_unrecoverable_and_no_foreign_links(
         revision,
         purge,
     };
-    match rebind::classify(ledger, &names) {
-        Ok(Plan::Content(ino)) => {
-            if let Some((_, file)) = locked.iter_mut().find(|(file_ino, _)| *file_ino == ino) {
-                file.seek(SeekFrom::Start(0))?;
-                let mut digests = RevisionDigests::default();
-                match digests.verify(reservation_id, file, size_bytes, content_digest) {
-                    Ok(()) => {
-                        return Err(Failure(
-                            "payload verifies intact; run storage rebind instead",
-                        ));
-                    }
-                    Err(Failure("size_or_digest_mismatch" | READ_FAILED)) => {}
-                    Err(other) => return Err(other),
+    // Verify candidate payload files BEFORE `rebind::classify` so an unexpected anchor or split
+    // layout can never bypass SHA-256 verification and unlink intact payload bytes.
+    let mut checked_inos: Vec<u64> = Vec::with_capacity(4);
+    for (slot, maybe) in entries.iter().enumerate() {
+        let Some(e) = maybe else { continue };
+        let is_payload_slot = matches!(slot, 0 | 2);
+        if e.len != size_bytes || (!is_payload_slot && size_bytes == 0) {
+            continue;
+        }
+        if checked_inos.contains(&e.ino) {
+            continue;
+        }
+        checked_inos.push(e.ino);
+        if let Some((_, file)) = locked.iter_mut().find(|(file_ino, _)| *file_ino == e.ino) {
+            file.seek(SeekFrom::Start(0))?;
+            let mut digests = RevisionDigests::default();
+            match digests.verify(reservation_id, file, size_bytes, content_digest) {
+                Ok(()) => {
+                    return Err(match rebind::classify(ledger, &names) {
+                        Ok(Plan::Content(_)) => {
+                            Failure("payload verifies intact; run storage rebind instead")
+                        }
+                        _ => Failure(
+                            "payload verifies intact; resolve layout mismatch or run storage rebind instead",
+                        ),
+                    });
                 }
+                Err(Failure("size_or_digest_mismatch" | READ_FAILED)) => {}
+                Err(other) => return Err(other),
             }
         }
-        Ok(Plan::Empty { .. }) if ledger.revision == Some("purging") => {
-            return Err(Failure(
-                "purging payload is already acceptable to storage rebind",
-            ));
-        }
-        Ok(Plan::Skip | Plan::Empty { .. } | Plan::Cleanup) | Err(_) => {}
+    }
+    if matches!(rebind::classify(ledger, &names), Ok(Plan::Empty { .. }))
+        && ledger.revision == Some("purging")
+    {
+        return Err(Failure(
+            "purging payload is already acceptable to storage rebind",
+        ));
     }
     if has_foreign_hard_link(entries) {
         return Err(Failure("foreign hard link"));
@@ -141,6 +173,82 @@ fn inspect_and_lock(
     let entries = stat_reservation(v, names)?.ok_or(Failure("invalid volume entry"))?;
     let locked = lock_reservation_files(v, names, &entries, check_links)?;
     Ok((entries, locked))
+}
+
+/// Re-verifies, on continuously-held `LOCK_EX` descriptors, that every reservation path still
+/// maps to the exact stat'd `(ino, len, links)` and that no foreign hard link appeared.
+fn verify_locked_reservation(
+    v: &Volume,
+    names: &OwnedNames,
+    entries: &ReservationEntries,
+    locked: &LockedFiles,
+    mtimes: &[(i64, i64)],
+) -> Result<(), Failure> {
+    let current = stat_reservation(v, names)?.ok_or(Failure("invalid volume entry"))?;
+    let mut own_links: HashMap<u64, u64> = HashMap::new();
+    let mut expected_len: HashMap<u64, u64> = HashMap::new();
+    for e in entries.iter().flatten() {
+        *own_links.entry(e.ino).or_insert(0) += 1;
+        expected_len.insert(e.ino, e.len);
+    }
+    if locked.len() != own_links.len() || mtimes.len() != locked.len() {
+        return Err(Failure(CHANGED));
+    }
+    for ((ino, file), &(mtime, mtime_nsec)) in locked.iter().zip(mtimes.iter()) {
+        let Some(&own) = own_links.get(ino) else {
+            return Err(Failure(CHANGED));
+        };
+        let meta = file.metadata()?;
+        if meta.ino() != *ino
+            || meta.dev() != v.dev
+            || meta.len() != expected_len[ino]
+            || meta.mtime() != mtime
+            || meta.mtime_nsec() != mtime_nsec
+        {
+            return Err(Failure(CHANGED));
+        }
+        let nlink = meta.nlink();
+        if nlink > own {
+            return Err(Failure("foreign hard link"));
+        }
+        if nlink < own {
+            return Err(Failure(CHANGED));
+        }
+    }
+    if current != *entries {
+        return Err(Failure(CHANGED));
+    }
+    Ok(())
+}
+
+fn snapshot_mtimes(locked: &LockedFiles) -> Result<Vec<(i64, i64)>, Failure> {
+    locked
+        .iter()
+        .map(|(_, file)| {
+            let meta = file.metadata()?;
+            Ok((meta.mtime(), meta.mtime_nsec()))
+        })
+        .collect()
+}
+
+/// Post-commit unlink under continuously-held exclusive file locks and bounded by `deadline`.
+fn unlink_after_commit(
+    v: &Volume,
+    pin: &str,
+    names: &OwnedNames,
+    entries: &ReservationEntries,
+    locked: &LockedFiles,
+    mtimes: &[(i64, i64)],
+    deadline: Instant,
+) -> Result<usize, Failure> {
+    check_fence(deadline)?;
+    v.verify(pin)?;
+    verify_locked_reservation(v, names, entries, locked, mtimes)?;
+    if entries.iter().any(Option::is_some) {
+        unlink_reservation_files(v, names, entries, Some(deadline))
+    } else {
+        Ok(0)
+    }
 }
 
 /// Declare one settled artifact revision's unrecoverable payload permanently lost.
@@ -162,8 +270,8 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     let _ = adoption::owner_run(c).await?;
 
     // Read-only preflight outside the write transaction so hashing a large intact payload never
-    // holds PostgreSQL row locks across disk I/O. Every invariant is re-verified inside the
-    // locked READ COMMITTED transaction before any state change or unlink.
+    // holds PostgreSQL row locks across disk I/O. Exclusive file locks acquired here are held
+    // continuously across the locked READ COMMITTED transaction and post-commit unlink.
     let (pin, adopting, gate_open, volume_active, required_seq, head_seq): (
         Option<String>,
         bool,
@@ -235,7 +343,14 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
 
     let target = sqlx::query(
         "SELECT s.id::text AS reservation_id, s.state AS reservation_state, s.reclaim_state,
-                r.state AS revision_state, r.purge_stage, r.size_bytes, r.content_digest
+                r.state AS revision_state, r.purge_stage, r.size_bytes, r.content_digest,
+                EXISTS (
+                    SELECT 1
+                      FROM openmettle.deletion_journal dj
+                     WHERE dj.scope_id = r.scope_id
+                       AND dj.entity_id = r.id
+                       AND dj.event_kind = 'artifact_revision.purged'
+                ) AS has_purge_commitment
            FROM openmettle.artifact_revisions r
            JOIN openmettle.storage_reservations s
              ON s.scope_id = r.scope_id AND s.id = r.reservation_id
@@ -253,10 +368,13 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     let pre_purge_stage: String = target.try_get("purge_stage")?;
     let pre_size: i64 = target.try_get("size_bytes")?;
     let pre_digest: Vec<u8> = target.try_get("content_digest")?;
+    let pre_has_purge_commitment: bool = target.try_get("has_purge_commitment")?;
     let size_u64 = u64::try_from(pre_size).map_err(|_| Failure("invalid revision size"))?;
 
     let names = reservation_names(&pre_res_id);
-    if !is_replay {
+    // Hold the exclusive file locks continuously from preflight verification across DB commit and
+    // post-commit unlink so no window exists for replacement or foreign hard linking.
+    let (entries, locked, mtimes) = if !is_replay {
         if pre_res_state != "settled" {
             return Err(Failure(
                 "artifact revision is not eligible to be declared lost",
@@ -276,6 +394,9 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
                 ));
             }
         }
+        if pre_has_purge_commitment {
+            return Err(Failure(TERMINAL_PURGE_COMMITTED));
+        }
         let (entries, mut locked) = inspect_and_lock(&v, &names, false)?;
         let ledger = Ledger {
             state: &pre_res_state,
@@ -291,23 +412,29 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
             size_u64,
             &pre_digest,
         )?;
-        // Re-verify link counts strictly under the exclusive file locks before releasing them.
-        drop(locked);
-        let _ = inspect_and_lock(&v, &names, true)?;
-    } else if pre_rev_state != "lost" {
-        return Err(Failure(
-            "replayed declare-lost target revision is not in lost state",
-        ));
-    }
+        let mtimes = snapshot_mtimes(&locked)?;
+        verify_locked_reservation(&v, &names, &entries, &locked, &mtimes)?;
+        (entries, locked, mtimes)
+    } else {
+        if pre_rev_state != "lost" {
+            return Err(Failure(
+                "replayed declare-lost target revision is not in lost state",
+            ));
+        }
+        let (entries, locked) = inspect_and_lock(&v, &names, true)?;
+        let mtimes = snapshot_mtimes(&locked)?;
+        (entries, locked, mtimes)
+    };
 
     // Atomic READ COMMITTED transaction: acquire canonical locks via storage_declare_payload_lost,
-    // re-verify volume sentinel, payload unrecoverability and link counts under lock, unlink any
-    // remaining unrecoverable files and fsync parent dirs, then commit.
+    // re-verify volume sentinel, fence deadline, and continuously-held locked descriptors, then
+    // commit durable DB state BEFORE unlinking leftover files on disk.
     let mut tx = c.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)
         .await?;
     sqlx::query(FS_TX_IDLE_TIMEOUT).execute(&mut *tx).await?;
+    let fence_deadline = Instant::now() + TX_FENCE_BUDGET;
 
     let (applied, reservation_id, scope_id, artifact_id, previous_state, journal_seq): (
         bool,
@@ -329,36 +456,19 @@ pub async fn declare_lost(c: &mut PgConnection, opts: &Options<'_>) -> Result<Ou
     .await
     .map_err(map_sql_error)?;
 
-    v.verify(&pin)?;
-    let locked_names = reservation_names(&reservation_id);
-    let (entries, mut locked) = inspect_and_lock(&v, &locked_names, false)?;
-    if applied {
-        let ledger = Ledger {
-            state: "settled",
-            reclaim: "none",
-            revision: Some(&previous_state),
-            purge: Some("none"),
-        };
-        check_unrecoverable_and_no_foreign_links(
-            &ledger,
-            &entries,
-            &mut locked,
-            &reservation_id,
-            size_u64,
-            &pre_digest,
-        )?;
+    if reservation_id != pre_res_id || (applied && previous_state != pre_rev_state) {
+        return Err(Failure(CHANGED));
     }
-    // Re-acquire/verify with strict link-count enforcement under exclusive flock before unlinking.
-    drop(locked);
-    let (final_entries, final_locked) = inspect_and_lock(&v, &locked_names, true)?;
-    let unlinked_files = if final_entries.iter().any(Option::is_some) {
-        unlink_reservation_files(&v, &locked_names, &final_entries, None)?
-    } else {
-        0
-    };
-    drop(final_locked);
+    check_fence(fence_deadline)?;
+    v.verify(&pin)?;
+    verify_locked_reservation(&v, &names, &entries, &locked, &mtimes)?;
+    check_fence(fence_deadline)?;
 
     tx.commit().await.map_err(|_| Failure(COMMIT_UNKNOWN))?;
+
+    let unlinked_files =
+        unlink_after_commit(&v, &pin, &names, &entries, &locked, &mtimes, fence_deadline)?;
+    drop(locked);
     Ok(Outcome {
         applied,
         revision_id: opts.revision.to_owned(),
@@ -482,5 +592,121 @@ mod tests {
         assert!(!valid_trimmed_text("trailing ", 128));
         assert!(!valid_trimmed_text("line\nbreak", 128));
         assert!(!valid_trimmed_text(&"a".repeat(129), 128));
+    }
+
+    #[test]
+    fn intact_payload_with_stale_purge_anchor_or_staged_copy_is_refused() {
+        let dir = Dir::new();
+        let root = dir.path("vol");
+        std::fs::create_dir(&root).unwrap();
+        let v = Volume::open(Path::new(&root), true).unwrap();
+        let res_id = "33333333-3333-4333-8333-333333333333";
+        let payload = b"intact-despite-stray-anchor";
+        let digest = Sha256::digest(payload).to_vec();
+        let rev_path = Path::new(&root).join("revisions").join(res_id);
+        let purge_path = Path::new(&root)
+            .join("revisions")
+            .join(format!(".purge.{res_id}"));
+        std::fs::write(&rev_path, payload).unwrap();
+        // Stray `.purge.<id>` hard link causes `rebind::classify` to return Err("unexpected purge
+        // anchor") on active/retained or Err("anchor is not empty") on purging. SHA-256 must run
+        // independently and refuse unlinking the intact payload.
+        std::fs::hard_link(&rev_path, &purge_path).unwrap();
+
+        let names = reservation_names(res_id);
+        let (entries, mut locked) = inspect_and_lock(&v, &names, false).unwrap();
+        for state in ["active", "retained", "purging"] {
+            let ledger = Ledger {
+                state: "settled",
+                reclaim: "none",
+                revision: Some(state),
+                purge: Some("none"),
+            };
+            let err = check_unrecoverable_and_no_foreign_links(
+                &ledger,
+                &entries,
+                &mut locked,
+                res_id,
+                payload.len() as u64,
+                &digest,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.0,
+                "payload verifies intact; resolve layout mismatch or run storage rebind instead"
+            );
+        }
+        drop(locked);
+        assert_eq!(std::fs::read(&rev_path).unwrap(), payload);
+        assert_eq!(std::fs::read(&purge_path).unwrap(), payload);
+
+        // Intact bytes remaining only in `staging/<id>` must also be refused.
+        let staging_path = Path::new(&root).join("staging").join(res_id);
+        std::fs::remove_file(&rev_path).unwrap();
+        std::fs::remove_file(&purge_path).unwrap();
+        std::fs::write(&staging_path, payload).unwrap();
+        let (entries, mut locked) = inspect_and_lock(&v, &names, false).unwrap();
+        let active = Ledger {
+            state: "settled",
+            reclaim: "none",
+            revision: Some("active"),
+            purge: Some("none"),
+        };
+        let err = check_unrecoverable_and_no_foreign_links(
+            &active,
+            &entries,
+            &mut locked,
+            res_id,
+            payload.len() as u64,
+            &digest,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            "payload verifies intact; resolve layout mismatch or run storage rebind instead"
+        );
+    }
+
+    #[test]
+    fn continuous_flock_detects_foreign_link_and_expired_fence_aborts_before_unlink() {
+        let dir = Dir::new();
+        let root = dir.path("vol");
+        std::fs::create_dir(&root).unwrap();
+        let v = Volume::open(Path::new(&root), true).unwrap();
+        let pin = v
+            .publish_identity("44444444-4444-4444-8444-444444444444")
+            .unwrap();
+        let res_id = "55555555-5555-4555-8555-555555555555";
+        let rev_path = Path::new(&root).join("revisions").join(res_id);
+        std::fs::write(&rev_path, b"corrupt").unwrap();
+
+        let names = reservation_names(res_id);
+        let (entries, locked) = inspect_and_lock(&v, &names, true).unwrap();
+        let mtimes = snapshot_mtimes(&locked).unwrap();
+
+        // 1. Expired fence budget aborts strictly before unlinking, leaving the file untouched.
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+        let err =
+            unlink_after_commit(&v, &pin, &names, &entries, &locked, &mtimes, expired).unwrap_err();
+        assert_eq!(err.0, FENCE_EXPIRED);
+        assert!(rev_path.exists());
+
+        // 2. While `locked` is held continuously (no drop/reopen), an added foreign hard link is
+        //    detected and blocks unlinking.
+        let foreign = Path::new(&root).join("foreign-after-lock");
+        std::fs::hard_link(&rev_path, &foreign).unwrap();
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        let err =
+            unlink_after_commit(&v, &pin, &names, &entries, &locked, &mtimes, valid).unwrap_err();
+        assert_eq!(err.0, "foreign hard link");
+        assert!(rev_path.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"corrupt");
+
+        // Removing the foreign link lets post-commit unlink succeed under the same held lock.
+        std::fs::remove_file(&foreign).unwrap();
+        let unlinked =
+            unlink_after_commit(&v, &pin, &names, &entries, &locked, &mtimes, valid).unwrap();
+        assert_eq!(unlinked, 1);
+        assert!(!rev_path.exists());
     }
 }

@@ -257,10 +257,61 @@ fn parse_accept_gap_args(
     ))
 }
 
+struct RestoreReplayArgs {
+    file: String,
+    root: Option<String>,
+    db_only: bool,
+}
+
+fn parse_restore_replay_args(args: &[String]) -> Result<RestoreReplayArgs, &'static str> {
+    let usage = "usage: openmettle-admin restore replay [--db-only] FILE [ROOT]";
+    let mut db_only = false;
+    let mut positional: Vec<String> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--db-only" => {
+                if db_only {
+                    return Err("duplicate --db-only");
+                }
+                db_only = true;
+            }
+            s if s.starts_with('-') => return Err("unknown restore replay option"),
+            _ => positional.push(arg.clone()),
+        }
+    }
+    if db_only {
+        if positional.len() != 1 {
+            return Err("usage: openmettle-admin restore replay --db-only FILE");
+        }
+        return Ok(RestoreReplayArgs {
+            file: positional.remove(0),
+            root: None,
+            db_only: true,
+        });
+    }
+    match positional.len() {
+        1 => Ok(RestoreReplayArgs {
+            file: positional.remove(0),
+            root: None,
+            db_only: false,
+        }),
+        2 => {
+            let root = positional.pop();
+            let file = positional.remove(0);
+            Ok(RestoreReplayArgs {
+                file,
+                root,
+                db_only: false,
+            })
+        }
+        _ => Err(usage),
+    }
+}
+
 /// ADR 0041: `journal export FILE`,
 /// `restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]`,
 /// `restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON`,
-/// `restore replay FILE [ROOT]`.
+/// `restore replay [--db-only] FILE [ROOT]`.
 async fn journal(
     command: (Option<String>, Option<String>),
     args: &[String],
@@ -387,15 +438,28 @@ async fn journal(
                 println!("replayed restore.accept_coverage_gap");
             }
         }
-        (Some("restore"), Some("replay")) if matches!(args.len(), 1 | 2) => {
-            let file = &args[0];
-            let store = args
-                .get(1)
+        (Some("restore"), Some("replay")) => {
+            let replay_args = parse_restore_replay_args(args)?;
+            let text =
+                fs::read_to_string(&replay_args.file).map_err(|_| "export file unreadable")?;
+            let export = restore::Export::parse(&text).map_err(failed("restore replay"))?;
+            if replay_args.db_only {
+                let pool = pool(1).await?;
+                let applied = restore::apply(&pool, &export)
+                    .await
+                    .map_err(failed("restore replay"))?;
+                println!(
+                    "replayed {applied} records through {}; database journal caught up (restore gate remains closed)",
+                    export.seq
+                );
+                return Ok(());
+            }
+            let store = replay_args
+                .root
+                .as_deref()
                 .map(|root| openmettle_core::artifact_fs::Store::open_existing(Path::new(root)))
                 .transpose()
                 .map_err(|_| "volume unavailable")?;
-            let text = fs::read_to_string(file).map_err(|_| "export file unreadable")?;
-            let export = restore::Export::parse(&text).map_err(failed("restore replay"))?;
             let pool = pool(2).await?;
             if let Some(store) = store.as_ref() {
                 let mut conn = pool
@@ -425,7 +489,7 @@ async fn journal(
         }
         _ => {
             return Err(
-                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
+                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] [--required-lifecycle-baseline-digest HEX] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay [--db-only] FILE [ROOT]",
             );
         }
     }
@@ -942,7 +1006,7 @@ async fn vault_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stati
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_declare_lost_args, parse_restore_lock_args};
+    use super::{parse_declare_lost_args, parse_restore_lock_args, parse_restore_replay_args};
     use openmettle_core::restore::GENESIS;
 
     fn vecs(items: &[&str]) -> Vec<String> {
@@ -1040,6 +1104,29 @@ mod tests {
         assert_eq!(
             parse_declare_lost_args(&vecs(&["--revision", "a", "--revision", "b"])).err(),
             Some("duplicate --revision")
+        );
+    }
+
+    #[test]
+    fn restore_replay_parses_db_only_and_rejects_root_combination() {
+        let db_only = parse_restore_replay_args(&vecs(&["--db-only", "export.txt"])).unwrap();
+        assert!(db_only.db_only);
+        assert_eq!(db_only.file, "export.txt");
+        assert_eq!(db_only.root, None);
+
+        let full = parse_restore_replay_args(&vecs(&["export.txt", "/var/artifacts"])).unwrap();
+        assert!(!full.db_only);
+        assert_eq!(full.file, "export.txt");
+        assert_eq!(full.root.as_deref(), Some("/var/artifacts"));
+
+        assert!(parse_restore_replay_args(&vecs(&["--db-only", "export.txt", "/root"])).is_err());
+        assert_eq!(
+            parse_restore_replay_args(&vecs(&["--db-only", "--db-only", "export.txt"])).err(),
+            Some("duplicate --db-only")
+        );
+        assert_eq!(
+            parse_restore_replay_args(&vecs(&["--unknown", "export.txt"])).err(),
+            Some("unknown restore replay option")
         );
     }
 }
