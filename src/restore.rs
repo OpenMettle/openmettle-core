@@ -265,6 +265,17 @@ pub(crate) async fn lock_open_gate(c: &mut PgConnection) -> Result<bool, sqlx::E
         .await
 }
 
+/// Lock the restore reconciliation gate `FOR SHARE` on a database already known to have schema
+/// 41+, skipping the `to_regclass` probe. Returns `Some(gate_generation)` when open and `None`
+/// when closed.
+pub(crate) async fn lock_open_gate_generation_known_41(
+    c: &mut PgConnection,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
+        .fetch_one(c)
+        .await
+}
+
 /// Lock the restore reconciliation gate `FOR SHARE` inside the caller's transaction, returning
 /// `Some(gate_generation)` when open (`Some(0)` on pre-41 schemas where
 /// `restore_reconciliation_gate` does not exist) and `None` when closed. On schema 41+, invokes
@@ -281,9 +292,7 @@ pub(crate) async fn lock_open_gate_generation(
     if !gated {
         return Ok(Some(0));
     }
-    sqlx::query_scalar("SELECT openmettle.restore_gate_lock_open_generation()")
-        .fetch_one(c)
-        .await
+    lock_open_gate_generation_known_41(c).await
 }
 
 /// Lock the restore reconciliation gate `FOR SHARE`, returning the open `gate_generation` or a

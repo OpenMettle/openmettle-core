@@ -17,7 +17,7 @@ use tokio::{
 
 pub(super) const SSE_MAX_IN_FLIGHT: usize = 128;
 const BATCH_LIMIT: i64 = 16;
-const CHANNEL_FRAMES: usize = 1;
+const CHANNEL_FRAMES: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const REAUTH_INTERVAL: Duration = Duration::from_secs(10);
@@ -238,13 +238,13 @@ fn frame(cursor: &str, event: &Value) -> Result<Bytes, Problem> {
     Ok(format!("id: {cursor}\ndata: {data}\n\n").into())
 }
 
+/// Callers must already hold `restore_reconciliation_gate` `FOR SHARE` in the active transaction.
 async fn authorize(
     c: &mut PgConnection,
     context: &sessions::Context,
     row: &PgRow,
     min_now_ms: i64,
 ) -> Result<(), StoreError> {
-    crate::restore::require_open_gate(c).await?;
     let now_ms = authz::store::post_lock_clock_ms(c, min_now_ms.max(context.observed_ms())).await?;
     let principal = principal_at(c, context, now_ms).await?;
     let conversation = projects::read_resource(
@@ -445,6 +445,23 @@ async fn stopping(stop: Option<watch::Receiver<bool>>) {
     }
 }
 
+async fn check_open_gate_generation(
+    conn: &mut PgConnection,
+    expected: i64,
+) -> Result<(), StoreError> {
+    let current = if expected > 0 {
+        crate::restore::lock_open_gate_generation_known_41(conn).await?
+    } else {
+        crate::restore::lock_open_gate_generation(conn).await?
+    };
+    if current != Some(expected) {
+        return Err(StoreError::Database(sqlx::Error::Protocol(
+            "restore reconciliation pending".into(),
+        )));
+    }
+    Ok(())
+}
+
 struct Subscription {
     api: Arc<Api>,
     session: Session,
@@ -465,45 +482,76 @@ impl Subscription {
     }
 
     async fn send_gated(&self, tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
-        // Wait for backpressure clearance BEFORE acquiring the restore gate share lock, then hold
-        // that READ COMMITTED transaction across synchronous `permit.send(bytes)` so gate closure
-        // cannot commit between checking `gate_generation` and enqueuing the frame.
-        let permit = reserve_send(tx).await?;
+        self.send_gated_batch(tx, vec![bytes]).await
+    }
+
+    async fn send_gated_batch(
+        &self,
+        tx: &mpsc::Sender<Bytes>,
+        frames: Vec<Bytes>,
+    ) -> Result<(), Problem> {
+        let mut iter = frames.into_iter().peekable();
         let Some(expected) = self.gate_generation else {
-            permit.send(bytes);
+            for bytes in iter {
+                reserve_send(tx).await?.send(bytes);
+            }
             return Ok(());
         };
-        let mut permit = Some(permit);
-        let mut bytes = Some(bytes);
-        self.api
-            .database(async |c| {
-                let mut db_tx = authz::store::begin(c).await?;
-                let result = async {
-                    let conn = db_tx.connection()?;
-                    let current = crate::restore::lock_open_gate_generation(conn).await?;
-                    if current != Some(expected) {
-                        return Err(StoreError::Database(sqlx::Error::Protocol(
-                            "restore reconciliation pending".into(),
-                        )));
+
+        // Enqueue consecutive non-backpressured frames synchronously inside one READ COMMITTED
+        // transaction holding `FOR SHARE` on `restore_reconciliation_gate`, committing and
+        // releasing the DB checkout immediately before awaiting backpressure clearance.
+        let mut pending_permit: Option<mpsc::Permit<'_, Bytes>> = None;
+        while iter.peek().is_some() {
+            if pending_permit.is_none() && tx.capacity() == 0 {
+                pending_permit = Some(reserve_send(tx).await?);
+            }
+            let mut closed = false;
+            self.api
+                .database(async |c| {
+                    let mut db_tx = authz::store::begin(c).await?;
+                    let result = async {
+                        let conn = db_tx.connection()?;
+                        check_open_gate_generation(conn, expected).await?;
+                        while iter.peek().is_some() {
+                            let permit = if let Some(permit) = pending_permit.take() {
+                                permit
+                            } else {
+                                match tx.try_reserve() {
+                                    Ok(permit) => permit,
+                                    Err(mpsc::error::TrySendError::Full(())) => break,
+                                    Err(mpsc::error::TrySendError::Closed(())) => {
+                                        closed = true;
+                                        break;
+                                    }
+                                }
+                            };
+                            if let Some(bytes) = iter.next() {
+                                permit.send(bytes);
+                            }
+                        }
+                        Ok::<_, StoreError>(())
                     }
-                    if let (Some(permit), Some(bytes)) = (permit.take(), bytes.take()) {
-                        permit.send(bytes);
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            db_tx.commit().await?;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            let _ = db_tx.rollback().await;
+                            Err(err)
+                        }
                     }
-                    Ok::<_, StoreError>(())
-                }
-                .await;
-                match result {
-                    Ok(()) => {
-                        db_tx.commit().await?;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = db_tx.rollback().await;
-                        Err(err)
-                    }
-                }
-            })
-            .await?;
+                })
+                .await?;
+            if closed {
+                return Err(UNAVAILABLE);
+            }
+            if iter.peek().is_some() {
+                pending_permit = Some(reserve_send(tx).await?);
+            }
+        }
         Ok(())
     }
 
@@ -518,14 +566,13 @@ impl Subscription {
                     let mut tx = authz::store::begin(c).await?;
                     let result = async {
                         let conn = tx.connection()?;
-                        let generation = crate::restore::require_open_gate_generation(conn).await?;
-                        if let Some(expected) = expected_gen
-                            && generation != expected
-                        {
-                            return Err(StoreError::Database(sqlx::Error::Protocol(
-                                "restore reconciliation pending".into(),
-                            )));
-                        }
+                        let generation = match expected_gen {
+                            Some(expected) => {
+                                check_open_gate_generation(conn, expected).await?;
+                                expected
+                            }
+                            None => crate::restore::require_open_gate_generation(conn).await?,
+                        };
                         let row = sqlx::query(BATCH)
                             .bind(&self.run)
                             .bind(self.position)
@@ -555,14 +602,14 @@ impl Subscription {
                         let mut tx = authz::store::begin(c).await?;
                         let result = async {
                             let conn = tx.connection()?;
-                            let generation =
-                                crate::restore::require_open_gate_generation(conn).await?;
-                            if let Some(expected) = expected_gen
-                                && generation != expected
-                            {
-                                return Err(StoreError::Database(sqlx::Error::Protocol(
-                                    "restore reconciliation pending".into(),
-                                )));
+                            match expected_gen {
+                                Some(expected) => {
+                                    check_open_gate_generation(conn, expected).await?;
+                                }
+                                None => {
+                                    let _ =
+                                        crate::restore::require_open_gate_generation(conn).await?;
+                                }
                             }
                             authorize(conn, &context, &row, context.observed_ms()).await
                         }
@@ -589,15 +636,21 @@ impl Subscription {
         let mut last_write = Instant::now();
         loop {
             let full = batch.events.len() == BATCH_LIMIT as usize;
+            let mut frames = Vec::with_capacity(batch.events.len());
+            let mut last_seq = self.position;
             for stored in batch.events {
                 let sequence = stored.0;
                 if let Some(event) = event(&self.run, &stored)? {
                     let id = self.binding(&batch.scope).sign(&self.keys, sequence);
-                    self.send_gated(tx, frame(&id, &event)?).await?;
-                    last_write = Instant::now();
+                    frames.push(frame(&id, &event)?);
                 }
-                self.position = sequence;
+                last_seq = sequence;
             }
+            if !frames.is_empty() {
+                self.send_gated_batch(tx, frames).await?;
+                last_write = Instant::now();
+            }
+            self.position = last_seq;
             if batch.terminal && (self.position >= batch.last || !full) {
                 return Ok(());
             }

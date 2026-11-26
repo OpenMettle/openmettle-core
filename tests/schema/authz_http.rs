@@ -4712,7 +4712,9 @@ async fn post_runs_rejects_authority_expired_during_quota_budget_lock_wait() {
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let expires_ms = db_now_ms + 1_500;
     sqlx::query(
         "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
     )
@@ -4954,7 +4956,9 @@ async fn post_runs_rejects_attachment_share_expired_during_quota_budget_lock_wai
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let obs_expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let obs_expires_ms = db_now_ms + 1_500;
     sqlx::query(
         "UPDATE openmettle.membership_observations
             SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
@@ -5423,7 +5427,9 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let expires_ms = db_now_ms + 1_500;
     let alice_session_id = alice_cookie.split('.').next().unwrap();
     let updated_sessions =
         sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")

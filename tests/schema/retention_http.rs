@@ -2980,8 +2980,8 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
     assert_eq!(delivered_seqs[0], 1);
 
     // Yield long enough that an un-backpressured stream would drain all 80 events; with vectored
-    // WriteStrategy::Queue (MAX_BUF_LIST_BUFFERS = 16) + mpsc::channel(1), the producer parks
-    // genuinely on tx.reserve() mid-batch inside batch 2 (17..=32).
+    // WriteStrategy::Queue (MAX_BUF_LIST_BUFFERS = 16) + mpsc::channel(16), the producer parks
+    // genuinely on tx.reserve() mid-batch inside batch 3 (33..=48).
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Close the restore gate while the producer is backpressured mid-batch!
