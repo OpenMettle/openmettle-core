@@ -375,7 +375,7 @@ async fn recheck(db: &TestDb, claim: &ClaimedRun) -> Result<RunRecheckOutcome, l
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn identical_admissions_admit_once_and_replays_keep_the_original_admission() {
-    let db = TestDb::migrated().await;
+    let db = TestDb::migrated_exclusive().await;
     seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
@@ -524,7 +524,7 @@ async fn identical_admissions_admit_once_and_replays_keep_the_original_admission
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn concurrent_admissions_admit_exactly_the_actor_scope_and_queue_limits() {
-    let db = TestDb::migrated().await;
+    let db = TestDb::migrated_exclusive().await;
     seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
