@@ -37,10 +37,11 @@ ALTER TABLE openmettle.capacity_grants
 
 -- Locale- and encoding-independent identifier check matching Rust
 -- `runs::bounded(s, max) && s.trim() == s && !s.chars().any(char::is_control)`.
--- Pure 7-bit ASCII SQL over raw bytes so CREATE FUNCTION succeeds on both UTF8 and SQL_ASCII
--- databases: enforces 1..=max UTF-8 bytes, strict RFC 3629 UTF-8 with no C0/DEL/C1 control
--- characters (U+0000..U+001F, U+007F..U+009F), and no leading or trailing Unicode White_Space
--- (all 25 White_Space code points, independent of LC_CTYPE).
+-- Pure 7-bit ASCII SQL so CREATE FUNCTION succeeds on UTF8, SQL_ASCII and legacy single-byte
+-- encodings (e.g. WIN1252): validates raw bytes directly on SQL_ASCII and converts all other
+-- server encodings to UTF-8 before enforcing 1..=max bytes (in both server and UTF-8 encoding),
+-- strict RFC 3629 UTF-8 with no C0/DEL/C1 control characters (U+0000..U+001F, U+007F..U+009F),
+-- and no leading or trailing Unicode White_Space (all 25 White_Space code points).
 CREATE FUNCTION openmettle.capacity_valid_name(p_value text, p_max_bytes integer)
 RETURNS boolean
 LANGUAGE sql
@@ -51,12 +52,18 @@ AS $$
     SELECT CASE
         WHEN p_value IS NULL OR p_max_bytes IS NULL THEN false
         ELSE (
-            SELECT length(raw) BETWEEN 1 AND p_max_bytes
+            SELECT octet_length(p_value) BETWEEN 1 AND p_max_bytes
+               AND length(raw) BETWEEN 1 AND p_max_bytes
                AND hex COLLATE "C" ~ '^([2-6][0-9a-f]|7[0-9a-e]|c2[ab][0-9a-f]|(c[3-9a-f]|d[0-9a-f])[89ab][0-9a-f]|e0[ab][0-9a-f][89ab][0-9a-f]|e[1-9abc][89ab][0-9a-f][89ab][0-9a-f]|ed[89][0-9a-f][89ab][0-9a-f]|e[ef][89ab][0-9a-f][89ab][0-9a-f]|f0[9ab][0-9a-f][89ab][0-9a-f][89ab][0-9a-f]|f[1-3][89ab][0-9a-f][89ab][0-9a-f][89ab][0-9a-f]|f48[0-9a-f][89ab][0-9a-f][89ab][0-9a-f])+$'
                AND hex COLLATE "C" !~ '^(20|c2a0|e19a80|e2808[0-9a]|e280a[89f]|e2819f|e38080)'
                AND hex COLLATE "C" !~ '(20|c2a0|e19a80|e2808[0-9a]|e280a[89f]|e2819f|e38080)$'
-              FROM (SELECT convert_to(p_value, getdatabaseencoding()::name) AS raw) r,
-                   LATERAL (SELECT encode(r.raw, 'hex') AS hex) h
+              FROM (
+                  SELECT CASE
+                      WHEN getdatabaseencoding() = 'SQL_ASCII' THEN convert_to(p_value, 'SQL_ASCII')
+                      ELSE convert_to(p_value, 'UTF8')
+                  END AS raw
+              ) r,
+              LATERAL (SELECT encode(r.raw, 'hex') AS hex) h
         )
     END
 $$;

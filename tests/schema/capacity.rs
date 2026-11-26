@@ -5990,3 +5990,276 @@ async fn migration_40_and_capacity_valid_name_work_on_sql_ascii() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_40_and_capacity_valid_name_work_on_win1252() {
+    use openmettle_core::capacity::adapter::{
+        BackendDeviceConfig, CapacityWait, CoordinatorError, DispatchOutcome, FencedBackend,
+        GroupCoordinator,
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    let db = TestDb::create(
+        "SELECT pg_advisory_lock_shared($1)",
+        "TEMPLATE template0 ENCODING 'WIN1252' LOCALE_PROVIDER libc LC_COLLATE 'C' LC_CTYPE 'C'",
+    )
+    .await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000000),
+                    ('personal', 'device_reservations', 8)",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+         VALUES ($1::uuid, 60000)",
+    )
+    .bind(GROUP)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+         VALUES ($1::uuid, $2::uuid, $3)",
+    )
+    .bind(GPU0)
+    .bind(GROUP)
+    .bind(FLOOR)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let mut api = connect(&db.0, API).await;
+    let (branch, message) = super::quotas::branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 16,
+        live_per_scope: 16,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 4,
+    };
+    for i in 0..2 {
+        let key = format!("win1252-run-{i}");
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = authz_queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &alice.user,
+                    conversation: &chat,
+                    branch: &branch,
+                    message: &message,
+                    key: &key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: b"{}",
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: None,
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        assert!(
+            quotas::reserve_admitted_run_budget(
+                &mut tx,
+                &RunBudgetReservation {
+                    scope_id: &scope,
+                    scope_kind: "personal",
+                    actor_user_id: &alice.user,
+                    actor_approval_id: &alice.approval,
+                    run_id: &run_id,
+                    token_units: 100,
+                    per_round_cost_micros: None,
+                    round_limit: 1,
+                    requires_device_slot: true,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().await.unwrap();
+    }
+
+    let mut worker = connect(&db.0, WORKER).await;
+    let mut claims = Vec::new();
+    for _ in 0..2 {
+        claims.push(
+            authz_queue::claim_next(
+                &mut worker,
+                &ClaimLimits {
+                    executing_per_actor: 16,
+                    executing_per_scope: 16,
+                },
+                &LeaseSettings {
+                    lease: Duration::from_secs(60),
+                    execution_timeout: Duration::from_secs(600),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(role_options(&db.0, WORKER))
+        .await
+        .unwrap();
+    let backend = Arc::new(
+        FencedBackend::new(
+            GROUP,
+            vec![BackendDeviceConfig {
+                device_id: GPU0.into(),
+                total_bytes: TOTAL,
+                safety_headroom_bytes: HEADROOM,
+                active_chat_floor_bytes: FLOOR,
+                backed_chat_floor_bytes: FLOOR,
+                reclaimable_bytes: 0,
+                unattributed_used_bytes: 0,
+            }],
+        )
+        .unwrap(),
+    );
+    let ctl = Controller::acquire(&mut worker, GROUP, LEASE)
+        .await
+        .unwrap();
+    let coord = GroupCoordinator::new(pool, ctl, backend.clone());
+    coord.takeover_and_reconcile().await.unwrap();
+    assert!(
+        publish(
+            &mut worker,
+            coord.controller(),
+            1,
+            0,
+            &backend.observe().unwrap()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(coord.resume().await.unwrap());
+
+    // 1. Valid WIN1252 multibyte-in-UTF-8 string "café" (stored as 0xE9 in WIN1252) must be
+    //    accepted by `capacity_valid_name`, `capacity_profiles`, and end-to-end `dispatch_grant`.
+    let cafe = "caf\u{00e9}";
+    let cafe_ok: bool = sqlx::query_scalar("SELECT openmettle.capacity_valid_name($1, 128)")
+        .bind(cafe)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert!(cafe_ok, "valid WIN1252 name 'café' must pass");
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_profiles
+             (profile, group_id, per_device_bytes, required_devices, model_id)
+         VALUES ($1, $2::uuid, $3, 1, $1)",
+    )
+    .bind(cafe)
+    .bind(GROUP)
+    .bind(GIB)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let one_gib = [bytes(GPU0, GIB)];
+    let DispatchOutcome::Dispatched { .. } = coord
+        .dispatch_grant(
+            &GrantRequest {
+                scope_id: &scope,
+                run_id: &claims[0].run_id,
+                claim_token: &claims[0].claim_token,
+                request_key: "win1252-cafe",
+                profile: cafe,
+                footprint: &one_gib,
+            },
+            &CapacityWait::start(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected WIN1252 'café' grant to dispatch");
+    };
+
+    // 2. Trailing NBSP "\u{00c3}\u{00a0}" (stored as WIN1252 bytes C3 A0, mimicking UTF-8 'à')
+    //    must be rejected by `capacity_valid_name`, `capacity_profiles`, `capacity::grant`, and
+    //    `GroupCoordinator::dispatch_grant` without creating a grant, consuming run 1's slot, or
+    //    closing the group!
+    let spoofed_nbsp = "\u{00c3}\u{00a0}";
+    let bad_ok: bool = sqlx::query_scalar("SELECT openmettle.capacity_valid_name($1, 128)")
+        .bind(spoofed_nbsp)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert!(
+        !bad_ok,
+        "WIN1252 trailing NBSP (bytes C3 A0) must be rejected"
+    );
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "INSERT INTO openmettle.capacity_profiles
+                     (profile, group_id, per_device_bytes, required_devices)
+                 VALUES ($1, $2::uuid, $3, 1)",
+            )
+            .bind(spoofed_nbsp)
+            .bind(GROUP)
+            .bind(GIB)
+            .execute(&mut owner)
+            .await
+        ),
+        "23514"
+    );
+    let bad_req = GrantRequest {
+        scope_id: &scope,
+        run_id: &claims[1].run_id,
+        claim_token: &claims[1].claim_token,
+        request_key: "win1252-nbsp",
+        profile: spoofed_nbsp,
+        footprint: &one_gib,
+    };
+    assert_eq!(
+        capacity::grant(&mut worker, coord.controller(), &bad_req).await,
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        coord.dispatch_grant(&bad_req, &CapacityWait::start()).await,
+        Err(CoordinatorError::Store(Error::Invalid))
+    );
+    let grant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.capacity_grants")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(grant_count, 1);
+    let slot1_state: String = sqlx::query_scalar(
+        "SELECT state FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+            AND resource_kind = 'device_reservations'",
+    )
+    .bind(&claims[1].run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(slot1_state, "held");
+    assert!(admits(&mut worker).await);
+}
