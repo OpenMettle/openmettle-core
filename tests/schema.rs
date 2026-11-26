@@ -415,18 +415,46 @@ enum ColumnDefault {
     Int(i64),
     Str(&'static str),
     EmptyArray,
+    /// Value depends on an existing column in the same row (for example migration 40's backfill
+    /// of `capacity_grants.dispatch_state` to `'confirmed'` for released rows and `'pending'`
+    /// otherwise).
+    ByState {
+        state_column: &'static str,
+        match_state: &'static str,
+        when_matched: &'static str,
+        otherwise: &'static str,
+    },
     /// Non-null value assigned dynamically at upgrade time (for example `clock_timestamp()`).
     AnyNonNull,
 }
 
 impl ColumnDefault {
-    fn matches(self, value: &serde_json::Value) -> bool {
+    fn matches(
+        self,
+        row: &serde_json::Map<String, serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> bool {
         match self {
             Self::Null => value.is_null(),
             Self::Bool(expected) => value.as_bool() == Some(expected),
             Self::Int(expected) => value.as_i64() == Some(expected),
             Self::Str(expected) => value.as_str() == Some(expected),
             Self::EmptyArray => value.as_array().is_some_and(Vec::is_empty),
+            Self::ByState {
+                state_column,
+                match_state,
+                when_matched,
+                otherwise,
+            } => {
+                let expected = if row.get(state_column).and_then(serde_json::Value::as_str)
+                    == Some(match_state)
+                {
+                    when_matched
+                } else {
+                    otherwise
+                };
+                value.as_str() == Some(expected)
+            }
             Self::AnyNonNull => !value.is_null(),
         }
     }
@@ -438,6 +466,14 @@ impl ColumnDefault {
             Self::Int(v) => v.to_string(),
             Self::Str(v) => format!("{v:?}"),
             Self::EmptyArray => "[]".to_owned(),
+            Self::ByState {
+                state_column,
+                match_state,
+                when_matched,
+                otherwise,
+            } => format!(
+                "{when_matched:?} when {state_column} == {match_state:?}, else {otherwise:?}"
+            ),
             Self::AnyNonNull => "a non-null value".to_owned(),
         }
     }
@@ -790,13 +826,18 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         since: 40,
         table: "capacity_groups",
         column: "backend_unknown",
-        default: ColumnDefault::Bool(false),
+        default: ColumnDefault::Bool(true),
     },
     AdditiveColumn {
         since: 40,
         table: "capacity_grants",
         column: "dispatch_state",
-        default: ColumnDefault::Str("pending"),
+        default: ColumnDefault::ByState {
+            state_column: "state",
+            match_state: "released",
+            when_matched: "confirmed",
+            otherwise: "pending",
+        },
     },
     AdditiveColumn {
         since: 40,
@@ -1154,9 +1195,12 @@ fn normalize_upgraded_row(table: &str, base_version: i64, raw: &str) -> Result<S
     let object = value
         .as_object_mut()
         .ok_or_else(|| format!("{table}: expected JSON object row, got {raw}"))?;
-    for entry in additive_columns_since(base_version).filter(|entry| entry.table == table) {
-        if let Some(found) = object.remove(entry.column)
-            && !entry.default.matches(&found)
+    let to_strip: Vec<&AdditiveColumn> = additive_columns_since(base_version)
+        .filter(|entry| entry.table == table)
+        .collect();
+    for entry in &to_strip {
+        if let Some(found) = object.get(entry.column)
+            && !entry.default.matches(object, found)
         {
             return Err(format!(
                 "{table}.{} (migration {}): expected {}, got {found}",
@@ -1165,6 +1209,9 @@ fn normalize_upgraded_row(table: &str, base_version: i64, raw: &str) -> Result<S
                 entry.default.describe()
             ));
         }
+    }
+    for entry in to_strip {
+        object.remove(entry.column);
     }
     Ok(value.to_string())
 }
@@ -1297,7 +1344,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
         "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
-        "ba7a053fa1c6efcec0cd6d8d04a708de182e7cea86fb034751ed03001da0418f",
+        "331738b2a1a6910c02839cc98f10f4ad694e3debc0b7478b3592e16fed3c47eb",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1566,6 +1613,29 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
         r#"{"id":"p1"}"#
     );
 
+    let upgraded_cap_live = r#"{
+        "id": "cg1",
+        "state": "granted",
+        "dispatch_state": "pending",
+        "dispatch_epoch": null,
+        "extra_devices": []
+    }"#;
+    assert_eq!(
+        normalize_upgraded_row("capacity_grants", 39, upgraded_cap_live).unwrap(),
+        r#"{"id":"cg1","state":"granted"}"#
+    );
+    let upgraded_cap_released = r#"{
+        "id": "cg2",
+        "state": "released",
+        "dispatch_state": "confirmed",
+        "dispatch_epoch": null,
+        "extra_devices": []
+    }"#;
+    assert_eq!(
+        normalize_upgraded_row("capacity_grants", 39, upgraded_cap_released).unwrap(),
+        r#"{"id":"cg2","state":"released"}"#
+    );
+
     // Doctored non-default values on stripped columns must be rejected with clear diagnostics.
     for (table, base, row, expected_column) in [
         (
@@ -1597,6 +1667,18 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             7,
             r#"{"id":"p1","changed_at":null}"#,
             "login_providers.changed_at",
+        ),
+        (
+            "capacity_grants",
+            39,
+            r#"{"id":"cg1","state":"granted","dispatch_state":"confirmed","dispatch_epoch":null,"extra_devices":[]}"#,
+            "capacity_grants.dispatch_state",
+        ),
+        (
+            "capacity_grants",
+            39,
+            r#"{"id":"cg2","state":"released","dispatch_state":"pending","dispatch_epoch":null,"extra_devices":[]}"#,
+            "capacity_grants.dispatch_state",
         ),
     ] {
         let error = normalize_upgraded_row(table, base, row).unwrap_err();

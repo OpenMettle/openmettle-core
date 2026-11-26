@@ -18,7 +18,7 @@
 -- extra ranks cannot be lost across later release attempts.
 
 ALTER TABLE openmettle.capacity_groups
-    ADD COLUMN backend_unknown boolean NOT NULL DEFAULT false;
+    ADD COLUMN backend_unknown boolean NOT NULL DEFAULT true;
 
 ALTER TABLE openmettle.capacity_grants
     ADD COLUMN dispatch_state text NOT NULL DEFAULT 'pending'
@@ -37,7 +37,9 @@ ALTER TABLE openmettle.capacity_grants
 
 CREATE TABLE openmettle.capacity_profiles (
     profile text PRIMARY KEY
-        CHECK (octet_length(profile) BETWEEN 1 AND 128 AND btrim(profile) = profile),
+        CHECK (octet_length(profile) BETWEEN 1 AND 128
+               AND btrim(profile) = profile
+               AND profile !~ '^\s|\s$'),
     group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
     per_device_bytes bigint NOT NULL CHECK (per_device_bytes > 0),
     required_devices integer NOT NULL CHECK (required_devices BETWEEN 1 AND 64),
@@ -50,7 +52,9 @@ CREATE TABLE openmettle.capacity_profiles (
     CHECK (capability_gate <> 'opt_in' OR required_capability IS NOT NULL),
     model_id text
         CHECK (model_id IS NULL
-               OR (octet_length(model_id) BETWEEN 1 AND 128 AND btrim(model_id) = model_id)),
+               OR (octet_length(model_id) BETWEEN 1 AND 128
+                   AND btrim(model_id) = model_id
+                   AND model_id !~ '^\s|\s$')),
     estimated_wait_seconds integer
         CHECK (estimated_wait_seconds IS NULL OR estimated_wait_seconds BETWEEN 1 AND 86400)
 );
@@ -176,6 +180,45 @@ AS $$
     SELECT openmettle.capacity_admits_excluding(p_group, p_resuming, NULL::uuid)
 $$;
 
+-- Extend migration 27's capacity_acquire_controller so every newly acquired epoch atomically
+-- sets backend_unknown = true and clears ready_epoch until backend inventory is reconciled.
+-- Signature, security and privileges are unchanged.
+CREATE OR REPLACE FUNCTION openmettle.capacity_acquire_controller(
+    p_group uuid,
+    p_secret bytea,
+    p_lease_ms integer
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    g openmettle.capacity_groups%ROWTYPE;
+    v_epoch bigint;
+BEGIN
+    IF octet_length(p_secret) IS DISTINCT FROM 32
+       OR p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 600000 THEN
+        RAISE EXCEPTION 'invalid controller lease' USING ERRCODE = '22023';
+    END IF;
+    g := openmettle.capacity_lock_group(p_group);
+    IF g.lease_expires_at > clock_timestamp() THEN
+        RAISE EXCEPTION 'capacity controller fenced' USING ERRCODE = 'OMC01';
+    END IF;
+    UPDATE openmettle.capacity_groups
+       SET controller_token_hash = sha256(p_secret),
+           controller_epoch = nextval('openmettle.capacity_controller_epoch_seq'),
+           lease_expires_at = clock_timestamp() + p_lease_ms * interval '1 millisecond',
+           epoch_started_at = clock_timestamp(),
+           backend_unknown = true,
+           ready_epoch = NULL
+     WHERE id = p_group
+    RETURNING controller_epoch INTO v_epoch;
+    PERFORM openmettle.capacity_fence(p_group, p_secret, v_epoch);
+    RETURN v_epoch;
+END;
+$$;
+
 -- Durable backend-unknown fence toggled around takeover inventory reconciliation. Setting
 -- p_unknown = true also clears ready_epoch so bursts remain closed until recovery finishes cleanly.
 CREATE FUNCTION openmettle.capacity_set_backend_unknown(
@@ -261,7 +304,14 @@ BEGIN
        FOR NO KEY UPDATE;
     IF NOT FOUND
        OR (p_extra_devices IS NOT NULL
-           AND EXISTS (SELECT FROM unnest(p_extra_devices) AS x WHERE x IS NULL)) THEN
+           AND EXISTS (
+               SELECT FROM unnest(p_extra_devices) AS x
+                WHERE x IS NULL
+                   OR NOT EXISTS (
+                       SELECT FROM openmettle.capacity_devices d
+                        WHERE d.group_id = p_group AND d.id = x
+                   )
+           )) THEN
         RAISE EXCEPTION 'invalid capacity release preparation' USING ERRCODE = '22023';
     END IF;
     IF v.state = 'released' THEN
@@ -334,7 +384,10 @@ BEGIN
         END IF;
         UPDATE openmettle.capacity_grants
            SET reconciled_epoch = g.controller_epoch,
-               dispatch_state = 'confirmed'
+               dispatch_state = CASE
+                   WHEN dispatch_state = 'release_in_flight' THEN 'release_in_flight'
+                   ELSE 'confirmed'
+               END
          WHERE id = p_grant;
     ELSIF p_evidence = 'releasing' THEN
         IF v.state = 'granted' THEN
@@ -433,6 +486,7 @@ DECLARE
 BEGIN
     IF p_request_key IS NULL OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
        OR p_profile IS NULL OR octet_length(p_profile) NOT BETWEEN 1 AND 128
+       OR btrim(p_profile) <> p_profile OR p_profile ~ '^\s|\s$'
        OR jsonb_typeof(p_footprint) IS DISTINCT FROM 'array'
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';

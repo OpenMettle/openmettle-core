@@ -250,6 +250,25 @@ async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> Result
     Ok(stale)
 }
 
+/// Toggle the group's durable backend-unknown recovery fence under the controller lease.
+///
+/// Newly acquired epochs start with `backend_unknown = true` so bursts cannot reopen until
+/// backend inventory has been reconciled. Setting `unknown = true` also clears `ready_epoch`.
+pub async fn set_backend_unknown(
+    c: &mut PgConnection,
+    controller: &Controller,
+    unknown: bool,
+) -> Result<(), Error> {
+    sqlx::query("SELECT openmettle.capacity_set_backend_unknown($1::uuid, $2, $3, $4)")
+        .bind(&controller.group_id)
+        .bind(controller.secret.as_slice())
+        .bind(controller.epoch)
+        .bind(unknown)
+        .execute(c)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn resume_with_metrics(
     c: &mut PgConnection,
     controller: &Controller,

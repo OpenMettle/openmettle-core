@@ -1105,6 +1105,8 @@ pub enum DispatchOutcome {
 
 struct DurableLiveGrant {
     state: String,
+    dispatch_state: String,
+    granted_epoch: i64,
     profile: String,
     footprint: BTreeMap<String, i64>,
     unreleased_devices: Vec<String>,
@@ -1174,7 +1176,7 @@ async fn load_live_grants(
     group_id: &str,
 ) -> Result<Vec<(String, DurableLiveGrant)>, StoreError> {
     let rows = sqlx::query(
-        "SELECT g.id::text AS grant_id, g.state, g.profile,
+        "SELECT g.id::text AS grant_id, g.state, g.dispatch_state, g.granted_epoch, g.profile,
                 ARRAY(SELECT x::text FROM unnest(g.extra_devices) AS x ORDER BY x) AS extra_devices,
                 gd.device_id::text AS device_id, gd.bytes,
                 gd.released_at IS NOT NULL AS device_released
@@ -1200,6 +1202,8 @@ async fn load_live_grants(
                     grant_id,
                     DurableLiveGrant {
                         state: row.try_get("state")?,
+                        dispatch_state: row.try_get("dispatch_state")?,
+                        granted_epoch: row.try_get("granted_epoch")?,
                         profile: row.try_get("profile")?,
                         footprint: BTreeMap::new(),
                         unreleased_devices: Vec::new(),
@@ -1292,13 +1296,11 @@ async fn prepare_dispatch_tx(
     if !is_canonical_uuid(request.scope_id)
         || !is_canonical_uuid(request.run_id)
         || !is_canonical_uuid(request.claim_token)
-        || request
-            .footprint
-            .iter()
-            .any(|d| !is_canonical_uuid(&d.device_id))
     {
         return Err(StoreError::Invalid);
     }
+    check_profile(request.profile).map_err(|_| StoreError::Invalid)?;
+    canonical_footprint(request.footprint).map_err(|_| StoreError::Invalid)?;
     let footprint = serde_json::to_string(request.footprint).map_err(|_| StoreError::Invalid)?;
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
         .await
@@ -1390,17 +1392,16 @@ async fn reconcile_tx(
     Ok(state)
 }
 
-async fn grant_needs_inventory_check(
+async fn load_grant_state(
     pool: &PgPool,
     group_id: &str,
     grant_id: &str,
-    epoch: i64,
-) -> Result<bool, StoreError> {
+) -> Result<Option<String>, StoreError> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, true)
         .await
         .map_err(map_tx_error)?;
-    let row = sqlx::query(
-        "SELECT state, reconciled_epoch
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state
            FROM openmettle.capacity_grants
           WHERE group_id = $1::uuid AND id = $2::uuid",
     )
@@ -1409,12 +1410,7 @@ async fn grant_needs_inventory_check(
     .fetch_optional(tx.connection().map_err(map_tx_error)?)
     .await?;
     tx.commit().await.map_err(map_tx_error)?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-    let state: String = row.try_get("state")?;
-    let reconciled_epoch: i64 = row.try_get("reconciled_epoch")?;
-    Ok(state == "unknown_allocation" || reconciled_epoch < epoch)
+    Ok(state)
 }
 
 fn parse_establish_inventory(
@@ -1566,7 +1562,6 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         &self,
         grant_id: &str,
         extra_candidates: &[String],
-        caller_devices: Option<&BTreeSet<String>>,
     ) -> Result<GrantState, CoordinatorError> {
         let prepared =
             prepare_release_tx(&self.pool, &self.controller, grant_id, extra_candidates).await?;
@@ -1574,24 +1569,21 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             return Ok(GrantState::Released);
         }
 
-        let mut reconcile_targets = BTreeSet::new();
+        // Every rank sent to the backend MUST first be durably persisted in either
+        // `unreleased_devices` or `extra_devices`, so `targets` is identical to the set that
+        // `capacity_reconcile` requires before settling the grant.
+        let mut targets = BTreeSet::new();
         for d in &prepared.unreleased_devices {
-            reconcile_targets.insert(d.clone());
+            targets.insert(d.clone());
         }
         for d in &prepared.extra_devices {
-            reconcile_targets.insert(d.clone());
+            targets.insert(d.clone());
         }
-        let mut union = reconcile_targets.clone();
-        if let Some(caller) = caller_devices {
-            for d in caller {
-                union.insert(d.clone());
-            }
-        }
-        if union.is_empty() {
+        if targets.is_empty() {
             return Err(CoordinatorError::Adapter(AdapterError::Invalid));
         }
 
-        let verified = match self.adapter_release_verified(grant_id, &union).await {
+        let verified = match self.adapter_release_verified(grant_id, &targets).await {
             Ok(verified) => verified,
             Err(err @ (AdapterError::StaleEpoch { .. } | AdapterError::Unfenced)) => {
                 return Err(CoordinatorError::Adapter(err));
@@ -1609,16 +1601,6 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             }
         };
 
-        let released_ids: Vec<String> = verified
-            .released_ids
-            .into_iter()
-            .filter(|d| reconcile_targets.contains(d))
-            .collect();
-        let not_allocated_ids: Vec<String> = verified
-            .not_allocated_ids
-            .into_iter()
-            .filter(|d| reconcile_targets.contains(d))
-            .collect();
         let has_unknown = !verified.unknown_ids.is_empty();
 
         let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
@@ -1626,25 +1608,25 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             .map_err(map_tx_error)?;
         let conn = tx.connection().map_err(map_tx_error)?;
         let mut final_state = None;
-        if !released_ids.is_empty() {
+        if !verified.released_ids.is_empty() {
             final_state = Some(
                 super::reconcile_with_metrics(
                     conn,
                     &self.controller,
                     grant_id,
-                    Evidence::Released(&released_ids),
+                    Evidence::Released(&verified.released_ids),
                     self.metrics(),
                 )
                 .await?,
             );
         }
-        if !not_allocated_ids.is_empty() {
+        if !verified.not_allocated_ids.is_empty() {
             final_state = Some(
                 super::reconcile_with_metrics(
                     conn,
                     &self.controller,
                     grant_id,
-                    Evidence::NotAllocated(&not_allocated_ids),
+                    Evidence::NotAllocated(&verified.not_allocated_ids),
                     self.metrics(),
                 )
                 .await?,
@@ -1748,6 +1730,19 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 continue;
             }
 
+            // Preserve an eligible same-epoch low-level `pending` reservation that has not been
+            // dispatched to the backend yet so a subsequent `dispatch_grant` can dispatch it;
+            // older-epoch `pending` grants absent on the backend are still released below.
+            let same_epoch_pending = durable.state == "granted"
+                && durable.dispatch_state == "pending"
+                && durable.granted_epoch == self.controller.epoch()
+                && durable.extra_devices.is_empty()
+                && durable.unreleased_devices.len() == durable.footprint.len()
+                && !backend_live.contains_key(&grant_id);
+            if same_epoch_pending {
+                continue;
+            }
+
             let backend_devices: Vec<String> = backend_live
                 .get(&grant_id)
                 .map(|live| live.footprint.keys().cloned().collect())
@@ -1767,7 +1762,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             }
 
             match self
-                .prepare_and_apply_release(&grant_id, &backend_devices, None)
+                .prepare_and_apply_release(&grant_id, &backend_devices)
                 .await
             {
                 Ok(GrantState::Released) => report.released += 1,
@@ -2004,10 +1999,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         result.map_err(CoordinatorError::Adapter)
     }
 
-    /// Durably close bursts via `dispatch_state = 'release_in_flight'`, merge any persisted or
-    /// live backend extra ranks, obtain confirmed per-device release evidence behind the adapter
-    /// epoch fence, and settle the durable grant and its device slot only once every durable and
-    /// extra device has confirmed `Released` or `NotAllocated`.
+    /// Inspect fenced backend inventory under a committed controller lease, durably close the
+    /// group if unrelated rogue or mismatched allocations are discovered, persist all caller and
+    /// backend target ranks alongside `dispatch_state = 'release_in_flight'`, obtain confirmed
+    /// per-device release evidence behind the epoch fence, and settle the durable grant and its
+    /// device slot only once every durable and extra device has confirmed `Released` or
+    /// `NotAllocated`.
     pub async fn release_grant(
         &self,
         grant_id: &str,
@@ -2018,27 +2015,66 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             return Err(CoordinatorError::Store(StoreError::Invalid));
         }
         let caller_set = canonical_devices(devices)?;
-        let mut discovered_extra = Vec::new();
-        if grant_needs_inventory_check(
-            &self.pool,
-            self.controller.group_id(),
-            grant_id,
-            self.controller.epoch(),
-        )
-        .await?
-        {
-            check_controller_tx(&self.pool, &self.controller).await?;
-            let inv = parse_establish_inventory(
-                &self.controller,
-                self.adapter
-                    .establish_epoch(EstablishEpochRequest::new(&self.controller))
-                    .await?,
-            )?;
-            if let Some(live) = inv.get(grant_id) {
-                discovered_extra.extend(live.footprint.keys().cloned());
-            }
+        check_controller_tx(&self.pool, &self.controller).await?;
+        let Some(state) =
+            load_grant_state(&self.pool, self.controller.group_id(), grant_id).await?
+        else {
+            return Err(CoordinatorError::Store(StoreError::Invalid));
+        };
+        if state == "released" {
+            return Ok(GrantState::Released);
         }
-        self.prepare_and_apply_release(grant_id, &discovered_extra, Some(&caller_set))
+
+        // Always inspect fenced backend inventory for any non-released grant so unexpected extra
+        // ranks and unrelated rogue allocations are discovered before settlement.
+        let inv = parse_establish_inventory(
+            &self.controller,
+            self.adapter
+                .establish_epoch(EstablishEpochRequest::new(&self.controller))
+                .await?,
+        )?;
+        let live_grants = {
+            let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, true)
+                .await
+                .map_err(map_tx_error)?;
+            let grants = load_live_grants(
+                tx.connection().map_err(map_tx_error)?,
+                self.controller.group_id(),
+            )
+            .await?;
+            tx.commit().await.map_err(map_tx_error)?;
+            grants
+        };
+        let durable_by_id: BTreeMap<&str, &DurableLiveGrant> = live_grants
+            .iter()
+            .map(|(id, grant)| (id.as_str(), grant))
+            .collect();
+        let has_rogue_or_other_mismatch = inv.iter().any(|(id, live)| {
+            if id == grant_id {
+                return false;
+            }
+            match durable_by_id.get(id.as_str()) {
+                None => true,
+                Some(durable) => {
+                    durable.state != "granted"
+                        || !durable.extra_devices.is_empty()
+                        || durable.unreleased_devices.len() != durable.footprint.len()
+                        || live.profile != durable.profile
+                        || live.footprint != durable.footprint
+                }
+            }
+        });
+        if has_rogue_or_other_mismatch {
+            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
+            self.reconciled_clean.store(false, Ordering::Release);
+        }
+
+        let mut all_candidates = caller_set;
+        if let Some(live) = inv.get(grant_id) {
+            all_candidates.extend(live.footprint.keys().cloned());
+        }
+        let extra_candidates: Vec<String> = all_candidates.into_iter().collect();
+        self.prepare_and_apply_release(grant_id, &extra_candidates)
             .await
     }
 
