@@ -244,6 +244,7 @@ async fn authorize(
     row: &PgRow,
     min_now_ms: i64,
 ) -> Result<(), StoreError> {
+    crate::restore::require_open_gate(c).await?;
     let now_ms = authz::store::post_lock_clock_ms(c, min_now_ms.max(context.observed_ms())).await?;
     let principal = principal_at(c, context, now_ms).await?;
     let conversation = projects::read_resource(
@@ -303,6 +304,7 @@ impl Api {
     ) -> Result<Response, Problem> {
         let row = self
             .database(async |c| {
+                crate::restore::require_open_gate(c).await?;
                 let row = sqlx::query(SNAPSHOT)
                     .bind(run)
                     .fetch_optional(&mut *c)
@@ -460,6 +462,7 @@ impl Subscription {
             let row = self
                 .api
                 .database(async |c| {
+                    crate::restore::require_open_gate(c).await?;
                     sqlx::query(BATCH)
                         .bind(&self.run)
                         .bind(self.position)

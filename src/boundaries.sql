@@ -313,19 +313,27 @@ runtime_functions(signature,definer,roles) AS (
                  ELSE ARRAY['openmettle_api','openmettle_worker']::text[] END),
         ('openmettle.restore_gate_guard_purge()',true,ARRAY[]::text[]),
         ('openmettle.deletion_journal_digest(bytea,openmettle.deletion_journal)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean)',false,ARRAY[]::text[]),
-        ('openmettle.restore_verify_export(bigint,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.restore_verify_checkpoints()',false,ARRAY[]::text[]),
-        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea)',false,ARRAY[]::text[]),
         ('openmettle.restore_renew_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
         ('openmettle.restore_assert_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
         ('openmettle.restore_release_volume_phase(uuid,uuid)',false,ARRAY[]::text[]),
-        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid)',false,ARRAY[]::text[]),
         ('openmettle.restore_accept_coverage_gap(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 41
-    UNION ALL SELECT 'openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[] WHERE $1 = 41
     UNION ALL SELECT * FROM (VALUES
+        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean)',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_export(bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[])) AS f WHERE $1 = 41
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.restore_gate_is_closed_for_owner()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.deletion_journal_append_lifecycle()',true,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock(bigint,bigint,bytea,boolean,uuid,boolean,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_export(bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid,bigint)',false,ARRAY[]::text[]),
         ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.artifact_revision_live_referenced(uuid,uuid)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.artifact_revision_has_hold(uuid,uuid)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.retention_assert_active_admin(uuid,uuid,bigint)',false,ARRAY[]::text[]),
         ('openmettle.retention_preview_deadlines(uuid,uuid,bigint,integer,uuid)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.retention_apply_deadlines(uuid,uuid,bigint,integer,uuid,text,text)',true,ARRAY['openmettle_api']::text[]),

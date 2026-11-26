@@ -161,6 +161,9 @@ impl Api {
                 }
                 (Op::ListConversations, _) => conversations(c, &actor, page.as_ref().ok_or(INTERNAL)?, now).await,
                 (_, content) => {
+                    if op == Op::ListMessages {
+                        crate::restore::require_open_gate(c).await?;
+                    }
                     let view = projects::read_resource(c, &actor, ResourceKind::Conversation, target, now).await?;
                     let chat = Conversation { id: target, scope: &view.scope_id };
                     match (op,content) {

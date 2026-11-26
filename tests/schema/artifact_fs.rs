@@ -157,12 +157,17 @@ impl Fixture {
         .await
     }
 
-    pub(super) async fn payload(&self, key: &str, body: &[u8]) -> Stored {
+    pub(super) async fn payload_sized(&self, key: &str, body: &[u8], max: i64) -> Stored {
         let doc = new_uuid(&self.db).await;
         let form = form("x", &[METADATA, file(None, body)], true);
-        self.upload(key, &doc, 100, "x", chunked(&form, 16), true)
+        let chunk = if body.len() > 1024 { 4096 } else { 16 };
+        self.upload(key, &doc, max, "x", chunked(&form, chunk), true)
             .await
             .unwrap()
+    }
+
+    pub(super) async fn payload(&self, key: &str, body: &[u8]) -> Stored {
+        self.payload_sized(key, body, 100).await
     }
 
     pub(super) fn files(&self, sub: &str) -> Vec<String> {
@@ -1081,22 +1086,27 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
     let f = Fixture::new().await;
     let mut owner = connect(&f.db.0, OWNER).await;
     let s = due(&f, "gated").await;
-    let (origin_us, head_seq, head_digest): (i64, i64, String) = sqlx::query_as(
-        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
-                journal_seq,
-                encode(chain_digest, 'hex')
-           FROM openmettle.deletion_journal_head WHERE id",
-    )
-    .fetch_one(&mut owner)
-    .await
-    .unwrap();
-    sqlx::query("SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true)")
-        .bind(origin_us)
-        .bind(head_seq)
-        .bind(&head_digest)
-        .execute(&mut owner)
+    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, i64, i64, String) =
+        sqlx::query_as(
+            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    journal_seq,
+                    encode(chain_digest, 'hex')
+               FROM openmettle.deletion_journal_head WHERE id",
+        )
+        .fetch_one(&mut owner)
         .await
         .unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+    )
+    .bind(origin_us)
+    .bind(head_seq)
+    .bind(&head_digest)
+    .bind(lifecycle_origin_us)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let mut seed = WriteTransaction::begin(&mut owner).await.unwrap();
     let ids = expired_runs(&f, &mut seed, "gated").await;
     seed.commit().await.unwrap();
@@ -1113,13 +1123,15 @@ async fn worker_binary_purges_only_while_the_restore_gate_is_open() {
                     $1,
                     $2,
                     decode($3, 'hex'),
-                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                    $4
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex')) AS c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) AS c",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
+    .bind(lifecycle_origin_us)
     .execute(&mut owner)
     .await
     .unwrap();

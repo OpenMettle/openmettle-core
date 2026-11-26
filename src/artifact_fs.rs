@@ -302,6 +302,50 @@ impl Store {
         start: u64,
         len: u64,
     ) -> Result<Content, Error> {
+        self.open_content(c, None, reservation, size, start, len)
+            .await
+    }
+
+    /// [`Self::read_on`] for `/v1` downloads: verifies the restore reconciliation gate before
+    /// reading each streamed chunk via `gate_pool`, aborting mid-stream and dropping the shared
+    /// payload lock immediately if the gate closes.
+    pub(crate) async fn read_gated_on(
+        &self,
+        c: &mut PgConnection,
+        gate_pool: PgPool,
+        reservation: &str,
+        size: i64,
+        start: u64,
+        len: u64,
+    ) -> Result<Content, Error> {
+        self.open_content(c, Some(gate_pool), reservation, size, start, len)
+            .await
+    }
+
+    /// Deterministic integration-test entry point for [`Self::read_gated_on`].
+    #[doc(hidden)]
+    pub async fn read_gated_for_test(
+        &self,
+        c: &mut PgConnection,
+        gate_pool: PgPool,
+        reservation: &str,
+        size: i64,
+        start: u64,
+        len: u64,
+    ) -> Result<Content, Error> {
+        self.read_gated_on(c, gate_pool, reservation, size, start, len)
+            .await
+    }
+
+    async fn open_content(
+        &self,
+        c: &mut PgConnection,
+        gate_pool: Option<PgPool>,
+        reservation: &str,
+        size: i64,
+        start: u64,
+        len: u64,
+    ) -> Result<Content, Error> {
         runs::uuid(reservation)?;
         let size = u64::try_from(size).map_err(|_| Error::Missing)?;
         if start.checked_add(len).is_none_or(|end| end > size) {
@@ -336,6 +380,7 @@ impl Store {
         Ok(Content {
             file: Some(file),
             remaining: len,
+            gate_pool,
             pending: None,
         })
     }
@@ -407,6 +452,8 @@ pub struct Content {
     /// `None` while a read is pending.
     file: Option<fs::File>,
     remaining: u64,
+    /// When set, each streamed chunk verifies `restore::lock_open_gate` before reading.
+    gate_pool: Option<PgPool>,
     pending: Option<PendingRead>,
 }
 
@@ -421,17 +468,40 @@ impl HttpBody for Content {
         let this = self.get_mut();
         if this.pending.is_none() {
             if this.remaining == 0 {
+                this.file = None;
                 return Poll::Ready(None);
             }
             let Some(mut file) = this.file.take() else {
                 return Poll::Ready(Some(Err(ErrorKind::Other.into())));
             };
             // At most READ_CHUNK, so the cast cannot truncate.
-            let mut chunk = vec![0; this.remaining.min(READ_CHUNK) as usize];
-            this.pending = Some(tokio::task::spawn_blocking(move || {
-                file.read_exact(&mut chunk)?;
-                Ok((file, chunk))
-            }));
+            let chunk_len = this.remaining.min(READ_CHUNK) as usize;
+            if let Some(pool) = this.gate_pool.clone() {
+                this.pending = Some(tokio::spawn(async move {
+                    let open = match pool.acquire().await {
+                        Ok(mut conn) => crate::restore::lock_open_gate(&mut conn)
+                            .await
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if !open {
+                        drop(file);
+                        return Err(std::io::Error::other("restore reconciliation pending"));
+                    }
+                    blocking(move || {
+                        let mut chunk = vec![0; chunk_len];
+                        file.read_exact(&mut chunk)?;
+                        Ok((file, chunk))
+                    })
+                    .await
+                }));
+            } else {
+                this.pending = Some(tokio::task::spawn_blocking(move || {
+                    let mut chunk = vec![0; chunk_len];
+                    file.read_exact(&mut chunk)?;
+                    Ok((file, chunk))
+                }));
+            }
         }
         let Some(pending) = this.pending.as_mut() else {
             return Poll::Ready(None);
@@ -440,8 +510,10 @@ impl HttpBody for Content {
         this.pending = None;
         Poll::Ready(Some(match read {
             Ok(Ok((file, chunk))) => {
-                this.file = Some(file);
                 this.remaining -= chunk.len() as u64;
+                if this.remaining > 0 {
+                    this.file = Some(file);
+                }
                 Ok(Frame::data(Bytes::from(chunk)))
             }
             Ok(Err(error)) => {
@@ -576,16 +648,27 @@ where
                     .bind(&id).execute(tx.connection()?).await?;
                 Ok::<_, Error>(())
             }).await?;
-            if let Some(pin) = pin.as_deref() {
-                store.volume.verify(pin)?;
-            }
-            let staged = store.stage(&id).await?;
-            committed(pool, async |tx| {
+            let staged = committed(pool, async |tx| {
+                sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+                    .execute(tx.connection()?)
+                    .await?;
                 lock_writer(tx, &id, pin.as_deref(), true, None, false).await?;
-                store.volume.matches(staged.file.as_ref().ok_or(Error::Io)?, &store.volume.staging, &id, staged.ino)?;
+                if let Some(pin) = pin.as_deref() {
+                    store.volume.verify(pin)?;
+                }
+                let staged = store.stage(&id).await?;
+                store.volume.matches(
+                    staged.file.as_ref().ok_or(Error::Io)?,
+                    &store.volume.staging,
+                    &id,
+                    staged.ino,
+                )?;
                 sqlx::query("UPDATE openmettle.storage_reservations SET payload_ino=$2::text::numeric WHERE id=$1::uuid")
-                    .bind(&id).bind(staged.ino.to_string()).execute(tx.connection()?).await?;
-                Ok::<_, Error>(())
+                    .bind(&id)
+                    .bind(staged.ino.to_string())
+                    .execute(tx.connection()?)
+                    .await?;
+                Ok::<_, Error>(staged)
             }).await?;
             Some(staged)
         }
@@ -641,8 +724,13 @@ where
         display_name: form.display_name.as_deref(),
     };
     if let Some(file) = staged.as_ref() {
-        committed(pool, async |tx| {
-            lock_writer(tx, &id, pin.as_deref(), true, Some(file.ino), false).await?;
+        let mut connection = pool.acquire().await.map_err(runs::Error::from)?;
+        let mut tx = WriteTransaction::begin(&mut connection).await?;
+        let published = async {
+            sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+                .execute(tx.connection()?)
+                .await?;
+            lock_writer(&mut tx, &id, pin.as_deref(), true, Some(file.ino), false).await?;
             store.volume.matches(
                 file.file.as_ref().ok_or(Error::Io)?,
                 &store.volume.staging,
@@ -655,15 +743,43 @@ where
             .bind(&id)
             .execute(tx.connection()?)
             .await?;
-            Ok::<_, Error>(())
-        })
-        .await?;
-        if let Some(pin) = &pin {
-            store.volume.verify(pin)?;
+            if let Some(pin) = &pin {
+                store.volume.verify(pin)?;
+            }
+            if file.publish().is_err() {
+                sqlx::query(
+                    "UPDATE openmettle.storage_reservations
+                        SET adoption_unverified=true, publish_pending=false
+                      WHERE id=$1::uuid AND payload_ino=$2::text::numeric
+                        AND state='reserved' AND reclaim_state='none'",
+                )
+                .bind(&id)
+                .bind(file.ino.to_string())
+                .execute(tx.connection()?)
+                .await?;
+                return Ok::<_, Error>(false);
+            }
+            Ok(true)
         }
-        if file.publish().is_err() {
-            quarantine_writer(pool, &id, file.ino).await?;
-            return Err(Error::Io);
+        .await;
+        match published {
+            Ok(true) => {
+                if let Err(err) = tx.commit().await {
+                    let _ = quarantine_writer(pool, &id, file.ino).await;
+                    return Err(err.into());
+                }
+            }
+            Ok(false) => {
+                if let Err(err) = tx.commit().await {
+                    let _ = quarantine_writer(pool, &id, file.ino).await;
+                    return Err(err.into());
+                }
+                return Err(Error::Io);
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
         }
     }
     let revision = committed(pool, async |tx| {
@@ -716,7 +832,7 @@ where
 async fn quarantine_writer(pool: &PgPool, id: &str, ino: u64) -> Result<(), Error> {
     sqlx::query(
         "UPDATE openmettle.storage_reservations SET adoption_unverified=true,publish_pending=false
-        WHERE id=$1::uuid AND payload_ino=$2::text::numeric AND publish_pending
+        WHERE id=$1::uuid AND payload_ino=$2::text::numeric
         AND state='reserved' AND reclaim_state='none'",
     )
     .bind(id)
@@ -747,6 +863,11 @@ async fn lock_writer(
     .await?;
     if ok != Some(true) {
         return Err(Error::InProgress);
+    }
+    if !crate::restore::lock_open_gate(tx.connection()?).await? {
+        return Err(Error::Storage(runs::Error::Database(
+            sqlx::Error::Protocol("restore reconciliation pending".into()),
+        )));
     }
     let (vol, adopting): (Option<String>, bool) = sqlx::query_as(
         "SELECT volume_id::text,adoption_run_id IS NOT NULL

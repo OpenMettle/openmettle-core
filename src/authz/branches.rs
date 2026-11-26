@@ -344,7 +344,7 @@ pub(crate) async fn readable_revision(
     if revision_is_active(c, actor, scope, id, now).await? {
         Ok(())
     } else {
-        Err(StoreError::Conflict("artifact revision is retained"))
+        Err(HIDDEN)
     }
 }
 

@@ -175,17 +175,19 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
     let f = Fixture::new().await;
     let id = f.admit("restore-gate").await;
     let mut owner = connect(&f.db.0, OWNER).await;
-    let origin_us: i64 = sqlx::query_scalar(
-        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint
+    let (origin_us, lifecycle_origin_us): (i64, i64) = sqlx::query_as(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint
            FROM openmettle.deletion_journal_head WHERE id",
     )
     .fetch_one(&mut owner)
     .await
     .unwrap();
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true)",
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2)",
     )
     .bind(origin_us)
+    .bind(lifecycle_origin_us)
     .execute(&mut owner)
     .await
     .unwrap();
@@ -200,11 +202,13 @@ async fn no_run_is_claimed_while_the_restore_gate_is_closed() {
                     $1,
                     0,
                     decode(repeat('00', 32), 'hex'),
-                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                    $2
                 )
-           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex')) AS c",
+           FROM openmettle.restore_claim_volume_phase($1, 0, decode(repeat('00', 32), 'hex'), $2) AS c",
     )
     .bind(origin_us)
+    .bind(lifecycle_origin_us)
     .execute(&mut owner)
     .await
     .unwrap();
@@ -224,8 +228,9 @@ async fn claim_next_waiting_on_dispatch_lock_returns_none_after_gate_closes() {
     let f = Fixture::new().await;
     let _id = f.admit("gated-race").await;
     let mut owner = connect(&f.db.0, OWNER).await;
-    let origin_us: i64 = sqlx::query_scalar(
-        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint
+    let (origin_us, lifecycle_origin_us): (i64, i64) = sqlx::query_as(
+        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint
            FROM openmettle.deletion_journal_head WHERE id",
     )
     .fetch_one(&mut owner)
@@ -255,9 +260,10 @@ async fn claim_next_waiting_on_dispatch_lock_returns_none_after_gate_closes() {
     wait_for_blocked_peer(&f.db, holder).await;
     // Close the gate while `claim_next` is blocked on `run_dispatch_lock`, then release the lock.
     sqlx::query(
-        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true)",
+        "SELECT openmettle.restore_gate_lock($1, 0, decode(repeat('00', 32), 'hex'), true, NULL, true, $2)",
     )
     .bind(origin_us)
+    .bind(lifecycle_origin_us)
     .execute(&mut owner)
     .await
     .unwrap();

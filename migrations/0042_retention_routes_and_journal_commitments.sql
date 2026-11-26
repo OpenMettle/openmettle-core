@@ -1,7 +1,9 @@
 -- V1-16 migration 42 (ADR 0041 PR3): journaled deadline commitments and pre-expiry restores,
--- extended restore-gate guards on artifact_revisions, least-privilege API restore-gate helper
--- execution, idempotent retention_set_grace, audited account_admin deadline preview/apply, and
--- read-only admin_retention_status projection. Released migrations are immutable.
+-- lifecycle journal origin cutoff (rejecting pre-42 backups under --export-complete unless
+-- explicitly accepted via audited break-glass), extended restore-gate guards on artifact_revisions,
+-- live-reference and hold check helpers for disassociation/restore, least-privilege API
+-- restore-gate helper execution, idempotent retention_set_grace, audited account_admin deadline
+-- preview/apply, and audited admin_retention_status projection. Released migrations are immutable.
 -- Runs once per release as openmettle_owner in one transaction with search_path
 -- pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
 --
@@ -10,13 +12,15 @@
 --   users (ascending id) -> runs -> storage_reservations -> artifacts ->
 --   artifact_revisions (scope_id, id) -> restore_reconciliation_gate (FOR SHARE) ->
 --   storage_volume_control -> storage_accounts -> storage_instance ->
---   retention_policy -> deletion_journal_head (deferred at commit).
+--   retention_policy -> deletion_journal_head (flushed before post-write authority recheck).
 --
 -- Upgrade from 41: existing deletion_journal rows (all 'artifact_revision.purged') keep
 -- retained_at = NULL and preserve their exact openmettle.deletion_journal/1 chain digest.
--- New lifecycle transitions ('artifact_revision.retained', 'artifact_revision.deadline_adjusted',
--- 'artifact_revision.restored') append domain-separated openmettle.deletion_journal/2 records on
--- the same monotonic hash chain.
+-- deletion_journal_head records lifecycle_coverage_started_at (when migration 42 was installed)
+-- so backups taken at schema <= 41 cannot satisfy --export-complete on schema 42 without explicit
+-- audited break-glass acceptance. New lifecycle transitions ('artifact_revision.retained',
+-- 'artifact_revision.deadline_adjusted', 'artifact_revision.restored') append domain-separated
+-- openmettle.deletion_journal/2 records on the same monotonic hash chain.
 
 -- Acquire ACCESS EXCLUSIVE on every pre-existing table modified by migration 42 in one atomic
 -- bounded NOWAIT retry loop at the top of the transaction so concurrent 0041 writers cannot
@@ -54,6 +58,53 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- Record when lifecycle commitment journaling began (migration 42 installation) so a backup taken
+-- at schema <= 41 and migrated to 42 during recovery gets a distinct lifecycle_coverage_started_at
+-- timestamp and cannot reopen under --export-complete without audited break-glass acceptance.
+ALTER TABLE openmettle.deletion_journal_head
+    ADD COLUMN lifecycle_coverage_started_at timestamptz;
+DO $$
+DECLARE
+    v_started timestamptz;
+BEGIN
+    IF pg_catalog.to_regclass('openmettle._sqlx_migrations') IS NOT NULL THEN
+        EXECUTE 'SELECT installed_on FROM openmettle._sqlx_migrations WHERE version = 42'
+           INTO v_started;
+    END IF;
+    UPDATE openmettle.deletion_journal_head
+       SET lifecycle_coverage_started_at = coalesce(v_started, pg_catalog.clock_timestamp())
+     WHERE id;
+END
+$$;
+ALTER TABLE openmettle.deletion_journal_head
+    ALTER COLUMN lifecycle_coverage_started_at SET NOT NULL,
+    ALTER COLUMN lifecycle_coverage_started_at SET DEFAULT clock_timestamp();
+
+ALTER TABLE openmettle.restore_reconciliation_gate
+    ADD COLUMN required_lifecycle_origin_us bigint,
+    DROP CONSTRAINT restore_reconciliation_gate_closed_check,
+    ADD CONSTRAINT restore_reconciliation_gate_closed_check CHECK (
+        (
+            open
+            AND restore_run_id IS NULL
+            AND required_origin_us IS NULL
+            AND required_lifecycle_origin_us IS NULL
+            AND checkpoints = '[]'::jsonb
+            AND volume_claim_token IS NULL
+            AND volume_lease_until IS NULL
+        ) OR (
+            NOT open
+            AND restore_run_id IS NOT NULL
+            AND required_origin_us IS NOT NULL
+            AND locked_at IS NOT NULL
+            AND snapshot_journal_seq IS NOT NULL
+            AND required_journal_seq >= snapshot_journal_seq
+            AND required_chain_digest IS NOT NULL
+            AND opened_at IS NULL
+            AND ((volume_claim_token IS NULL) = (volume_lease_until IS NULL))
+        )
+    );
 
 -- Extend deletion_journal to record disassociations (active -> retained), explicit admin
 -- deadline adjustments on retained revisions, and pre-expiry restores (retained -> active)
@@ -123,9 +174,23 @@ RETURNS bytea LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
     END
 $$;
 
+-- Owner-only gate probe used inside trigger WHEN CASE guards only after both session_user and
+-- current_user are verified to hold openmettle_owner and the replay GUC is 'on'. Marked SECURITY
+-- DEFINER with EXECUTE granted to openmettle_api and openmettle_worker because PostgreSQL checks
+-- EXECUTE privileges for every function in a trigger WHEN expression as the invoking role; the body
+-- still requires session_user to hold openmettle_owner so application roles always receive false
+-- and learn nothing about gate state.
+CREATE FUNCTION openmettle.restore_gate_is_closed_for_owner()
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+    SELECT pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
+       AND EXISTS (SELECT FROM openmettle.restore_reconciliation_gate WHERE id AND NOT open)
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_is_closed_for_owner() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.restore_gate_is_closed_for_owner() TO openmettle_api, openmettle_worker;
+
 -- Keep migration 28's deadline stamping for all normal disassociations while letting owner
--- deletion_journal_replay preserve exact journaled retained_at, purge_after and policy_revision
--- without restarting the grace window.
+-- deletion_journal_replay (and only an openmettle_owner session while the restore gate is closed)
+-- preserve exact journaled retained_at, purge_after and policy_revision without restarting grace.
 DROP TRIGGER artifact_revisions_retention_deadline ON openmettle.artifact_revisions;
 CREATE TRIGGER artifact_revisions_retention_deadline
     BEFORE UPDATE OF state ON openmettle.artifact_revisions
@@ -134,8 +199,13 @@ CREATE TRIGGER artifact_revisions_retention_deadline
         AND NEW.state = 'retained'
         AND pg_catalog.has_column_privilege('openmettle.artifact_revisions', 'purge_after', 'UPDATE')
         AND NOT (
-            pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
-            AND pg_catalog.current_setting('openmettle.replaying_deletion_journal', true) IS NOT DISTINCT FROM 'on'
+            CASE
+                WHEN pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
+                 AND pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
+                 AND pg_catalog.current_setting('openmettle.replaying_deletion_journal', true) IS NOT DISTINCT FROM 'on'
+                THEN openmettle.restore_gate_is_closed_for_owner()
+                ELSE false
+            END
         )
     )
     EXECUTE FUNCTION openmettle.retention_stamp_deadline();
@@ -190,9 +260,10 @@ END
 $$;
 
 -- Deferred append trigger for retained, deadline_adjusted and restored lifecycle commitments.
--- Fires at commit so deletion_journal_head is always locked last and rolled-back savepoints or
--- transactions append nothing. Skipped during owner deletion_journal_replay via the trigger WHEN
--- guard evaluated at statement execution time.
+-- Fires at commit (or when explicitly flushed via SET CONSTRAINTS ... IMMEDIATE strictly before
+-- post-write approval expiry rechecks) so deletion_journal_head is always locked last and
+-- rolled-back savepoints or transactions append nothing. Skipped ONLY for an openmettle_owner
+-- session during deletion_journal_replay while the restore gate is closed.
 CREATE FUNCTION openmettle.deletion_journal_append_lifecycle()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
@@ -243,11 +314,306 @@ CREATE CONSTRAINT TRIGGER artifact_revisions_lifecycle_journal
             OR (OLD.state = 'retained' AND NEW.state = 'active')
         )
         AND NOT (
-            pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
-            AND pg_catalog.current_setting('openmettle.replaying_deletion_journal', true) IS NOT DISTINCT FROM 'on'
+            CASE
+                WHEN pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
+                 AND pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
+                 AND pg_catalog.current_setting('openmettle.replaying_deletion_journal', true) IS NOT DISTINCT FROM 'on'
+                THEN openmettle.restore_gate_is_closed_for_owner()
+                ELSE false
+            END
         )
     )
     EXECUTE FUNCTION openmettle.deletion_journal_append_lifecycle();
+
+-- Owner only: close or update the restore reconciliation gate, enforcing both coverage_started_at
+-- (migration 28) and lifecycle_coverage_started_at (migration 42). Backups predating migration 42
+-- or exports lacking a matching lifecycle_origin cannot set coverage_complete = true (OMR04) and
+-- require audited restore.accept_coverage_gap before the gate may open.
+DROP FUNCTION openmettle.restore_gate_lock(bigint, bigint, bytea, boolean, uuid, boolean);
+
+CREATE FUNCTION openmettle.restore_gate_lock(
+    p_origin_us bigint,
+    p_required_seq bigint,
+    p_required_digest bytea,
+    p_coverage_complete boolean,
+    p_replace_restore_run uuid DEFAULT NULL,
+    p_new_restore boolean DEFAULT true,
+    p_lifecycle_origin_us bigint DEFAULT NULL)
+RETURNS openmettle.restore_reconciliation_gate
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    head openmettle.deletion_journal_head%ROWTYPE;
+    v_genesis bytea := decode(repeat('00', 32), 'hex');
+    v_head_origin_us bigint;
+    v_head_lifecycle_origin_us bigint;
+    v_stored_digest bytea;
+    v_digest_hex text;
+    v_req_hex text;
+    v_effective_required_seq bigint;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'restore gate changes require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_origin_us IS NULL OR p_required_seq IS NULL OR p_required_seq < 0
+       OR p_required_digest IS NULL OR octet_length(p_required_digest) <> 32
+       OR p_coverage_complete IS NULL OR p_new_restore IS NULL THEN
+        RAISE EXCEPTION 'invalid restore gate lock parameters' USING ERRCODE = '22023';
+    END IF;
+    IF p_required_seq = 0 AND p_required_digest <> v_genesis THEN
+        RAISE EXCEPTION 'sequence 0 requires the genesis chain digest' USING ERRCODE = 'OMR03';
+    END IF;
+    SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
+    IF g.open THEN
+        IF NOT p_new_restore OR p_replace_restore_run IS NOT NULL THEN
+            RAISE EXCEPTION 'cannot replace a restore run while the restore gate is open'
+                USING ERRCODE = 'OMR02';
+        END IF;
+    ELSE
+        IF p_replace_restore_run IS NULL OR p_replace_restore_run IS DISTINCT FROM g.restore_run_id THEN
+            RAISE EXCEPTION 'restore gate is already closed; pass --replace-restore-run matching current restore_run_id'
+                USING ERRCODE = 'OMR02';
+        END IF;
+        IF g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp() THEN
+            RAISE EXCEPTION 'restore volume phase is active' USING ERRCODE = 'OMR02';
+        END IF;
+        g.volume_claim_token := NULL;
+        g.volume_lease_until := NULL;
+    END IF;
+
+    SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id;
+    v_head_origin_us := (extract(epoch FROM head.coverage_started_at) * 1000000)::bigint;
+    v_head_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
+    IF p_origin_us IS DISTINCT FROM v_head_origin_us THEN
+        RAISE EXCEPTION 'required origin % does not match restored journal origin %',
+            p_origin_us, v_head_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_coverage_complete
+       AND (p_lifecycle_origin_us IS NULL OR p_lifecycle_origin_us IS DISTINCT FROM v_head_lifecycle_origin_us) THEN
+        RAISE EXCEPTION 'cannot assert complete export coverage when lifecycle journal origin % does not match restored %',
+            p_lifecycle_origin_us, v_head_lifecycle_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_required_seq <= head.journal_seq THEN
+        IF p_required_seq = 0 THEN
+            v_stored_digest := v_genesis;
+        ELSE
+            SELECT chain_digest INTO v_stored_digest
+              FROM openmettle.deletion_journal
+             WHERE journal_seq = p_required_seq;
+        END IF;
+        IF v_stored_digest IS DISTINCT FROM p_required_digest THEN
+            RAISE EXCEPTION 'required watermark digest does not match stored journal at %',
+                p_required_seq USING ERRCODE = 'OMR03';
+        END IF;
+    END IF;
+    IF g.open OR p_new_restore THEN
+        v_effective_required_seq := head.journal_seq;
+    ELSE
+        v_effective_required_seq := greatest(head.journal_seq, g.required_journal_seq);
+    END IF;
+    IF p_coverage_complete AND p_required_seq < v_effective_required_seq THEN
+        RAISE EXCEPTION 'cannot assert complete export coverage for watermark % below target sequence %',
+            p_required_seq, v_effective_required_seq USING ERRCODE = 'OMR04';
+    END IF;
+
+    v_digest_hex := encode(p_required_digest, 'hex');
+    IF g.open OR p_new_restore THEN
+        g.restore_run_id := gen_random_uuid();
+        g.required_origin_us := p_origin_us;
+        g.required_lifecycle_origin_us := p_lifecycle_origin_us;
+        g.snapshot_journal_seq := head.journal_seq;
+        g.locked_at := clock_timestamp();
+        g.opened_at := NULL;
+        g.coverage_complete := p_coverage_complete;
+        g.volume_claim_token := NULL;
+        g.volume_lease_until := NULL;
+        g.checkpoints := jsonb_build_array(
+            jsonb_build_object('seq', p_required_seq, 'digest', v_digest_hex)
+        );
+        IF p_required_seq >= head.journal_seq THEN
+            g.required_journal_seq := p_required_seq;
+            g.required_chain_digest := p_required_digest;
+        ELSE
+            g.required_journal_seq := head.journal_seq;
+            g.required_chain_digest := head.chain_digest;
+            v_req_hex := encode(head.chain_digest, 'hex');
+            g.checkpoints := g.checkpoints || jsonb_build_array(
+                jsonb_build_object('seq', head.journal_seq, 'digest', v_req_hex)
+            );
+        END IF;
+    ELSE
+        IF p_origin_us IS DISTINCT FROM g.required_origin_us THEN
+            RAISE EXCEPTION 'required origin % conflicts with locked restore origin %',
+                p_origin_us, g.required_origin_us USING ERRCODE = 'OMR04';
+        END IF;
+        IF g.required_lifecycle_origin_us IS NOT NULL
+           AND p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+            RAISE EXCEPTION 'required lifecycle origin % conflicts with locked restore lifecycle origin %',
+                p_lifecycle_origin_us, g.required_lifecycle_origin_us USING ERRCODE = 'OMR04';
+        END IF;
+        IF g.required_lifecycle_origin_us IS NULL AND p_lifecycle_origin_us IS NOT NULL THEN
+            g.required_lifecycle_origin_us := p_lifecycle_origin_us;
+        END IF;
+        IF EXISTS (
+            SELECT FROM pg_catalog.jsonb_array_elements(g.checkpoints) AS c
+             WHERE (c->>'seq')::bigint = p_required_seq
+               AND (c->>'digest') IS DISTINCT FROM v_digest_hex
+        ) THEN
+            RAISE EXCEPTION 'required watermark digest conflicts with pinned checkpoint at %',
+                p_required_seq USING ERRCODE = 'OMR03';
+        END IF;
+        IF p_required_seq = g.required_journal_seq AND p_required_digest <> g.required_chain_digest THEN
+            RAISE EXCEPTION 'required watermark digest conflicts with locked gate'
+                USING ERRCODE = 'OMR03';
+        END IF;
+        IF NOT EXISTS (
+            SELECT FROM pg_catalog.jsonb_array_elements(g.checkpoints) AS c
+             WHERE (c->>'seq')::bigint = p_required_seq
+        ) THEN
+            g.checkpoints := g.checkpoints || jsonb_build_array(
+                jsonb_build_object('seq', p_required_seq, 'digest', v_digest_hex)
+            );
+        END IF;
+        IF p_required_seq > g.required_journal_seq THEN
+            g.required_journal_seq := p_required_seq;
+            g.required_chain_digest := p_required_digest;
+            g.coverage_complete := p_coverage_complete;
+        ELSIF p_required_seq = g.required_journal_seq THEN
+            g.coverage_complete := g.coverage_complete OR p_coverage_complete;
+        END IF;
+    END IF;
+
+    UPDATE openmettle.restore_reconciliation_gate
+       SET open = false,
+           restore_run_id = g.restore_run_id,
+           required_origin_us = g.required_origin_us,
+           required_lifecycle_origin_us = g.required_lifecycle_origin_us,
+           snapshot_journal_seq = g.snapshot_journal_seq,
+           required_journal_seq = g.required_journal_seq,
+           required_chain_digest = g.required_chain_digest,
+           checkpoints = g.checkpoints,
+           coverage_complete = g.coverage_complete,
+           volume_claim_token = NULL,
+           volume_lease_until = NULL,
+           locked_at = g.locked_at,
+           opened_at = NULL
+     WHERE id
+    RETURNING * INTO STRICT g;
+    RETURN g;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_lock(bigint, bigint, bytea, boolean, uuid, boolean, bigint) FROM PUBLIC;
+
+-- Owner only: validate an export's watermark, installation origin and lifecycle origin against the
+-- closed restore gate before deletion_journal_replay writes any row.
+DROP FUNCTION openmettle.restore_verify_export(bigint, bigint, bytea);
+
+CREATE FUNCTION openmettle.restore_verify_export(
+    p_origin_us bigint,
+    p_export_seq bigint,
+    p_export_digest bytea,
+    p_lifecycle_origin_us bigint DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    head openmettle.deletion_journal_head%ROWTYPE;
+    v_origin_us bigint;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'export verification requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_origin_us IS NULL OR p_export_seq IS NULL OR p_export_seq < 0
+       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32 THEN
+        RAISE EXCEPTION 'invalid export verification parameters' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO g FROM openmettle.restore_reconciliation_gate WHERE id AND NOT open FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'journal replay requires a closed restore gate' USING ERRCODE = 'OMR02';
+    END IF;
+    IF g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp() THEN
+        RAISE EXCEPTION 'restore volume phase is active' USING ERRCODE = 'OMR02';
+    END IF;
+    SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id;
+    IF p_export_seq < g.snapshot_journal_seq
+       OR p_export_seq < head.journal_seq
+       OR p_export_seq <> g.required_journal_seq THEN
+        RAISE EXCEPTION 'export sequence % does not match locked restore requirement %',
+            p_export_seq, g.required_journal_seq USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_export_digest IS DISTINCT FROM g.required_chain_digest THEN
+        RAISE EXCEPTION 'export watermark digest does not match locked requirement'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    v_origin_us := (extract(epoch FROM head.coverage_started_at) * 1000000)::bigint;
+    IF p_origin_us IS DISTINCT FROM g.required_origin_us OR v_origin_us IS DISTINCT FROM p_origin_us THEN
+        RAISE EXCEPTION 'journal origin mismatch: backup predates deletion journal creation or belongs to another installation'
+            USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+        RAISE EXCEPTION 'export lifecycle origin % does not match locked requirement %',
+            p_lifecycle_origin_us, g.required_lifecycle_origin_us USING ERRCODE = 'OMR04';
+    END IF;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_verify_export(bigint, bigint, bytea, bigint) FROM PUBLIC;
+
+-- Owner only: claim the exclusive volume-phase lease, checking both origins, watermark and
+-- pinned checkpoints.
+DROP FUNCTION openmettle.restore_claim_volume_phase(bigint, bigint, bytea);
+
+CREATE FUNCTION openmettle.restore_claim_volume_phase(
+    p_origin_us bigint,
+    p_export_seq bigint,
+    p_export_digest bytea,
+    p_lifecycle_origin_us bigint DEFAULT NULL)
+RETURNS TABLE(restore_run_id uuid, volume_claim_token uuid)
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    head openmettle.deletion_journal_head%ROWTYPE;
+    v_origin_us bigint;
+    v_token uuid;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'restore volume phase claim requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_origin_us IS NULL OR p_export_seq IS NULL OR p_export_seq < 0
+       OR p_export_digest IS NULL OR octet_length(p_export_digest) <> 32 THEN
+        RAISE EXCEPTION 'invalid restore volume phase parameters' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
+    IF g.open THEN
+        RAISE EXCEPTION 'restore gate is not closed' USING ERRCODE = 'OMR02';
+    END IF;
+    IF g.volume_claim_token IS NOT NULL AND g.volume_lease_until > clock_timestamp() THEN
+        RAISE EXCEPTION 'restore volume phase is already active' USING ERRCODE = 'OMR02';
+    END IF;
+    SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR SHARE;
+    v_origin_us := (extract(epoch FROM head.coverage_started_at) * 1000000)::bigint;
+    IF p_origin_us IS DISTINCT FROM g.required_origin_us OR p_origin_us IS DISTINCT FROM v_origin_us THEN
+        RAISE EXCEPTION 'journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+        RAISE EXCEPTION 'lifecycle journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_export_seq IS DISTINCT FROM head.journal_seq OR head.journal_seq <> g.required_journal_seq THEN
+        RAISE EXCEPTION 'journal export sequence does not match restored head or locked requirement'
+            USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_export_digest IS DISTINCT FROM head.chain_digest OR head.chain_digest IS DISTINCT FROM g.required_chain_digest THEN
+        RAISE EXCEPTION 'journal chain digest does not match export or locked requirement'
+            USING ERRCODE = 'OMR03';
+    END IF;
+    PERFORM openmettle.restore_verify_checkpoints();
+    v_token := gen_random_uuid();
+    UPDATE openmettle.restore_reconciliation_gate
+       SET volume_claim_token = v_token,
+           volume_lease_until = clock_timestamp() + interval '300 seconds'
+     WHERE id;
+    RETURN QUERY SELECT g.restore_run_id, v_token;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_claim_volume_phase(bigint, bigint, bytea, bigint) FROM PUBLIC;
 
 -- Owner only: replay any of the four deletion_journal event kinds in strict journal_seq order.
 -- Replaces migration 41's 10-arg form with an 11-arg form whose trailing p_retained_us defaults
@@ -444,20 +810,24 @@ REVOKE ALL ON FUNCTION openmettle.deletion_journal_replay(bigint, bigint, text, 
     bigint, bytea, bigint, bytea, bigint) FROM PUBLIC;
 
 -- Require only 'artifact_revision.purged' journal rows to have state = 'purged' before opening
--- the restore gate; retained, deadline_adjusted and restored records leave revisions in retained
--- or active states as replayed.
-CREATE OR REPLACE FUNCTION openmettle.restore_gate_open(
+-- the restore gate, and require matching lifecycle_coverage_started_at unless an audited owner
+-- restore.accept_coverage_gap record explicitly accepted the coverage gap for this restore_run_id.
+DROP FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid);
+
+CREATE FUNCTION openmettle.restore_gate_open(
     p_restore_run_id uuid,
     p_claim_token uuid,
     p_origin_us bigint,
     p_export_seq bigint,
     p_export_digest bytea,
-    p_expected_volume_id uuid)
+    p_expected_volume_id uuid,
+    p_lifecycle_origin_us bigint DEFAULT NULL)
 RETURNS void LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.restore_reconciliation_gate%ROWTYPE;
     head openmettle.deletion_journal_head%ROWTYPE;
     v_origin_us bigint;
+    v_lifecycle_origin_us bigint;
     v_volume_id uuid;
     v_adoption_run_id uuid;
 BEGIN
@@ -494,8 +864,26 @@ BEGIN
     END IF;
     SELECT * INTO STRICT head FROM openmettle.deletion_journal_head WHERE id FOR SHARE;
     v_origin_us := (extract(epoch FROM head.coverage_started_at) * 1000000)::bigint;
+    v_lifecycle_origin_us := (extract(epoch FROM head.lifecycle_coverage_started_at) * 1000000)::bigint;
     IF p_origin_us IS DISTINCT FROM g.required_origin_us OR p_origin_us IS DISTINCT FROM v_origin_us THEN
         RAISE EXCEPTION 'journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF p_lifecycle_origin_us IS DISTINCT FROM g.required_lifecycle_origin_us THEN
+        RAISE EXCEPTION 'lifecycle journal origin mismatch' USING ERRCODE = 'OMR04';
+    END IF;
+    IF (p_lifecycle_origin_us IS NULL OR p_lifecycle_origin_us IS DISTINCT FROM v_lifecycle_origin_us)
+       AND NOT EXISTS (
+           SELECT FROM openmettle.authorization_audit
+            WHERE actor_kind = 'operator'
+              AND action = 'restore.accept_coverage_gap'
+              AND target_kind = 'restore_gate'
+              AND target_id = 'instance'
+              AND (details->>'restore_run_id') = g.restore_run_id::text
+              AND (details->>'required_journal_seq')::bigint = g.required_journal_seq
+              AND (details->>'required_chain_digest') = encode(g.required_chain_digest, 'hex')
+       ) THEN
+        RAISE EXCEPTION 'backup predates lifecycle journal coverage; inspect or run restore accept-coverage-gap'
+            USING ERRCODE = 'OMR04';
     END IF;
     IF p_export_seq IS DISTINCT FROM head.journal_seq
        OR head.journal_seq <> g.required_journal_seq THEN
@@ -518,10 +906,81 @@ BEGIN
            opened_at = clock_timestamp(),
            restore_run_id = NULL,
            required_origin_us = NULL,
+           required_lifecycle_origin_us = NULL,
            checkpoints = '[]'::jsonb,
            volume_claim_token = NULL,
            volume_lease_until = NULL
      WHERE id;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.restore_gate_open(uuid, uuid, bigint, bigint, bytea, uuid, bigint) FROM PUBLIC;
+
+-- Record required_lifecycle_origin_us alongside required_origin_us in break-glass audit details.
+CREATE OR REPLACE FUNCTION openmettle.restore_accept_coverage_gap(
+    p_restore_run_id uuid,
+    p_operator_id uuid,
+    p_request_key text,
+    p_reason text)
+RETURNS boolean LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.restore_reconciliation_gate%ROWTYPE;
+    v_details jsonb;
+    v_existing record;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'restore gate changes require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    IF p_restore_run_id IS NULL
+       OR p_operator_id IS NULL
+       OR p_request_key IS NULL
+       OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
+       OR btrim(p_request_key) <> p_request_key
+       OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR p_reason IS NULL
+       OR octet_length(p_reason) NOT BETWEEN 1 AND 512
+       OR btrim(p_reason) <> p_reason
+       OR p_reason COLLATE "C" ~ '[[:cntrl:]]' THEN
+        RAISE EXCEPTION 'invalid coverage gap acceptance parameters' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO STRICT g FROM openmettle.restore_reconciliation_gate WHERE id FOR UPDATE;
+    IF g.open OR g.restore_run_id IS DISTINCT FROM p_restore_run_id THEN
+        RAISE EXCEPTION 'restore gate is not closed under the specified restore_run_id'
+            USING ERRCODE = 'OMR02';
+    END IF;
+    v_details := jsonb_build_object(
+        'restore_run_id', g.restore_run_id,
+        'required_origin_us', g.required_origin_us,
+        'required_lifecycle_origin_us', g.required_lifecycle_origin_us,
+        'snapshot_journal_seq', g.snapshot_journal_seq,
+        'required_journal_seq', g.required_journal_seq,
+        'required_chain_digest', encode(g.required_chain_digest, 'hex')
+    );
+    SELECT actor_kind, operator_id, target_kind, target_id, reason, details
+      INTO v_existing
+      FROM openmettle.authorization_audit
+     WHERE actor_kind = 'operator'
+       AND action = 'restore.accept_coverage_gap'
+       AND request_key = p_request_key;
+    IF FOUND THEN
+        IF v_existing.actor_kind = 'operator'
+           AND v_existing.operator_id = p_operator_id
+           AND v_existing.target_kind = 'restore_gate'
+           AND v_existing.target_id = 'instance'
+           AND v_existing.reason = p_reason
+           AND v_existing.details = v_details THEN
+            RETURN false;
+        END IF;
+        RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
+    END IF;
+    INSERT INTO openmettle.authorization_audit
+        (actor_kind, actor_user_id, operator_id, action, target_kind, target_id, request_key, reason, details)
+    VALUES
+        ('operator', NULL, p_operator_id, 'restore.accept_coverage_gap', 'restore_gate',
+         'instance', p_request_key, p_reason, v_details);
+    UPDATE openmettle.restore_reconciliation_gate
+       SET coverage_complete = true
+     WHERE id;
+    RETURN true;
 END
 $$;
 
@@ -529,7 +988,69 @@ $$;
 -- granting openmettle_api direct SELECT on restore_reconciliation_gate.
 GRANT EXECUTE ON FUNCTION openmettle.restore_gate_lock_open() TO openmettle_api;
 
--- Widen authorization_audit action check additively for PR3 routes.
+-- Least-privilege live-reference check for disassociation (active -> retained): true when any
+-- live message attachment references (p_scope, p_revision) OR its writing run/operation is still
+-- unfinished. Requires READ COMMITTED so callers holding artifact_revisions FOR UPDATE see every
+-- attachment or run/operation transition committed before the lock.
+CREATE FUNCTION openmettle.artifact_revision_live_referenced(
+    p_scope uuid,
+    p_revision uuid)
+RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'live reference checks require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    RETURN EXISTS (
+               SELECT FROM openmettle.message_parts
+                WHERE scope_id = p_scope
+                  AND artifact_revision_id = p_revision
+           )
+        OR EXISTS (
+               SELECT FROM openmettle.artifact_revisions r
+                 JOIN openmettle.storage_reservations s
+                   ON s.scope_id = r.scope_id AND s.id = r.reservation_id
+                 JOIN openmettle.runs u
+                   ON u.scope_id = s.scope_id AND u.id = s.run_id
+                WHERE r.scope_id = p_scope
+                  AND r.id = p_revision
+                  AND (
+                      u.state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')
+                      OR EXISTS (
+                          SELECT FROM openmettle.operations o
+                           WHERE o.scope_id = u.scope_id
+                             AND o.run_id = u.id
+                             AND (s.operation_id IS NULL OR o.id = s.operation_id)
+                             AND o.outcome IN ('intent', 'outcome_unknown')
+                      )
+                  )
+           );
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.artifact_revision_live_referenced(uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.artifact_revision_live_referenced(uuid, uuid) TO openmettle_api;
+
+-- Least-privilege operator-hold check for pre-expiry restore (retained -> active): lets
+-- openmettle_api refuse restoring a revision placed under an operator hold without granting
+-- openmettle_api direct SELECT on artifact_retention_holds.
+CREATE FUNCTION openmettle.artifact_revision_has_hold(
+    p_scope uuid,
+    p_revision uuid)
+RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'retention hold checks require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    RETURN EXISTS (
+        SELECT FROM openmettle.artifact_retention_holds
+         WHERE scope_id = p_scope
+           AND artifact_revision_id = p_revision
+    );
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.artifact_revision_has_hold(uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.artifact_revision_has_hold(uuid, uuid) TO openmettle_api;
+
+-- Widen authorization_audit action check additively for PR3 routes (including audited admin reads).
 ALTER TABLE openmettle.authorization_audit
     DROP CONSTRAINT authorization_audit_action_check,
     ADD CONSTRAINT authorization_audit_action_check CHECK (action IN (
@@ -545,6 +1066,7 @@ ALTER TABLE openmettle.authorization_audit
         'capability.user_grant', 'capability.user_revoke',
         'conversation.create', 'branch.create', 'quota.override.set', 'quota.override.revoke',
         'retention.policy_update', 'retention.deadlines_apply',
+        'retention.status_read', 'retention.deadlines_preview',
         'artifact.delete', 'artifact_revision.delete', 'artifact_revision.restore',
         'family_policy.set', 'family_policy.clear',
         'family_policy.model_study_allow', 'family_policy.model_study_revoke',
@@ -669,9 +1191,11 @@ BEGIN
 END
 $$;
 
--- Audited account_admin read-only preview of adjusting existing 'retained' deadlines to
+-- Audited account_admin preview of adjusting existing 'retained' deadlines to
 -- retained_at + p_target_grace_seconds. Exposes counts and total bytes only; never exposes
--- artifact IDs, filenames or content.
+-- artifact IDs, filenames or content. Verifies authority at server-side clock_timestamp() and
+-- writes a redacted retention.deadlines_preview audit record while remaining available when the
+-- restore gate is closed.
 CREATE FUNCTION openmettle.retention_preview_deadlines(
     p_actor uuid,
     p_approval uuid,
@@ -683,12 +1207,31 @@ RETURNS TABLE(
     affected_bytes bigint,
     current_policy_revision bigint,
     target_grace_seconds integer)
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     v_policy openmettle.retention_policy%ROWTYPE;
     v_now_ms bigint;
+    v_affected_revisions bigint;
+    v_affected_bytes bigint;
 BEGIN
-    v_now_ms := coalesce(p_now_ms, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint);
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'retention deadline preview requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    PERFORM FROM openmettle.account_admin_lock WHERE id FOR SHARE;
+    PERFORM FROM openmettle.login_providers p
+     WHERE p.id = (SELECT a.provider_id FROM openmettle.local_identity_approvals a
+                    WHERE a.id = p_approval)
+       FOR SHARE;
+    PERFORM FROM openmettle.local_identity_approvals a
+     WHERE a.id = p_approval
+       FOR SHARE;
+    PERFORM FROM openmettle.users u
+     WHERE u.id = p_actor
+       FOR SHARE;
+    v_now_ms := greatest(
+        coalesce(p_now_ms, 0),
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+    );
     PERFORM openmettle.retention_assert_active_admin(p_actor, p_approval, v_now_ms);
     SELECT * INTO STRICT v_policy FROM openmettle.retention_policy WHERE id;
     IF p_target_grace_seconds IS NULL
@@ -700,15 +1243,39 @@ BEGIN
        AND NOT EXISTS (SELECT FROM openmettle.scopes WHERE id = p_scope_id) THEN
         RAISE EXCEPTION 'scope not found' USING ERRCODE = 'P0002';
     END IF;
-    RETURN QUERY
     SELECT count(*)::bigint,
-           coalesce(sum(r.size_bytes), 0)::bigint,
-           v_policy.revision,
-           p_target_grace_seconds
+           coalesce(sum(r.size_bytes), 0)::bigint
+      INTO v_affected_revisions, v_affected_bytes
       FROM openmettle.artifact_revisions r
      WHERE r.state = 'retained'
        AND (p_scope_id IS NULL OR r.scope_id = p_scope_id)
        AND r.purge_after IS DISTINCT FROM (r.retained_at + p_target_grace_seconds * interval '1 second');
+
+    INSERT INTO openmettle.authorization_audit
+        (actor_user_id, action, target_kind, target_id, request_key, reason, details)
+    VALUES (
+        p_actor,
+        'retention.deadlines_preview',
+        'retention_policy',
+        coalesce(p_scope_id::text, 'instance'),
+        gen_random_uuid()::text,
+        'admin_inspection',
+        jsonb_build_object(
+            'current_policy_revision', v_policy.revision,
+            'target_grace_seconds', p_target_grace_seconds,
+            'scope_id', p_scope_id,
+            'affected_revisions', v_affected_revisions,
+            'affected_bytes', v_affected_bytes
+        )
+    );
+
+    v_now_ms := greatest(
+        v_now_ms,
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+    );
+    PERFORM openmettle.retention_assert_active_admin(p_actor, p_approval, v_now_ms);
+
+    RETURN QUERY SELECT v_affected_revisions, v_affected_bytes, v_policy.revision, p_target_grace_seconds;
 END
 $$;
 REVOKE ALL ON FUNCTION openmettle.retention_preview_deadlines(uuid, uuid, bigint, integer, uuid) FROM PUBLIC;
@@ -717,10 +1284,8 @@ GRANT EXECUTE ON FUNCTION openmettle.retention_preview_deadlines(uuid, uuid, big
 -- Audited account_admin explicit deadline adjustment for existing 'retained' revisions.
 -- Follows canonical lock order (account_admin_lock -> login_providers -> local_identity_approvals
 -- -> users -> artifact_revisions (scope_id, id) -> restore_reconciliation_gate FOR SHARE ->
--- retention_policy FOR SHARE -> authorization_audit -> deletion_journal_head at commit), appends
--- 'artifact_revision.deadline_adjusted' journal entries via the deferred trigger, records one
--- authorization_audit row with zero private metadata, supports exact replay on (actor, request_key)
--- and re-verifies live authority post-write.
+-- retention_policy FOR SHARE -> authorization_audit -> deletion_journal_head via explicit
+-- SET CONSTRAINTS ... IMMEDIATE before the post-write authority recheck).
 CREATE FUNCTION openmettle.retention_apply_deadlines(
     p_actor uuid,
     p_approval uuid,
@@ -747,6 +1312,8 @@ BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'retention deadline adjustments require READ COMMITTED' USING ERRCODE = '25000';
     END IF;
+    -- Defense-in-depth: never allow a caller-set session GUC to suppress lifecycle journaling.
+    PERFORM pg_catalog.set_config('openmettle.replaying_deletion_journal', 'off', true);
     PERFORM FROM openmettle.account_admin_lock WHERE id FOR UPDATE;
     PERFORM FROM openmettle.login_providers p
      WHERE p.id = (SELECT a.provider_id FROM openmettle.local_identity_approvals a
@@ -872,6 +1439,11 @@ BEGIN
         )
     );
 
+    -- Flush deferred lifecycle journal appends (acquiring deletion_journal_head FOR UPDATE)
+    -- strictly BEFORE the final post-write approval-expiry recheck so an approval expiring
+    -- during a contended deletion_journal_head wait rolls the entire transaction back.
+    SET CONSTRAINTS openmettle.artifact_revisions_lifecycle_journal IMMEDIATE;
+
     now_ms := floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint;
     PERFORM openmettle.retention_assert_active_admin(p_actor, p_approval, now_ms);
 
@@ -881,10 +1453,12 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.retention_apply_deadlines(uuid, uuid, bigint, integer, uuid, text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.retention_apply_deadlines(uuid, uuid, bigint, integer, uuid, text, text) TO openmettle_api;
 
--- Read-only SECURITY DEFINER projection for active account_admins: exposes retention policy,
+-- Audited SECURITY DEFINER projection for active account_admins: exposes retention policy,
 -- restore-gate state (without volume_claim_token, restore_run_id or checkpoints) and deletion
 -- journal head sequence/origin without granting openmettle_api direct SELECT on deletion_journal,
--- deletion_journal_head or restore_reconciliation_gate. Works even while the restore gate is closed.
+-- deletion_journal_head or restore_reconciliation_gate. Evaluates authority at server-side
+-- clock_timestamp(), records a redacted retention.status_read audit row, and works even while
+-- the restore gate is closed.
 CREATE FUNCTION openmettle.admin_retention_status(
     p_actor uuid,
     p_approval uuid,
@@ -900,13 +1474,39 @@ RETURNS TABLE(
     coverage_complete boolean,
     journal_seq bigint,
     coverage_started_at_us bigint)
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     v_now_ms bigint;
+    v_policy_revision bigint;
+    v_grace_seconds integer;
+    v_min_grace_seconds integer;
+    v_max_grace_seconds integer;
+    v_gate_open boolean;
+    v_snapshot_journal_seq bigint;
+    v_required_journal_seq bigint;
+    v_coverage_complete boolean;
+    v_journal_seq bigint;
+    v_coverage_started_at_us bigint;
 BEGIN
-    v_now_ms := coalesce(p_now_ms, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint);
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'retention status inspection requires READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
+    PERFORM FROM openmettle.account_admin_lock WHERE id FOR SHARE;
+    PERFORM FROM openmettle.login_providers p
+     WHERE p.id = (SELECT a.provider_id FROM openmettle.local_identity_approvals a
+                    WHERE a.id = p_approval)
+       FOR SHARE;
+    PERFORM FROM openmettle.local_identity_approvals a
+     WHERE a.id = p_approval
+       FOR SHARE;
+    PERFORM FROM openmettle.users u
+     WHERE u.id = p_actor
+       FOR SHARE;
+    v_now_ms := greatest(
+        coalesce(p_now_ms, 0),
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+    );
     PERFORM openmettle.retention_assert_active_admin(p_actor, p_approval, v_now_ms);
-    RETURN QUERY
     SELECT p.revision,
            p.grace_seconds,
            p.min_grace_seconds,
@@ -917,10 +1517,55 @@ BEGIN
            g.coverage_complete,
            h.journal_seq,
            (extract(epoch FROM h.coverage_started_at) * 1000000)::bigint
+      INTO STRICT
+           v_policy_revision,
+           v_grace_seconds,
+           v_min_grace_seconds,
+           v_max_grace_seconds,
+           v_gate_open,
+           v_snapshot_journal_seq,
+           v_required_journal_seq,
+           v_coverage_complete,
+           v_journal_seq,
+           v_coverage_started_at_us
       FROM openmettle.retention_policy p
       CROSS JOIN openmettle.restore_reconciliation_gate g
       CROSS JOIN openmettle.deletion_journal_head h
      WHERE p.id AND g.id AND h.id;
+
+    INSERT INTO openmettle.authorization_audit
+        (actor_user_id, action, target_kind, target_id, request_key, reason, details)
+    VALUES (
+        p_actor,
+        'retention.status_read',
+        'retention_policy',
+        'instance',
+        gen_random_uuid()::text,
+        'admin_inspection',
+        jsonb_build_object(
+            'policy_revision', v_policy_revision,
+            'gate_open', v_gate_open,
+            'journal_seq', v_journal_seq
+        )
+    );
+
+    v_now_ms := greatest(
+        v_now_ms,
+        floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+    );
+    PERFORM openmettle.retention_assert_active_admin(p_actor, p_approval, v_now_ms);
+
+    RETURN QUERY SELECT
+        v_policy_revision,
+        v_grace_seconds,
+        v_min_grace_seconds,
+        v_max_grace_seconds,
+        v_gate_open,
+        v_snapshot_journal_seq,
+        v_required_journal_seq,
+        v_coverage_complete,
+        v_journal_seq,
+        v_coverage_started_at_us;
 END
 $$;
 REVOKE ALL ON FUNCTION openmettle.admin_retention_status(uuid, uuid, bigint) FROM PUBLIC;

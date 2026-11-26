@@ -383,13 +383,6 @@ pub(super) async fn preview(
             if input
                 .parts
                 .iter()
-                .any(|p| matches!(p.value, PartContent::RetainedAttachment(_)))
-            {
-                return Err(CONFLICT);
-            }
-            if input
-                .parts
-                .iter()
                 .any(|p| !matches!(p.value, PartContent::Available(_)))
             {
                 return Err(NOT_FOUND);

@@ -66,6 +66,7 @@ fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
 
 struct RestoreLockArgs {
     origin_us: i64,
+    lifecycle_origin_us: Option<i64>,
     required_seq: i64,
     required_digest: String,
     export_complete: bool,
@@ -74,8 +75,9 @@ struct RestoreLockArgs {
 }
 
 fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static str> {
-    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
+    let usage = "usage: openmettle-admin restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore]";
     let mut origin_us = None;
+    let mut lifecycle_origin_us = None;
     let mut required_seq = None;
     let mut required_digest = None;
     let mut export_complete = false;
@@ -91,6 +93,16 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
                 i += 1;
                 let raw = args.get(i).ok_or("missing --required-origin value")?;
                 origin_us = Some(raw.parse().map_err(|_| "invalid origin")?);
+            }
+            "--required-lifecycle-origin" => {
+                if lifecycle_origin_us.is_some() {
+                    return Err("duplicate --required-lifecycle-origin");
+                }
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or("missing --required-lifecycle-origin value")?;
+                lifecycle_origin_us = Some(raw.parse().map_err(|_| "invalid lifecycle origin")?);
             }
             "--required-seq" => {
                 if required_seq.is_some() {
@@ -151,6 +163,7 @@ fn parse_restore_lock_args(args: &[String]) -> Result<RestoreLockArgs, &'static 
     let new_restore = replace_restore_run.is_none() || new_restore_flag;
     Ok(RestoreLockArgs {
         origin_us,
+        lifecycle_origin_us,
         required_seq,
         required_digest,
         export_complete,
@@ -248,12 +261,20 @@ async fn journal(
                 })
                 .map_err(|_| "export file could not be created")?;
             println!("{}", text.lines().rev().nth(1).unwrap_or_default());
+            if let Some(lc) = text
+                .lines()
+                .nth(2)
+                .filter(|line| line.starts_with("lifecycle_origin "))
+            {
+                println!("{lc}");
+            }
         }
         (Some("restore"), Some("lock")) => {
             let lock_args = parse_restore_lock_args(args)?;
             let locked = restore::lock(
                 &pool(1).await?,
                 lock_args.origin_us,
+                lock_args.lifecycle_origin_us,
                 lock_args.required_seq,
                 &lock_args.required_digest,
                 lock_args.export_complete,
@@ -262,14 +283,25 @@ async fn journal(
             )
             .await
             .map_err(failed("restore lock"))?;
-            println!(
-                "restore gate closed: restore_run {}, origin {}, snapshot {}, required {}, coverage_complete {}",
-                locked.restore_run_id,
-                locked.origin_us,
-                locked.snapshot_seq,
-                locked.required_seq,
-                locked.coverage_complete
-            );
+            match locked.lifecycle_origin_us {
+                Some(lc) => println!(
+                    "restore gate closed: restore_run {}, origin {}, lifecycle_origin {}, snapshot {}, required {}, coverage_complete {}",
+                    locked.restore_run_id,
+                    locked.origin_us,
+                    lc,
+                    locked.snapshot_seq,
+                    locked.required_seq,
+                    locked.coverage_complete
+                ),
+                None => println!(
+                    "restore gate closed: restore_run {}, origin {}, snapshot {}, required {}, coverage_complete {}",
+                    locked.restore_run_id,
+                    locked.origin_us,
+                    locked.snapshot_seq,
+                    locked.required_seq,
+                    locked.coverage_complete
+                ),
+            }
         }
         (Some("restore"), Some("accept-coverage-gap")) => {
             let (restore_run_id, operator_id, request_key, reason) = parse_accept_gap_args(args)?;
@@ -326,7 +358,7 @@ async fn journal(
         }
         _ => {
             return Err(
-                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
+                "usage: openmettle-admin journal export FILE | restore lock --required-origin ORIGIN_US [--required-lifecycle-origin ORIGIN_US] --required-seq N --required-digest HEX [--export-complete] [--replace-restore-run UUID] [--new-restore] | restore accept-coverage-gap --restore-run UUID --operator-id UUID --request-key KEY --reason REASON | restore replay FILE [ROOT]",
             );
         }
     }

@@ -842,6 +842,18 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     assert!(revision.media_type.starts_with("text/plain") && revision.sha256.len() == 64);
     let unnamed = consumer::decode_revision(&fixture("ArtifactRevisionActive--unnamed")).unwrap();
     assert!(unnamed.display_name.is_none());
+    // Backward compatibility: pre-PR3 servers omit optional `retained_at` and `purge_after`.
+    let mut legacy_revision = fixture("ArtifactRevisionActive");
+    let obj = legacy_revision.as_object_mut().unwrap();
+    obj.remove("retained_at");
+    obj.remove("purge_after");
+    let revision_validator = validator_for("#/components/schemas/ArtifactRevision");
+    assert!(revision_validator.is_valid(&legacy_revision));
+    let decoded_legacy = consumer::decode_revision(&legacy_revision).unwrap();
+    assert_eq!(
+        (decoded_legacy.retained_at, decoded_legacy.purge_after),
+        (None, None)
+    );
     // A newer state is surfaced and never offered for download.
     let newer = fixture("ArtifactRevisionActive--unrecognized-state");
     let newer = consumer::decode_revision(&newer).unwrap();

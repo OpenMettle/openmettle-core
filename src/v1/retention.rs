@@ -3,7 +3,7 @@
 use super::{
     Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, POLICY, Problem, Session,
     UNAUTHENTICATED, UNAVAILABLE, denied, parse_unique, principal,
-    quotas::parse_non_negative_decimal, read_only_snapshot, reply, request_key, timestamp,
+    quotas::parse_non_negative_decimal, reply, request_key, timestamp,
 };
 use crate::{
     authz::{self, Action, AdminChange, store},
@@ -15,6 +15,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::PgConnection;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +141,27 @@ type StatusRow = (
     i64,
 );
 
+async fn with_retention_tx<T>(
+    c: &mut PgConnection,
+    work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, Problem>,
+) -> Result<T, Problem> {
+    let mut tx = store::begin(c).await?;
+    let outcome = match tx.connection() {
+        Ok(conn) => work(conn).await,
+        Err(err) => Err(Problem::from(store::StoreError::from(err))),
+    };
+    match outcome {
+        Ok(val) => {
+            tx.commit().await?;
+            Ok(val)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}
+
 impl Api {
     pub(super) async fn retention_operation(
         &self,
@@ -157,8 +179,8 @@ impl Api {
                 let context = self.authenticate(&session).await?;
                 let row: StatusRow = self
                     .with_connection(async |c| {
-                        read_only_snapshot(c, async |tx| {
-                            let p = principal(tx, &context).await?;
+                        with_retention_tx(c, async |conn| {
+                            let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             sqlx::query_as(
                                 "SELECT policy_revision, grace_seconds, min_grace_seconds,
@@ -170,7 +192,7 @@ impl Api {
                             .bind(context.user_id())
                             .bind(context.approval_id())
                             .bind(context.observed_ms())
-                            .fetch_one(tx)
+                            .fetch_one(conn)
                             .await
                             .map_err(map_retention_sql_error)
                         })
@@ -205,9 +227,7 @@ impl Api {
                 let context = self.authenticate(&session).await?;
                 let (revision, min_grace, max_grace): (i64, i32, i32) = self
                     .with_connection(async |c| {
-                        let mut tx = store::begin(c).await?;
-                        let outcome = async {
-                            let conn = tx.connection()?;
+                        with_retention_tx(c, async |conn| {
                             let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             let rev: i64 = sqlx::query_scalar(
@@ -228,19 +248,9 @@ impl Api {
                             )
                             .fetch_one(&mut *conn)
                             .await?;
-                            Ok::<_, Problem>((rev, min_grace, max_grace))
-                        }
-                        .await;
-                        match outcome {
-                            Ok(val) => {
-                                tx.commit().await?;
-                                Ok(val)
-                            }
-                            Err(err) => {
-                                let _ = tx.rollback().await;
-                                Err(err)
-                            }
-                        }
+                            Ok((rev, min_grace, max_grace))
+                        })
+                        .await
                     })
                     .await?;
                 Ok(reply(
@@ -263,8 +273,8 @@ impl Api {
                     i32,
                 ) = self
                     .with_connection(async |c| {
-                        read_only_snapshot(c, async |tx| {
-                            let p = principal(tx, &context).await?;
+                        with_retention_tx(c, async |conn| {
+                            let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             sqlx::query_as(
                                 "SELECT affected_revisions, affected_bytes,
@@ -278,7 +288,7 @@ impl Api {
                             .bind(context.observed_ms())
                             .bind(target_grace_seconds)
                             .bind(scope_id.as_deref())
-                            .fetch_one(tx)
+                            .fetch_one(conn)
                             .await
                             .map_err(map_retention_sql_error)
                         })
@@ -305,9 +315,7 @@ impl Api {
                 let context = self.authenticate(&session).await?;
                 let (affected_revisions, affected_bytes, policy_revision): (i64, i64, i64) = self
                     .with_connection(async |c| {
-                        let mut tx = store::begin(c).await?;
-                        let outcome = async {
-                            let conn = tx.connection()?;
+                        with_retention_tx(c, async |conn| {
                             let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             sqlx::query_as(
@@ -323,21 +331,11 @@ impl Api {
                             .bind(scope_id.as_deref())
                             .bind(&reason)
                             .bind(&key)
-                            .fetch_one(&mut *conn)
+                            .fetch_one(conn)
                             .await
                             .map_err(map_retention_sql_error)
-                        }
-                        .await;
-                        match outcome {
-                            Ok(val) => {
-                                tx.commit().await?;
-                                Ok(val)
-                            }
-                            Err(err) => {
-                                let _ = tx.rollback().await;
-                                Err(err)
-                            }
-                        }
+                        })
+                        .await
                     })
                     .await?;
                 Ok(reply(

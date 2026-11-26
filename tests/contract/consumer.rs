@@ -780,9 +780,9 @@ struct WireArtifactRevision {
     state: String,
     #[allow(dead_code)]
     created_at: String,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     retained_at: Option<String>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     purge_after: Option<String>,
 }
 

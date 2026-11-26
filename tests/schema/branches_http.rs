@@ -878,7 +878,7 @@ async fn shares_catalog_preview_history_and_cancellation() {
         json!({"kind":"attachment","revision_id":attachment,"state":"retained","part_id":ordered[1]["part_id"]})
     );
     api.post(&u.cookie, "/v1/runs", "inactive", &make_fork("retry"))
-        .problem(409, "conflict");
+        .problem(404, "not_found");
     sqlx::query(
         "UPDATE openmettle.artifact_revisions
         SET state='purged',purging_at=purge_after,purged_at=purge_after WHERE id=$1::uuid",

@@ -401,6 +401,11 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
         match ReservationState::parse(row.get("state"))? {
             ReservationState::Released => return Err(Error::Conflict),
             ReservationState::Settled => {
+                if !crate::restore::lock_open_gate(&mut sp).await? {
+                    return Err(Error::Database(sqlx::Error::Protocol(
+                        "restore reconciliation pending".into(),
+                    )));
+                }
                 let rev = sqlx::query("SELECT id::text,artifact_id::text,size_bytes,content_digest,media_type,
                      display_name,created_by_user_id::text FROM openmettle.artifact_revisions
                      WHERE scope_id=$1::uuid AND reservation_id=$2::uuid")

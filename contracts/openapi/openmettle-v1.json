@@ -397,7 +397,7 @@
       "delete": {
         "operationId": "deleteArtifactRevision",
         "summary": "Disassociate one artifact revision",
-        "description": "Moves an active revision to retained under the installation's current retention policy, keeping its bytes charged until purge succeeds (ADR 0041). Needs current write/delete access to the artifact; a revision of another artifact or an inaccessible artifact is not_found, a read-only share is policy and an archived project is conflict. A non-replayed delete on a purging or purged revision is conflict; an exact retry with the same Idempotency-Key returns the revision with 200. Refused with 503 unavailable while the restore reconciliation gate is closed.",
+        "description": "Moves an active revision to retained under the installation's current retention policy, keeping its bytes charged until purge succeeds (ADR 0041). Needs current write/delete access to the artifact; an inaccessible artifact, unknown revision, revision of another artifact, or fresh call on a purged revision is not_found, a read-only share on a visible live revision is policy, and an archived project, live message attachment or unfinished writing run, or non-replayed purging revision is conflict. An exact retry with the same Idempotency-Key returns the original transition receipt with 200. Refused with 503 unavailable while the restore reconciliation gate is closed.",
         "x-openmettle-implementation": "implemented",
         "security": [
           {
@@ -470,7 +470,7 @@
       "post": {
         "operationId": "restoreArtifactRevision",
         "summary": "Restore a retained artifact revision before its purge deadline",
-        "description": "Returns a retained revision to active strictly before purge_after without reinstating revoked shares (ADR 0041). Needs current write access to the artifact; an inaccessible artifact or revision of another artifact is not_found, a read-only share is policy, and an archived project, elapsed deadline, purging/purged state or already-active non-replayed request is conflict. Refused with 503 unavailable while the restore reconciliation gate is closed.",
+        "description": "Returns a retained revision to active strictly before purge_after without reinstating revoked shares (ADR 0041). Needs current write access to the artifact; an inaccessible artifact, unknown revision, revision of another artifact, or fresh call on a purged revision is not_found, a read-only share on a visible live revision is policy, and an archived project, operator retention hold, elapsed deadline, purging state or already-active non-replayed request is conflict. An exact retry with the same Idempotency-Key returns the original transition receipt with 200. Refused with 503 unavailable while the restore reconciliation gate is closed.",
         "x-openmettle-implementation": "implemented",
         "security": [
           {
@@ -5353,9 +5353,7 @@
           "sha256",
           "display_name",
           "state",
-          "created_at",
-          "retained_at",
-          "purge_after"
+          "created_at"
         ],
         "properties": {
           "artifact_id": {

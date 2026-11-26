@@ -273,8 +273,8 @@ async fn artifact_disassociation_and_pre_expiry_restore_routes_enforce_authz_ide
     let (dl_status, _, _) = api.download(alice_b, "GET", &r1_content, None);
     assert_eq!(dl_status, 409);
 
-    // POST /v1/runs attaching a visible retained revision fails with 409 conflict (whereas an
-    // unknown/unshared revision stays concealed as 404 not_found).
+    // POST /v1/runs attaching a visible retained revision excludes it with 404 not_found
+    // (ADR 0036 & ADR 0041), matching unknown/unshared revisions.
     let conv = success(
         api.call(
             alice_b,
@@ -312,8 +312,8 @@ async fn artifact_disassociation_and_pre_expiry_restore_routes_enforce_authz_ide
             Some("run-retained"),
             Some(&attach_run(&r1_id, "00000000-0000-4000-8000-00000000a101")),
         ),
-        409,
-        "conflict",
+        404,
+        "not_found",
     );
     refused(
         api.call(
@@ -433,6 +433,7 @@ async fn artifact_disassociation_and_pre_expiry_restore_routes_enforce_authz_ide
         409,
         "conflict",
     );
+    // Fresh DELETE and restore on a purged revision conceal it with 404 not_found (P2 #11).
     let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     storage::confirm_purge(&mut tx, &personal, &r2_id)
         .await
@@ -440,13 +441,13 @@ async fn artifact_disassociation_and_pre_expiry_restore_routes_enforce_authz_ide
     tx.commit().await.unwrap();
     refused(
         api.call(alice_b, "DELETE", &r2_path, Some("del-r2-purged"), None),
-        409,
-        "conflict",
+        404,
+        "not_found",
     );
     refused(
         api.call(alice_b, "POST", &r2_restore, Some("rest-r2-purged"), None),
-        409,
-        "conflict",
+        404,
+        "not_found",
     );
 
     // Project scope: viewer gets 403, archived project refuses delete & restore with 409, deleted
@@ -1116,24 +1117,58 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
     );
     let run_id = run["run_id"].as_str().unwrap().to_owned();
 
+    // Verify content/run-history read routes succeed while the gate is open, and open an active
+    // SSE stream BEFORE closing the gate so we can verify active SSE termination on gate close.
+    let messages_path = format!("/v1/conversations/{conv_id}/branches/{branch_id}/messages");
+    let run_path = format!("/v1/runs/{run_id}");
+    let approvals_path = format!("/v1/runs/{run_id}/approvals");
+    let events_path = format!("/v1/runs/{run_id}/events");
+    success(api.call(alice_n, "GET", &messages_path, None, None), 200);
+    success(api.call(alice_n, "GET", &run_path, None, None), 200);
+    success(api.call(alice_n, "GET", &approvals_path, None, None), 200);
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sse = tokio::net::TcpStream::connect(&api.bind).await.unwrap();
+    let sse_req = format!(
+        "GET {events_path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {alice_tok}\r\nConnection: close\r\n\r\n",
+        api.bind
+    );
+    sse.write_all(sse_req.as_bytes()).await.unwrap();
+    let mut sse_buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let head_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&sse_buf).contains("\n\n") {
+        let n = tokio::time::timeout_at(head_deadline, sse.read(&mut tmp))
+            .await
+            .expect("SSE headers timed out")
+            .unwrap();
+        assert!(n > 0, "SSE stream closed prematurely before gate lock");
+        sse_buf.extend_from_slice(&tmp[..n]);
+    }
+    let sse_head = String::from_utf8_lossy(&sse_buf);
+    assert!(sse_head.starts_with("HTTP/1.1 200 "), "{sse_head}");
+
     // Close the restore reconciliation gate at the current journal head.
     let owner_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(role_options(&db.0, OWNER))
         .await
         .unwrap();
-    let (origin_us, head_seq, head_digest): (i64, i64, String) = sqlx::query_as(
-        "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
-                journal_seq,
-                encode(chain_digest, 'hex')
-           FROM openmettle.deletion_journal_head WHERE id",
-    )
-    .fetch_one(&owner_pool)
-    .await
-    .unwrap();
+    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, Option<i64>, i64, String) =
+        sqlx::query_as(
+            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    journal_seq,
+                    encode(chain_digest, 'hex')
+               FROM openmettle.deletion_journal_head WHERE id",
+        )
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
     restore::lock(
         &owner_pool,
         origin_us,
+        lifecycle_origin_us,
         head_seq,
         &head_digest,
         true,
@@ -1143,7 +1178,44 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
     .await
     .unwrap();
 
-    // Every mutating `/v1` route AND artifact content download must return `503 unavailable`.
+    // Active SSE stream must terminate promptly once the gate closes (P1 #5).
+    let sse_eof = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut rest = Vec::new();
+        sse.read_to_end(&mut rest).await.unwrap();
+        rest
+    })
+    .await
+    .expect("active SSE stream did not terminate after restore gate closed");
+    drop(sse_eof);
+
+    // Every mutating `/v1` route, settled upload replay (P1 #6), download, AND content/run-history
+    // read route (P1 #5) must return `503 unavailable`.
+    refused(
+        api.call(alice_n, "GET", &messages_path, None, None),
+        503,
+        "unavailable",
+    );
+    refused(
+        api.call(alice_n, "GET", &run_path, None, None),
+        503,
+        "unavailable",
+    );
+    refused(
+        api.call(alice_n, "GET", &approvals_path, None, None),
+        503,
+        "unavailable",
+    );
+    refused(
+        api.call(alice_n, "GET", &events_path, None, None),
+        503,
+        "unavailable",
+    );
+    // Settled upload retry with the exact earlier Idempotency-Key (`g-up1`) also returns 503.
+    refused(
+        api.upload(alice_n, "/v1/artifacts", "g-up1", &body),
+        503,
+        "unavailable",
+    );
     refused(
         api.call(
             alice_n,
@@ -1339,7 +1411,19 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
     );
     assert_eq!(closed_preview["affected_revisions"], "1");
 
-    // Reopen the gate and verify mutations and downloads immediately resume.
+    // Verify P2 #12/#13: both admin inspection routes committed redacted authorization_audit rows
+    // even while the restore gate was closed.
+    let (status_audits, preview_audits): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE action = 'retention.status_read'),
+                count(*) FILTER (WHERE action = 'retention.deadlines_preview')
+           FROM openmettle.authorization_audit",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert!(status_audits >= 1 && preview_audits >= 1);
+
+    // Reopen the gate and verify mutations, downloads, and run/message reads immediately resume.
     sqlx::query(
         "SELECT openmettle.restore_gate_open(
                     c.restore_run_id,
@@ -1347,13 +1431,15 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
                     $1,
                     $2,
                     decode($3, 'hex'),
-                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id)
+                    (SELECT volume_id FROM openmettle.storage_volume_control WHERE id),
+                    $4
                 )
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex')) c",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4) c",
     )
     .bind(origin_us)
     .bind(head_seq)
     .bind(&head_digest)
+    .bind(lifecycle_origin_us)
     .execute(&owner_pool)
     .await
     .unwrap();
@@ -1365,6 +1451,9 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
         None,
     );
     assert_eq!((dl_ok, dl_bytes.as_str()), (200, "gate-content"));
+    success(api.call(alice_n, "GET", &messages_path, None, None), 200);
+    success(api.call(alice_n, "GET", &run_path, None, None), 200);
+    success(api.call(alice_n, "GET", &approvals_path, None, None), 200);
     success(
         api.call(
             alice_n,
@@ -1385,4 +1474,612 @@ async fn closed_restore_gate_returns_503_unavailable_for_mutations_and_downloads
         ),
         200,
     );
+}
+
+/// Cross-provider Review #1 regressions (P1 #4 admission fence, P1 #7 live-referenced delete &
+/// held restore refusals, P2 #9 personal-artifact unshare lock serialization, P2 #10 stored
+/// transition receipt replay across restore/re-delete/purge, P2 #11 unknown revision concealment
+/// under read-only share, and P2 #12/#13 server-clock admin read expiry & audit logging).
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn review_regressions_live_refs_holds_receipts_concealment_unshare_and_admin_reads() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    seed_token_quotas(&mut owner).await;
+    sqlx::query(
+        "UPDATE openmettle.retention_policy
+            SET min_grace_seconds = 0, max_grace_seconds = 86400, grace_seconds = 3600
+          WHERE id",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let (api, log_path) = start_full_api(&db);
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let reader = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let collab = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (admin_tok, alice_tok, reader_tok, collab_tok) = (
+        native(&db, &admin, 1).await,
+        native(&db, &alice, 2).await,
+        native(&db, &reader, 3).await,
+        native(&db, &collab, 4).await,
+    );
+    let (admin_n, alice_n, reader_n) = (
+        As::Native(&admin_tok),
+        As::Native(&alice_tok),
+        As::Native(&reader_tok),
+    );
+    let personal = personal_of(&db, &alice).await;
+
+    let upload_body = |tag: &str, text: &str| {
+        form(
+            tag,
+            &[
+                file_part(Some(CANARY_FILENAME), "text/plain", text),
+                metadata_part("{}"),
+            ],
+            true,
+        )
+    };
+
+    // --- P2 #11: read-only share on unknown revision UUID gets 404 not_found (NOT 403 policy) ---
+    let art_ro = success(
+        api.upload(
+            alice_n,
+            "/v1/artifacts",
+            "ro-up",
+            &upload_body("ro", "ro-data"),
+        ),
+        201,
+    );
+    let art_ro_id = art_ro["artifact_id"].as_str().unwrap().to_owned();
+    let rev_ro_id = art_ro["revision_id"].as_str().unwrap().to_owned();
+    success(
+        api.call(
+            alice_n,
+            "PUT",
+            &format!("/v1/artifacts/{art_ro_id}/shares"),
+            Some("ro-share"),
+            Some(&shared("user", Some(&reader.user), "read")),
+        ),
+        200,
+    );
+    let missing_rev = "00000000-0000-4000-8000-00000000dead";
+    refused(
+        api.call(
+            reader_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ro_id}/revisions/{missing_rev}"),
+            Some("ro-del-missing"),
+            None,
+        ),
+        404,
+        "not_found",
+    );
+    refused(
+        api.call(
+            reader_n,
+            "POST",
+            &format!("/v1/artifacts/{art_ro_id}/revisions/{missing_rev}/restore"),
+            Some("ro-rest-missing"),
+            None,
+        ),
+        404,
+        "not_found",
+    );
+    // On an existing active revision, read-only share still gets 403 policy.
+    refused(
+        api.call(
+            reader_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ro_id}/revisions/{rev_ro_id}"),
+            Some("ro-del-real"),
+            None,
+        ),
+        403,
+        "policy",
+    );
+
+    // --- P1 #7: live-referenced delete refusal (message_parts + unfinished run) & held restore ---
+    let art_ref = success(
+        api.upload(
+            alice_n,
+            "/v1/artifacts",
+            "ref-up1",
+            &upload_body("ref1", "attached-bytes"),
+        ),
+        201,
+    );
+    let art_ref_id = art_ref["artifact_id"].as_str().unwrap().to_owned();
+    let rev_attached = art_ref["revision_id"].as_str().unwrap().to_owned();
+    let rev_sibling = success(
+        api.upload(
+            alice_n,
+            &format!("/v1/artifacts/{art_ref_id}/revisions"),
+            "ref-up2",
+            &upload_body("ref2", "unattached-sibling"),
+        ),
+        201,
+    )["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let conv = success(
+        api.call(
+            alice_n,
+            "POST",
+            "/v1/conversations",
+            Some("ref-conv"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run = success(
+        api.call(
+            alice_n,
+            "POST",
+            "/v1/runs",
+            Some("ref-run"),
+            Some(&json!({
+                "conversation_id": conv["conversation_id"],
+                "branch_id": conv["branch_id"],
+                "proposal": {
+                    "expected_head_message_id": null,
+                    "turn": {
+                        "mode": "append",
+                        "input_message_id": "00000000-0000-4000-8000-00000000c001",
+                        "parts": [{"attachment": rev_attached}]
+                    },
+                    "selection": {
+                        "model": "a",
+                        "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                    },
+                    "requested_rounds": 1
+                }
+            })),
+        ),
+        201,
+    );
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
+
+    // Single-revision DELETE and whole-artifact DELETE both fail with 409 conflict without
+    // partially retaining the unattached sibling revision!
+    refused(
+        api.call(
+            alice_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ref_id}/revisions/{rev_attached}"),
+            Some("del-attached-1"),
+            None,
+        ),
+        409,
+        "conflict",
+    );
+    refused(
+        api.call(
+            alice_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ref_id}"),
+            Some("del-attached-art"),
+            None,
+        ),
+        409,
+        "conflict",
+    );
+    for rev in [&rev_attached, &rev_sibling] {
+        let st: String = sqlx::query_scalar(
+            "SELECT state FROM openmettle.artifact_revisions WHERE id = $1::uuid",
+        )
+        .bind(rev)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(st, "active", "refused delete must leave {rev} active");
+    }
+
+    // Also test unfinished-run reference (storage_reservations.run_id -> queued run):
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations
+            SET run_id = $2::uuid
+          WHERE id = (SELECT reservation_id FROM openmettle.artifact_revisions WHERE id = $1::uuid)",
+    )
+    .bind(&rev_sibling)
+    .bind(&run_id)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    refused(
+        api.call(
+            alice_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ref_id}/revisions/{rev_sibling}"),
+            Some("del-unfinished-run"),
+            None,
+        ),
+        409,
+        "conflict",
+    );
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations
+            SET run_id = NULL
+          WHERE id = (SELECT reservation_id FROM openmettle.artifact_revisions WHERE id = $1::uuid)",
+    )
+    .bind(&rev_sibling)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Operator retention hold blocks pre-expiry restore with 409 conflict until removed.
+    success(
+        api.call(
+            alice_n,
+            "DELETE",
+            &format!("/v1/artifacts/{art_ref_id}/revisions/{rev_sibling}"),
+            Some("del-sibling-ok"),
+            None,
+        ),
+        200,
+    );
+    sqlx::query(
+        "INSERT INTO openmettle.artifact_retention_holds (scope_id, artifact_revision_id)
+         VALUES ($1::uuid, $2::uuid)",
+    )
+    .bind(&personal)
+    .bind(&rev_sibling)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    refused(
+        api.call(
+            alice_n,
+            "POST",
+            &format!("/v1/artifacts/{art_ref_id}/revisions/{rev_sibling}/restore"),
+            Some("rest-held"),
+            None,
+        ),
+        409,
+        "conflict",
+    );
+    sqlx::query(
+        "DELETE FROM openmettle.artifact_retention_holds
+          WHERE scope_id = $1::uuid AND artifact_revision_id = $2::uuid",
+    )
+    .bind(&personal)
+    .bind(&rev_sibling)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let restored_sibling = success(
+        api.call(
+            alice_n,
+            "POST",
+            &format!("/v1/artifacts/{art_ref_id}/revisions/{rev_sibling}/restore"),
+            Some("rest-unheld"),
+            None,
+        ),
+        200,
+    );
+    assert_eq!(restored_sibling["state"], "active");
+
+    // --- P2 #10: exact Idempotency-Key replays original transition receipt across restore/re-delete/purge ---
+    let art_rec = success(
+        api.upload(
+            alice_n,
+            "/v1/artifacts",
+            "rec-up",
+            &upload_body("rec", "receipt-bytes"),
+        ),
+        201,
+    );
+    let art_rec_id = art_rec["artifact_id"].as_str().unwrap().to_owned();
+    let rev_rec_id = art_rec["revision_id"].as_str().unwrap().to_owned();
+    let rec_path = format!("/v1/artifacts/{art_rec_id}/revisions/{rev_rec_id}");
+    let rec_restore = format!("{rec_path}/restore");
+
+    let del1 = success(
+        api.call(alice_n, "DELETE", &rec_path, Some("rec-del-1"), None),
+        200,
+    );
+    assert_eq!(del1["state"], "retained");
+    let rest1 = success(
+        api.call(alice_n, "POST", &rec_restore, Some("rec-rest-1"), None),
+        200,
+    );
+    assert_eq!(rest1["state"], "active");
+
+    // Replay rec-del-1 while revision is active -> returns ORIGINAL retained receipt without mutating!
+    let del1_replay_active = success(
+        api.call(alice_n, "DELETE", &rec_path, Some("rec-del-1"), None),
+        200,
+    );
+    assert_eq!(del1_replay_active, del1);
+    assert_eq!(
+        success(api.call(alice_n, "GET", &rec_path, None, None), 200)["state"],
+        "active"
+    );
+
+    // Re-delete with a new key -> replay rec-rest-1 while revision is retained -> returns ORIGINAL
+    // active receipt without mutating!
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let del2 = success(
+        api.call(alice_n, "DELETE", &rec_path, Some("rec-del-2"), None),
+        200,
+    );
+    assert_ne!(del2["retained_at"], del1["retained_at"]);
+    let rest1_replay_ret = success(
+        api.call(alice_n, "POST", &rec_restore, Some("rec-rest-1"), None),
+        200,
+    );
+    assert_eq!(rest1_replay_ret, rest1);
+    assert_eq!(
+        success(api.call(alice_n, "GET", &rec_path, None, None), 200)["state"],
+        "retained"
+    );
+
+    // Expire and purge the revision -> replay rec-del-1 STILL returns original retained receipt,
+    // while fresh DELETE / restore keys return 404 not_found!
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET retained_at = clock_timestamp() - interval '10 seconds',
+                purge_after = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(&rev_rec_id)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut worker = connect(&db.0, WORKER).await;
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
+    storage::begin_purge(&mut tx, &personal, &rev_rec_id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
+    storage::confirm_purge(&mut tx, &personal, &rev_rec_id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let del1_replay_purged = success(
+        api.call(alice_n, "DELETE", &rec_path, Some("rec-del-1"), None),
+        200,
+    );
+    assert_eq!(del1_replay_purged, del1);
+    refused(
+        api.call(alice_n, "DELETE", &rec_path, Some("rec-del-fresh"), None),
+        404,
+        "not_found",
+    );
+    refused(
+        api.call(alice_n, "POST", &rec_restore, Some("rec-rest-fresh"), None),
+        404,
+        "not_found",
+    );
+
+    // --- P2 #9: personal-artifact collaborator delete serializes with owner resource.unshare ---
+    let art_col = success(
+        api.upload(
+            alice_n,
+            "/v1/artifacts",
+            "col-up",
+            &upload_body("col", "collab-bytes"),
+        ),
+        201,
+    );
+    let art_col_id = art_col["artifact_id"].as_str().unwrap().to_owned();
+    let rev_col_id = art_col["revision_id"].as_str().unwrap().to_owned();
+    success(
+        api.call(
+            alice_n,
+            "PUT",
+            &format!("/v1/artifacts/{art_col_id}/shares"),
+            Some("col-share"),
+            Some(&shared("user", Some(&collab.user), "write")),
+        ),
+        200,
+    );
+
+    // Hold alice's user row FOR NO KEY UPDATE (the exact lock resource.unshare takes), revoke
+    // collab's share inside that tx, spawn collab's DELETE so it blocks on alice's user row, then
+    // commit the unshare and confirm collab's delete is refused with 404 not_found.
+    let mut holder_conn = connect(&db.0, OWNER).await;
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder_conn)
+        .await
+        .unwrap();
+    let mut holder_tx = holder_conn.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&alice.user)
+        .execute(&mut *holder_tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "WITH target AS (
+             SELECT id, scope_id, last_revision
+               FROM openmettle.grant_assignments
+              WHERE target_kind = 'artifact'
+                AND target_id = $1::uuid
+                AND grantee_user_id = $2::uuid
+         ),
+         revoked AS (
+             INSERT INTO openmettle.grant_changes (
+                 scope_id, assignment_id, revision, source_kind, actor_user_id,
+                 request_key, decision, cycle_id, request_identity, request_digest
+             )
+             SELECT scope_id, id, last_revision + 1, 'direct', $3::uuid,
+                    'col-unshare-race', 'revoke', NULL,
+                    decode('00', 'hex'), decode(repeat('00', 32), 'hex')
+               FROM target
+             RETURNING assignment_id, revision
+         )
+         UPDATE openmettle.grant_assignments ga
+            SET last_revision = r.revision
+           FROM revoked r
+          WHERE ga.id = r.assignment_id",
+    )
+    .bind(&art_col_id)
+    .bind(&collab.user)
+    .bind(&alice.user)
+    .execute(&mut *holder_tx)
+    .await
+    .unwrap();
+    let collab_bind = api.bind.clone();
+    let collab_tok_owned = collab_tok.clone();
+    let collab_path = format!("/v1/artifacts/{art_col_id}/revisions/{rev_col_id}");
+    let collab_task = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(&collab_bind).unwrap();
+        let req = format!(
+            "DELETE {collab_path} HTTP/1.1\r\nHost: {collab_bind}\r\nAuthorization: Bearer {collab_tok_owned}\r\nIdempotency-Key: col-race-del\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    });
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "collab delete did not block on owner users row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    holder_tx.commit().await.unwrap();
+    let collab_resp = collab_task.await.unwrap();
+    assert!(
+        collab_resp.starts_with("HTTP/1.1 404 "),
+        "expected 404 after serialized unshare, got {collab_resp}"
+    );
+    let col_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id = $1::uuid")
+            .bind(&rev_col_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(col_state, "active");
+
+    // --- P1 #4: DownloadArtifactRevision admission serializes with restore_gate_lock ---
+    let (origin_us, lifecycle_origin_us, head_seq, head_digest): (i64, Option<i64>, i64, String) =
+        sqlx::query_as(
+            "SELECT (extract(epoch FROM coverage_started_at) * 1000000)::bigint,
+                    (extract(epoch FROM lifecycle_coverage_started_at) * 1000000)::bigint,
+                    journal_seq,
+                    encode(chain_digest, 'hex')
+               FROM openmettle.deletion_journal_head WHERE id",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let mut gate_holder = connect(&db.0, OWNER).await;
+    let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut gate_holder)
+        .await
+        .unwrap();
+    let mut gate_tx = gate_holder.begin().await.unwrap();
+    sqlx::query(
+        "SELECT openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), true, NULL, true, $4)",
+    )
+    .bind(origin_us)
+    .bind(head_seq)
+    .bind(&head_digest)
+    .bind(lifecycle_origin_us)
+    .execute(&mut *gate_tx)
+    .await
+    .unwrap();
+    let dl_bind = api.bind.clone();
+    let dl_tok = alice_tok.clone();
+    let dl_path = format!("/v1/artifacts/{art_col_id}/revisions/{rev_col_id}/content");
+    let dl_task = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(&dl_bind).unwrap();
+        let req = format!(
+            "GET {dl_path} HTTP/1.1\r\nHost: {dl_bind}\r\nAuthorization: Bearer {dl_tok}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    });
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(gate_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "download did not serialize on restore_gate_lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    gate_tx.commit().await.unwrap();
+    let dl_resp = dl_task.await.unwrap();
+    assert!(
+        dl_resp.starts_with("HTTP/1.1 503 "),
+        "expected 503 after serialized restore_gate_lock commit, got {dl_resp}"
+    );
+
+    // --- P2 #12/#13: server-clock expiry cannot be bypassed with stale p_now_ms ---
+    let expired_admin = account(&mut owner, PROVIDER, true, 1_000).await;
+    make_admin(&mut owner, &expired_admin).await;
+    let mut api_conn = connect(&db.0, API).await;
+    let stale_status =
+        sqlx::query("SELECT * FROM openmettle.admin_retention_status($1::uuid, $2::uuid, 1)")
+            .bind(&expired_admin.user)
+            .bind(&expired_admin.approval)
+            .execute(&mut api_conn)
+            .await;
+    assert_eq!(sqlstate(stale_status), "42501");
+    let stale_preview = sqlx::query(
+        "SELECT * FROM openmettle.retention_preview_deadlines($1::uuid, $2::uuid, 1, 120, NULL)",
+    )
+    .bind(&expired_admin.user)
+    .bind(&expired_admin.approval)
+    .execute(&mut api_conn)
+    .await;
+    assert_eq!(sqlstate(stale_preview), "42501");
+
+    // Verify valid admin status/preview write redacted audit rows and leak zero canaries.
+    success(
+        api.call(admin_n, "GET", "/v1/admin/retention/status", None, None),
+        200,
+    );
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            "/v1/admin/retention/deadlines/preview",
+            None,
+            Some(&json!({"target_grace_seconds": 120})),
+        ),
+        200,
+    );
+    assert_chain(&db).await;
+    assert_storage_reconciled(&db).await;
+    drop(api);
+    assert_no_canary_in_logs(&log_path, &[CANARY_FILENAME]);
+    assert_no_canary_in_audit_or_journal(&db, &[CANARY_FILENAME]).await;
 }
