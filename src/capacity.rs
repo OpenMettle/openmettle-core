@@ -229,6 +229,28 @@ fn error_outcome(error: &Error) -> CapacityOutcome {
     }
 }
 
+pub(crate) fn store_error_outcome(error: &Error) -> CapacityOutcome {
+    error_outcome(error)
+}
+
+async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT coalesce(
+             observed_at IS NOT NULL
+             AND observed_at + observation_ttl_ms * interval '1 millisecond' <= clock_timestamp(),
+             false
+         )
+           FROM openmettle.capacity_groups
+          WHERE id = $1::uuid",
+    )
+    .bind(group_id)
+    .fetch_optional(c)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
 /// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
 /// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
@@ -310,7 +332,7 @@ pub async fn grant(
     controller: &Controller,
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
-    let result = grant_inner(c, controller, request).await;
+    let result = grant_inner(&mut *c, controller, request).await;
     let outcome = match &result {
         Ok(Decision::Grant { state, .. }) => match state {
             GrantState::Granted => CapacityOutcome::Granted,
@@ -319,7 +341,13 @@ pub async fn grant(
             GrantState::Released => CapacityOutcome::Released,
         },
         Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
-        Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
+        Ok(Decision::Unavailable) => {
+            if group_observation_stale(&mut *c, &controller.group_id).await {
+                metrics::global()
+                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+            }
+            CapacityOutcome::Unavailable
+        }
         Err(err) => {
             if *err == Error::Expired {
                 metrics::global()

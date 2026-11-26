@@ -783,6 +783,12 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "cost_micros_per_token",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 40,
+        table: "capacity_grants",
+        column: "dispatch_state",
+        default: ColumnDefault::Str("confirmed"),
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1270,7 +1276,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
         "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
-        "fe367ef17bd6c228550a4652bb93757f187ec7ee0ac8ef6aa27f8052ae7ce6c1",
+        "bb7c11faa171c4993de74d776fba4b0c786c3dffb9ba9b14ce9ecf3884d8ebc0",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

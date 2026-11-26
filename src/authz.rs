@@ -678,11 +678,20 @@ pub const CAPABILITY_INSPECT_CAPACITY: &str = "capacity.inspect";
 
 /// Decide whether `principal` may inspect detailed managed GPU group and device observations
 /// (ADR 0042): active `account_admin` (`Action::InspectCapacity`) or an active principal granted
-/// the opt-in `capacity.inspect` capability (subject to platform and user denies). Grants no
-/// content access.
+/// the opt-in `capacity.inspect` capability. Per ADR 0027, explicit platform and user denies on
+/// `capacity.inspect` override `account_admin` as well. Grants no content access.
 pub fn authorize_capacity_inspection(principal: &Principal, platform: &PlatformPolicy) -> Decision {
     if !principal.is_active() {
         return Decision::Deny(InactivePrincipal);
+    }
+    if platform
+        .denied_capabilities
+        .contains(CAPABILITY_INSPECT_CAPACITY)
+        || principal
+            .denied_capabilities
+            .contains(CAPABILITY_INSPECT_CAPACITY)
+    {
+        return policy(PolicyReason::CapabilityDenied);
     }
     if authorize_admin(
         principal,

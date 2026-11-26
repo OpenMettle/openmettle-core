@@ -4,12 +4,13 @@
 //! `queued_estimate`, `unavailable`) without reserving capacity and omits inaccessible profiles.
 //! `GET /v1/admin/capacity/groups` exposes versioned per-group and per-device observations only
 //! to active `account_admin` principals or active operators granted the opt-in `capacity.inspect`
-//! capability. Both run in a `REPEATABLE READ, READ ONLY` transaction and read only through
-//! `openmettle.capacity_profiles` and `openmettle.capacity_group_observations()`, never touching
+//! capability (explicit user or platform denies on `capacity.inspect` always win). Both run in a
+//! `REPEATABLE READ, READ ONLY` transaction and read only through `openmettle.capacity_profiles`
+//! and `openmettle.capacity_group_observations()`, never touching
 //! `capacity_groups.controller_token_hash` or tenant `capacity_grants` rows.
 use super::{
-    Api, INTERNAL, INVALID, Op, Problem, Session, catalog, denied, principal, read_only_snapshot,
-    reply, timestamp,
+    Api, INTERNAL, INVALID, Op, Problem, Session, UNAVAILABLE, catalog, denied, principal,
+    read_only_snapshot, reply, timestamp,
 };
 use crate::{
     authz::{self, CapabilityGate, PlatformPolicy, Principal, store},
@@ -27,6 +28,10 @@ use std::{
     sync::Arc,
 };
 
+const MAX_CAPACITY_PROFILES: usize = 256;
+const MAX_CAPACITY_GROUPS: usize = 64;
+const MAX_CAPACITY_DEVICES_PER_GROUP: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProfileConfig {
     profile: String,
@@ -35,7 +40,7 @@ struct ProfileConfig {
     required_devices: usize,
     required_capability: Option<String>,
     capability_gate: CapabilityGate,
-    estimated_wait_seconds: Option<i32>,
+    model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +78,7 @@ fn parse_capability_gate(value: &str) -> Result<CapabilityGate, Problem> {
 async fn load_profiles(tx: &mut PgConnection) -> Result<Vec<ProfileConfig>, Problem> {
     let rows = sqlx::query(
         "SELECT profile, group_id::text AS group_id, per_device_bytes, required_devices,
-                required_capability, capability_gate, estimated_wait_seconds
+                required_capability, capability_gate, model_id
            FROM openmettle.capacity_profiles
           ORDER BY profile",
     )
@@ -91,7 +96,7 @@ async fn load_profiles(tx: &mut PgConnection) -> Result<Vec<ProfileConfig>, Prob
             required_devices,
             required_capability: row.try_get("required_capability")?,
             capability_gate: parse_capability_gate(&gate)?,
-            estimated_wait_seconds: row.try_get("estimated_wait_seconds")?,
+            model_id: row.try_get("model_id")?,
         });
     }
     Ok(profiles)
@@ -144,10 +149,28 @@ async fn load_group_observations(tx: &mut PgConnection) -> Result<Vec<ObservedGr
     Ok(groups)
 }
 
+fn collect_profile_models<'a>(
+    profiles: &'a [ProfileConfig],
+    model_catalog: Option<&Catalog>,
+) -> Vec<&'a str> {
+    let Some(cat) = model_catalog else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    for profile in profiles {
+        let candidate = profile.model_id.as_deref().unwrap_or(&profile.profile);
+        if cat.model(candidate).is_some() {
+            seen.insert(candidate);
+        }
+    }
+    seen.into_iter().collect()
+}
+
 fn profile_authorized(
     principal: &Principal,
     platform: &PlatformPolicy,
     model_catalog: Option<&Catalog>,
+    family_permitted: &BTreeSet<String>,
     profile: &ProfileConfig,
 ) -> bool {
     if let Some(cap) = profile.required_capability.as_deref()
@@ -156,9 +179,22 @@ fn profile_authorized(
     {
         return false;
     }
-    if let Some(model_catalog) = model_catalog
-        && model_catalog.model(&profile.profile).is_some()
-        && !catalog::allowed(model_catalog, principal, platform, &profile.profile, None)
+    if let Some(model_id) = profile.model_id.as_deref() {
+        // Explicit model-backed profiles fail closed when no catalog is loaded, when the model
+        // has been removed from the catalog, or when capability or family policy denies it.
+        let Some(cat) = model_catalog else {
+            return false;
+        };
+        if cat.model(model_id).is_none()
+            || !catalog::allowed(cat, principal, platform, model_id, None)
+            || !family_permitted.contains(model_id)
+        {
+            return false;
+        }
+    } else if let Some(cat) = model_catalog
+        && cat.model(&profile.profile).is_some()
+        && (!catalog::allowed(cat, principal, platform, &profile.profile, None)
+            || !family_permitted.contains(&profile.profile))
     {
         return false;
     }
@@ -196,9 +232,8 @@ fn profile_availability(
         .filter(|d| device_physically_satisfiable(d, profile.per_device_bytes))
         .count();
     if satisfiable >= profile.required_devices {
-        if let Some(wait) = profile.estimated_wait_seconds {
-            return ("queued_estimate", Some(wait));
-        }
+        // Until per-caller stored waits exist, an occupied satisfiable profile reports `busy`
+        // rather than a static operator-configured wait estimate.
         return ("busy", None);
     }
     ("unavailable", None)
@@ -208,15 +243,22 @@ fn project_user_capacity(
     principal: &Principal,
     platform: &PlatformPolicy,
     model_catalog: Option<&Catalog>,
+    family_permitted: &BTreeSet<String>,
     profiles: &[ProfileConfig],
     groups: &[ObservedGroup],
-) -> (Value, usize) {
+) -> Result<(Value, usize), Problem> {
     let by_id: BTreeMap<&str, &ObservedGroup> =
         groups.iter().map(|g| (g.group_id.as_str(), g)).collect();
     let mut stale_groups = BTreeSet::new();
     let mut projected = Vec::new();
     for profile in profiles {
-        if !profile_authorized(principal, platform, model_catalog, profile) {
+        if !profile_authorized(
+            principal,
+            platform,
+            model_catalog,
+            family_permitted,
+            profile,
+        ) {
             continue;
         }
         let group = by_id.get(profile.group_id.as_str()).copied();
@@ -232,13 +274,22 @@ fn project_user_capacity(
             "estimated_wait_seconds": estimated_wait_seconds,
         }));
     }
-    (json!({ "profiles": projected }), stale_groups.len())
+    if projected.len() > MAX_CAPACITY_PROFILES {
+        return Err(UNAVAILABLE);
+    }
+    Ok((json!({ "profiles": projected }), stale_groups.len()))
 }
 
 fn project_admin_groups(groups: &[ObservedGroup]) -> Result<(Value, usize), Problem> {
+    if groups.len() > MAX_CAPACITY_GROUPS {
+        return Err(UNAVAILABLE);
+    }
     let mut stale_count = 0usize;
     let mut projected = Vec::with_capacity(groups.len());
     for group in groups {
+        if group.devices.len() > MAX_CAPACITY_DEVICES_PER_GROUP {
+            return Err(UNAVAILABLE);
+        }
         if group.observation_stale {
             stale_count += 1;
         }
@@ -316,13 +367,27 @@ impl Api {
                             let policy = store::load_platform_capabilities(tx).await?;
                             let profiles = load_profiles(tx).await?;
                             let groups = load_group_observations(tx).await?;
-                            Ok(project_user_capacity(
+                            let family_models = collect_profile_models(&profiles, model_catalog);
+                            let family_permitted = if family_models.is_empty() {
+                                BTreeSet::new()
+                            } else {
+                                authz::gateway::family::permits_models(
+                                    tx,
+                                    &p.user_id,
+                                    context.approval_id(),
+                                    &family_models,
+                                    context.observed_ms(),
+                                )
+                                .await?
+                            };
+                            project_user_capacity(
                                 &p,
                                 &policy,
                                 model_catalog,
+                                &family_permitted,
                                 &profiles,
                                 &groups,
-                            ))
+                            )
                         })
                         .await
                     })
@@ -402,8 +467,15 @@ mod tests {
         }
     }
 
+    fn test_catalog() -> Catalog {
+        Catalog::load(include_bytes!(
+            "../../tests/fixtures/conversation-catalog-v1.json"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn user_projection_filters_capabilities_and_maps_all_four_availability_states() {
+    fn user_projection_filters_capabilities_and_reports_busy_instead_of_static_queue_estimates() {
         let mut user = active_user();
         user.denied_capabilities.insert("media.denied".into());
         let platform = PlatformPolicy::default();
@@ -438,16 +510,16 @@ mod tests {
                 required_devices: 1,
                 required_capability: None,
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: Some(20),
+                model_id: None,
             },
             ProfileConfig {
-                profile: "b.queued".into(),
+                profile: "b.occupied".into(),
                 group_id: GROUP_A.into(),
                 per_device_bytes: 5 * GIB,
                 required_devices: 2,
                 required_capability: None,
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: Some(30),
+                model_id: None,
             },
             ProfileConfig {
                 profile: "c.busy".into(),
@@ -456,7 +528,7 @@ mod tests {
                 required_devices: 1,
                 required_capability: None,
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: None,
+                model_id: None,
             },
             ProfileConfig {
                 profile: "d.too_large".into(),
@@ -465,7 +537,7 @@ mod tests {
                 required_devices: 1,
                 required_capability: None,
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: Some(10),
+                model_id: None,
             },
             ProfileConfig {
                 profile: "e.stale".into(),
@@ -474,7 +546,7 @@ mod tests {
                 required_devices: 1,
                 required_capability: None,
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: Some(10),
+                model_id: None,
             },
             ProfileConfig {
                 profile: "f.denied".into(),
@@ -483,7 +555,7 @@ mod tests {
                 required_devices: 1,
                 required_capability: Some("media.denied".into()),
                 capability_gate: CapabilityGate::OnByDefault,
-                estimated_wait_seconds: None,
+                model_id: None,
             },
             ProfileConfig {
                 profile: "g.opt_in_hidden".into(),
@@ -492,18 +564,20 @@ mod tests {
                 required_devices: 1,
                 required_capability: Some("media.video".into()),
                 capability_gate: CapabilityGate::OptIn,
-                estimated_wait_seconds: None,
+                model_id: None,
             },
         ];
 
-        let (body, stale) = project_user_capacity(&user, &platform, None, &profiles, &groups);
+        let (body, stale) =
+            project_user_capacity(&user, &platform, None, &BTreeSet::new(), &profiles, &groups)
+                .unwrap();
         assert_eq!(stale, 1);
         assert_eq!(
             body,
             json!({
                 "profiles": [
                     { "profile": "a.ready", "availability": "ready", "estimated_wait_seconds": null },
-                    { "profile": "b.queued", "availability": "queued_estimate", "estimated_wait_seconds": 30 },
+                    { "profile": "b.occupied", "availability": "busy", "estimated_wait_seconds": null },
                     { "profile": "c.busy", "availability": "busy", "estimated_wait_seconds": null },
                     { "profile": "d.too_large", "availability": "unavailable", "estimated_wait_seconds": null },
                     { "profile": "e.stale", "availability": "unavailable", "estimated_wait_seconds": null },
@@ -515,6 +589,163 @@ mod tests {
         for forbidden in [GROUP_A, GROUP_B, DEV_0, DEV_1, "grantable", "total_bytes"] {
             assert!(!rendered.contains(forbidden), "{rendered}");
         }
+    }
+
+    #[test]
+    fn model_backed_profiles_fail_closed_without_catalog_missing_model_or_family_policy() {
+        let user = active_user();
+        let platform = PlatformPolicy::default();
+        let cat = test_catalog();
+        let groups = vec![ObservedGroup {
+            group_id: GROUP_A.into(),
+            controller_epoch: 1,
+            admits_bursts: true,
+            observation_stale: false,
+            observation_revision: 1,
+            observed_at_us: Some(1_795_000_000_000_000),
+            devices: vec![device(DEV_0, 24 * GIB, 7 * GIB, 7 * GIB, 0)],
+        }];
+        let profiles = vec![
+            ProfileConfig {
+                profile: "model.a".into(),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OnByDefault,
+                model_id: Some("a".into()),
+            },
+            ProfileConfig {
+                profile: "model.removed".into(),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OnByDefault,
+                model_id: Some("does-not-exist".into()),
+            },
+            ProfileConfig {
+                profile: "b".into(),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OnByDefault,
+                model_id: None,
+            },
+        ];
+
+        // Without catalog: model_id-backed profiles fail closed; non-model profile stays visible.
+        let (no_cat, _) =
+            project_user_capacity(&user, &platform, None, &BTreeSet::new(), &profiles, &groups)
+                .unwrap();
+        assert_eq!(
+            no_cat,
+            json!({
+                "profiles": [
+                    { "profile": "b", "availability": "ready", "estimated_wait_seconds": null }
+                ]
+            })
+        );
+
+        // With catalog and family policy allowing only "a": "model.a" is shown, "model.removed"
+        // and family-blocked "b" are both omitted.
+        let allowed_models: BTreeSet<String> = ["a".to_owned()].into_iter().collect();
+        let (filtered, _) = project_user_capacity(
+            &user,
+            &platform,
+            Some(&cat),
+            &allowed_models,
+            &profiles,
+            &groups,
+        )
+        .unwrap();
+        assert_eq!(
+            filtered,
+            json!({
+                "profiles": [
+                    { "profile": "model.a", "availability": "ready", "estimated_wait_seconds": null }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn projections_fail_closed_when_cardinality_ceilings_are_exceeded() {
+        let user = active_user();
+        let platform = PlatformPolicy::default();
+        let groups = vec![ObservedGroup {
+            group_id: GROUP_A.into(),
+            controller_epoch: 1,
+            admits_bursts: true,
+            observation_stale: false,
+            observation_revision: 1,
+            observed_at_us: Some(1_795_000_000_000_000),
+            devices: vec![device(DEV_0, 24 * GIB, 7 * GIB, 7 * GIB, 0)],
+        }];
+        let too_many_profiles: Vec<ProfileConfig> = (0..=MAX_CAPACITY_PROFILES)
+            .map(|i| ProfileConfig {
+                profile: format!("p-{i:03}"),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OnByDefault,
+                model_id: None,
+            })
+            .collect();
+        assert_eq!(
+            project_user_capacity(
+                &user,
+                &platform,
+                None,
+                &BTreeSet::new(),
+                &too_many_profiles,
+                &groups,
+            )
+            .unwrap_err(),
+            UNAVAILABLE
+        );
+
+        let too_many_groups: Vec<ObservedGroup> = (0..=MAX_CAPACITY_GROUPS)
+            .map(|i| ObservedGroup {
+                group_id: format!("00000000-0000-4000-8000-{i:012x}"),
+                controller_epoch: 1,
+                admits_bursts: false,
+                observation_stale: false,
+                observation_revision: 0,
+                observed_at_us: None,
+                devices: Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            project_admin_groups(&too_many_groups).unwrap_err(),
+            UNAVAILABLE
+        );
+
+        let too_many_devices = vec![ObservedGroup {
+            group_id: GROUP_A.into(),
+            controller_epoch: 1,
+            admits_bursts: true,
+            observation_stale: false,
+            observation_revision: 1,
+            observed_at_us: Some(1_795_000_000_000_000),
+            devices: (0..=MAX_CAPACITY_DEVICES_PER_GROUP)
+                .map(|i| {
+                    device(
+                        &format!("00000000-0000-4000-8000-{i:012x}"),
+                        24 * GIB,
+                        7 * GIB,
+                        7 * GIB,
+                        0,
+                    )
+                })
+                .collect(),
+        }];
+        assert_eq!(
+            project_admin_groups(&too_many_devices).unwrap_err(),
+            UNAVAILABLE
+        );
     }
 
     #[test]

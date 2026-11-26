@@ -1082,7 +1082,7 @@ fn capacity_inspection_requires_admin_or_opt_in_capability_and_grants_no_content
         HIDDEN
     );
 
-    // User-level and platform-level denies block the opt-in operator capability.
+    // User-level and platform-level denies block both opt-in operators AND account_admins (ADR 0027).
     let mut denied_op = operator.clone();
     denied_op
         .denied_capabilities
@@ -1091,11 +1091,23 @@ fn capacity_inspection_requires_admin_or_opt_in_capability_and_grants_no_content
         authorize_capacity_inspection(&denied_op, &platform),
         refused(PolicyReason::CapabilityDenied)
     );
+    let mut denied_admin = admin("adm");
+    denied_admin
+        .denied_capabilities
+        .insert(CAPABILITY_INSPECT_CAPACITY.into());
+    assert_eq!(
+        authorize_capacity_inspection(&denied_admin, &platform),
+        refused(PolicyReason::CapabilityDenied)
+    );
     let platform_denied = PlatformPolicy {
         denied_capabilities: [CAPABILITY_INSPECT_CAPACITY.to_owned()].into(),
     };
     assert_eq!(
         authorize_capacity_inspection(&operator, &platform_denied),
+        refused(PolicyReason::CapabilityDenied)
+    );
+    assert_eq!(
+        authorize_capacity_inspection(&admin("adm"), &platform_denied),
         refused(PolicyReason::CapabilityDenied)
     );
 

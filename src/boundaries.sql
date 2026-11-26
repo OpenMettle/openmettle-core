@@ -48,10 +48,12 @@
 -- Version 39 adds `runtime_feature_gates` (`SELECT` only for `openmettle_api` and
 -- `openmettle_worker`; zero write grants for runtime roles) and the owner-owned SECURITY DEFINER
 -- trigger `resolve_terminal_write_intents()` (no role may call) (ADR 0039, V1-14 PR3).
--- Version 40 adds `capacity_profiles` (`SELECT` only for `openmettle_api`) and the read-only
--- SECURITY DEFINER projection `capacity_group_observations()` (`openmettle_api` only) so `/v1`
--- capacity endpoints never hold table or column privileges on `capacity_groups` or
--- `capacity_grants` (ADR 0042, V1-18 PR3).
+-- Version 40 adds `capacity_grants.dispatch_state`, `capacity_profiles` (`SELECT` only for
+-- `openmettle_api`), cardinality guard triggers (no role may call), worker-only two-phase
+-- dispatch helpers (`capacity_admits_excluding`, `capacity_prepare_dispatch`,
+-- `capacity_confirm_dispatch`), and the read-only SECURITY DEFINER projection
+-- `capacity_group_observations()` (`openmettle_api` only) so `/v1` capacity endpoints never hold
+-- table or column privileges on `capacity_groups` or `capacity_grants` (ADR 0042, V1-18 PR3).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -281,7 +283,14 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT 'openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 37
     UNION ALL SELECT 'openmettle.retention_set_grace(uuid,uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 38
     UNION ALL SELECT 'openmettle.resolve_terminal_write_intents()',true,ARRAY[]::text[] WHERE $1 >= 39
-    UNION ALL SELECT 'openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 40
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.capacity_enforce_profile_limit()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_enforce_group_limit()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_enforce_device_limit()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_admits_excluding(uuid,boolean,uuid)',false,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_prepare_dispatch(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 40
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES
