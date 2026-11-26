@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionPolicyTypical--auto-missing-min_grace_seconds",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "max_grace_seconds": 31536000,
+    "revision": "2"
+  },
+  "mutation": {
+    "name": "auto-missing-min_grace_seconds",
+    "op": "remove",
+    "path": "/min_grace_seconds"
+  },
+  "schema": "#/components/schemas/RetentionPolicy",
+  "source": "#/components/examples/RetentionPolicyTypical"
+}

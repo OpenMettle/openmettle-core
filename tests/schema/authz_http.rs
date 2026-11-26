@@ -115,6 +115,37 @@ impl Api {
         Self { process, dir, bind }
     }
 
+    pub(super) fn configured_logged(
+        db: &TestDb,
+        dir: auth_config_support::Dir,
+        document: Value,
+        connections: u32,
+    ) -> (Self, std::path::PathBuf) {
+        let auth = dir.write("auth.json", document.to_string().as_bytes());
+        let log_path = std::path::PathBuf::from(dir.path("api.stderr.log"));
+        let log_file = fs::File::create(&log_path).unwrap();
+        let bind = address();
+        let mut cmd = binary("api");
+        if Path::new(&dir.path("artifacts")).is_dir() {
+            cmd.env("OPENMETTLE_API_ARTIFACTS_DIR", dir.path("artifacts"));
+        }
+        let child = cmd
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
+            .env("OPENMETTLE_API_DB_MAX_CONNECTIONS", connections.to_string())
+            .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
+            .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
+            .env("OPENMETTLE_API_LOG_LEVEL", "debug")
+            .stdout(Stdio::null())
+            .stderr(log_file)
+            .spawn()
+            .unwrap();
+        let mut process = Process(child);
+        wait_ready(&mut process, &bind);
+        (Self { process, dir, bind }, log_path)
+    }
+
     /// Kills the process as a crash would, keeping its directory.
     fn kill(self) -> auth_config_support::Dir {
         drop(self.process);
@@ -4681,7 +4712,9 @@ async fn post_runs_rejects_authority_expired_during_quota_budget_lock_wait() {
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let expires_ms = db_now_ms + 1_500;
     sqlx::query(
         "UPDATE openmettle.local_identity_approvals SET expires_ms = $1 WHERE id = $2::uuid",
     )
@@ -4923,7 +4956,9 @@ async fn post_runs_rejects_attachment_share_expired_during_quota_budget_lock_wai
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let obs_expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let obs_expires_ms = db_now_ms + 1_500;
     sqlx::query(
         "UPDATE openmettle.membership_observations
             SET issued_ms = $1, expires_ms = $2, max_age_seconds = 180
@@ -5392,7 +5427,9 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let expires_ms = db_now_ms + 700;
+    // Leave enough pre-lock budget for restore-gate + admission queries on slow CI runners while
+    // staying 500 ms below the 2 s `lock_timeout` on `quota_budgets`.
+    let expires_ms = db_now_ms + 1_500;
     let alice_session_id = alice_cookie.split('.').next().unwrap();
     let updated_sessions =
         sqlx::query("UPDATE openmettle.local_sessions SET expires_ms = $1 WHERE id = $2")
@@ -5485,3 +5522,6 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
 
 #[path = "run_events_http.rs"]
 mod run_events_http;
+
+#[path = "retention_http.rs"]
+mod retention_http;

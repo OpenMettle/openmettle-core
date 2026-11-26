@@ -1,0 +1,18 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RetentionDeadlinesApplyRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_policy_revision": "2",
+    "reason": "Align retained deadlines with updated seven-day policy",
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+  "source": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+}

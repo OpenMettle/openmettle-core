@@ -197,9 +197,10 @@ async fn publish(
         let store = store.clone();
         let pin = pin.clone();
         let id = reservation.clone();
+        let step_deadline = cx.step.deadline;
         tokio::task::spawn_blocking(move || {
             store.volume.verify(&pin)?;
-            let stage = store.create_stage(&id, true)?;
+            let stage = store.create_stage(&id, true, Some(step_deadline.into()))?;
             stage.file.as_ref().ok_or(Error::Io)?.sync_all()?;
             Ok::<_, Error>((stage, permit))
         })
@@ -259,7 +260,7 @@ async fn publish(
         if step.stop.borrow().is_some() || Instant::now() >= step.deadline {
             return Err(Error::InProgress);
         }
-        stage.0.publish()?;
+        stage.0.publish(step.deadline.into())?;
         stage.0.volume.verify(&pin_copy)?;
         Ok::<_, Error>(Arc::new(stage))
     })

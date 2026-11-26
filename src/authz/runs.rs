@@ -1498,6 +1498,7 @@ pub async fn cancel_run(
     uuid(scope_id, "scope_id")?;
     uuid(run_id, "run_id")?;
     transaction(c, async |c| {
+        crate::restore::require_open_gate(c).await?;
         let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(LOCK_RUN)
             .bind(scope_id)
             .bind(run_id)

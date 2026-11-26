@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "UpdateRetentionPolicyRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "reason": "Shorten retention grace to seven days",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/UpdateRetentionPolicyRequest",
+  "source": "#/components/examples/UpdateRetentionPolicyRequestTypical"
+}

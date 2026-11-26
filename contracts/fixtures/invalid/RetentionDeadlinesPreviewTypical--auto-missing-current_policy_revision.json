@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesPreviewTypical--auto-missing-current_policy_revision",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "affected_bytes": "4096",
+    "affected_revisions": "3",
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "auto-missing-current_policy_revision",
+    "op": "remove",
+    "path": "/current_policy_revision"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreview",
+  "source": "#/components/examples/RetentionDeadlinesPreviewTypical"
+}

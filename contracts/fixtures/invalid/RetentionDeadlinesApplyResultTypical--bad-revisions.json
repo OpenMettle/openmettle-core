@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/affected_revisions",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesApplyResultTypical--bad-revisions",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "affected_bytes": "4096",
+    "affected_revisions": "03",
+    "policy_revision": "2",
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "bad-revisions",
+    "op": "set",
+    "path": "/affected_revisions",
+    "value": "03"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesApplyResult",
+  "source": "#/components/examples/RetentionDeadlinesApplyResultTypical"
+}

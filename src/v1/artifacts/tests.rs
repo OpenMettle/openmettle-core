@@ -174,6 +174,8 @@ fn revisions_serialize_without_internal_identifiers() {
         display_name: None,
         state: "active".into(),
         created_us: 1_763_370_000_000_001,
+        retained_us: None,
+        purge_after_us: None,
     };
     let body = revision_json(&revision).unwrap();
     assert_eq!(
@@ -191,6 +193,8 @@ fn revisions_serialize_without_internal_identifiers() {
             "display_name": null,
             "state": "active",
             "created_at": "2025-11-17T09:00:00.000001Z",
+            "retained_at": null,
+            "purge_after": null,
         })
     );
     assert!(!body.to_string().contains("CANARY"));

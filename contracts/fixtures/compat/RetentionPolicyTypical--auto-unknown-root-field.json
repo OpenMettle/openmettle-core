@@ -1,0 +1,25 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RetentionPolicyTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": 604800,
+    "max_grace_seconds": 31536000,
+    "min_grace_seconds": 0,
+    "revision": "2",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/RetentionPolicy",
+  "source": "#/components/examples/RetentionPolicyTypical"
+}

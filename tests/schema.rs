@@ -498,8 +498,8 @@ struct AdditiveTable {
 
 const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
-const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
-const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
+const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000","lifecycle_baseline_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_lifecycle_origin_us":null,"snapshot_lifecycle_baseline_digest":null,"required_lifecycle_origin_us":null,"required_lifecycle_baseline_digest":null,"replayed_lifecycle_baseline_digest":null,"gate_generation":1,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -858,6 +858,60 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "coverage_started_at",
         default: ColumnDefault::AnyNonNull,
     },
+    AdditiveColumn {
+        since: 42,
+        table: "deletion_journal",
+        column: "retained_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "deletion_journal_head",
+        column: "lifecycle_coverage_started_at",
+        default: ColumnDefault::AnyNonNull,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "deletion_journal_head",
+        column: "lifecycle_baseline_digest",
+        default: ColumnDefault::AnyNonNull,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "snapshot_lifecycle_origin_us",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "snapshot_lifecycle_baseline_digest",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "required_lifecycle_origin_us",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "required_lifecycle_baseline_digest",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "replayed_lifecycle_baseline_digest",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 42,
+        table: "restore_reconciliation_gate",
+        column: "gate_generation",
+        default: ColumnDefault::Int(1),
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1175,6 +1229,12 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "restore_reconciliation_gate",
         seed_row: Some(RESTORE_GATE_SEED),
     },
+    AdditiveTable {
+        since: 42,
+        dropped_in: None,
+        table: "retention_upgrade_baseline",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1359,6 +1419,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
         "49a30070ef07ae4471f0e7d2035c54a605a15e4abab24f2e6bff69953ee4f3ff",
         "3fb443c44eb91d520bff06b7b0eaef3615c15d0e86c2f1bfc768c1d5dcff96ca",
+        "3d6e5c6d44cb3ee77cbcf26dc77e4ca5d460bfc658a17d5c48307b067fcdd6d6",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1505,7 +1566,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 45);
+    assert_eq!(after_14.len(), 46);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1568,6 +1629,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ),
             ("capacity_profiles", None),
             ("restore_reconciliation_gate", Some(RESTORE_GATE_SEED)),
+            ("retention_upgrade_baseline", None),
         ]
     );
 

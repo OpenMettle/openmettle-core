@@ -1,0 +1,21 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RetentionDeadlinesPreviewRequestTypical--scoped",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "scoped",
+    "op": "set",
+    "path": "/scope_id",
+    "value": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+  "source": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+}

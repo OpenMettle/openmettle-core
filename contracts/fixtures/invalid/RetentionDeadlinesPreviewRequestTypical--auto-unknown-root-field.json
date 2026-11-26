@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesPreviewRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "scope_id": null,
+    "target_grace_seconds": 604800,
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+  "source": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+}

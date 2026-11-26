@@ -716,7 +716,7 @@ type Decode = fn(&Value) -> Result<(), String>;
 
 /// The consumer's decoders of the V1-05 project, conversation, artifact, V1-17 quota and V1-18
 /// capacity responses.
-fn v1_decoders() -> [(&'static str, Decode); 12] {
+fn v1_decoders() -> [(&'static str, Decode); 16] {
     [
         ("#/components/schemas/Run", |v| {
             consumer::decode_run(v).map(drop)
@@ -753,6 +753,18 @@ fn v1_decoders() -> [(&'static str, Decode); 12] {
         }),
         ("#/components/schemas/AdminCapacityGroupList", |v| {
             consumer::decode_admin_capacity_groups(v).map(drop)
+        }),
+        ("#/components/schemas/RetentionPolicy", |v| {
+            consumer::decode_retention_policy(v).map(drop)
+        }),
+        ("#/components/schemas/AdminRetentionStatus", |v| {
+            consumer::decode_admin_retention_status(v).map(drop)
+        }),
+        ("#/components/schemas/RetentionDeadlinesPreview", |v| {
+            consumer::decode_retention_deadlines_preview(v).map(drop)
+        }),
+        ("#/components/schemas/RetentionDeadlinesApplyResult", |v| {
+            consumer::decode_retention_deadlines_apply_result(v).map(drop)
         }),
     ]
 }
@@ -830,6 +842,18 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     assert!(revision.media_type.starts_with("text/plain") && revision.sha256.len() == 64);
     let unnamed = consumer::decode_revision(&fixture("ArtifactRevisionActive--unnamed")).unwrap();
     assert!(unnamed.display_name.is_none());
+    // Backward compatibility: pre-PR3 servers omit optional `retained_at` and `purge_after`.
+    let mut legacy_revision = fixture("ArtifactRevisionActive");
+    let obj = legacy_revision.as_object_mut().unwrap();
+    obj.remove("retained_at");
+    obj.remove("purge_after");
+    let revision_validator = validator_for("#/components/schemas/ArtifactRevision");
+    assert!(revision_validator.is_valid(&legacy_revision));
+    let decoded_legacy = consumer::decode_revision(&legacy_revision).unwrap();
+    assert_eq!(
+        (decoded_legacy.retained_at, decoded_legacy.purge_after),
+        (None, None)
+    );
     // A newer state is surfaced and never offered for download.
     let newer = fixture("ArtifactRevisionActive--unrecognized-state");
     let newer = consumer::decode_revision(&newer).unwrap();
@@ -1947,4 +1971,53 @@ fn consumer_decodes_capacity_visibility_and_admin_group_observations() {
         ))
         .is_err()
     );
+}
+
+#[test]
+fn consumer_reads_retention_status_policy_and_deadlines() {
+    let retained = consumer::decode_revision(&fixture("ArtifactRevisionRetained")).unwrap();
+    assert_eq!(retained.state, consumer::RevisionState::Retained);
+    assert_eq!(
+        retained.retained_at.as_deref(),
+        Some("2026-11-21T09:00:00.000000Z")
+    );
+    assert_eq!(
+        retained.purge_after.as_deref(),
+        Some("2026-12-21T09:00:00.000000Z")
+    );
+
+    let status =
+        consumer::decode_admin_retention_status(&fixture("AdminRetentionStatusOpen")).unwrap();
+    assert!(status.restore_gate.open);
+    assert_eq!(status.policy.revision, 1);
+    assert_eq!(status.deletion_journal.journal_seq, 4);
+
+    let closed =
+        consumer::decode_admin_retention_status(&fixture("AdminRetentionStatusOpen--closed-gate"))
+            .unwrap();
+    assert!(!closed.restore_gate.open);
+    assert_eq!(closed.restore_gate.snapshot_journal_seq, Some(2));
+    assert_eq!(closed.restore_gate.required_journal_seq, Some(4));
+    assert!(!closed.restore_gate.coverage_complete);
+
+    let policy = consumer::decode_retention_policy(&fixture("RetentionPolicyTypical")).unwrap();
+    assert_eq!((policy.revision, policy.grace_seconds), (2, 604_800));
+
+    let preview =
+        consumer::decode_retention_deadlines_preview(&fixture("RetentionDeadlinesPreviewTypical"))
+            .unwrap();
+    assert_eq!(
+        (
+            preview.policy_revision,
+            preview.affected_revisions,
+            preview.affected_bytes
+        ),
+        (2, 3, 4096)
+    );
+
+    let applied = consumer::decode_retention_deadlines_apply_result(&fixture(
+        "RetentionDeadlinesApplyResultTypical",
+    ))
+    .unwrap();
+    assert_eq!(applied, preview);
 }

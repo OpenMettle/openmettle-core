@@ -678,8 +678,10 @@ async fn indexed_batch_seeks_in_a_many_run_history_without_a_sort() {
         .execute(&mut owner)
         .await
         .unwrap();
-    // Observe the exact SQL of an idle live stream after its first empty poll.
-    // The one primary backend last ran the batch query. Read it as that same role.
+    // Observe the exact SQL of an idle live stream on its next empty poll by briefly holding an
+    // ACCESS EXCLUSIVE lock on `run_events` so the stream's READ COMMITTED batch transaction
+    // pauses on the `BATCH` SELECT (after acquiring the restore gate share lock) long enough to
+    // read its live query text as the same role.
     let snapshot = f.snapshot();
     let _stream = Stream::open(
         &f.api,
@@ -688,16 +690,22 @@ async fn indexed_batch_seeks_in_a_many_run_history_without_a_sort() {
         snapshot["resume_cursor"].as_str(),
     )
     .await;
+    let mut lock_tx = owner.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.run_events IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
     let mut observer = connect(&f.db.0, API).await;
     let sql: String = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let query = sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid<>pg_backend_pid()
-                AND datname=current_database() AND usename=current_user AND state='idle' AND query LIKE 'SELECT r.scope_id%AS events%'")
+                AND datname=current_database() AND usename=current_user AND state='active' AND query LIKE 'SELECT r.scope_id%AS events%'")
                 .fetch_optional(&mut observer).await.unwrap();
             if let Some(query) = query { break query; }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }).await.unwrap();
+    lock_tx.rollback().await.unwrap();
     assert!(include_str!("../../src/v1/runs.rs").contains(sql.as_str()));
     let explain = AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}"));
     let row = sqlx::query(explain)

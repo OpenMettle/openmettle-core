@@ -887,6 +887,8 @@ async fn shares_catalog_preview_history_and_cancellation() {
     .execute(&mut owner)
     .await
     .unwrap();
+    api.post(&u.cookie, "/v1/runs", "purged-retry", &make_fork("retry"))
+        .problem(404, "not_found");
     assert!(
         !api.get(&u.cookie, &owner_next)
             .expect(200)

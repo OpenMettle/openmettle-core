@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/grace_seconds",
+    "keyword": "minimum",
+    "valid": false
+  },
+  "fixture": "UpdateRetentionPolicyRequestTypical--negative-grace",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grace_seconds": -1,
+    "reason": "Shorten retention grace to seven days"
+  },
+  "mutation": {
+    "name": "negative-grace",
+    "op": "set",
+    "path": "/grace_seconds",
+    "value": -1
+  },
+  "schema": "#/components/schemas/UpdateRetentionPolicyRequest",
+  "source": "#/components/examples/UpdateRetentionPolicyRequestTypical"
+}

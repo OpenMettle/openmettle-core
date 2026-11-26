@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 41);
+    assert_eq!(served.len(), 48);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -42,7 +42,11 @@ fn every_write_and_only_a_write_needs_a_key_and_reads_take_no_body() {
         for (method, op) in operations {
             assert_eq!(
                 op.reads(),
-                method == Method::GET || op == Op::PreviewConfiguration,
+                method == Method::GET
+                    || matches!(
+                        op,
+                        Op::PreviewConfiguration | Op::PreviewAdminRetentionDeadlines
+                    ),
                 "{}",
                 op.id()
             );

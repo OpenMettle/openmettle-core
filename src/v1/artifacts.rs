@@ -13,18 +13,18 @@
 //!   artifact on every request, then only an `active` revision streams from the store.
 use super::{
     Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, PROVISIONING, Problem,
-    Session, TIMEOUT, UNAVAILABLE, path_id, principal, problem, quota_problem, reply, request_id,
-    request_key, response_headers, single_header, timestamp,
+    Session, TIMEOUT, UNAVAILABLE, no_content, path_id, principal, problem, quota_problem, reply,
+    request_id, request_key, response_headers, single_header, timestamp,
 };
 use crate::{
     artifact_fs::{self, UPLOAD_TIMEOUT},
     authz::{
         Action, DenialReason,
         projects::{self, hex},
-        store::StoreError,
+        store::{AuditContext, StoreError},
     },
     multipart::Parser,
-    runs,
+    restore, runs,
     storage::{self, Revision},
 };
 use axum::{
@@ -209,17 +209,20 @@ fn revision_json(r: &Revision) -> Result<Value, Problem> {
         "display_name": r.display_name,
         "state": r.state,
         "created_at": timestamp(r.created_us)?,
+        "retained_at": r.retained_us.map(timestamp).transpose()?,
+        "purge_after": r.purge_after_us.map(timestamp).transpose()?,
     }))
 }
 
 fn ingest_problem(error: artifact_fs::Error) -> Problem {
     use artifact_fs::Error::{
-        Body, InProgress, Io, Missing, Multipart, Rejected, Storage, TooLarge,
+        Body, GateClosed, InProgress, Io, Missing, Multipart, Rejected, Storage, TooLarge,
     };
     match error {
         Multipart(_) | Rejected | Body => BODY,
         TooLarge => TOO_LARGE,
         InProgress => IN_PROGRESS,
+        GateClosed => UNAVAILABLE,
         Io | Missing => INTERNAL,
         Storage(error) => storage_problem(error),
     }
@@ -326,6 +329,7 @@ impl Api {
             let artifact = self
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
+                    restore::require_open_gate(c).await?;
                     projects::authorize_create_in_scope(c, &principal, scope, now).await?;
                     Ok(storage::upload_artifact(c, scope, actor, &key).await?)
                 })
@@ -335,6 +339,7 @@ impl Api {
             let located = self
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
+                    restore::require_open_gate(c).await?;
                     projects::authorize_artifact(c, &principal, target, Action::Write, now).await
                 })
                 .await?;
@@ -385,43 +390,120 @@ impl Api {
             false => (None, None),
         };
         let context = self.authenticate(&session).await?;
-        let action = if download {
-            Action::Download
-        } else {
-            Action::Read
-        };
-        let revision = self
-            .database(async |c| {
-                let principal = principal(c, &context).await?;
-                let now = context.observed_ms();
-                projects::authorize_artifact(c, &principal, artifact, action, now).await?;
-                read_revision(c, artifact, revision_id).await
+        if !download {
+            let revision = self
+                .database(async |c| {
+                    let principal = principal(c, &context).await?;
+                    let now = context.observed_ms();
+                    projects::authorize_artifact(c, &principal, artifact, Action::Read, now)
+                        .await?;
+                    read_revision(c, artifact, revision_id).await
+                })
+                .await?;
+            return Ok(reply(StatusCode::OK, revision_json(&revision)?));
+        }
+        let store = store.ok_or(INTERNAL)?;
+        struct DownloadStream {
+            revision: Revision,
+            status: StatusCode,
+            first: u64,
+            len: u64,
+            total: u64,
+            media_type: HeaderValue,
+            content: artifact_fs::Content,
+        }
+        enum DownloadPlan {
+            Unsatisfiable(u64),
+            Stream(Box<DownloadStream>),
+        }
+        let plan = self
+            .with_connection(async |c| {
+                let mut tx = crate::authz::store::begin(c).await?;
+                let outcome = async {
+                    let conn = tx.connection()?;
+                    let principal = principal(conn, &context).await?;
+                    let now = context.observed_ms();
+                    projects::authorize_artifact(conn, &principal, artifact, Action::Download, now)
+                        .await?;
+                    // Canonical lock order (storage.rs): lock artifact_revisions FOR SHARE first,
+                    // then restore_reconciliation_gate FOR SHARE.
+                    let revision = storage::read_revision_for_share(conn, artifact, revision_id)
+                        .await?
+                        .ok_or(StoreError::Denied(DenialReason::NotFound))?;
+                    let expected_generation = restore::require_open_gate_generation(conn).await?;
+                    if revision.state != "active" {
+                        return Err(NOT_SERVABLE);
+                    }
+                    let total = u64::try_from(revision.size_bytes).map_err(|_| INTERNAL)?;
+                    let (status, first, len) = match range.map(|r| r.resolve(total)) {
+                        None => (StatusCode::OK, 0, total),
+                        Some(Some((first, last))) => {
+                            (StatusCode::PARTIAL_CONTENT, first, last - first + 1)
+                        }
+                        Some(None) => return Ok(DownloadPlan::Unsatisfiable(total)),
+                    };
+                    let media_type =
+                        HeaderValue::from_str(&revision.media_type).map_err(|_| INTERNAL)?;
+                    let content = store
+                        .read_gated_on(
+                            conn,
+                            self.pool.clone(),
+                            expected_generation,
+                            &revision.id,
+                            &revision.reservation_id,
+                            revision.size_bytes,
+                            first,
+                            len,
+                        )
+                        .await
+                        .map_err(|err| match err {
+                            artifact_fs::Error::GateClosed
+                            | artifact_fs::Error::Storage(runs::Error::Database(_)) => UNAVAILABLE,
+                            _ => INTERNAL,
+                        })?;
+                    Ok::<_, Problem>(DownloadPlan::Stream(Box::new(DownloadStream {
+                        revision,
+                        status,
+                        first,
+                        len,
+                        total,
+                        media_type,
+                        content,
+                    })))
+                }
+                .await;
+                match outcome {
+                    Ok(plan) => {
+                        tx.commit().await.map_err(|_| UNAVAILABLE)?;
+                        Ok(plan)
+                    }
+                    Err(err) => {
+                        let _ = tx.rollback().await;
+                        Err(err)
+                    }
+                }
             })
             .await?;
-        let Some(store) = store else {
-            return Ok(reply(StatusCode::OK, revision_json(&revision)?));
+        let DownloadPlan::Stream(stream) = plan else {
+            let DownloadPlan::Unsatisfiable(total) = plan else {
+                return Err(INTERNAL);
+            };
+            let mut response = UNSATISFIABLE.response(request_id(&parts.extensions));
+            let unsatisfied = HeaderValue::from_str(&format!("bytes */{total}"));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_RANGE, unsatisfied.map_err(|_| INTERNAL)?);
+            return Ok(response);
         };
-        if revision.state != "active" {
-            return Err(NOT_SERVABLE);
-        }
-        let total = u64::try_from(revision.size_bytes).map_err(|_| INTERNAL)?;
-        let (status, first, len) = match range.map(|r| r.resolve(total)) {
-            None => (StatusCode::OK, 0, total),
-            Some(Some((first, last))) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
-            Some(None) => {
-                let mut response = UNSATISFIABLE.response(request_id(&parts.extensions));
-                let unsatisfied = HeaderValue::from_str(&format!("bytes */{total}"));
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_RANGE, unsatisfied.map_err(|_| INTERNAL)?);
-                return Ok(response);
-            }
-        };
-        let media_type = HeaderValue::from_str(&revision.media_type).map_err(|_| INTERNAL)?;
-        let content = store
-            .read(&revision.reservation_id, revision.size_bytes, first, len)
-            .await
-            .map_err(|_| INTERNAL)?;
+        let DownloadStream {
+            revision,
+            status,
+            first,
+            len,
+            total,
+            media_type,
+            content,
+        } = *stream;
         let mut response = Response::new(Body::new(content));
         *response.status_mut() = status;
         let headers = response.headers_mut();
@@ -443,6 +525,64 @@ impl Api {
             headers.insert(header::CONTENT_RANGE, range.map_err(|_| INTERNAL)?);
         }
         Ok(response)
+    }
+
+    /// `deleteArtifact`, `deleteArtifactRevision` and `restoreArtifactRevision` (ADR 0041 PR3).
+    pub(super) async fn lifecycle(
+        &self,
+        op: Op,
+        parts: &Parts,
+        session: Session,
+        artifact: &str,
+        client_key: &str,
+    ) -> Result<Response, Problem> {
+        if parts.uri.query().is_some() {
+            return Err(INVALID);
+        }
+        let revision_id = match op {
+            Op::DeleteArtifact => None,
+            Op::DeleteArtifactRevision | Op::RestoreArtifactRevision => Some(path_id(parts, 5)?),
+            _ => return Err(INTERNAL),
+        };
+        let context = self.authenticate(&session).await?;
+        let key_target = match revision_id {
+            Some(rev) => format!("{artifact}/{rev}"),
+            None => artifact.to_owned(),
+        };
+        let key = request_key(op, &key_target, client_key);
+        let audit = AuditContext {
+            actor_user_id: context.user_id(),
+            actor_approval_id: context.approval_id(),
+            now_ms: context.observed_ms(),
+            request_key: &key,
+            reason: op.id(),
+        };
+        match op {
+            Op::DeleteArtifact => {
+                self.database(async |c| projects::delete_artifact(c, &audit, artifact).await)
+                    .await?;
+                Ok(no_content())
+            }
+            Op::DeleteArtifactRevision => {
+                let rev_id = revision_id.ok_or(INTERNAL)?;
+                let rev = self
+                    .database(async |c| {
+                        projects::delete_artifact_revision(c, &audit, artifact, rev_id).await
+                    })
+                    .await?;
+                Ok(reply(StatusCode::OK, revision_json(&rev)?))
+            }
+            Op::RestoreArtifactRevision => {
+                let rev_id = revision_id.ok_or(INTERNAL)?;
+                let rev = self
+                    .database(async |c| {
+                        projects::restore_artifact_revision(c, &audit, artifact, rev_id).await
+                    })
+                    .await?;
+                Ok(reply(StatusCode::OK, revision_json(&rev)?))
+            }
+            _ => Err(INTERNAL),
+        }
     }
 }
 

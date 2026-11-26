@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesApplyRequestTypical--auto-missing-reason",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_policy_revision": "2",
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "auto-missing-reason",
+    "op": "remove",
+    "path": "/reason"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+  "source": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+}

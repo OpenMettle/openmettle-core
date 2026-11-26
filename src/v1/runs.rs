@@ -17,7 +17,7 @@ use tokio::{
 
 pub(super) const SSE_MAX_IN_FLIGHT: usize = 128;
 const BATCH_LIMIT: i64 = 16;
-const CHANNEL_FRAMES: usize = 8;
+const CHANNEL_FRAMES: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const REAUTH_INTERVAL: Duration = Duration::from_secs(10);
@@ -238,6 +238,7 @@ fn frame(cursor: &str, event: &Value) -> Result<Bytes, Problem> {
     Ok(format!("id: {cursor}\ndata: {data}\n\n").into())
 }
 
+/// Callers must already hold `restore_reconciliation_gate` `FOR SHARE` in the active transaction.
 async fn authorize(
     c: &mut PgConnection,
     context: &sessions::Context,
@@ -303,13 +304,21 @@ impl Api {
     ) -> Result<Response, Problem> {
         let row = self
             .database(async |c| {
-                let row = sqlx::query(SNAPSHOT)
-                    .bind(run)
-                    .fetch_optional(&mut *c)
-                    .await?
-                    .ok_or(StoreError::NotFound)?;
-                authorize(c, context, &row, min_now_ms).await?;
-                Ok(row)
+                let mut tx = authz::store::begin(c).await?;
+                let result = async {
+                    let conn = tx.connection()?;
+                    crate::restore::require_open_gate(conn).await?;
+                    let row = sqlx::query(SNAPSHOT)
+                        .bind(run)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                        .ok_or(StoreError::NotFound)?;
+                    authorize(conn, context, &row, min_now_ms).await?;
+                    Ok::<_, StoreError>(row)
+                }
+                .await;
+                let _ = tx.rollback().await;
+                result
             })
             .await?;
         let last = last_sequence(&row)?;
@@ -383,6 +392,7 @@ impl Api {
             keys,
             position,
             authorized_at: Instant::now(),
+            gate_generation: None,
         };
         let first = stream.batch(true).await?;
         if let Some(cursor) = cursor? {
@@ -435,6 +445,23 @@ async fn stopping(stop: Option<watch::Receiver<bool>>) {
     }
 }
 
+async fn check_open_gate_generation(
+    conn: &mut PgConnection,
+    expected: i64,
+) -> Result<(), StoreError> {
+    let current = if expected > 0 {
+        crate::restore::lock_open_gate_generation_known_41(conn).await?
+    } else {
+        crate::restore::lock_open_gate_generation(conn).await?
+    };
+    if current != Some(expected) {
+        return Err(StoreError::Database(sqlx::Error::Protocol(
+            "restore reconciliation pending".into(),
+        )));
+    }
+    Ok(())
+}
+
 struct Subscription {
     api: Arc<Api>,
     session: Session,
@@ -443,6 +470,7 @@ struct Subscription {
     keys: Arc<CursorKeys>,
     position: i64,
     authorized_at: Instant,
+    gate_generation: Option<i64>,
 }
 impl Subscription {
     fn binding<'a>(&'a self, scope: &'a str) -> Binding<'a> {
@@ -453,30 +481,142 @@ impl Subscription {
         }
     }
 
+    async fn send_gated(&self, tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
+        self.send_gated_batch(tx, vec![bytes]).await
+    }
+
+    async fn send_gated_batch(
+        &self,
+        tx: &mpsc::Sender<Bytes>,
+        frames: Vec<Bytes>,
+    ) -> Result<(), Problem> {
+        let mut iter = frames.into_iter().peekable();
+        let Some(expected) = self.gate_generation else {
+            for bytes in iter {
+                reserve_send(tx).await?.send(bytes);
+            }
+            return Ok(());
+        };
+
+        // Enqueue consecutive non-backpressured frames synchronously inside one READ COMMITTED
+        // transaction holding `FOR SHARE` on `restore_reconciliation_gate`, committing and
+        // releasing the DB checkout immediately before awaiting backpressure clearance.
+        let mut pending_permit: Option<mpsc::Permit<'_, Bytes>> = None;
+        while iter.peek().is_some() {
+            if pending_permit.is_none() && tx.capacity() == 0 {
+                pending_permit = Some(reserve_send(tx).await?);
+            }
+            let mut closed = false;
+            self.api
+                .database(async |c| {
+                    let mut db_tx = authz::store::begin(c).await?;
+                    let result = async {
+                        let conn = db_tx.connection()?;
+                        check_open_gate_generation(conn, expected).await?;
+                        while iter.peek().is_some() {
+                            let permit = if let Some(permit) = pending_permit.take() {
+                                permit
+                            } else {
+                                match tx.try_reserve() {
+                                    Ok(permit) => permit,
+                                    Err(mpsc::error::TrySendError::Full(())) => break,
+                                    Err(mpsc::error::TrySendError::Closed(())) => {
+                                        closed = true;
+                                        break;
+                                    }
+                                }
+                            };
+                            if let Some(bytes) = iter.next() {
+                                permit.send(bytes);
+                            }
+                        }
+                        Ok::<_, StoreError>(())
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            db_tx.commit().await?;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            let _ = db_tx.rollback().await;
+                            Err(err)
+                        }
+                    }
+                })
+                .await?;
+            if closed {
+                return Err(UNAVAILABLE);
+            }
+            if iter.peek().is_some() {
+                pending_permit = Some(reserve_send(tx).await?);
+            }
+        }
+        Ok(())
+    }
+
     /// The native and browser validators manage their own checkout. Release the batch
     /// checkout first, so revalidation works even with a single primary pool slot.
     async fn batch(&mut self, first: bool) -> Result<Batch, Problem> {
         tokio::time::timeout(OPERATION_TIMEOUT, async {
-            let row = self
+            let expected_gen = self.gate_generation;
+            let (generation, row) = self
                 .api
                 .database(async |c| {
-                    sqlx::query(BATCH)
-                        .bind(&self.run)
-                        .bind(self.position)
-                        .bind(BATCH_LIMIT)
-                        .fetch_optional(c)
-                        .await?
-                        .ok_or(StoreError::NotFound)
+                    let mut tx = authz::store::begin(c).await?;
+                    let result = async {
+                        let conn = tx.connection()?;
+                        let generation = match expected_gen {
+                            Some(expected) => {
+                                check_open_gate_generation(conn, expected).await?;
+                                expected
+                            }
+                            None => crate::restore::require_open_gate_generation(conn).await?,
+                        };
+                        let row = sqlx::query(BATCH)
+                            .bind(&self.run)
+                            .bind(self.position)
+                            .bind(BATCH_LIMIT)
+                            .fetch_optional(&mut *conn)
+                            .await?
+                            .ok_or(StoreError::NotFound)?;
+                        Ok::<_, StoreError>((generation, row))
+                    }
+                    .await;
+                    let _ = tx.rollback().await;
+                    result
                 })
                 .await?;
+            if self.gate_generation.is_none() {
+                self.gate_generation = Some(generation);
+            }
             let events: Vec<StoredEvent> = row.get("events");
             if first || !events.is_empty() || self.authorized_at.elapsed() >= REAUTH_INTERVAL {
                 let context = self.api.authenticate(&self.session).await?;
                 if context.user_id() != self.user {
                     return Err(UNAUTHENTICATED);
                 }
+                let expected_gen = self.gate_generation;
                 self.api
-                    .database(async |c| authorize(c, &context, &row, context.observed_ms()).await)
+                    .database(async |c| {
+                        let mut tx = authz::store::begin(c).await?;
+                        let result = async {
+                            let conn = tx.connection()?;
+                            match expected_gen {
+                                Some(expected) => {
+                                    check_open_gate_generation(conn, expected).await?;
+                                }
+                                None => {
+                                    let _ =
+                                        crate::restore::require_open_gate_generation(conn).await?;
+                                }
+                            }
+                            authorize(conn, &context, &row, context.observed_ms()).await
+                        }
+                        .await;
+                        let _ = tx.rollback().await;
+                        result
+                    })
                     .await?;
                 self.authorized_at = Instant::now();
             }
@@ -492,24 +632,30 @@ impl Subscription {
     }
 
     async fn deliver(&mut self, mut batch: Batch, tx: &mpsc::Sender<Bytes>) -> Result<(), Problem> {
-        send(tx, HEARTBEAT).await?;
+        self.send_gated(tx, HEARTBEAT).await?;
         let mut last_write = Instant::now();
         loop {
             let full = batch.events.len() == BATCH_LIMIT as usize;
+            let mut frames = Vec::with_capacity(batch.events.len());
+            let mut last_seq = self.position;
             for stored in batch.events {
                 let sequence = stored.0;
                 if let Some(event) = event(&self.run, &stored)? {
                     let id = self.binding(&batch.scope).sign(&self.keys, sequence);
-                    send(tx, frame(&id, &event)?).await?;
-                    last_write = Instant::now();
+                    frames.push(frame(&id, &event)?);
                 }
-                self.position = sequence;
+                last_seq = sequence;
             }
+            if !frames.is_empty() {
+                self.send_gated_batch(tx, frames).await?;
+                last_write = Instant::now();
+            }
+            self.position = last_seq;
             if batch.terminal && (self.position >= batch.last || !full) {
                 return Ok(());
             }
             if last_write.elapsed() >= HEARTBEAT_INTERVAL {
-                send(tx, HEARTBEAT).await?;
+                self.send_gated(tx, HEARTBEAT).await?;
                 last_write = Instant::now();
             }
             if !full {
@@ -520,8 +666,8 @@ impl Subscription {
     }
 }
 
-async fn send(tx: &mpsc::Sender<Bytes>, bytes: Bytes) -> Result<(), Problem> {
-    tokio::time::timeout(WRITE_TIMEOUT, tx.send(bytes))
+async fn reserve_send(tx: &mpsc::Sender<Bytes>) -> Result<mpsc::Permit<'_, Bytes>, Problem> {
+    tokio::time::timeout(WRITE_TIMEOUT, tx.reserve())
         .await
         .map_err(|_| TIMEOUT)?
         .map_err(|_| UNAVAILABLE)
@@ -715,7 +861,11 @@ mod tests {
                 biased;
                 _ = stopping(Some(stop_rx)) => Ok(()),
                 _ = tx.closed() => Ok(()),
-                result = send(&tx, Bytes::from_static(b"overflow")) => result,
+                result = async {
+                    let permit = reserve_send(&tx).await?;
+                    permit.send(Bytes::from_static(b"overflow"));
+                    Ok(())
+                } => result,
             }
         });
 

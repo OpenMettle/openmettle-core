@@ -323,7 +323,10 @@ enum Op {
     RevokeResourceShare(ResourceKind),
     CreateArtifact,
     CreateArtifactRevision,
+    DeleteArtifact,
     GetArtifactRevision,
+    DeleteArtifactRevision,
+    RestoreArtifactRevision,
     DownloadArtifactRevision,
     GetPersonalQuotas,
     GetProjectQuotas,
@@ -331,6 +334,10 @@ enum Op {
     RevokeQuotaOverride,
     GetCapacity,
     ListAdminCapacityGroups,
+    GetAdminRetentionStatus,
+    UpdateAdminRetentionPolicy,
+    PreviewAdminRetentionDeadlines,
+    ApplyAdminRetentionDeadlines,
 }
 
 impl Op {
@@ -371,7 +378,10 @@ impl Op {
             Self::RevokeResourceShare(_) => "revokeArtifactShare",
             Self::CreateArtifact => "createArtifact",
             Self::CreateArtifactRevision => "createArtifactRevision",
+            Self::DeleteArtifact => "deleteArtifact",
             Self::GetArtifactRevision => "getArtifactRevision",
+            Self::DeleteArtifactRevision => "deleteArtifactRevision",
+            Self::RestoreArtifactRevision => "restoreArtifactRevision",
             Self::DownloadArtifactRevision => "downloadArtifactRevision",
             Self::GetPersonalQuotas => "getPersonalQuotas",
             Self::GetProjectQuotas => "getProjectQuotas",
@@ -379,6 +389,10 @@ impl Op {
             Self::RevokeQuotaOverride => "revokeQuotaOverride",
             Self::GetCapacity => "getCapacity",
             Self::ListAdminCapacityGroups => "listAdminCapacityGroups",
+            Self::GetAdminRetentionStatus => "getAdminRetentionStatus",
+            Self::UpdateAdminRetentionPolicy => "updateAdminRetentionPolicy",
+            Self::PreviewAdminRetentionDeadlines => "previewAdminRetentionDeadlines",
+            Self::ApplyAdminRetentionDeadlines => "applyAdminRetentionDeadlines",
         }
     }
     fn reads(self) -> bool {
@@ -404,6 +418,8 @@ impl Op {
                 | Self::GetProjectQuotas
                 | Self::GetCapacity
                 | Self::ListAdminCapacityGroups
+                | Self::GetAdminRetentionStatus
+                | Self::PreviewAdminRetentionDeadlines
         )
     }
     /// Streams a `multipart/form-data` artifact upload (ADR 0031).
@@ -427,6 +443,9 @@ impl Op {
                 | Self::RevokeResourceShare(_)
                 | Self::SetQuotaOverride
                 | Self::RevokeQuotaOverride
+                | Self::UpdateAdminRetentionPolicy
+                | Self::PreviewAdminRetentionDeadlines
+                | Self::ApplyAdminRetentionDeadlines
         )
     }
     /// Names its target by a UUID in the third path segment.
@@ -447,6 +466,10 @@ impl Op {
                 | Self::RevokeQuotaOverride
                 | Self::GetCapacity
                 | Self::ListAdminCapacityGroups
+                | Self::GetAdminRetentionStatus
+                | Self::UpdateAdminRetentionPolicy
+                | Self::PreviewAdminRetentionDeadlines
+                | Self::ApplyAdminRetentionDeadlines
         )
     }
 }
@@ -805,6 +828,38 @@ struct Api {
     streams: Arc<Semaphore>,
 }
 
+/// Optional validated catalog, admission limits and cursor keys extracted from `AuthConfig` and
+/// attached as Axum extensions onto a `/v1` router.
+#[doc(hidden)]
+pub struct AuthExtensions {
+    catalog: Option<crate::model_config::Catalog>,
+    admission_limits: Option<crate::authz::runs::AdmissionLimits>,
+    cursor_keys: Option<crate::auth_config::CursorKeys>,
+}
+
+impl AuthExtensions {
+    pub fn take(settings: &mut crate::auth_config::AuthConfig) -> Self {
+        Self {
+            catalog: settings.catalog.take(),
+            admission_limits: settings.admission_limits.take(),
+            cursor_keys: settings.cursor_keys.take(),
+        }
+    }
+
+    pub fn apply(self, mut router: Router) -> Router {
+        if let Some(catalog) = self.catalog {
+            router = router.layer(axum::Extension(Arc::new(catalog)));
+        }
+        if let Some(limits) = self.admission_limits {
+            router = router.layer(axum::Extension(limits));
+        }
+        if let Some(keys) = self.cursor_keys {
+            router = router.layer(axum::Extension(Arc::new(keys)));
+        }
+        router
+    }
+}
+
 /// Builds the `/v1` routes over the mounted browser service, the optional native service, the
 /// configured browser origin, the primary pool and the optional artifact store. Mount it with
 /// `Router::merge`; the sign-in settings checks refuse every `/v1` path
@@ -846,7 +901,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 37] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 42] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -933,7 +988,10 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 37] {
         ("/v1/artifacts", vec![(post.clone(), CreateArtifact)]),
         (
             "/v1/artifacts/{artifact_id}",
-            vec![(get.clone(), GetResource(Artifact))],
+            vec![
+                (get.clone(), GetResource(Artifact)),
+                (Method::DELETE, DeleteArtifact),
+            ],
         ),
         (
             "/v1/artifacts/{artifact_id}/shares",
@@ -949,7 +1007,14 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 37] {
         ),
         (
             "/v1/artifacts/{artifact_id}/revisions/{revision_id}",
-            vec![(get.clone(), GetArtifactRevision)],
+            vec![
+                (get.clone(), GetArtifactRevision),
+                (Method::DELETE, DeleteArtifactRevision),
+            ],
+        ),
+        (
+            "/v1/artifacts/{artifact_id}/revisions/{revision_id}/restore",
+            vec![(post.clone(), RestoreArtifactRevision)],
         ),
         (
             "/v1/artifacts/{artifact_id}/revisions/{revision_id}/content",
@@ -965,16 +1030,32 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 37] {
         ),
         (
             "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}",
-            vec![(put, SetQuotaOverride)],
+            vec![(put.clone(), SetQuotaOverride)],
         ),
         (
             "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}/revoke",
-            vec![(post, RevokeQuotaOverride)],
+            vec![(post.clone(), RevokeQuotaOverride)],
         ),
         ("/v1/capacity", vec![(get.clone(), GetCapacity)]),
         (
             "/v1/admin/capacity/groups",
-            vec![(get, ListAdminCapacityGroups)],
+            vec![(get.clone(), ListAdminCapacityGroups)],
+        ),
+        (
+            "/v1/admin/retention/status",
+            vec![(get, GetAdminRetentionStatus)],
+        ),
+        (
+            "/v1/admin/retention/policy",
+            vec![(put, UpdateAdminRetentionPolicy)],
+        ),
+        (
+            "/v1/admin/retention/deadlines/preview",
+            vec![(post.clone(), PreviewAdminRetentionDeadlines)],
+        ),
+        (
+            "/v1/admin/retention/deadlines/apply",
+            vec![(post, ApplyAdminRetentionDeadlines)],
         ),
     ]
 }
@@ -1065,8 +1146,27 @@ impl Api {
         if matches!(op, Op::GetCapacity | Op::ListAdminCapacityGroups) {
             return self.capacity_operation(op, &parts, session).await;
         }
+        if matches!(
+            op,
+            Op::GetAdminRetentionStatus
+                | Op::UpdateAdminRetentionPolicy
+                | Op::PreviewAdminRetentionDeadlines
+                | Op::ApplyAdminRetentionDeadlines
+        ) {
+            return self
+                .retention_operation(op, &parts, session, key.as_deref(), &body)
+                .await;
+        }
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
             return self.revision(op, &parts, session, target).await;
+        }
+        if matches!(
+            op,
+            Op::DeleteArtifact | Op::DeleteArtifactRevision | Op::RestoreArtifactRevision
+        ) {
+            return self
+                .lifecycle(op, &parts, session, target, key.as_deref().ok_or(INTERNAL)?)
+                .await;
         }
         if matches!(op, Op::ListRunApprovals | Op::DecideRunApproval) {
             return self
@@ -1459,6 +1559,7 @@ mod catalog;
 mod conversations;
 mod pagination;
 mod quotas;
+mod retention;
 mod runs;
 mod submission;
 

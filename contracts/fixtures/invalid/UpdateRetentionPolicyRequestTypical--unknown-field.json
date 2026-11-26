@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "UpdateRetentionPolicyRequestTypical--unknown-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "extra": true,
+    "grace_seconds": 604800,
+    "reason": "Shorten retention grace to seven days"
+  },
+  "mutation": {
+    "name": "unknown-field",
+    "op": "set",
+    "path": "/extra",
+    "value": true
+  },
+  "schema": "#/components/schemas/UpdateRetentionPolicyRequest",
+  "source": "#/components/examples/UpdateRetentionPolicyRequestTypical"
+}

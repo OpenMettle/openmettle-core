@@ -178,6 +178,62 @@
             "$ref": "#/components/responses/Timeout"
           }
         }
+      },
+      "delete": {
+        "operationId": "deleteArtifact",
+        "summary": "Disassociate all active revisions of an artifact",
+        "description": "Moves every currently active revision of the artifact to retained under the installation's current retention policy, keeping retained bytes charged until purge succeeds (ADR 0041). Needs current write/delete access to the artifact: an unshared or deleted-project artifact is not_found, a read-only share is policy and an archived project is conflict. Refused with 503 unavailable while the restore reconciliation gate is closed. Replaying with the same Idempotency-Key returns 204.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Every active revision of the artifact is retained.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
       }
     },
     "/v1/artifacts/{artifact_id}/revisions": {
@@ -326,6 +382,150 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteArtifactRevision",
+        "summary": "Disassociate one artifact revision",
+        "description": "Moves an active revision to retained under the installation's current retention policy, keeping its bytes charged until purge succeeds (ADR 0041). Needs current write/delete access to the artifact; an inaccessible artifact, unknown revision, revision of another artifact, or fresh call on a purged revision is not_found, a read-only share on a visible live revision is policy, and an archived project, live message attachment or unfinished writing run, or non-replayed purging revision is conflict. An exact retry with the same Idempotency-Key returns the original transition receipt with 200. Refused with 503 unavailable while the restore reconciliation gate is closed.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/RevisionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The disassociated revision with its database-stamped retention deadline.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRevision"
+                },
+                "examples": {
+                  "retained": {
+                    "$ref": "#/components/examples/ArtifactRevisionRetained"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/revisions/{revision_id}/restore": {
+      "post": {
+        "operationId": "restoreArtifactRevision",
+        "summary": "Restore a retained artifact revision before its purge deadline",
+        "description": "Returns a retained revision to active strictly before purge_after without reinstating revoked shares (ADR 0041). Needs current write access to the artifact; an inaccessible artifact, unknown revision, revision of another artifact, or fresh call on a purged revision is not_found, a read-only share on a visible live revision is policy, and an archived project, operator retention hold, elapsed deadline, purging state or already-active non-replayed request is conflict. An exact retry with the same Idempotency-Key returns the original transition receipt with 200. Refused with 503 unavailable while the restore reconciliation gate is closed.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/RevisionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The restored active revision.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRevision"
+                },
+                "examples": {
+                  "active": {
+                    "$ref": "#/components/examples/ArtifactRevisionActive"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -3020,6 +3220,297 @@
           }
         }
       }
+    },
+    "/v1/admin/retention/status": {
+      "get": {
+        "operationId": "getAdminRetentionStatus",
+        "summary": "Inspect retention policy, restore reconciliation gate and deletion journal head",
+        "description": "Active account_admin only (ManageRetention). Remains available while the restore reconciliation gate is closed so administrators can inspect restore progress without exposing claim tokens, checkpoints or private tenant data (ADR 0041).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current retention policy, restore-gate state and deletion journal watermark summary.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminRetentionStatus"
+                },
+                "examples": {
+                  "open": {
+                    "$ref": "#/components/examples/AdminRetentionStatusOpen"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/retention/policy": {
+      "put": {
+        "operationId": "updateAdminRetentionPolicy",
+        "summary": "Update the installation retention grace period",
+        "description": "Audited active account_admin write (ManageRetention) setting grace_seconds within operator deployment bounds [min_grace_seconds, max_grace_seconds] for subsequent disassociations (ADR 0041). Replaying the same Idempotency-Key with identical parameters returns the recorded policy revision; reusing it with different parameters fails with idempotency_conflict. Refused with 503 unavailable while the restore reconciliation gate is closed.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRetentionPolicyRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/UpdateRetentionPolicyRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated retention policy.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionPolicy"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/RetentionPolicyTypical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/retention/deadlines/preview": {
+      "post": {
+        "operationId": "previewAdminRetentionDeadlines",
+        "summary": "Preview adjusting purge deadlines of existing retained revisions",
+        "description": "Read-only active account_admin preview (ManageRetention) returning aggregate affected revision and byte counts for recomputing purge_after = retained_at + target_grace_seconds across retained revisions (optionally filtered to one scope_id). Never exposes private filenames, artifact IDs or content (ADR 0041).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionDeadlinesPreviewRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Aggregate count and total bytes of retained revisions whose deadline would change.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionDeadlinesPreview"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/RetentionDeadlinesPreviewTypical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/retention/deadlines/apply": {
+      "post": {
+        "operationId": "applyAdminRetentionDeadlines",
+        "summary": "Apply an explicit purge deadline adjustment to existing retained revisions",
+        "description": "Audited active account_admin write (ManageRetention) that updates purge_after = retained_at + target_grace_seconds on matching retained revisions when expected_policy_revision matches the current retention policy revision, journaling each deadline adjustment in deletion_journal and recording one aggregate authorization_audit row with zero private metadata (ADR 0041). Stale expected_policy_revision fails with conflict; reused Idempotency-Key with different parameters fails with idempotency_conflict; closed restore gate fails with 503 unavailable.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionDeadlinesApplyRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/RetentionDeadlinesApplyRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Aggregate count and total bytes of retained revisions updated.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionDeadlinesApplyResult"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/RetentionDeadlinesApplyResultTypical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4933,6 +5424,28 @@
           },
           "created_at": {
             "$ref": "#/components/schemas/Timestamp"
+          },
+          "retained_at": {
+            "description": "When the revision was disassociated, or null while active.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purge_after": {
+            "description": "Earliest instant the retained revision is eligible for purge, or null while active.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -7515,6 +8028,265 @@
             }
           }
         }
+      },
+      "RetentionPolicy": {
+        "description": "Installation-wide retention grace policy and operator deployment bounds (ADR 0041).",
+        "type": "object",
+        "required": [
+          "revision",
+          "grace_seconds",
+          "min_grace_seconds",
+          "max_grace_seconds"
+        ],
+        "properties": {
+          "revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "min_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "max_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          }
+        }
+      },
+      "RestoreGateStatus": {
+        "description": "Safe administrative summary of restore_reconciliation_gate without claim tokens or checkpoints (ADR 0041).",
+        "type": "object",
+        "required": [
+          "open",
+          "snapshot_journal_seq",
+          "required_journal_seq",
+          "coverage_complete"
+        ],
+        "properties": {
+          "open": {
+            "type": "boolean"
+          },
+          "snapshot_journal_seq": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "required_journal_seq": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "coverage_complete": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DeletionJournalStatus": {
+        "description": "Safe administrative summary of deletion_journal_head (ADR 0041).",
+        "type": "object",
+        "required": [
+          "journal_seq",
+          "coverage_started_at"
+        ],
+        "properties": {
+          "journal_seq": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "coverage_started_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "AdminRetentionStatus": {
+        "description": "Combined retention policy, restore reconciliation gate and deletion journal watermark status for active account_admins (ADR 0041).",
+        "type": "object",
+        "required": [
+          "policy",
+          "restore_gate",
+          "deletion_journal"
+        ],
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/RetentionPolicy"
+          },
+          "restore_gate": {
+            "$ref": "#/components/schemas/RestoreGateStatus"
+          },
+          "deletion_journal": {
+            "$ref": "#/components/schemas/DeletionJournalStatus"
+          }
+        }
+      },
+      "UpdateRetentionPolicyRequest": {
+        "description": "Audited account_admin update to the installation retention grace period (ADR 0041).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grace_seconds",
+          "reason"
+        ],
+        "properties": {
+          "grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "RetentionDeadlinesPreviewRequest": {
+        "description": "Read-only preview request for adjusting existing retained revision deadlines (ADR 0041).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "target_grace_seconds"
+        ],
+        "properties": {
+          "target_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "RetentionDeadlinesPreview": {
+        "description": "Aggregate preview of adjusting existing retained revision deadlines (ADR 0041). Contains zero private identifiers or filenames.",
+        "type": "object",
+        "required": [
+          "current_policy_revision",
+          "target_grace_seconds",
+          "scope_id",
+          "affected_revisions",
+          "affected_bytes"
+        ],
+        "properties": {
+          "current_policy_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "target_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "affected_revisions": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "affected_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          }
+        }
+      },
+      "RetentionDeadlinesApplyRequest": {
+        "description": "Audited account_admin request to adjust purge_after on existing retained revisions (ADR 0041).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expected_policy_revision",
+          "target_grace_seconds",
+          "reason"
+        ],
+        "properties": {
+          "expected_policy_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "target_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "RetentionDeadlinesApplyResult": {
+        "description": "Aggregate result of applying an audited retention deadline adjustment (ADR 0041).",
+        "type": "object",
+        "required": [
+          "policy_revision",
+          "target_grace_seconds",
+          "scope_id",
+          "affected_revisions",
+          "affected_bytes"
+        ],
+        "properties": {
+          "policy_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "target_grace_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "affected_revisions": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "affected_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          }
+        }
       }
     },
     "examples": {
@@ -9143,7 +9915,9 @@
           "sha256": "09ca7e4eaa6e8ae9c7d261167129184883644d07dfba7cbfbc4c8a2e08360d5b",
           "display_name": "notes.txt",
           "state": "active",
-          "created_at": "2026-11-20T09:00:00.000000Z"
+          "created_at": "2026-11-20T09:00:00.000000Z",
+          "retained_at": null,
+          "purge_after": null
         },
         "x-openmettle-fixture": {
           "schema": "#/components/schemas/ArtifactRevision",
@@ -10797,6 +11571,263 @@
               "expect": {
                 "instancePath": "/groups/0/observed_at",
                 "keyword": "anyOf"
+              }
+            }
+          ]
+        }
+      },
+      "ArtifactRevisionRetained": {
+        "summary": "A disassociated artifact revision awaiting its purge deadline",
+        "dataValue": {
+          "artifact_id": "a2c3ef73-c084-4d12-8d5f-60718293a4b5",
+          "revision_id": "3b4c5d6e-7f80-4912-a3b4-c5d6e7f80912",
+          "revision": "1",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "media_type": "text/plain;charset=utf-8",
+          "size_bytes": "12",
+          "sha256": "09ca7e4eaa6e8ae9c7d261167129184883644d07dfba7cbfbc4c8a2e08360d5b",
+          "display_name": "notes.txt",
+          "state": "retained",
+          "created_at": "2026-11-20T09:00:00.000000Z",
+          "retained_at": "2026-11-21T09:00:00.000000Z",
+          "purge_after": "2026-12-21T09:00:00.000000Z"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ArtifactRevision",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-purge-after",
+              "class": "invalid",
+              "op": "set",
+              "path": "/purge_after",
+              "value": "2026-12-21T09:00:00Z",
+              "expect": {
+                "instancePath": "/purge_after",
+                "keyword": "anyOf"
+              }
+            }
+          ]
+        }
+      },
+      "AdminRetentionStatusOpen": {
+        "summary": "Open restore gate with default 30-day retention policy",
+        "dataValue": {
+          "policy": {
+            "revision": "1",
+            "grace_seconds": 2592000,
+            "min_grace_seconds": 2592000,
+            "max_grace_seconds": 2592000
+          },
+          "restore_gate": {
+            "open": true,
+            "snapshot_journal_seq": null,
+            "required_journal_seq": null,
+            "coverage_complete": true
+          },
+          "deletion_journal": {
+            "journal_seq": "4",
+            "coverage_started_at": "2026-11-23T09:00:00.000000Z"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/AdminRetentionStatus",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "closed-gate",
+              "class": "valid",
+              "op": "set",
+              "path": "/restore_gate",
+              "value": {
+                "open": false,
+                "snapshot_journal_seq": "2",
+                "required_journal_seq": "4",
+                "coverage_complete": false
+              }
+            },
+            {
+              "name": "bad-journal-seq",
+              "class": "invalid",
+              "op": "set",
+              "path": "/deletion_journal/journal_seq",
+              "value": "01",
+              "expect": {
+                "instancePath": "/deletion_journal/journal_seq",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "UpdateRetentionPolicyRequestTypical": {
+        "summary": "Audited retention grace period update",
+        "dataValue": {
+          "grace_seconds": 604800,
+          "reason": "Shorten retention grace to seven days"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/UpdateRetentionPolicyRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "negative-grace",
+              "class": "invalid",
+              "op": "set",
+              "path": "/grace_seconds",
+              "value": -1,
+              "expect": {
+                "instancePath": "/grace_seconds",
+                "keyword": "minimum"
+              }
+            },
+            {
+              "name": "unknown-field",
+              "class": "invalid",
+              "op": "set",
+              "path": "/extra",
+              "value": true,
+              "expect": {
+                "instancePath": "",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "RetentionPolicyTypical": {
+        "summary": "Updated retention policy response",
+        "dataValue": {
+          "revision": "2",
+          "grace_seconds": 604800,
+          "min_grace_seconds": 0,
+          "max_grace_seconds": 31536000
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RetentionPolicy",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "negative-min-grace",
+              "class": "invalid",
+              "op": "set",
+              "path": "/min_grace_seconds",
+              "value": -1,
+              "expect": {
+                "instancePath": "/min_grace_seconds",
+                "keyword": "minimum"
+              }
+            }
+          ]
+        }
+      },
+      "RetentionDeadlinesPreviewRequestTypical": {
+        "summary": "Preview instance-wide retention deadline adjustment",
+        "dataValue": {
+          "target_grace_seconds": 604800,
+          "scope_id": null
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "scoped",
+              "class": "valid",
+              "op": "set",
+              "path": "/scope_id",
+              "value": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071"
+            },
+            {
+              "name": "unknown-field",
+              "class": "invalid",
+              "op": "set",
+              "path": "/extra",
+              "value": 1,
+              "expect": {
+                "instancePath": "",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "RetentionDeadlinesPreviewTypical": {
+        "summary": "Aggregate retention deadline preview response",
+        "dataValue": {
+          "current_policy_revision": "2",
+          "target_grace_seconds": 604800,
+          "scope_id": null,
+          "affected_revisions": "3",
+          "affected_bytes": "4096"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RetentionDeadlinesPreview",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-bytes",
+              "class": "invalid",
+              "op": "set",
+              "path": "/affected_bytes",
+              "value": "-1",
+              "expect": {
+                "instancePath": "/affected_bytes",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "RetentionDeadlinesApplyRequestTypical": {
+        "summary": "Audited retention deadline apply request",
+        "dataValue": {
+          "expected_policy_revision": "2",
+          "target_grace_seconds": 604800,
+          "scope_id": null,
+          "reason": "Align retained deadlines with updated seven-day policy"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RetentionDeadlinesApplyRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "missing-reason",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/reason",
+              "expect": {
+                "instancePath": "",
+                "keyword": "required"
+              }
+            }
+          ]
+        }
+      },
+      "RetentionDeadlinesApplyResultTypical": {
+        "summary": "Aggregate retention deadline apply response",
+        "dataValue": {
+          "policy_revision": "2",
+          "target_grace_seconds": 604800,
+          "scope_id": null,
+          "affected_revisions": "3",
+          "affected_bytes": "4096"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RetentionDeadlinesApplyResult",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-revisions",
+              "class": "invalid",
+              "op": "set",
+              "path": "/affected_revisions",
+              "value": "03",
+              "expect": {
+                "instancePath": "/affected_revisions",
+                "keyword": "pattern"
               }
             }
           ]

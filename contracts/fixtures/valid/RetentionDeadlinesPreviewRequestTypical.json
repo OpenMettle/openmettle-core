@@ -1,0 +1,16 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RetentionDeadlinesPreviewRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "scope_id": null,
+    "target_grace_seconds": 604800
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/RetentionDeadlinesPreviewRequest",
+  "source": "#/components/examples/RetentionDeadlinesPreviewRequestTypical"
+}

@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RetentionDeadlinesPreviewTypical--auto-missing-scope_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "affected_bytes": "4096",
+    "affected_revisions": "3",
+    "current_policy_revision": "2",
+    "target_grace_seconds": 604800
+  },
+  "mutation": {
+    "name": "auto-missing-scope_id",
+    "op": "remove",
+    "path": "/scope_id"
+  },
+  "schema": "#/components/schemas/RetentionDeadlinesPreview",
+  "source": "#/components/examples/RetentionDeadlinesPreviewTypical"
+}

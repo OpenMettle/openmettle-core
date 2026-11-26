@@ -12,6 +12,8 @@
     "display_name": "notes.txt",
     "media_type": "text/plain;charset=utf-8",
     "project_id": null,
+    "purge_after": null,
+    "retained_at": null,
     "revision": "1",
     "revision_id": "3b4c5d6e-7f80-4912-a3b4-c5d6e7f80912",
     "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",

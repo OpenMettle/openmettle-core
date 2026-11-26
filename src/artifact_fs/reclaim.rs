@@ -1,15 +1,7 @@
 //! A claim fences stale workers. A durable hard link pins the payload inode until the SQL
 //! credit commits. Detached anchors are retried independently of normal expiry scans.
-use super::*;
+use super::{FS_TX_IDLE_TIMEOUT, TX_FENCE_BUDGET as FS_FENCE_WINDOW, *};
 use std::{fs::File, time::Instant};
-
-/// Transaction-local idle timeout for transactions that span synchronous filesystem I/O so a
-/// strict session default cannot drop the PostgreSQL fencing locks early.
-const FS_TX_IDLE_TIMEOUT: &str = "SET LOCAL idle_in_transaction_session_timeout = '300s'";
-/// Monotonic deadline strictly shorter than `FS_TX_IDLE_TIMEOUT` (and the 300 s restore
-/// volume-phase lease): if synchronous filesystem I/O stalls past this window, abort before any
-/// subsequent destructive filesystem call so no mutation runs after the DB fence expires.
-const FS_FENCE_WINDOW: Duration = Duration::from_secs(240);
 
 async fn set_fs_tx_idle_timeout(tx: &mut WriteTransaction<'_>) -> Result<(), Error> {
     sqlx::query(FS_TX_IDLE_TIMEOUT)
@@ -784,7 +776,10 @@ pub async fn purge_journaled(
                FROM openmettle.deletion_journal j
                JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
                JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
-              WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL AND j.journal_seq > $1
+              WHERE j.event_kind = 'artifact_revision.purged'
+                AND r.state = 'purging'
+                AND sr.payload_ino IS NOT NULL
+                AND j.journal_seq > $1
               ORDER BY j.journal_seq
               LIMIT 100",
         )
