@@ -2,7 +2,7 @@
 use openmettle_core::{
     artifact_fs::{
         adoption::{self, Options},
-        rebind,
+        lost, rebind,
     },
     authz::{
         gateway::family,
@@ -552,14 +552,19 @@ async fn run() -> Result<(), &'static str> {
         return Ok(());
     }
     let rebinding = command.1.as_deref() == Some("rebind");
+    let declaring_lost = command.1.as_deref() == Some("declare-lost");
     if command.0.as_deref() != Some("storage")
-        || (command.1.as_deref() != Some("adopt") && !rebinding)
+        || (command.1.as_deref() != Some("adopt") && !rebinding && !declaring_lost)
     {
         return Err(
-            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID] | vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]",
+            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID] | storage declare-lost ROOT --revision UUID --operator-id UUID --request-key KEY --reason REASON | vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]",
         );
     }
     let root = args.next().ok_or("missing artifact directory")?;
+    if declaring_lost {
+        let parsed = parse_declare_lost_args(&args.collect::<Vec<_>>())?;
+        return declare_lost_payload(Path::new(&root), &parsed).await;
+    }
     if rebinding {
         let replace = match (args.next().as_deref(), args.next(), args.next()) {
             (None, ..) => None,
@@ -692,6 +697,99 @@ fn print_drift(report: &openmettle_core::artifact_fs::Drift) {
         report.quarantined,
         report.unsettled_payloads
     );
+}
+
+struct DeclareLostArgs {
+    revision: String,
+    operator_id: String,
+    request_key: String,
+    reason: String,
+}
+
+fn parse_declare_lost_args(args: &[String]) -> Result<DeclareLostArgs, &'static str> {
+    let usage = "usage: openmettle-admin storage declare-lost ROOT --revision UUID --operator-id UUID --request-key KEY --reason REASON";
+    let mut revision = None;
+    let mut operator_id = None;
+    let mut request_key = None;
+    let mut reason = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--revision" => {
+                if revision.is_some() {
+                    return Err("duplicate --revision");
+                }
+                i += 1;
+                revision = Some(args.get(i).ok_or("missing --revision value")?.clone());
+            }
+            "--operator-id" => {
+                if operator_id.is_some() {
+                    return Err("duplicate --operator-id");
+                }
+                i += 1;
+                operator_id = Some(args.get(i).ok_or("missing --operator-id value")?.clone());
+            }
+            "--request-key" => {
+                if request_key.is_some() {
+                    return Err("duplicate --request-key");
+                }
+                i += 1;
+                request_key = Some(args.get(i).ok_or("missing --request-key value")?.clone());
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err("duplicate --reason");
+                }
+                i += 1;
+                reason = Some(args.get(i).ok_or("missing --reason value")?.clone());
+            }
+            _ => return Err("unknown declare-lost option"),
+        }
+        i += 1;
+    }
+    Ok(DeclareLostArgs {
+        revision: revision.ok_or(usage)?,
+        operator_id: operator_id.ok_or(usage)?,
+        request_key: request_key.ok_or(usage)?,
+        reason: reason.ok_or(usage)?,
+    })
+}
+
+async fn declare_lost_payload(root: &Path, parsed: &DeclareLostArgs) -> Result<(), &'static str> {
+    let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+        .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+    let mut c = PgConnection::connect(&url)
+        .await
+        .map_err(|_| "owner connection failed")?;
+    let outcome = lost::declare_lost(
+        &mut c,
+        &lost::Options {
+            root,
+            revision: &parsed.revision,
+            operator_id: &parsed.operator_id,
+            request_key: &parsed.request_key,
+            reason: &parsed.reason,
+        },
+    )
+    .await
+    .map_err(|failure| {
+        eprintln!("storage declare-lost: {}", failure.0);
+        "storage declare-lost refused"
+    })?;
+    let verb = if outcome.applied {
+        "applied"
+    } else {
+        "replayed"
+    };
+    println!(
+        "{verb} storage.declare_payload_lost revision={} reservation={} previous_state={} journal_seq={} unlinked={}",
+        outcome.revision_id,
+        outcome.reservation_id,
+        outcome.previous_state,
+        outcome.journal_seq,
+        outcome.unlinked_files
+    );
+    Ok(())
 }
 
 struct VaultRotateArgs {
@@ -844,7 +942,7 @@ async fn vault_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stati
 
 #[cfg(test)]
 mod tests {
-    use super::parse_restore_lock_args;
+    use super::{parse_declare_lost_args, parse_restore_lock_args};
     use openmettle_core::restore::GENESIS;
 
     fn vecs(items: &[&str]) -> Vec<String> {
@@ -914,5 +1012,34 @@ mod tests {
         let parsed = parse_restore_lock_args(&neither).unwrap();
         assert_eq!(parsed.lifecycle_origin_us, None);
         assert_eq!(parsed.lifecycle_baseline_digest, None);
+    }
+
+    #[test]
+    fn declare_lost_requires_all_four_audited_flags() {
+        let valid = vecs(&[
+            "--revision",
+            "11111111-1111-4111-8111-111111111111",
+            "--operator-id",
+            "22222222-2222-4222-8222-222222222222",
+            "--request-key",
+            "lost-req-1",
+            "--reason",
+            "unrecoverable disk corruption after restore",
+        ]);
+        let parsed = parse_declare_lost_args(&valid).unwrap();
+        assert_eq!(parsed.revision, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(parsed.operator_id, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(parsed.request_key, "lost-req-1");
+        assert_eq!(parsed.reason, "unrecoverable disk corruption after restore");
+
+        assert!(parse_declare_lost_args(&valid[..6]).is_err());
+        assert_eq!(
+            parse_declare_lost_args(&vecs(&["--unknown", "x"])).err(),
+            Some("unknown declare-lost option")
+        );
+        assert_eq!(
+            parse_declare_lost_args(&vecs(&["--revision", "a", "--revision", "b"])).err(),
+            Some("duplicate --revision")
+        );
     }
 }

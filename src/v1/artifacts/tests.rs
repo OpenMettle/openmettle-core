@@ -176,6 +176,7 @@ fn revisions_serialize_without_internal_identifiers() {
         created_us: 1_763_370_000_000_001,
         retained_us: None,
         purge_after_us: None,
+        lost_us: None,
     };
     let body = revision_json(&revision).unwrap();
     assert_eq!(
@@ -195,9 +196,18 @@ fn revisions_serialize_without_internal_identifiers() {
             "created_at": "2025-11-17T09:00:00.000001Z",
             "retained_at": null,
             "purge_after": null,
+            "lost_at": null,
         })
     );
     assert!(!body.to_string().contains("CANARY"));
+
+    let mut lost = revision;
+    lost.state = "lost".into();
+    lost.lost_us = Some(1_763_370_060_000_000);
+    let lost_body = revision_json(&lost).unwrap();
+    assert_eq!(lost_body["state"], "lost");
+    assert_eq!(lost_body["lost_at"], "2025-11-17T09:01:00.000000Z");
+    assert!(!lost_body.to_string().contains("CANARY"));
 }
 
 #[test]
@@ -232,12 +242,14 @@ fn upload_failures_map_to_adr_0007_categories() {
         RANGE,
         IN_PROGRESS,
         NOT_SERVABLE,
+        PAYLOAD_LOST,
         QUOTA,
         UNSATISFIABLE,
     ] {
         let expected = match problem.code {
             "validation" => 400,
             "conflict" => 409,
+            "payload_lost" => 410,
             "range_not_satisfiable" => 416,
             "quota" => 429,
             other => panic!("unexpected code {other}"),

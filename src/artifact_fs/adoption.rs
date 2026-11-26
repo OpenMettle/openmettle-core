@@ -206,6 +206,24 @@ impl Evidence {
         {
             return Ok(());
         }
+        if rev == Some("lost") {
+            let reclaim_name = format!(".reclaim.{id}");
+            let purge_name = format!(".purge.{id}");
+            let any_present = [
+                (&v.staging, id),
+                (&v.staging, reclaim_name.as_str()),
+                (&v.revisions, id),
+                (&v.revisions, purge_name.as_str()),
+            ]
+            .into_iter()
+            .try_fold(false, |found, (dir, name)| {
+                Ok::<_, Failure>(found || v.inode(dir, name)?.is_some())
+            })?;
+            if bound.is_some() || any_present {
+                return Err(Failure("unexpected payload"));
+            }
+            return Ok(());
+        }
         let reclaim_name = format!(".reclaim.{id}");
         let purge_name = format!(".purge.{id}");
         // Retired identities stop participating as soon as the last anchor is detached.

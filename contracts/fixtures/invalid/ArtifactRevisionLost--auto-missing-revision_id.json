@@ -1,0 +1,34 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ArtifactRevisionLost--auto-missing-revision_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "artifact_id": "a2c3ef73-c084-4d12-8d5f-60718293a4b5",
+    "created_at": "2026-11-20T09:00:00.000000Z",
+    "display_name": "notes.txt",
+    "lost_at": "2026-11-22T10:15:00.000000Z",
+    "media_type": "text/plain;charset=utf-8",
+    "project_id": null,
+    "purge_after": null,
+    "retained_at": null,
+    "revision": "1",
+    "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+    "scope_kind": "personal",
+    "sha256": "09ca7e4eaa6e8ae9c7d261167129184883644d07dfba7cbfbc4c8a2e08360d5b",
+    "size_bytes": "12",
+    "state": "lost"
+  },
+  "mutation": {
+    "name": "auto-missing-revision_id",
+    "op": "remove",
+    "path": "/revision_id"
+  },
+  "schema": "#/components/schemas/ArtifactRevision",
+  "source": "#/components/examples/ArtifactRevisionLost"
+}

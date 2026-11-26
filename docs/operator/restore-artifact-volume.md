@@ -155,6 +155,54 @@ If rebind is killed, the barrier stays set. Read `adoption_run_id` as above and 
 
 `storage adopt` accepts the same value. An adoption that is refused or fails verification hands the barrier back as it found it, so a failed adoption cannot open a volume that an incomplete rebind closed. An adoption that succeeds clears the barrier, as it always has.
 
+## Declaring an unrecoverable payload lost
+
+If `storage rebind` fails on one or more settled revisions (`missing revision`, `size_or_digest_mismatch`, `intra_reservation_inode_mismatch`, `cannot read revision digest`, or broken anchor layout) and no intact copy exists in any backup from the recovery point, use the separate owner-only `storage declare-lost` command instead of hand-editing PostgreSQL. `storage rebind` itself stays strictly non-destructive on settled revisions.
+
+### When NOT to use `storage declare-lost`
+
+- **Do not use it if an intact copy can be restored from another backup.** Declaring a payload lost is permanent: it unlinks any corrupt leftover bytes, transitions the revision to `lost`, and records an append-only `artifact_revision.lost` entry in `openmettle.deletion_journal`.
+- **Do not use it before replaying the deletion journal.** If the restore gate is closed and `deletion_journal_head.journal_seq < restore_reconciliation_gate.required_journal_seq`, `storage declare-lost` refuses the request. Replay the journal first: the missing revision may have been legitimately purged after the backup.
+- **Do not use it on a live open volume.** The command refuses when `storage_volume_control.adoption_run_id IS NULL` and `restore_reconciliation_gate.open = true`.
+- **Do not use it on an intact payload or an already-truncated `purging` payload.** The command verifies the reservation's files on disk and refuses any payload that `storage rebind` already accepts, as well as any file with a foreign hard link or an active lock.
+
+### Procedure
+
+1. Identify the failing `artifact_revisions.id` from the reservation ID reported by `storage rebind`:
+
+   ```sql
+   SELECT id AS revision_id, artifact_id, scope_id, state, size_bytes, encode(content_digest, 'hex') AS sha256
+     FROM openmettle.artifact_revisions
+    WHERE reservation_id = '<RESERVATION_UUID>'::uuid;
+   ```
+
+2. Run `storage declare-lost` as `openmettle_owner` with a unique `--request-key` (idempotent on exact retry) and an audited `--reason`:
+
+   ```sh
+   openmettle-admin storage declare-lost "$ARTIFACT_ROOT" \
+     --revision "$REVISION_ID" \
+     --operator-id "$OPERATOR_ID" \
+     --request-key "restore-2026-11-26-rev-${REVISION_ID}" \
+     --reason "Payload missing from all recovery copies after disk failure"
+   ```
+
+   A successful run prints `applied storage.declare_payload_lost ...` (or `replayed ...` on an exact retry). In one `READ COMMITTED` transaction it removes any operator retention hold, clears `storage_reservations.payload_ino`, decrements `active_bytes` or `retained_bytes` once, marks the revision `state = 'lost'` with `lost_at`, records `storage.declare_payload_lost` in `openmettle.authorization_audit`, appends `artifact_revision.lost` to `openmettle.deletion_journal`, and unlinks any corrupt leftover files under that reservation's names.
+
+3. Resume rebind using the latest barrier UUID reported by the previous `storage rebind` run:
+
+   ```sh
+   openmettle-admin storage rebind "$ARTIFACT_ROOT" --replace-adoption-run "$ADOPTION_RUN_ID"
+   ```
+
+4. If `restore_reconciliation_gate` is closed, re-run `openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"` with the same journal export file. The restore verifier validates the post-replay `artifact_revision.lost` tail against the active `restore_run_id` audit entries, runs drift verification (`file mismatches 0`, `storage mismatches 0`), and opens the gate.
+
+5. After services start, export a fresh deletion journal (`openmettle-admin journal export`) so the `artifact_revision.lost` entry is preserved for future restores. Replaying that export onto an older backup automatically transitions the revision to `lost`, releases its accounted bytes, and cleans its obsolete file.
+
+### Audit and owner visibility
+
+- Operators can inspect declarations in `openmettle.authorization_audit` (`action = 'storage.declare_payload_lost'`, `target_kind = 'artifact_revision'`, `target_id = revision_id`).
+- Artifact owners and authorized readers see `"state": "lost"` and `"lost_at"` on `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}`, and receive `410 Gone` (`code: "payload_lost"`) on `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}/content` (unauthorized callers still receive `404 not_found`). Existing conversation history continues to load without failing, and attaching a `lost` revision to a new message or mutating it via revision delete/restore is refused.
+
 ## Start-up check
 
 The API and worker compare up to 16 live settled payloads with the ledger before they do any artifact work. When a published file has another inode number than the ledger, start-up exits with status 78 and says what to do:
@@ -177,7 +225,6 @@ The check never refuses a healthy volume. It is a backstop, not the control that
 
 ## Known gaps
 
-- **A payload that cannot be recovered keeps the volume closed.** If a settled payload is lost or damaged in every copy, rebind cannot complete until the owner resolves that reservation by hand. A supported step to declare a payload lost does not exist yet.
 - **A quarantined reservation stays quarantined.** Rebind does not verify or rebind it, and nothing supported clears a quarantine on a copied volume. It does not keep the volume closed; the owner resolves it by hand, as before the backup.
 - **A process that got past the start-up check before rebind can cause damage that rebind does not undo.** A worker quarantines unsettled uploads whose files changed and claims due revisions for purge. You see `worker.sweep.failed`, reads answering 500 and a non-zero `quarantined` count. The supported recovery is to stop every service, restore the matched database and volume again, and restart the restore checklist at its first step.
 - **Exercised copy tools:** `cp -a`, GNU `tar` 1.34 and restic 0.14 on Linux, on a local filesystem. Velero file backup, NFS volumes, CSI snapshots and a real cluster restore have not been tested.

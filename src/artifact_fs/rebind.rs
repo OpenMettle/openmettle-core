@@ -17,6 +17,7 @@ use std::{
     fs::{File, TryLockError},
     os::unix::fs::MetadataExt,
     path::Path,
+    time::Instant,
 };
 
 pub struct Options<'a> {
@@ -113,43 +114,71 @@ fn identity(row: &PgRow) -> Identity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Entry {
-    ino: u64,
-    len: u64,
-    links: u64,
+pub(super) struct Entry {
+    pub ino: u64,
+    pub len: u64,
+    pub links: u64,
 }
 
 /// The four names one reservation can own.
 #[derive(Clone, Copy, Debug, Default)]
-struct Names {
-    staging: Option<Entry>,
-    reclaim: Option<Entry>,
-    revision: Option<Entry>,
-    purge: Option<Entry>,
+pub(super) struct Names {
+    pub staging: Option<Entry>,
+    pub reclaim: Option<Entry>,
+    pub revision: Option<Entry>,
+    pub purge: Option<Entry>,
 }
 
-struct Ledger<'a> {
-    state: &'a str,
-    reclaim: &'a str,
-    revision: Option<&'a str>,
-    purge: Option<&'a str>,
+pub(super) struct Ledger<'a> {
+    pub state: &'a str,
+    pub reclaim: &'a str,
+    pub revision: Option<&'a str>,
+    pub purge: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Plan {
+pub(super) enum Plan {
     /// The lifecycle state owns no file and none is present.
     Skip,
     /// Accept the published payload once its size and SHA-256 match the ledger.
     Content(u64),
     /// Accept an empty file. `truncate` first discards an unsettled upload's bytes.
     Empty { ino: u64, truncate: bool },
+    /// A lost revision still has leftover reservation files on disk with no foreign hard links.
+    Cleanup,
+}
+
+/// Returns `true` if any present inode among a reservation's four names has links outside
+/// those four names (including cross-reservation inode aliases or external hard links).
+pub(super) fn has_foreign_hard_link(entries: &[Option<Entry>; 4]) -> bool {
+    for entry in entries.iter().flatten() {
+        let own = entries
+            .iter()
+            .flatten()
+            .filter(|other| other.ino == entry.ino)
+            .count() as u64;
+        if entry.links != own {
+            return true;
+        }
+    }
+    false
 }
 
 /// Decide what a bound, unquarantined reservation needs, from its lifecycle state and every
 /// name found on disk. The layouts accepted here are the ones the drift check accepts, with
 /// one difference: no inode number is compared with the ledger, because a copy can keep one
 /// by chance. An error leaves the reservation untouched.
-fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
+pub(super) fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
+    let all = [n.staging, n.reclaim, n.revision, n.purge];
+    if l.state == "settled" && l.revision == Some("lost") {
+        if all.iter().all(Option::is_none) {
+            return Ok(Plan::Skip);
+        }
+        if has_foreign_hard_link(&all) {
+            return Err("foreign hard link");
+        }
+        return Ok(Plan::Cleanup);
+    }
     let reclaim_allowed = matches!(
         (l.state, l.reclaim),
         ("reserved", "claiming" | "truncated") | ("released", "anchor_pending_unlink")
@@ -230,6 +259,16 @@ fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
 /// bytes under its staging name, which the reconciler quarantines when the reservation
 /// expires (`reclaim::release`). Every other name is one the drift check rejects.
 fn classify_unbound(l: &Ledger<'_>, n: &Names) -> Result<bool, &'static str> {
+    if l.state == "settled" && l.revision == Some("lost") {
+        let all = [n.staging, n.reclaim, n.revision, n.purge];
+        if all.iter().all(Option::is_none) {
+            return Ok(false);
+        }
+        if has_foreign_hard_link(&all) {
+            return Err("foreign hard link");
+        }
+        return Ok(false);
+    }
     if n.reclaim.is_some() {
         return Err("unexpected reclaim anchor");
     }
@@ -254,7 +293,134 @@ enum Evidence {
 }
 
 /// One reservation's four names, as `(in revisions, name)`.
-type OwnedNames = [(bool, String); 4];
+pub(super) type OwnedNames = [(bool, String); 4];
+
+pub(super) fn reservation_names(id: &str) -> OwnedNames {
+    [
+        (false, id.to_owned()),
+        (false, format!(".reclaim.{id}")),
+        (true, id.to_owned()),
+        (true, format!(".purge.{id}")),
+    ]
+}
+
+/// Stat all four names of a reservation. `Ok(None)` means at least one name is not a regular
+/// file on this volume.
+pub(super) fn stat_reservation(
+    v: &Volume,
+    names: &OwnedNames,
+) -> Result<Option<[Option<Entry>; 4]>, Failure> {
+    let mut entries = [None; 4];
+    for (slot, (revisions, name)) in names.iter().enumerate() {
+        match v.stat(directory(v, *revisions), name) {
+            Ok(Some(stat)) => entries[slot] = Some(entry(&stat)),
+            Ok(None) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(entries))
+}
+
+/// Open and exclusively `flock` every unique regular inode present among a reservation's four
+/// names, verifying each name still maps to its stat'd inode and optionally checking that no
+/// foreign hard links exist outside those four names.
+pub(super) fn lock_reservation_files(
+    v: &Volume,
+    names: &OwnedNames,
+    entries: &[Option<Entry>; 4],
+    check_links: bool,
+) -> Result<Vec<(u64, File)>, Failure> {
+    let mut own_links: HashMap<u64, u64> = HashMap::new();
+    let mut unique_slots: Vec<(u64, usize)> = Vec::new();
+    for (slot, maybe) in entries.iter().enumerate() {
+        let Some(e) = maybe else { continue };
+        let count = own_links.entry(e.ino).or_insert(0);
+        if *count == 0 {
+            unique_slots.push((e.ino, slot));
+        }
+        *count += 1;
+    }
+    let mut locked = Vec::with_capacity(unique_slots.len());
+    for (ino, slot) in unique_slots {
+        let (revisions, name) = &names[slot];
+        let file = match v.regular(directory(v, *revisions), name, true) {
+            Ok(file) => file,
+            Err(e) if file_specific(&e) => return Err(Failure(INACCESSIBLE)),
+            Err(e) => return Err(e.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(Failure("reservation in use")),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let meta = file.metadata()?;
+        if meta.ino() != ino || meta.dev() != v.dev {
+            return Err(Failure(CHANGED));
+        }
+        locked.push((ino, file));
+    }
+    for ((revisions, name), expected) in names.iter().zip(entries.iter()) {
+        if v.inode(directory(v, *revisions), name)? != expected.map(|e| e.ino) {
+            return Err(Failure(CHANGED));
+        }
+    }
+    if check_links {
+        for (ino, file) in &locked {
+            let nlink = file.metadata()?.nlink();
+            let own = own_links[ino];
+            if nlink > own {
+                return Err(Failure("foreign hard link"));
+            }
+            if nlink < own {
+                return Err(Failure(CHANGED));
+            }
+        }
+    }
+    Ok(locked)
+}
+
+/// Unlink every present name among a reservation's four names and `fsync` each touched
+/// directory. Call only while holding the exclusive locks from [`lock_reservation_files`].
+pub(super) fn unlink_reservation_files(
+    v: &Volume,
+    names: &OwnedNames,
+    entries: &[Option<Entry>; 4],
+    deadline: Option<Instant>,
+) -> Result<usize, Failure> {
+    let mut unlinked = 0;
+    let mut touched_staging = false;
+    let mut touched_revisions = false;
+    for ((revisions, name), entry) in names.iter().zip(entries.iter()) {
+        let Some(e) = entry else { continue };
+        let dir = directory(v, *revisions);
+        if let Some(deadline) = deadline {
+            v.unlink_before(dir, name, e.ino, deadline)?;
+        } else {
+            v.unlink(dir, name, e.ino)?;
+        }
+        if *revisions {
+            touched_revisions = true;
+        } else {
+            touched_staging = true;
+        }
+        unlinked += 1;
+    }
+    if touched_staging {
+        at::fsync(&v.staging)?;
+    }
+    if touched_revisions {
+        at::fsync(&v.revisions)?;
+    }
+    Ok(unlinked)
+}
+
+/// A lost revision that still has leftover files on disk or a stale recorded `payload_ino`.
+struct LostCleanup {
+    id: String,
+    bound: Option<u64>,
+    names: OwnedNames,
+    entries: [Option<Entry>; 4],
+}
 
 /// A reservation whose file the scan accepted. No descriptor is kept between the scan and
 /// the apply: each step reopens the file and requires it unchanged.
@@ -272,7 +438,7 @@ struct Binding {
     evidence: Evidence,
 }
 
-fn directory(v: &Volume, revisions: bool) -> &File {
+pub(super) fn directory(v: &Volume, revisions: bool) -> &File {
     if revisions { &v.revisions } else { &v.staging }
 }
 
@@ -342,6 +508,7 @@ impl Binding {
 struct Scan {
     digests: RevisionDigests,
     bindings: Vec<Binding>,
+    lost_cleanups: Vec<LostCleanup>,
     report: Report,
 }
 
@@ -381,6 +548,36 @@ impl Scan {
             revision,
             purge,
         };
+        if ledger.state == "settled" && ledger.revision == Some("lost") {
+            let bound = bound
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| Failure("invalid inode"))?;
+            if entries.iter().all(Option::is_none) && bound.is_none() {
+                return Ok(());
+            }
+            if has_foreign_hard_link(&entries) {
+                fail("foreign hard link");
+                return Ok(());
+            }
+            // Verify every present file can be opened and exclusively locked without foreign links.
+            if let Err(err) = lock_reservation_files(v, &observed.names, &entries, true) {
+                match err.0 {
+                    INACCESSIBLE | "foreign hard link" => {
+                        fail(err.0);
+                        return Ok(());
+                    }
+                    _ => return Err(err),
+                }
+            }
+            self.lost_cleanups.push(LostCleanup {
+                id: id.to_owned(),
+                bound,
+                names: observed.names,
+                entries,
+            });
+            return Ok(());
+        }
         // Binding a reservation that never had an inode is adoption's decision. Its layout
         // is still validated, and its file is never touched.
         let Some(bound) = bound else {
@@ -398,7 +595,7 @@ impl Scan {
                 fail(reason);
                 return Ok(());
             }
-            Ok(Plan::Skip) => return Ok(()),
+            Ok(Plan::Skip | Plan::Cleanup) => return Ok(()),
             // The published name is index 2 of the reservation's names.
             Ok(Plan::Content(ino)) => (
                 ino,
@@ -470,12 +667,7 @@ fn observe(v: &Volume, rows: &[PgRow]) -> Result<(Vec<Observed>, HashSet<String>
     let mut observed = Vec::with_capacity(rows.len());
     for row in rows {
         let id: &str = row.try_get("id")?;
-        let names = [
-            (false, id.to_owned()),
-            (false, format!(".reclaim.{id}")),
-            (true, id.to_owned()),
-            (true, format!(".purge.{id}")),
-        ];
+        let names = reservation_names(id);
         let mut entries = Some([None; 4]);
         for (slot, (revisions, name)) in names.iter().enumerate() {
             match v.stat(directory(v, *revisions), name) {
@@ -622,9 +814,41 @@ async fn scan_and_apply(
         }
         bound.push(b);
     }
+    let mut cleared_lost = Vec::with_capacity(scan.lost_cleanups.len());
+    for lost in &scan.lost_cleanups {
+        let locked = match lock_reservation_files(v, &lost.names, &lost.entries, true) {
+            Ok(locked) => locked,
+            Err(Failure(reason @ (INACCESSIBLE | "foreign hard link"))) => {
+                report.failures.push((lost.id.clone(), reason));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if lost.entries.iter().any(Option::is_some) {
+            *modified = true;
+            unlink_reservation_files(v, &lost.names, &lost.entries, None)?;
+        }
+        drop(locked);
+        cleared_lost.push(lost);
+    }
     // The directory entries behind every recorded inode are durable before the commit.
     for dir in [&v.root, &v.staging, &v.revisions] {
         at::fsync(dir)?;
+    }
+    for lost in cleared_lost {
+        if let Some(prev) = lost.bound {
+            let updated = sqlx::query(
+                "UPDATE openmettle.storage_reservations SET payload_ino=NULL,publish_pending=false
+                 WHERE id=$1::uuid AND payload_ino=$2::text::numeric AND NOT adoption_unverified",
+            )
+            .bind(&lost.id)
+            .bind(prev.to_string())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(Failure("ledger changed during rebind"));
+            }
+        }
     }
     for b in bound {
         if b.ino == b.bound {
@@ -932,6 +1156,23 @@ mod tests {
             classify_unbound(&settled, &published),
             Err("reservation has no recorded inode")
         );
+        let lost = ledger("settled", "none", Some("lost"), Some("none"));
+        assert_eq!(classify(&lost, &NONE), Ok(Plan::Skip));
+        assert_eq!(classify(&lost, &published), Ok(Plan::Cleanup));
+        assert_eq!(classify_unbound(&lost, &NONE), Ok(false));
+        assert_eq!(classify_unbound(&lost, &published), Ok(false));
+        let linked = Names {
+            staging: entry(40, 9, 2),
+            revision: entry(40, 9, 2),
+            ..NONE
+        };
+        assert_eq!(classify(&lost, &linked), Ok(Plan::Cleanup));
+        let foreign = Names {
+            revision: entry(40, 9, 2),
+            ..NONE
+        };
+        assert_eq!(classify(&lost, &foreign), Err("foreign hard link"));
+        assert_eq!(classify_unbound(&lost, &foreign), Err("foreign hard link"));
     }
 
     /// A published, unsettled upload as the scan saw it: two names, one file.

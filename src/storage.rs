@@ -255,7 +255,7 @@ pub struct Revision {
     pub content_digest: Vec<u8>,
     pub media_type: String,
     pub display_name: Option<String>,
-    /// `active`, `retained`, `purging` or `purged`.
+    /// `active`, `retained`, `purging`, `purged` or `lost`.
     pub state: String,
     /// Creation time in Unix microseconds.
     pub created_us: i64,
@@ -263,6 +263,8 @@ pub struct Revision {
     pub retained_us: Option<i64>,
     /// Earliest purge deadline in Unix microseconds, or `None` while `active`.
     pub purge_after_us: Option<i64>,
+    /// Time the payload was declared permanently lost after a restore, or `None`.
+    pub lost_us: Option<i64>,
 }
 
 /// Reads revision `revision_id` of `artifact_id`, or `None` when it does not exist or belongs
@@ -301,7 +303,8 @@ async fn read_revision_locked(
                 r.display_name, r.state,
                 (extract(epoch FROM r.created_at) * 1000000)::bigint,
                 (extract(epoch FROM r.retained_at) * 1000000)::bigint,
-                (extract(epoch FROM r.purge_after) * 1000000)::bigint
+                (extract(epoch FROM r.purge_after) * 1000000)::bigint,
+                (extract(epoch FROM r.lost_at) * 1000000)::bigint
            FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
           WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid
             FOR SHARE OF r"
@@ -311,7 +314,8 @@ async fn read_revision_locked(
                 r.display_name, r.state,
                 (extract(epoch FROM r.created_at) * 1000000)::bigint,
                 (extract(epoch FROM r.retained_at) * 1000000)::bigint,
-                (extract(epoch FROM r.purge_after) * 1000000)::bigint
+                (extract(epoch FROM r.purge_after) * 1000000)::bigint,
+                (extract(epoch FROM r.lost_at) * 1000000)::bigint
            FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
           WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid"
     };
@@ -338,6 +342,7 @@ async fn read_revision_locked(
         created_us: row.try_get(11)?,
         retained_us: row.try_get(12)?,
         purge_after_us: row.try_get(13)?,
+        lost_us: row.try_get(14)?,
     }))
 }
 

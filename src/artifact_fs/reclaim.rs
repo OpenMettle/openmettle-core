@@ -1104,3 +1104,127 @@ pub async fn scrub_unsettled_on_restore(
     at::fsync(&v.staging)?;
     Ok(scrubbed)
 }
+
+/// Remove any leftover reservation files on disk for revisions already marked `'lost'` (for
+/// example after replaying an `artifact_revision.lost` journal entry onto an older backup whose
+/// artifact volume still holds the old bytes). Fenced by `restore_assert_volume_phase` and
+/// `storage_volume_control FOR SHARE`; refuses foreign hard links and active locks.
+pub async fn cleanup_lost_on_restore(
+    pool: &PgPool,
+    store: &Store,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<u64, Error> {
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Err(Error::Io);
+    };
+    let v = &store.volume;
+    v.verify(&pin)?;
+
+    let mut cleaned = 0u64;
+    let mut cursor: Option<String> = None;
+    loop {
+        renew_volume_phase(pool, restore_run_id, claim_token).await?;
+        let batch: Vec<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT s.id::text, s.scope_id::text, r.id::text, s.payload_ino IS NOT NULL
+               FROM openmettle.storage_reservations s
+               JOIN openmettle.artifact_revisions r
+                 ON r.scope_id = s.scope_id AND r.reservation_id = s.id
+              WHERE s.state = 'settled'
+                AND r.state = 'lost'
+                AND ($1::uuid IS NULL OR s.id > $1::uuid)
+              ORDER BY s.id ASC
+              LIMIT $2",
+        )
+        .bind(&cursor)
+        .bind(MAX_BATCH)
+        .fetch_all(pool)
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        for (res_id, scope_id, rev_id, has_ino) in batch {
+            cursor = Some(res_id.clone());
+            let names = super::rebind::reservation_names(&res_id);
+            let entries = super::rebind::stat_reservation(v, &names)
+                .map_err(|_| Error::Io)?
+                .ok_or(Error::Io)?;
+            let has_files = entries.iter().any(Option::is_some);
+            if !has_files && !has_ino {
+                continue;
+            }
+            let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+            set_fs_tx_idle_timeout(&mut tx).await?;
+            let locked_row: Option<(bool,)> = sqlx::query_as(
+                "SELECT s.payload_ino IS NOT NULL
+                   FROM openmettle.storage_reservations s
+                  WHERE s.scope_id = $1::uuid AND s.id = $2::uuid AND s.state = 'settled'
+                    FOR UPDATE",
+            )
+            .bind(&scope_id)
+            .bind(&res_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            let Some((still_has_ino,)) = locked_row else {
+                return Err(Error::Io);
+            };
+            let rev_lost: Option<bool> = sqlx::query_scalar(
+                "SELECT state = 'lost'
+                   FROM openmettle.artifact_revisions
+                  WHERE scope_id = $1::uuid AND id = $2::uuid
+                    FOR UPDATE",
+            )
+            .bind(&scope_id)
+            .bind(&rev_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            if rev_lost != Some(true) {
+                return Err(Error::Io);
+            }
+            assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
+            let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+            lock_pin(&mut tx, &pin).await?;
+            check_fence(fence_deadline)?;
+            v.verify(&pin)?;
+
+            let entries = super::rebind::stat_reservation(v, &names)
+                .map_err(|_| Error::Io)?
+                .ok_or(Error::Io)?;
+            let locked_files = super::rebind::lock_reservation_files(v, &names, &entries, true)
+                .map_err(|err| {
+                    if err.0 == "reservation in use" {
+                        Error::InProgress
+                    } else {
+                        Error::Io
+                    }
+                })?;
+            let unlinked = if entries.iter().any(Option::is_some) {
+                super::rebind::unlink_reservation_files(v, &names, &entries, Some(fence_deadline))
+                    .map_err(|_| Error::Io)?
+            } else {
+                0
+            };
+            drop(locked_files);
+            if still_has_ino {
+                sqlx::query(
+                    "UPDATE openmettle.storage_reservations
+                        SET payload_ino = NULL, adoption_unverified = false
+                      WHERE scope_id = $1::uuid AND id = $2::uuid",
+                )
+                .bind(&scope_id)
+                .bind(&res_id)
+                .execute(tx.connection()?)
+                .await?;
+            }
+            tx.commit().await?;
+            if unlinked > 0 || still_has_ino {
+                cleaned += 1;
+            }
+        }
+    }
+    renew_volume_phase(pool, restore_run_id, claim_token).await?;
+    v.verify(&pin)?;
+    at::fsync(&v.revisions)?;
+    at::fsync(&v.staging)?;
+    Ok(cleaned)
+}

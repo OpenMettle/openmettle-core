@@ -1690,6 +1690,7 @@ async fn artifact_revision_lifecycle(
                         rev.retained_us = rec_details.get("retained_us").and_then(Value::as_i64);
                         rev.purge_after_us =
                             rec_details.get("purge_after_us").and_then(Value::as_i64);
+                        rev.lost_us = None;
                     }
                     return Ok(rev);
                 }

@@ -777,6 +777,7 @@ impl Export {
                             "artifact_revision.retained"
                                 | "artifact_revision.deadline_adjusted"
                                 | "artifact_revision.restored"
+                                | "artifact_revision.lost"
                         )
                     {
                         return Err(Error::Export("unknown event kind"));
@@ -817,6 +818,18 @@ impl Export {
                                 || retained_us.is_some()
                             {
                                 return Err(Error::Export("malformed line"));
+                            }
+                        }
+                        "artifact_revision.lost" => {
+                            if purged_us.is_none()
+                                || (retained_us.is_none() != original_purge_after_us.is_none())
+                            {
+                                return Err(Error::Export("malformed line"));
+                            }
+                            if let (Some(a), Some(r)) = (original_purge_after_us, retained_us)
+                                && a < r
+                            {
+                                return Err(Error::Export("malformed number"));
                             }
                         }
                         "external_connection.disconnected"
@@ -1339,6 +1352,15 @@ async fn finish_claimed(
                 err.into()
             });
         }
+        if let Err(err) =
+            artifact_fs::cleanup_lost_on_restore(pool, store, restore_run_id, claim_token).await
+        {
+            return Err(if store.awaits_rebind() {
+                Error::RebindRequired
+            } else {
+                err.into()
+            });
+        }
     }
     // Hold `storage_volume_control FOR SHARE` continuously on Connection 1 across drift
     // verification and until Connection 2 (`open_tx`) has executed `restore_gate_open` (which
@@ -1791,6 +1813,55 @@ mod tests {
         assert!(matches!(
             Export::parse(&missing_conn_gen),
             Err(Error::Export("malformed line"))
+        ));
+
+        // Schema-44 artifact_revision.lost records parse cleanly (both active-when-lost with
+        // null retained/purge_after and retained/purging-when-lost with retained <= purge_after)
+        // and refuse missing lost_at (`purged_us`), unpaired retained/purge_after, or bad order.
+        let valid_lost = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             1 10 artifact_revision.lost {entity} {scope} - 10 {d} - {d} -\n\
+             2 20 artifact_revision.lost {entity2} {scope} 100 20 {d} 1 {d} 50\n\
+             watermark 1 2 {d} 21\n"
+        ));
+        let parsed_lost = Export::parse(&valid_lost).unwrap();
+        assert_eq!(parsed_lost.records.len(), 2);
+        assert_eq!(parsed_lost.records[0].event_kind, "artifact_revision.lost");
+        assert_eq!(parsed_lost.records[0].purged_us, Some(10));
+        assert_eq!(parsed_lost.records[0].retained_us, None);
+        assert_eq!(parsed_lost.records[0].original_purge_after_us, None);
+        assert_eq!(parsed_lost.records[1].purged_us, Some(20));
+        assert_eq!(parsed_lost.records[1].retained_us, Some(50));
+        assert_eq!(parsed_lost.records[1].original_purge_after_us, Some(100));
+
+        let missing_lost_at = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             1 10 artifact_revision.lost {entity} {scope} - - {d} - {d} -\n\
+             watermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&missing_lost_at),
+            Err(Error::Export("malformed line"))
+        ));
+
+        let unpaired_lost_retained = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             1 10 artifact_revision.lost {entity} {scope} 100 10 {d} - {d} -\n\
+             watermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&unpaired_lost_retained),
+            Err(Error::Export("malformed line"))
+        ));
+
+        let bad_lost_order = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             1 10 artifact_revision.lost {entity} {scope} 40 10 {d} - {d} 50\n\
+             watermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&bad_lost_order),
+            Err(Error::Export("malformed number"))
         ));
     }
 }
