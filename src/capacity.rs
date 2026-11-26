@@ -93,6 +93,15 @@ fn ids(values: &[&str]) -> Result<(), Error> {
         .ok_or(Error::Invalid)
 }
 
+/// Locale-independent capacity profile/model name check matching `openmettle.capacity_valid_name`:
+/// 1..=128 UTF-8 bytes, no leading or trailing Unicode whitespace (`str::trim()`), and no C0/C1
+/// control characters (`char::is_control`).
+pub(crate) fn valid_capacity_name(value: &str) -> bool {
+    crate::runs::bounded(value, 128)
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 fn lease_ms(lease: Duration) -> Result<i32, Error> {
     i32::try_from(lease.as_millis()).map_err(|_| Error::Invalid)
 }
@@ -399,10 +408,12 @@ async fn grant_inner(
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
     ids(&[request.scope_id, request.run_id, request.claim_token])?;
-    if request
-        .footprint
-        .iter()
-        .any(|d| !is_canonical_uuid(&d.device_id))
+    if !crate::runs::bounded(request.request_key, 128)
+        || !valid_capacity_name(request.profile)
+        || request
+            .footprint
+            .iter()
+            .any(|d| !is_canonical_uuid(&d.device_id))
     {
         return Err(Error::Invalid);
     }
@@ -669,5 +680,33 @@ mod tests {
         assert_eq!(lease_ms(Duration::from_secs(u64::MAX)), Err(Error::Invalid));
         assert_eq!(GrantState::parse("released"), Ok(GrantState::Released));
         assert_eq!(GrantState::parse("requested"), Err(Error::Database));
+    }
+
+    #[test]
+    fn valid_capacity_name_rejects_unicode_whitespace_and_control_characters() {
+        assert!(valid_capacity_name("synthetic-image"));
+        assert!(valid_capacity_name("model v1"));
+        assert!(valid_capacity_name(&"a".repeat(128)));
+        assert!(!valid_capacity_name(""));
+        assert!(!valid_capacity_name(&"a".repeat(129)));
+        for bad in [
+            " leading",
+            "trailing ",
+            "\tleading",
+            "trailing\n",
+            "\u{00a0}model",
+            "model\u{00a0}",
+            "\u{3000}model",
+            "model\u{2028}",
+            "model\tname",
+            "model\u{0085}name",
+            "model\u{007f}name",
+            "model\u{0000}name",
+        ] {
+            assert!(
+                !valid_capacity_name(bad),
+                "expected invalid capacity name: {bad:?}"
+            );
+        }
     }
 }

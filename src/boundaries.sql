@@ -284,6 +284,7 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT 'openmettle.retention_set_grace(uuid,uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[] WHERE $1 >= 38
     UNION ALL SELECT 'openmettle.resolve_terminal_write_intents()',true,ARRAY[]::text[] WHERE $1 >= 39
     UNION ALL SELECT * FROM (VALUES
+        ('openmettle.capacity_valid_name(text,integer)',false,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.capacity_enforce_profile_limit()',false,ARRAY[]::text[]),
         ('openmettle.capacity_enforce_group_limit()',false,ARRAY[]::text[]),
         ('openmettle.capacity_enforce_device_limit()',false,ARRAY[]::text[]),

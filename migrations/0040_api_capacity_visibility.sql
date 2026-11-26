@@ -7,9 +7,9 @@
 -- a STABLE SECURITY DEFINER read helper that never exposes controller_token_hash or per-tenant
 -- capacity_grants rows.
 --
--- capacity_groups gains backend_unknown (default false) so takeover reconciliation durably closes
--- the group in PostgreSQL before contacting the backend and keeps bursts closed while any backend
--- rogue allocation remains unresolved.
+-- capacity_groups gains backend_unknown (default true, reset on every new controller acquisition)
+-- so takeover reconciliation durably closes the group in PostgreSQL before contacting the backend
+-- and keeps bursts closed while any backend rogue allocation remains unresolved.
 --
 -- capacity_grants gains dispatch_state ('pending' | 'in_flight' | 'confirmed' |
 -- 'release_in_flight', default 'pending'), dispatch_epoch and extra_devices (default '{}') so
@@ -35,11 +35,33 @@ ALTER TABLE openmettle.capacity_grants
     ADD CONSTRAINT capacity_grants_released_settled_check
         CHECK (state <> 'released' OR (dispatch_state = 'confirmed' AND cardinality(extra_devices) = 0));
 
+-- Locale-independent identifier check matching Rust
+-- `runs::bounded(s, max) && s.trim() == s && !s.chars().any(char::is_control)`:
+-- 1..=max UTF-8 bytes, no C0/C1 control characters (U+0001..U+001F, U+007F..U+009F; U+0000 is
+-- rejected by PostgreSQL text), and no leading or trailing Unicode White_Space (all 25 Unicode
+-- White_Space code points, independent of LC_CTYPE).
+CREATE FUNCTION openmettle.capacity_valid_name(p_value text, p_max_bytes integer)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog
+AS $$
+    SELECT p_value IS NOT NULL
+       AND p_max_bytes IS NOT NULL
+       AND octet_length(p_value) BETWEEN 1 AND p_max_bytes
+       AND p_value !~ U&'[\0001-\001f\007f-\009f]'
+       AND btrim(
+               p_value,
+               U&' \0009\000a\000b\000c\000d\0085\00a0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200a\2028\2029\202f\205f\3000'
+           ) = p_value
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_valid_name(text, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_valid_name(text, integer) TO openmettle_api, openmettle_worker;
+
 CREATE TABLE openmettle.capacity_profiles (
     profile text PRIMARY KEY
-        CHECK (octet_length(profile) BETWEEN 1 AND 128
-               AND btrim(profile) = profile
-               AND profile !~ '^\s|\s$'),
+        CHECK (openmettle.capacity_valid_name(profile, 128)),
     group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
     per_device_bytes bigint NOT NULL CHECK (per_device_bytes > 0),
     required_devices integer NOT NULL CHECK (required_devices BETWEEN 1 AND 64),
@@ -52,9 +74,7 @@ CREATE TABLE openmettle.capacity_profiles (
     CHECK (capability_gate <> 'opt_in' OR required_capability IS NOT NULL),
     model_id text
         CHECK (model_id IS NULL
-               OR (octet_length(model_id) BETWEEN 1 AND 128
-                   AND btrim(model_id) = model_id
-                   AND model_id !~ '^\s|\s$')),
+               OR openmettle.capacity_valid_name(model_id, 128)),
     estimated_wait_seconds integer
         CHECK (estimated_wait_seconds IS NULL OR estimated_wait_seconds BETWEEN 1 AND 86400)
 );
@@ -446,6 +466,145 @@ BEGIN
 END;
 $$;
 
+-- Extend migration 27's capacity_grant with locale-independent profile validation via
+-- openmettle.capacity_valid_name so low-level grants enforce identical profile rules before
+-- binding a run's device slot. Signature, security and privileges are unchanged.
+CREATE OR REPLACE FUNCTION openmettle.capacity_grant(
+    p_group uuid,
+    p_secret bytea,
+    p_epoch bigint,
+    p_scope uuid,
+    p_run uuid,
+    p_claim uuid,
+    p_request_key text,
+    p_profile text,
+    p_footprint jsonb
+)
+RETURNS TABLE (grant_ref uuid, outcome text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    g openmettle.capacity_groups%ROWTYPE;
+    v_existing openmettle.capacity_grants%ROWTYPE;
+    v_digest bytea;
+    v_holds uuid[];
+    v_enforced boolean;
+    v_seq bigint;
+    v_id uuid;
+BEGIN
+    IF p_request_key IS NULL OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
+       OR NOT openmettle.capacity_valid_name(p_profile, 128)
+       OR jsonb_typeof(p_footprint) IS DISTINCT FROM 'array'
+       OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
+        RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
+    END IF;
+    SELECT sha256(convert_to(jsonb_build_array(
+               p_group, p_run, p_profile,
+               jsonb_agg(jsonb_build_array(f.device_id, f.bytes) ORDER BY f.device_id))::text, 'UTF8'))
+      INTO v_digest
+      FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint);
+    -- Lock order: the run row before the group.
+    PERFORM FROM openmettle.runs WHERE scope_id = p_scope AND id = p_run FOR NO KEY UPDATE;
+    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
+
+    SELECT * INTO v_existing
+      FROM openmettle.capacity_grants c
+     WHERE c.scope_id = p_scope AND c.request_key = p_request_key;
+    IF FOUND THEN
+        IF v_existing.request_digest <> v_digest THEN
+            RAISE EXCEPTION 'capacity request identity conflict' USING ERRCODE = '23505';
+        END IF;
+        RETURN QUERY SELECT v_existing.id, v_existing.state;
+        RETURN;
+    END IF;
+
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    IF EXISTS (
+        SELECT
+          FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
+          LEFT JOIN openmettle.capacity_devices d ON d.group_id = p_group AND d.id = f.device_id
+         WHERE d.id IS NULL OR f.bytes IS NULL OR f.bytes <= 0
+    ) OR (SELECT count(DISTINCT f.device_id) FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid))
+         <> jsonb_array_length(p_footprint) THEN
+        RAISE EXCEPTION 'invalid capacity footprint' USING ERRCODE = '22023';
+    END IF;
+    IF NOT openmettle.capacity_admits(p_group, false) THEN
+        RETURN QUERY SELECT NULL::uuid, 'unavailable'::text;
+        RETURN;
+    END IF;
+    -- Every requested device needs a current sample; a missing one never fits.
+    IF EXISTS (
+        SELECT
+          FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
+          LEFT JOIN openmettle.capacity_observations o
+            ON o.group_id = p_group AND o.device_id = f.device_id
+           AND o.revision = g.observation_revision
+         WHERE o.device_id IS NULL
+            OR f.bytes > o.grantable_bytes - coalesce((
+                   SELECT sum(gd.bytes)
+                     FROM openmettle.capacity_grant_devices gd
+                     JOIN openmettle.capacity_grants c ON c.id = gd.grant_id
+                    WHERE gd.group_id = p_group
+                      AND gd.device_id = f.device_id
+                      AND c.state <> 'released'
+                      AND c.commit_seq > g.commit_watermark), 0)
+    ) THEN
+        RETURN QUERY SELECT NULL::uuid, 'insufficient'::text;
+        RETURN;
+    END IF;
+
+    -- Only a held slot can back a new grant; a slot used by an earlier grant stays bound to it.
+    SELECT array_agg(h.id) INTO v_holds
+      FROM openmettle.quota_reservations h
+     WHERE h.scope_id = p_scope
+       AND h.run_id = p_run
+       AND h.gateway_request_id IS NULL
+       AND h.resource_kind = 'device_reservations'
+       AND h.state = 'held';
+    IF cardinality(v_holds) > 1 THEN
+        RAISE EXCEPTION 'ambiguous run device slot' USING ERRCODE = '23514';
+    END IF;
+    UPDATE openmettle.capacity_groups SET commit_seq = commit_seq + 1
+     WHERE id = p_group
+    RETURNING commit_seq INTO v_seq;
+    INSERT INTO openmettle.capacity_grants (
+        group_id, scope_id, run_id, claim_token, quota_hold_id, request_key, request_digest,
+        profile, granted_epoch, reconciled_epoch, commit_seq
+    ) VALUES (
+        p_group, p_scope, p_run, p_claim, v_holds[1], p_request_key, v_digest,
+        p_profile, g.controller_epoch, g.controller_epoch, v_seq
+    )
+    RETURNING id INTO v_id;
+    INSERT INTO openmettle.capacity_grant_devices (grant_id, group_id, device_id, bytes)
+    SELECT v_id, p_group, f.device_id, f.bytes
+      FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint);
+    IF v_holds[1] IS NOT NULL THEN
+        IF NOT openmettle.quota_commit_device_handoff(v_holds[1], p_scope, p_run, p_claim, v_id) THEN
+            RAISE EXCEPTION 'run device slot is not available for this grant' USING ERRCODE = '23505';
+        END IF;
+    ELSE
+        -- quota_enforcement is the final lock (ADR 0040).
+        SELECT metering_enforced INTO v_enforced
+          FROM openmettle.quota_enforcement WHERE id FOR SHARE;
+        IF v_enforced THEN
+            RAISE EXCEPTION 'run device slot required' USING ERRCODE = 'OMQ04';
+        END IF;
+    END IF;
+
+    -- Final recheck (see capacity_fence): the run lease, readiness, and the fence last. A lapsed
+    -- controller lease reports as fenced rather than expired.
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    IF NOT openmettle.capacity_admits(p_group, false) THEN
+        PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
+        RAISE EXCEPTION 'capacity decision expired' USING ERRCODE = 'OMC02';
+    END IF;
+    PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
+    RETURN QUERY SELECT v_id, 'granted'::text;
+END;
+$$;
+
 -- Two-phase grant preparation for adapter dispatch: commits a new grant with
 -- dispatch_state = 'in_flight' and dispatch_epoch = g.controller_epoch (blocking concurrent bursts
 -- until confirmed or reconciled). Replaying an already-settled or dispatch-confirmed grant returns
@@ -485,8 +644,7 @@ DECLARE
     v_stale boolean;
 BEGIN
     IF p_request_key IS NULL OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
-       OR p_profile IS NULL OR octet_length(p_profile) NOT BETWEEN 1 AND 128
-       OR btrim(p_profile) <> p_profile OR p_profile ~ '^\s|\s$'
+       OR NOT openmettle.capacity_valid_name(p_profile, 128)
        OR jsonb_typeof(p_footprint) IS DISTINCT FROM 'array'
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';

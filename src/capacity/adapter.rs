@@ -99,7 +99,7 @@ fn check_group_and_epoch(group_id: &str, epoch: i64) -> Result<(), AdapterError>
 }
 
 fn check_profile(profile: &str) -> Result<(), AdapterError> {
-    if !bounded(profile, 128) || profile.trim() != profile {
+    if !super::valid_capacity_name(profile) {
         return Err(AdapterError::Invalid);
     }
     Ok(())
@@ -1107,10 +1107,20 @@ struct DurableLiveGrant {
     state: String,
     dispatch_state: String,
     granted_epoch: i64,
+    run_eligible: bool,
     profile: String,
     footprint: BTreeMap<String, i64>,
     unreleased_devices: Vec<String>,
     extra_devices: Vec<String>,
+}
+
+fn is_eligible_same_epoch_pending(durable: &DurableLiveGrant, epoch: i64) -> bool {
+    durable.state == "granted"
+        && durable.dispatch_state == "pending"
+        && durable.granted_epoch == epoch
+        && durable.run_eligible
+        && durable.extra_devices.is_empty()
+        && durable.unreleased_devices.len() == durable.footprint.len()
 }
 
 enum PreparedDispatch {
@@ -1177,10 +1187,17 @@ async fn load_live_grants(
 ) -> Result<Vec<(String, DurableLiveGrant)>, StoreError> {
     let rows = sqlx::query(
         "SELECT g.id::text AS grant_id, g.state, g.dispatch_state, g.granted_epoch, g.profile,
+                (r.state = 'running'
+                 AND r.cancel_reason IS NULL
+                 AND r.claim_token IS NOT NULL
+                 AND r.claim_token = g.claim_token
+                 AND r.lease_expires_at > clock_timestamp()) AS run_eligible,
                 ARRAY(SELECT x::text FROM unnest(g.extra_devices) AS x ORDER BY x) AS extra_devices,
                 gd.device_id::text AS device_id, gd.bytes,
                 gd.released_at IS NOT NULL AS device_released
            FROM openmettle.capacity_grants g
+           JOIN openmettle.runs r
+             ON r.scope_id = g.scope_id AND r.id = g.run_id
            JOIN openmettle.capacity_grant_devices gd
              ON gd.group_id = g.group_id AND gd.grant_id = g.id
           WHERE g.group_id = $1::uuid AND g.state <> 'released'
@@ -1204,6 +1221,7 @@ async fn load_live_grants(
                         state: row.try_get("state")?,
                         dispatch_state: row.try_get("dispatch_state")?,
                         granted_epoch: row.try_get("granted_epoch")?,
+                        run_eligible: row.try_get("run_eligible")?,
                         profile: row.try_get("profile")?,
                         footprint: BTreeMap::new(),
                         unreleased_devices: Vec::new(),
@@ -1296,6 +1314,7 @@ async fn prepare_dispatch_tx(
     if !is_canonical_uuid(request.scope_id)
         || !is_canonical_uuid(request.run_id)
         || !is_canonical_uuid(request.claim_token)
+        || !bounded(request.request_key, 128)
     {
         return Err(StoreError::Invalid);
     }
@@ -1392,14 +1411,15 @@ async fn reconcile_tx(
     Ok(state)
 }
 
-async fn load_grant_state(
+async fn load_grant_state_and_group_devices(
     pool: &PgPool,
     group_id: &str,
     grant_id: &str,
-) -> Result<Option<String>, StoreError> {
+) -> Result<(Option<String>, BTreeSet<String>), StoreError> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, true)
         .await
         .map_err(map_tx_error)?;
+    let conn = tx.connection().map_err(map_tx_error)?;
     let state: Option<String> = sqlx::query_scalar(
         "SELECT state
            FROM openmettle.capacity_grants
@@ -1407,10 +1427,18 @@ async fn load_grant_state(
     )
     .bind(group_id)
     .bind(grant_id)
-    .fetch_optional(tx.connection().map_err(map_tx_error)?)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let device_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id::text
+           FROM openmettle.capacity_devices
+          WHERE group_id = $1::uuid",
+    )
+    .bind(group_id)
+    .fetch_all(&mut *conn)
     .await?;
     tx.commit().await.map_err(map_tx_error)?;
-    Ok(state)
+    Ok((state, device_ids.into_iter().collect()))
 }
 
 fn parse_establish_inventory(
@@ -1730,16 +1758,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 continue;
             }
 
-            // Preserve an eligible same-epoch low-level `pending` reservation that has not been
-            // dispatched to the backend yet so a subsequent `dispatch_grant` can dispatch it;
-            // older-epoch `pending` grants absent on the backend are still released below.
-            let same_epoch_pending = durable.state == "granted"
-                && durable.dispatch_state == "pending"
-                && durable.granted_epoch == self.controller.epoch()
-                && durable.extra_devices.is_empty()
-                && durable.unreleased_devices.len() == durable.footprint.len()
-                && !backend_live.contains_key(&grant_id);
-            if same_epoch_pending {
+            // Preserve an eligible same-epoch low-level `pending` reservation whose run still
+            // holds its active lease so a subsequent `dispatch_grant` can dispatch it; older-epoch
+            // or cancelled/expired-run `pending` grants absent on the backend are released below.
+            if is_eligible_same_epoch_pending(&durable, self.controller.epoch())
+                && !backend_live.contains_key(&grant_id)
+            {
                 continue;
             }
 
@@ -2016,23 +2040,66 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         }
         let caller_set = canonical_devices(devices)?;
         check_controller_tx(&self.pool, &self.controller).await?;
-        let Some(state) =
-            load_grant_state(&self.pool, self.controller.group_id(), grant_id).await?
-        else {
+        let (state, group_device_ids) =
+            load_grant_state_and_group_devices(&self.pool, self.controller.group_id(), grant_id)
+                .await?;
+        let Some(state) = state else {
             return Err(CoordinatorError::Store(StoreError::Invalid));
         };
+        // Reject caller-supplied devices outside this group before touching backend_unknown so bad
+        // caller input never closes a healthy group.
+        if !caller_set.is_subset(&group_device_ids) {
+            return Err(CoordinatorError::Store(StoreError::Invalid));
+        }
         if state == "released" {
             return Ok(GrantState::Released);
         }
 
         // Always inspect fenced backend inventory for any non-released grant so unexpected extra
-        // ranks and unrelated rogue allocations are discovered before settlement.
-        let inv = parse_establish_inventory(
-            &self.controller,
-            self.adapter
-                .establish_epoch(EstablishEpochRequest::new(&self.controller))
-                .await?,
-        )?;
+        // ranks, foreign-group devices, rogue allocations, and missing durable allocations are
+        // discovered before settlement. Any non-StaleEpoch inventory failure durably closes bursts.
+        let inv = match self
+            .adapter
+            .establish_epoch(EstablishEpochRequest::new(&self.controller))
+            .await
+            .and_then(|resp| parse_establish_inventory(&self.controller, resp))
+        {
+            Ok(inv) => inv,
+            Err(err @ AdapterError::StaleEpoch { .. }) => {
+                return Err(CoordinatorError::Adapter(err));
+            }
+            Err(err) => {
+                set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
+                self.reconciled_clean.store(false, Ordering::Release);
+                return Err(CoordinatorError::Adapter(err));
+            }
+        };
+
+        // Untrusted inventory reporting any device outside this group durably closes bursts (and
+        // marks the targeted grant unknown_allocation when affected or still granted) rather than
+        // failing with 22023 in capacity_prepare_release while leaving admission open.
+        if inv
+            .values()
+            .any(|live| live.footprint.keys().any(|d| !group_device_ids.contains(d)))
+        {
+            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
+            self.reconciled_clean.store(false, Ordering::Release);
+            let target_has_foreign = inv
+                .get(grant_id)
+                .is_some_and(|live| live.footprint.keys().any(|d| !group_device_ids.contains(d)));
+            if target_has_foreign || state == "granted" {
+                reconcile_tx(
+                    &self.pool,
+                    &self.controller,
+                    grant_id,
+                    Evidence::UnknownAllocation,
+                    self.metrics(),
+                )
+                .await?;
+            }
+            return Err(CoordinatorError::Adapter(AdapterError::Invalid));
+        }
+
         let live_grants = {
             let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, true)
                 .await
@@ -2049,7 +2116,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             .iter()
             .map(|(id, grant)| (id.as_str(), grant))
             .collect();
-        let has_rogue_or_other_mismatch = inv.iter().any(|(id, live)| {
+        let backend_mismatch = inv.iter().any(|(id, live)| {
             if id == grant_id {
                 return false;
             }
@@ -2064,7 +2131,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 }
             }
         });
-        if has_rogue_or_other_mismatch {
+        let missing_durable = durable_by_id.iter().any(|(id, durable)| {
+            *id != grant_id
+                && !inv.contains_key(*id)
+                && !is_eligible_same_epoch_pending(durable, self.controller.epoch())
+        });
+        if backend_mismatch || missing_durable {
             set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
             self.reconciled_clean.store(false, Ordering::Release);
         }
