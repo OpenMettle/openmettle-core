@@ -1,0 +1,21 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "AuthorizeConnectionRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access_token": "synthetic-access-example-1",
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "granted_scopes": [
+      "issues.read"
+    ],
+    "reason": "Initial credential authorization",
+    "refresh_token": "synthetic-refresh-example-1"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/AuthorizeConnectionRequest",
+  "source": "#/components/examples/AuthorizeConnectionRequestTypical"
+}

@@ -236,6 +236,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "retention routes and journal commitments",
         sql: include_str!("../migrations/0042_retention_routes_and_journal_commitments.sql"),
     },
+    Source {
+        version: 43,
+        description: "credential vault and external connections",
+        sql: include_str!("../migrations/0043_credential_vault_and_connections.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

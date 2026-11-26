@@ -285,6 +285,11 @@ impl McpTransport {
         })
     }
 
+    /// Canonical `https://host[:port]` origin of this pinned MCP endpoint.
+    pub fn origin(&self) -> String {
+        format!("https://{}", self.endpoint.authority)
+    }
+
     /// Execute one stateless `tools/list` call for catalog verification against this pinned server.
     pub async fn tools_list(
         &self,

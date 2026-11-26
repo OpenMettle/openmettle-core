@@ -218,8 +218,8 @@ pub(crate) struct Endpoint {
     pub(crate) url: String,
     host: String,
     port: u16,
-    authority: String,
-    pub(super) path: String,
+    pub(crate) authority: String,
+    pub(crate) path: String,
     /// `https://`. Only [`gateway_endpoint`] makes one without TLS.
     tls: bool,
 }

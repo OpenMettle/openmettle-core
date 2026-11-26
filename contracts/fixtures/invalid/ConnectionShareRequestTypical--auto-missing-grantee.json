@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ConnectionShareRequestTypical--auto-missing-grantee",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "use",
+    "reason": "Allow collaborator to run scoped tools"
+  },
+  "mutation": {
+    "name": "auto-missing-grantee",
+    "op": "remove",
+    "path": "/grantee"
+  },
+  "schema": "#/components/schemas/ConnectionShareRequest",
+  "source": "#/components/examples/ConnectionShareRequestTypical"
+}

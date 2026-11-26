@@ -1,0 +1,31 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "CreateConnectionRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "account_id": "acct-example-1",
+    "allowed_scopes": [
+      "issues.read",
+      "issues.write"
+    ],
+    "origin": "https://api.example.test",
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

@@ -32,6 +32,7 @@ pub mod sessions;
 pub mod storage;
 pub mod telemetry;
 pub mod v1;
+pub mod vault;
 pub mod worker;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
@@ -164,6 +165,9 @@ struct Config {
     /// `OPENMETTLE_WORKER_INFERENCE_CONFIG` (ADR 0043): the worker's inference document, set
     /// exactly when `RUN_SLOTS` is. Always `None` for the API.
     inference_config: Option<PathBuf>,
+    /// `VAULT_KEYS_CONFIG` (ADR 0045): optional versioned master keyring document for external
+    /// connection credentials, mounted on API and worker from separate Secret storage.
+    vault_keys_config: Option<PathBuf>,
     /// The gateway's upstream settings; `Some` exactly for the gateway.
     gateway: Option<gateway_proxy::Settings>,
 }
@@ -247,6 +251,11 @@ impl Config {
                 }) {
                     return Err("worker scheduling settings are refused on the API");
                 }
+                let vault_path = env_var(prefix, "VAULT_KEYS_CONFIG")?.map(PathBuf::from);
+                if vault_path.as_deref().is_some_and(|p| !p.is_absolute()) {
+                    return Err("invalid VAULT_KEYS_CONFIG");
+                }
+                config.vault_keys_config = vault_path;
             }
             Role::Worker => {
                 let settings =
@@ -262,7 +271,12 @@ impl Config {
                     }
                     _ => {}
                 }
+                let vault_path = env_var(prefix, "VAULT_KEYS_CONFIG")?.map(PathBuf::from);
+                if vault_path.as_deref().is_some_and(|p| !p.is_absolute()) {
+                    return Err("invalid VAULT_KEYS_CONFIG");
+                }
                 config.inference_config = path;
+                config.vault_keys_config = vault_path;
                 config.worker = Some(settings);
             }
             Role::Gateway => {
@@ -359,6 +373,7 @@ impl Config {
             issuance,
             artifacts_dir,
             inference_config: None,
+            vault_keys_config: None,
             gateway: None,
         })
     }
@@ -391,6 +406,7 @@ fn app(
     config: &Config,
     pool: &PgPool,
     artifacts: Option<artifact_fs::Store>,
+    vault_keys: Option<Arc<vault::VaultKeyRing>>,
 ) -> Result<(Router, Option<PgPool>), auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
@@ -424,7 +440,10 @@ fn app(
         bearer = Some(auth);
     }
     let origin = profile.handoff().origin;
-    let v1 = v1_extensions.apply(v1::router(service, bearer, origin, pool.clone(), artifacts));
+    let mut v1 = v1_extensions.apply(v1::router(service, bearer, origin, pool.clone(), artifacts));
+    if let Some(vault_keys) = vault_keys {
+        v1 = v1.layer(axum::Extension(vault_keys));
+    }
     Ok((app.merge(v1), Some(issuance)))
 }
 
@@ -557,7 +576,19 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     }
-    let (app, issuance) = match app(&config, &pool, artifacts.clone()) {
+    let vault_keys = match config
+        .vault_keys_config
+        .as_deref()
+        .map(vault::VaultKeyRing::load_from_config)
+    {
+        None => None,
+        Some(Ok(ring)) => Some(Arc::new(ring)),
+        Some(Err(error)) => {
+            eprintln!("vault configuration error: {error}");
+            return 78;
+        }
+    };
+    let (app, issuance) = match app(&config, &pool, artifacts.clone(), vault_keys) {
         Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");

@@ -1,0 +1,30 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "AuthorizeConnectionRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access_token": "synthetic-access-example-1",
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "granted_scopes": [
+      "issues.read"
+    ],
+    "reason": "Initial credential authorization",
+    "refresh_token": "synthetic-refresh-example-1",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/AuthorizeConnectionRequest",
+  "source": "#/components/examples/AuthorizeConnectionRequestTypical"
+}

@@ -67,6 +67,13 @@
 -- `retention_assert_active_admin` (owner only), and adds API-only `SECURITY DEFINER`
 -- `retention_preview_deadlines`, `retention_apply_deadlines`, and `admin_retention_status`
 -- (ADR 0041, V1-16 PR3).
+-- Version 43 adds `external_connections` (column-scoped non-secret SELECT and write-only secret
+-- UPDATE for `openmettle_api`; full SELECT and refresh-only UPDATE for `openmettle_worker`) and
+-- `external_connection_shares` (SELECT + column-scoped INSERT/UPDATE for `openmettle_api`, SELECT
+-- for `openmettle_worker`), `external_connection_scopes_valid` (`openmettle_api` and
+-- `openmettle_worker`), two trigger guards (no role may call), and two worker-only SECURITY
+-- DEFINER helpers (`external_connection_scope_lifecycle`, `external_connection_audit_worker`)
+-- (ADR 0045, V1-28).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -158,6 +165,36 @@ family_columns (relation,attribute,role,privilege) AS (
         ('family_policy_models','INSERT',ARRAY['policy_id','rule_kind','model','active','updated_by_user_id']),
         ('family_policy_models','UPDATE',ARRAY['active','revision','updated_at','updated_by_user_id'])
     ) AS t(relation,privilege,columns), unnest(columns) attribute WHERE $1 >= 35
+),
+-- Version 43 (ADR 0045, V1-28): external connections & shares; API cannot SELECT ciphertexts.
+vault_tables (relation,role,privilege) AS (
+    SELECT 'external_connection_shares', role, 'SELECT'
+    FROM unnest(ARRAY['openmettle_api','openmettle_worker']) role WHERE $1 >= 43
+    UNION ALL
+    SELECT 'external_connections', 'openmettle_worker', 'SELECT' WHERE $1 >= 43
+),
+vault_columns (relation,attribute,role,privilege) AS (
+    SELECT relation, attribute, role, privilege FROM (VALUES
+        ('external_connections','openmettle_api','SELECT',ARRAY['id','scope_id','scope_kind',
+            'owner_user_id','provider_kind','account_id','endpoint_origin','allowed_scopes',
+            'granted_scopes','state','expires_at','has_refresh','credential_generation',
+            'revocation_generation','share_revision','created_at','updated_at','disconnected_at']),
+        ('external_connections','openmettle_api','INSERT',ARRAY['id','scope_id','scope_kind',
+            'owner_user_id','provider_kind','account_id','endpoint_origin','allowed_scopes']),
+        ('external_connections','openmettle_api','UPDATE',ARRAY['granted_scopes','state','expires_at',
+            'encryption_key_id','access_salt','access_nonce','access_ciphertext','refresh_salt',
+            'refresh_nonce','refresh_ciphertext','credential_generation','revocation_generation',
+            'share_revision','refresh_claim_token','refresh_lease_until','updated_at','disconnected_at']),
+        ('external_connection_shares','openmettle_api','INSERT',ARRAY['connection_id','scope_id',
+            'grantee_kind','grantee_user_id','grantee_local_group_id','grantee_oidc_group_id',
+            'access','active','updated_by_user_id']),
+        ('external_connection_shares','openmettle_api','UPDATE',ARRAY['active','revision',
+            'updated_at','updated_by_user_id']),
+        ('external_connections','openmettle_worker','UPDATE',ARRAY['granted_scopes','state','expires_at',
+            'encryption_key_id','access_salt','access_nonce','access_ciphertext','refresh_salt',
+            'refresh_nonce','refresh_ciphertext','credential_generation','revocation_generation',
+            'refresh_claim_token','refresh_lease_until','updated_at'])
+    ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 43
 ),
 gateway_columns (relation,attribute,role,privilege) AS (
     SELECT relation, attribute, role, privilege FROM (VALUES
@@ -345,6 +382,12 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.retention_preview_deadlines(uuid,uuid,bigint,integer,uuid)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.retention_apply_deadlines(uuid,uuid,bigint,integer,uuid,text,text)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.admin_retention_status(uuid,uuid,bigint)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 42
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.external_connection_scopes_valid(text[],boolean)',false,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.enforce_external_connection_guards()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_external_connection_share_guards()',false,ARRAY[]::text[]),
+        ('openmettle.external_connection_scope_lifecycle(uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.external_connection_audit_worker(uuid,text,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 43
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES
@@ -470,6 +513,7 @@ contract (relation, role, privilege) AS (
     UNION ALL SELECT * FROM capacity_tables
     UNION ALL SELECT * FROM retention_tables
     UNION ALL SELECT * FROM family_tables
+    UNION ALL SELECT * FROM vault_tables
     UNION ALL
     SELECT 'runtime_feature_gates', role, 'SELECT'
     FROM unnest(ARRAY['openmettle_api','openmettle_worker']) role WHERE $1 >= 39
@@ -543,6 +587,8 @@ column_contract (relation, attribute, role, privilege) AS (
     SELECT * FROM retention_columns
     UNION ALL
     SELECT * FROM family_columns
+    UNION ALL
+    SELECT * FROM vault_columns
     UNION ALL
     SELECT * FROM gateway_columns
     UNION ALL
@@ -896,7 +942,8 @@ violations (violation) AS (
                                     OR g.object_name='artifact_retention_holds'))
                     OR ($1>=35 AND g.object_name LIKE 'family\_polic%')
                     OR ($1>=39 AND g.object_name='runtime_feature_gates')
-                    OR ($1>=41 AND g.object_name LIKE 'restore\_%'))
+                    OR ($1>=41 AND g.object_name LIKE 'restore\_%')
+                    OR ($1>=43 AND g.object_name LIKE 'external\_connection%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
@@ -931,14 +978,16 @@ violations (violation) AS (
     UNION ALL
     SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
     FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns UNION ALL SELECT * FROM quota_columns
-          UNION ALL SELECT * FROM retention_columns UNION ALL SELECT * FROM family_columns) c WHERE NOT EXISTS (
+          UNION ALL SELECT * FROM retention_columns UNION ALL SELECT * FROM family_columns
+          UNION ALL SELECT * FROM vault_columns) c WHERE NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND g.column_name=c.attribute
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
     WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables
-                          UNION ALL SELECT relation FROM retention_tables UNION ALL SELECT relation FROM family_tables)
+                          UNION ALL SELECT relation FROM retention_tables UNION ALL SELECT relation FROM family_tables
+                          UNION ALL SELECT relation FROM vault_tables)
            OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions','runtime_feature_gates')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)

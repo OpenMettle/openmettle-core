@@ -181,3 +181,7 @@ The check never refuses a healthy volume. It is a backstop, not the control that
 - **A quarantined reservation stays quarantined.** Rebind does not verify or rebind it, and nothing supported clears a quarantine on a copied volume. It does not keep the volume closed; the owner resolves it by hand, as before the backup.
 - **A process that got past the start-up check before rebind can cause damage that rebind does not undo.** A worker quarantines unsettled uploads whose files changed and claims due revisions for purge. You see `worker.sweep.failed`, reads answering 500 and a non-zero `quarantined` count. The supported recovery is to stop every service, restore the matched database and volume again, and restart the restore checklist at its first step.
 - **Exercised copy tools:** `cp -a`, GNU `tar` 1.34 and restic 0.14 on Linux, on a local filesystem. Velero file backup, NFS volumes, CSI snapshots and a real cluster restore have not been tested.
+
+## External connection vault keys
+
+External connection credentials in `openmettle.external_connections` are encrypted with versioned master keys kept outside PostgreSQL and artifact volume backups ([ADR 0045](../adr/0045-credential-vault-and-external-connection-lifecycle.md)). After opening the restore gate, verify key coverage with `openmettle-admin vault status` and follow [Credential vault and key recovery](credential-vault-and-key-recovery.md) before enabling external tool traffic.

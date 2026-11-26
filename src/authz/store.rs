@@ -112,7 +112,7 @@ const PRINCIPAL: &str = "SELECT sc.id::text, u.disabled_at IS NULL,
         WHERE a.id = $2::uuid AND i.user_id = u.id) ap ON true
  WHERE u.id = $1::uuid";
 
-pub(super) async fn hydrate(
+pub(crate) async fn hydrate(
     c: &mut PgConnection,
     user_id: &str,
     approval_id: &str,
@@ -241,11 +241,11 @@ impl WriteOutcome {
 
 /// One audited change. `target_id: None` asks the store to assign a new UUID (group or project
 /// creation); a replay then matches whatever target the original request recorded.
-pub(super) struct Change {
-    pub(super) action: &'static str,
-    pub(super) target_kind: &'static str,
-    pub(super) target_id: Option<String>,
-    pub(super) details: Value,
+pub(crate) struct Change {
+    pub(crate) action: &'static str,
+    pub(crate) target_kind: &'static str,
+    pub(crate) target_id: Option<String>,
+    pub(crate) details: Value,
 }
 
 pub(crate) const UNCHANGED: StoreError =
@@ -499,7 +499,7 @@ async fn acting(c: &mut PgConnection, ctx: &AuditContext<'_>) -> Result<Principa
 /// Insert the audit row first, so a reused request key is detected before any change. `Applied`
 /// carries the new (or given) target ID: apply the change next. `Replayed` means this exact
 /// change is already recorded: write nothing. A different recorded change is a `Conflict`.
-pub(super) async fn record(
+pub(crate) async fn record(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     change: &Change,

@@ -8,7 +8,7 @@ use openmettle_core::{
         gateway::family,
         store::{StoreError, WriteOutcome},
     },
-    restore,
+    restore, vault,
 };
 use sqlx::{Connection, PgConnection, PgPool};
 use std::{env, fs, path::Path, process::ExitCode};
@@ -415,6 +415,9 @@ async fn run() -> Result<(), &'static str> {
     if matches!(command.0.as_deref(), Some("journal" | "restore")) {
         return journal(command, &args.collect::<Vec<_>>()).await;
     }
+    if command.0.as_deref() == Some("vault") {
+        return vault_command(command.1.as_deref(), &args.collect::<Vec<_>>()).await;
+    }
     if command.0.as_deref() == Some("family") {
         let mut family_args = Vec::new();
         if let Some(sub) = command.1 {
@@ -530,7 +533,7 @@ async fn run() -> Result<(), &'static str> {
         || (command.1.as_deref() != Some("adopt") && !rebinding)
     {
         return Err(
-            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID]",
+            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID] | vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]",
         );
     }
     let root = args.next().ok_or("missing artifact directory")?;
@@ -666,6 +669,143 @@ fn print_drift(report: &openmettle_core::artifact_fs::Drift) {
         report.quarantined,
         report.unsettled_payloads
     );
+}
+
+struct VaultRotateArgs {
+    vault_keys: String,
+    operator_id: String,
+    request_key: String,
+    reason: String,
+    batch_size: usize,
+}
+
+fn parse_vault_rotate_args(args: &[String]) -> Result<VaultRotateArgs, &'static str> {
+    let usage = "usage: openmettle-admin vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]";
+    let mut vault_keys = None;
+    let mut operator_id = None;
+    let mut request_key = None;
+    let mut reason = None;
+    let mut batch_size = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--vault-keys" => {
+                if vault_keys.is_some() {
+                    return Err("duplicate --vault-keys");
+                }
+                i += 1;
+                vault_keys = Some(args.get(i).ok_or("missing --vault-keys value")?.clone());
+            }
+            "--operator-id" => {
+                if operator_id.is_some() {
+                    return Err("duplicate --operator-id");
+                }
+                i += 1;
+                operator_id = Some(args.get(i).ok_or("missing --operator-id value")?.clone());
+            }
+            "--request-key" => {
+                if request_key.is_some() {
+                    return Err("duplicate --request-key");
+                }
+                i += 1;
+                request_key = Some(args.get(i).ok_or("missing --request-key value")?.clone());
+            }
+            "--reason" => {
+                if reason.is_some() {
+                    return Err("duplicate --reason");
+                }
+                i += 1;
+                reason = Some(args.get(i).ok_or("missing --reason value")?.clone());
+            }
+            "--batch-size" => {
+                if batch_size.is_some() {
+                    return Err("duplicate --batch-size");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --batch-size value")?;
+                let parsed: usize = raw.parse().map_err(|_| "invalid --batch-size")?;
+                if !(1..=1000).contains(&parsed) {
+                    return Err("invalid --batch-size");
+                }
+                batch_size = Some(parsed);
+            }
+            _ => return Err("unknown vault rotate option"),
+        }
+        i += 1;
+    }
+    Ok(VaultRotateArgs {
+        vault_keys: vault_keys.ok_or(usage)?,
+        operator_id: operator_id.ok_or(usage)?,
+        request_key: request_key.ok_or(usage)?,
+        reason: reason.ok_or(usage)?,
+        batch_size: batch_size.unwrap_or(100),
+    })
+}
+
+async fn vault_command(sub: Option<&str>, args: &[String]) -> Result<(), &'static str> {
+    match sub {
+        Some("status") => {
+            if !args.is_empty() {
+                return Err("usage: openmettle-admin vault status");
+            }
+            let report = vault::vault_status(&pool(1).await?)
+                .await
+                .map_err(|_| "vault status failed")?;
+            println!(
+                "connections {}, encrypted {}",
+                report.total_connections, report.total_encrypted
+            );
+            for (state, count) in &report.by_state {
+                println!("state {state} {count}");
+            }
+            for (key_id, count) in &report.by_key_id {
+                println!("key_id {key_id} {count}");
+            }
+            Ok(())
+        }
+        Some("rotate") => {
+            let parsed = parse_vault_rotate_args(args)?;
+            let keyring = vault::VaultKeyRing::load_from_config(Path::new(&parsed.vault_keys))
+                .map_err(|err| match err {
+                    vault::VaultError::Configuration(msg) => msg,
+                    _ => "vault keyring configuration invalid",
+                })?;
+            let report = vault::vault_rotate(
+                &pool(2).await?,
+                &keyring,
+                &parsed.operator_id,
+                &parsed.request_key,
+                &parsed.reason,
+                parsed.batch_size,
+            )
+            .await
+            .map_err(|err| match err {
+                vault::VaultError::UnknownKey => {
+                    "vault rotation refused: stored key version missing from keyring"
+                }
+                vault::VaultError::Store(StoreError::Conflict(msg)) => msg,
+                vault::VaultError::Store(StoreError::InvalidInput(_)) => {
+                    "invalid vault rotation argument"
+                }
+                _ => "vault rotation failed",
+            })?;
+            if report.replayed {
+                println!(
+                    "replayed vault.rotated target_key_id={} rotated={} skipped={}",
+                    report.target_key_id, report.rotated_rows, report.skipped_rows
+                );
+            } else {
+                println!(
+                    "applied vault.rotated target_key_id={} rotated={} skipped={}",
+                    report.target_key_id, report.rotated_rows, report.skipped_rows
+                );
+            }
+            Ok(())
+        }
+        _ => Err(
+            "usage: openmettle-admin vault status | vault rotate --vault-keys PATH --operator-id UUID --request-key KEY --reason REASON [--batch-size N]",
+        ),
+    }
 }
 
 #[cfg(test)]

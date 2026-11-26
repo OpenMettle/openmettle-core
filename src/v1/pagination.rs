@@ -36,7 +36,7 @@ impl<'a> Page<'a> {
                     );
                 }
                 Some(("scope_id", s))
-                    if op == Op::ListConversations
+                    if matches!(op, Op::ListConversations | Op::ListConnections)
                         && scope.is_none()
                         && crate::runs::uuid(s).is_ok() =>
                 {
@@ -65,7 +65,9 @@ impl<'a> Page<'a> {
                 self.op.id().as_bytes(),
                 self.path.as_bytes(),
                 match self.op {
-                    Op::ListBranches | Op::ListConversations => b"created_at,id",
+                    Op::ListBranches | Op::ListConversations | Op::ListConnections => {
+                        b"created_at,id"
+                    }
                     Op::ListMessages => b"head-to-root",
                     _ => b"id",
                 },

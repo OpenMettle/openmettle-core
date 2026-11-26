@@ -1,0 +1,29 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/origin",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "CreateConnectionRequestTypical--http-origin",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "account_id": "acct-example-1",
+    "allowed_scopes": [
+      "issues.read",
+      "issues.write"
+    ],
+    "origin": "http://api.example.test",
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker"
+  },
+  "mutation": {
+    "name": "http-origin",
+    "op": "set",
+    "path": "/origin",
+    "value": "http://api.example.test"
+  },
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

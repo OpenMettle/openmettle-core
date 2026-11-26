@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "AuthorizeConnectionRequestTypical--auto-missing-access_token",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "granted_scopes": [
+      "issues.read"
+    ],
+    "reason": "Initial credential authorization",
+    "refresh_token": "synthetic-refresh-example-1"
+  },
+  "mutation": {
+    "name": "auto-missing-access_token",
+    "op": "remove",
+    "path": "/access_token"
+  },
+  "schema": "#/components/schemas/AuthorizeConnectionRequest",
+  "source": "#/components/examples/AuthorizeConnectionRequestTypical"
+}

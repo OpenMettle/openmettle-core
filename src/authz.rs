@@ -41,7 +41,7 @@ impl Principal {
         self.account_active && self.approval_active && self.provider_active
     }
 
-    fn matches(&self, grantee: &Grantee) -> bool {
+    pub(crate) fn matches(&self, grantee: &Grantee) -> bool {
         match grantee {
             Grantee::User(id) => *id == self.user_id,
             Grantee::LocalGroup(id) => self.local_groups.contains(id),
@@ -313,7 +313,7 @@ impl Project {
             .max()
     }
 
-    fn group_is_member(&self, grantee: &Grantee) -> bool {
+    pub(crate) fn group_is_member(&self, grantee: &Grantee) -> bool {
         self.grants
             .iter()
             .any(|g| g.effective() && g.grantee == *grantee)

@@ -1235,6 +1235,18 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "retention_upgrade_baseline",
         seed_row: None,
     },
+    AdditiveTable {
+        since: 43,
+        dropped_in: None,
+        table: "external_connections",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 43,
+        dropped_in: None,
+        table: "external_connection_shares",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1420,6 +1432,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "49a30070ef07ae4471f0e7d2035c54a605a15e4abab24f2e6bff69953ee4f3ff",
         "3fb443c44eb91d520bff06b7b0eaef3615c15d0e86c2f1bfc768c1d5dcff96ca",
         "3d6e5c6d44cb3ee77cbcf26dc77e4ca5d460bfc658a17d5c48307b067fcdd6d6",
+        "8a37e1cc57d6f33ae216886c2b78459e1bf76684f0f31ae6c9a39ad5bfb3c318",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1566,7 +1579,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 46);
+    assert_eq!(after_14.len(), 48);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1630,6 +1643,8 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("capacity_profiles", None),
             ("restore_reconciliation_gate", Some(RESTORE_GATE_SEED)),
             ("retention_upgrade_baseline", None),
+            ("external_connections", None),
+            ("external_connection_shares", None),
         ]
     );
 
@@ -3268,3 +3283,6 @@ mod capacity;
 
 #[path = "schema/family_policy.rs"]
 mod family_policy;
+
+#[path = "schema/vault.rs"]
+mod vault;

@@ -81,6 +81,12 @@ pub struct CredentialRequest<'a> {
     pub account_id: &'a str,
     pub scope_id: &'a str,
     pub actor_user_id: &'a str,
+    /// Active approval bound to the executing run when available.
+    pub actor_approval_id: Option<&'a str>,
+    /// Canonical `https://host[:port]` origin of the pinned MCP transport.
+    pub expected_origin: Option<&'a str>,
+    /// Contract action scope required for this dispatch (`granted_scopes` must include it).
+    pub required_scope: Option<&'a str>,
 }
 
 /// Result of resolving an external MCP credential at dispatch or reconciliation.
@@ -118,12 +124,14 @@ pub struct ReconcileTarget<'a> {
     pub scope_id: &'a str,
     pub run_id: &'a str,
     pub actor_user_id: &'a str,
+    pub actor_approval_id: Option<&'a str>,
     pub connection_id: &'a str,
     pub account_id: &'a str,
     pub tool_id: &'a str,
     pub tool_version: &'a str,
     pub destination: &'a str,
     pub capability: &'a str,
+    pub expected_origin: Option<&'a str>,
 }
 
 /// Live destination authorization seam checked inside `Fence::Hold` before any reconciliation
@@ -215,18 +223,6 @@ impl ExternalMcpAdapter {
             return Err(PreflightError::Refused);
         };
         let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
-        let credential = resolve_credential_bounded(
-            self.credentials.as_ref(),
-            CredentialRequest {
-                connection_id: &contract.connection_id,
-                account_id: &contract.account_id,
-                scope_id: &run.claim.scope_id,
-                actor_user_id,
-            },
-            call_deadline,
-            &step.stop,
-        )
-        .await?;
         let cache_key: CatalogCacheKey = (
             contract.connection_id.clone(),
             contract.account_id.clone(),
@@ -234,6 +230,32 @@ impl ExternalMcpAdapter {
             actor_user_id.to_owned(),
             fingerprint,
         );
+        let expected_origin = transport.origin();
+        let credential = match resolve_credential_bounded(
+            self.credentials.as_ref(),
+            CredentialRequest {
+                connection_id: &contract.connection_id,
+                account_id: &contract.account_id,
+                scope_id: &run.claim.scope_id,
+                actor_user_id,
+                actor_approval_id: Some(&run.claim.actor_approval_id),
+                expected_origin: Some(&expected_origin),
+                required_scope: Some(&contract.action),
+            },
+            call_deadline,
+            &step.stop,
+        )
+        .await
+        {
+            Ok(cred) => cred,
+            Err(err) => {
+                self.verified_catalogs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&cache_key);
+                return Err(err);
+            }
+        };
         let fresh = {
             let guard = self
                 .verified_catalogs
@@ -519,6 +541,9 @@ impl ExternalMcpAdapter {
             });
         };
 
+        let transport = self.transports.get(&contract.connection_id)?;
+        let expected_origin = transport.origin();
+
         // Check BOTH `recheck_decision` AND live destination read/reconcile authorization inside
         // `Fence::Hold` strictly BEFORE any `McpCredentialProvider` lookup or outbound HTTP call.
         let authorized = {
@@ -531,12 +556,14 @@ impl ExternalMcpAdapter {
                 scope_id: &run.claim.scope_id,
                 run_id: &run.claim.run_id,
                 actor_user_id: &actor_user_id,
+                actor_approval_id: Some(&run.claim.actor_approval_id),
                 connection_id: &contract.connection_id,
                 account_id: &contract.account_id,
                 tool_id: &contract.tool_id,
                 tool_version: &contract.version,
                 destination: proposal.destination(),
                 capability: &op.capability,
+                expected_origin: Some(&expected_origin),
             };
             let reconcile_auth = self.reconcile_auth.clone();
             leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, held| {
@@ -571,7 +598,6 @@ impl ExternalMcpAdapter {
         if !authorized {
             return None;
         }
-        let transport = self.transports.get(&contract.connection_id)?;
         let call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
         let Ok(credential) = resolve_credential_bounded(
             self.credentials.as_ref(),
@@ -580,6 +606,9 @@ impl ExternalMcpAdapter {
                 account_id: &contract.account_id,
                 scope_id: &run.claim.scope_id,
                 actor_user_id: &actor_user_id,
+                actor_approval_id: Some(&run.claim.actor_approval_id),
+                expected_origin: Some(&expected_origin),
+                required_scope: Some(&contract.action),
             },
             call_deadline,
             &step.stop,
@@ -1250,6 +1279,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         StepResult::ToolResponse(Err(ToolFault::Transient))
                     };
                 }
+                let expected_origin = transport.origin();
                 let credential = match resolve_credential_bounded(
                     self.credentials.as_ref(),
                     CredentialRequest {
@@ -1257,6 +1287,9 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         account_id: &contract.account_id,
                         scope_id: lease.scope_id,
                         actor_user_id: &actor_user_id,
+                        actor_approval_id: Some(&run.claim.actor_approval_id),
+                        expected_origin: Some(&expected_origin),
+                        required_scope: Some(&contract.action),
                     },
                     call_deadline,
                     &step.stop,
