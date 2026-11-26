@@ -2193,11 +2193,15 @@ async fn migration_40_restricts_api_capacity_visibility_without_exposing_secrets
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_round_trip() {
-    use openmettle_core::capacity::adapter::{
-        self, ADAPTER_CONTRACT_VERSION, AdapterError, BackendDeviceConfig, CapacityAdapter,
-        CapacityWait, CoordinatorError, DispatchGrantCommand, DispatchOutcome,
-        EstablishEpochRequest, FencedBackend, GroupCoordinator, ReleaseGrantCommand,
+    use openmettle_core::{
+        capacity::adapter::{
+            self, ADAPTER_CONTRACT_VERSION, AdapterError, BackendDeviceConfig, CapacityAdapter,
+            CapacityWait, CoordinatorError, DispatchGrantCommand, DispatchOutcome,
+            EstablishEpochRequest, FencedBackend, GroupCoordinator, ReleaseGrantCommand,
+        },
+        telemetry::{Process, metrics::Metrics},
     };
+    use opentelemetry_proto::tonic::metrics::v1::metric;
     use sqlx::postgres::PgPoolOptions;
 
     let mut f = Fixture::new(&[GPU0, GPU1], 3).await;
@@ -2233,10 +2237,12 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
         )
         .unwrap(),
     );
+    let registry = Arc::new(Metrics::new());
 
     // Epoch 1: acquire, establish fence on backend, publish conservative observation, resume.
     let c1 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
-    let coord1 = GroupCoordinator::new(pool.clone(), c1, backend.clone());
+    let coord1 =
+        GroupCoordinator::with_metrics(pool.clone(), c1, backend.clone(), registry.clone());
     let r1 = coord1.takeover_and_reconcile().await.unwrap();
     assert_eq!(r1.established_epoch, coord1.controller().epoch());
     let obs1 = backend.observe().unwrap();
@@ -2249,7 +2255,8 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
     );
     assert!(coord1.resume().await.unwrap());
 
-    // Run 0 needs 6 GiB per GPU: insufficient before tail-KV reclaim.
+    // Run 0 needs 6 GiB per GPU: insufficient before tail-KV reclaim. Intermediate Busy does NOT
+    // consume `wait0`, so retrying on `wait0` after reclaim emits a single histogram sample.
     let six_each = [bytes(GPU0, 6 * GIB), bytes(GPU1, 6 * GIB)];
     let wait0 = CapacityWait::start();
     assert_eq!(
@@ -2259,6 +2266,7 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
             .unwrap(),
         DispatchOutcome::Insufficient
     );
+    assert!(!wait0.is_recorded());
 
     // Fenced tail-KV reclaim hands back 2 GiB per device while preserving the 16 GiB chat floor.
     let reclaimed = coord1
@@ -2285,7 +2293,7 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
     );
 
     // Commit-before-dispatch run 0 (3 GiB on both GPUs); replaying the already-confirmed grant
-    // returns Existing without calling the backend again.
+    // returns Existing without calling the backend again and emits exact 1 wait sample total.
     let three_each = [bytes(GPU0, 3 * GIB), bytes(GPU1, 3 * GIB)];
     let DispatchOutcome::Dispatched {
         grant_id: g0,
@@ -2297,6 +2305,7 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
     else {
         panic!("expected initial dispatch");
     };
+    assert!(wait0.is_recorded());
     assert_eq!(
         coord1
             .dispatch_grant(&f.request(0, "run0", &three_each), &wait0)
@@ -2306,6 +2315,22 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
             grant_id: g0.clone(),
             state: GrantState::Granted,
         }
+    );
+    let otlp = registry.encode_otlp(Process::Worker, None).unwrap();
+    let wait_samples: u64 = otlp.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .filter(|m| m.name == "openmettle.capacity.wait.duration")
+        .filter_map(|m| match m.data.as_ref() {
+            Some(metric::Data::Histogram(h)) => {
+                Some(h.data_points.iter().map(|dp| dp.count).sum::<u64>())
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        wait_samples, 1,
+        "retry loop sharing one CapacityWait must emit exactly 1 histogram sample"
     );
 
     // Run 1 suffers an ambiguous/lost dispatch reply -> durable grant enters unknown_allocation
@@ -2332,7 +2357,7 @@ async fn adapter_fenced_takeover_reconciliation_reclaim_and_partial_release_roun
     let epoch1 = coord1.controller().epoch();
     f.expire_controller_lease().await;
     let c2 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
-    let coord2 = GroupCoordinator::new(pool.clone(), c2, backend.clone());
+    let coord2 = GroupCoordinator::with_metrics(pool.clone(), c2, backend.clone(), registry);
     assert!(coord2.controller().epoch() > epoch1);
     let report = coord2.takeover_and_reconcile().await.unwrap();
     assert_eq!(report.established_epoch, coord2.controller().epoch());
@@ -2460,22 +2485,23 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
  {
     use openmettle_core::{
         capacity::adapter::{
-            AdapterError, BackendDeviceConfig, CapacityAdapter, CapacityWait, CoordinatorError,
-            DispatchOutcome, FencedBackend, GroupCoordinator,
+            ADAPTER_CONTRACT_VERSION, AdapterError, BackendDeviceConfig, CapacityAdapter,
+            CapacityWait, CoordinatorError, DispatchGrantCommand, DispatchGrantResponse,
+            DispatchOutcome, EstablishEpochRequest, EstablishEpochResponse, FencedBackend,
+            GroupCoordinator, ReclaimKvCommand, ReclaimKvResponse, ReleaseGrantCommand,
+            ReleaseGrantResponse,
         },
-        telemetry::{
-            Process,
-            metrics::{self},
-        },
+        telemetry::{Process, metrics::Metrics},
     };
     use opentelemetry_proto::tonic::{
         common::v1::any_value::Value as AnyVal,
         metrics::v1::{metric, number_data_point::Value as NumVal},
     };
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    fn metric_count(metric_name: &str, attr_key: &str, attr_val: &str) -> u64 {
-        let Some(req) = metrics::global().encode_otlp(Process::Worker, None) else {
+    fn metric_count(registry: &Metrics, metric_name: &str, attr_key: &str, attr_val: &str) -> u64 {
+        let Some(req) = registry.encode_otlp(Process::Worker, None) else {
             return 0;
         };
         let mut total = 0u64;
@@ -2522,6 +2548,61 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         total
     }
 
+    // Adapter wrapper that counts calls and can pause `dispatch_grant` on a Notify before touching
+    // the inner backend so we can cancel an in-flight future cleanly via `tokio::select!`.
+    struct GateAdapter {
+        inner: Arc<FencedBackend>,
+        establish_calls: AtomicUsize,
+        reclaim_calls: AtomicUsize,
+        pause_next_dispatch: AtomicBool,
+        entered: tokio::sync::Notify,
+        release_gate: tokio::sync::Notify,
+    }
+    impl GateAdapter {
+        fn new(inner: Arc<FencedBackend>) -> Self {
+            Self {
+                inner,
+                establish_calls: AtomicUsize::new(0),
+                reclaim_calls: AtomicUsize::new(0),
+                pause_next_dispatch: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release_gate: tokio::sync::Notify::new(),
+            }
+        }
+    }
+    impl CapacityAdapter for GateAdapter {
+        async fn establish_epoch(
+            &self,
+            request: EstablishEpochRequest,
+        ) -> Result<EstablishEpochResponse, AdapterError> {
+            self.establish_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.establish_epoch(request).await
+        }
+        async fn dispatch_grant(
+            &self,
+            command: DispatchGrantCommand,
+        ) -> Result<DispatchGrantResponse, AdapterError> {
+            if self.pause_next_dispatch.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release_gate.notified().await;
+            }
+            self.inner.dispatch_grant(command).await
+        }
+        async fn reclaim_kv(
+            &self,
+            command: ReclaimKvCommand,
+        ) -> Result<ReclaimKvResponse, AdapterError> {
+            self.reclaim_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.reclaim_kv(command).await
+        }
+        async fn release_grant(
+            &self,
+            command: ReleaseGrantCommand,
+        ) -> Result<ReleaseGrantResponse, AdapterError> {
+            self.inner.release_grant(command).await
+        }
+    }
+
     let mut f = Fixture::new(&[GPU0], 3).await;
     let pool = PgPoolOptions::new()
         .max_connections(4)
@@ -2544,42 +2625,100 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         )
         .unwrap(),
     );
+    let gate = Arc::new(GateAdapter::new(backend.clone()));
+    let registry = Arc::new(Metrics::new());
 
+    // 1. P1 #4: An UNCOMMITTED or rolled-back Controller::acquire cannot establish_epoch or
+    //    reclaim_kv on the backend because the coordinator checks a committed DB fence first.
+    {
+        let mut uncommitted_conn = f.worker().await;
+        let mut tx = uncommitted_conn.begin().await.unwrap();
+        let uncommitted_ctl = Controller::acquire(&mut tx, GROUP, LEASE).await.unwrap();
+        let uncommitted_coord = GroupCoordinator::with_metrics(
+            pool.clone(),
+            uncommitted_ctl,
+            gate.clone(),
+            registry.clone(),
+        );
+        // While `tx` still holds the uncommitted group row lock, the pool-backed fence waits up
+        // to lock_timeout and fails without touching the adapter.
+        assert_eq!(
+            uncommitted_coord.takeover_and_reconcile().await,
+            Err(CoordinatorError::Store(Error::Database))
+        );
+        assert_eq!(gate.establish_calls.load(Ordering::SeqCst), 0);
+        // Once rolled back, both `takeover_and_reconcile` and `reclaim_kv` fail immediately with
+        // Store(Fenced) without touching the adapter.
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            uncommitted_coord.takeover_and_reconcile().await,
+            Err(CoordinatorError::Store(Error::Fenced))
+        );
+        assert_eq!(
+            uncommitted_coord
+                .reclaim_kv("uncommitted-reclaim", &[bytes(GPU0, GIB)])
+                .await,
+            Err(CoordinatorError::Store(Error::Fenced))
+        );
+        assert_eq!(gate.establish_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.reclaim_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // 2. P1 #2: A freshly constructed GroupCoordinator starts unreconciled and refuses both
+    //    `resume()` and `dispatch_grant()` until `takeover_and_reconcile()` succeeds cleanly.
     let c1 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
-    let coord = GroupCoordinator::new(pool.clone(), c1, backend.clone());
-    // Do NOT establish_epoch yet so dispatch_grant hits AdapterError::Unfenced after Tx 1 commits
-    // `dispatch_state = 'in_flight'`.
+    let coord = GroupCoordinator::with_metrics(pool.clone(), c1, gate.clone(), registry.clone());
+    assert!(!coord.is_reconciled());
     let obs = backend.observe().unwrap();
     assert!(
         publish(&mut c, coord.controller(), 1, 0, &obs)
             .await
             .unwrap()
     );
-    assert!(coord.resume().await.unwrap());
-
-    let one_gib = [bytes(GPU0, GIB)];
+    assert!(!coord.resume().await.unwrap());
+    let three_gib = [bytes(GPU0, 3 * GIB)];
     let wait0 = CapacityWait::start();
     assert_eq!(
         coord
-            .dispatch_grant(&f.request(0, "inflight-run0", &one_gib), &wait0)
-            .await,
-        Err(CoordinatorError::Adapter(AdapterError::Unfenced))
+            .dispatch_grant(&f.request(0, "before-reconcile", &three_gib), &wait0)
+            .await
+            .unwrap(),
+        DispatchOutcome::Unavailable
     );
 
-    // The prepared grant is durable with `dispatch_state = 'in_flight'` and IMMEDIATELY blocks
-    // concurrent bursts (P1 #4).
-    let (state, dispatch_state): (String, String) = sqlx::query_as(
-        "SELECT state, dispatch_state FROM openmettle.capacity_grants
+    // Run clean takeover_and_reconcile + resume.
+    coord.takeover_and_reconcile().await.unwrap();
+    assert!(coord.is_reconciled());
+    assert!(coord.resume().await.unwrap());
+
+    // 3. P1 #4 & P1 #5: Cancel `dispatch_grant` mid-await right when it enters the adapter
+    //    (after Tx 1 committed `dispatch_state = 'in_flight'`, before backend allocation).
+    gate.pause_next_dispatch.store(true, Ordering::SeqCst);
+    {
+        let req0 = f.request(0, "inflight-run0", &three_gib);
+        let dispatch_fut = coord.dispatch_grant(&req0, &wait0);
+        tokio::pin!(dispatch_fut);
+        tokio::select! {
+            _ = &mut dispatch_fut => panic!("expected dispatch to pause at gate"),
+            _ = gate.entered.notified() => {}
+        }
+    }
+
+    // The prepared grant is durable with `dispatch_state = 'in_flight'`, `dispatch_epoch = epoch`,
+    // and IMMEDIATELY blocks concurrent bursts.
+    let (state, dispatch_state, dispatch_epoch): (String, String, Option<i64>) = sqlx::query_as(
+        "SELECT state, dispatch_state, dispatch_epoch FROM openmettle.capacity_grants
           WHERE request_key = 'inflight-run0'",
     )
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
     assert_eq!(
-        (state.as_str(), dispatch_state.as_str()),
-        ("granted", "in_flight")
+        (state.as_str(), dispatch_state.as_str(), dispatch_epoch),
+        ("granted", "in_flight", Some(coord.controller().epoch()))
     );
     assert!(!admits(&mut c).await);
+    let one_gib = [bytes(GPU0, GIB)];
     assert_eq!(
         coord
             .dispatch_grant(
@@ -2591,26 +2730,17 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         DispatchOutcome::Unavailable
     );
 
-    // Establish epoch on backend, then expire run 0's lease: retrying the unconfirmed `in_flight`
-    // grant MUST fail with LeaseLost and NEVER allocate on the backend (P1 #1).
-    let est = backend
-        .establish_epoch(
-            openmettle_core::capacity::adapter::EstablishEpochRequest::new(coord.controller()),
-        )
-        .await
-        .unwrap();
-    assert!(est.allocations.is_empty());
+    // 4. P1 #1: Expiring run 0's lease fails retrying the unconfirmed `in_flight` grant with
+    //    LeaseLost and NEVER allocates on the backend.
     f.expire_run_lease(0).await;
     assert_eq!(
         coord
-            .dispatch_grant(&f.request(0, "inflight-run0", &one_gib), &wait0)
+            .dispatch_grant(&f.request(0, "inflight-run0", &three_gib), &wait0)
             .await,
         Err(CoordinatorError::Store(Error::LeaseLost))
     );
     let after_expired_retry = backend
-        .establish_epoch(
-            openmettle_core::capacity::adapter::EstablishEpochRequest::new(coord.controller()),
-        )
+        .establish_epoch(EstablishEpochRequest::new(coord.controller()))
         .await
         .unwrap();
     assert!(
@@ -2618,8 +2748,9 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         "expired run lease must never dispatch onto backend"
     );
 
-    // Restore run 0's lease and retry the unconfirmed `in_flight` grant: it now dispatches once
-    // and confirms (`dispatch_state = 'confirmed'`), reopening bursts.
+    // 5. P1 #5: Restore run 0's lease, then publish a newer observation (commit_watermark = 0)
+    //    reporting only 2 GiB grantable: replaying the unsent 3 GiB `in_flight` grant MUST return
+    //    Insufficient and NEVER dispatch onto the backend!
     let run0_id = f.runs[0].run.clone();
     f.owner_exec(
         "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() + interval '60 seconds'
@@ -2627,11 +2758,56 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         &[&run0_id],
     )
     .await;
+    let tight_sample = DeviceObservation {
+        device_id: GPU0.into(),
+        total_bytes: TOTAL,
+        committed_bytes: 0,
+        actual_used_bytes: FLOOR + 5 * GIB,
+        reclaimable_bytes: 0,
+        safety_headroom_bytes: HEADROOM,
+        active_chat_floor_bytes: FLOOR,
+        grantable_bytes: 2 * GIB,
+    };
+    assert!(
+        publish(&mut c, coord.controller(), 2, 0, &[tight_sample])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        coord
+            .dispatch_grant(&f.request(0, "inflight-run0", &three_gib), &wait0)
+            .await
+            .unwrap(),
+        DispatchOutcome::Insufficient
+    );
+    assert!(
+        backend
+            .establish_epoch(EstablishEpochRequest::new(coord.controller()))
+            .await
+            .unwrap()
+            .allocations
+            .is_empty(),
+        "unfitted replay must not dispatch onto backend"
+    );
+
+    // Restore full spare observation (commit_watermark = 0): retrying run 0 now dispatches once
+    // and confirms (`dispatch_state = 'confirmed'`), reopening bursts.
+    assert!(
+        publish(
+            &mut c,
+            coord.controller(),
+            3,
+            0,
+            &backend.observe().unwrap()
+        )
+        .await
+        .unwrap()
+    );
     let DispatchOutcome::Dispatched {
         grant_id: g0,
         replayed: true,
     } = coord
-        .dispatch_grant(&f.request(0, "inflight-run0", &one_gib), &wait0)
+        .dispatch_grant(&f.request(0, "inflight-run0", &three_gib), &wait0)
         .await
         .unwrap()
     else {
@@ -2647,17 +2823,30 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
     assert_eq!(confirmed, "confirmed");
     assert!(admits(&mut c).await);
 
-    // Replaying an already-confirmed grant MUST return Existing WITHOUT calling the backend and
-    // WITHOUT incrementing grant or wait metrics (P1 #1).
-    let grants_before = metric_count("openmettle.capacity.grants", "outcome", "granted");
-    let waits_before = metric_count("openmettle.capacity.wait.duration", "outcome", "granted");
-    assert!(grants_before > 0, "initial grant must have recorded metric");
-    assert!(waits_before > 0, "initial wait must have recorded metric");
-    // Inject a one-shot dispatch error that would fire if the backend were touched on replay.
+    // 6. P1 #1 & P2 #12: Replaying an already-confirmed grant MUST return Existing WITHOUT
+    //    calling the backend and WITHOUT incrementing isolated grant or wait metrics!
+    assert_eq!(
+        metric_count(
+            &registry,
+            "openmettle.capacity.grants",
+            "outcome",
+            "granted"
+        ),
+        1
+    );
+    assert_eq!(
+        metric_count(
+            &registry,
+            "openmettle.capacity.wait.duration",
+            "outcome",
+            "granted",
+        ),
+        1
+    );
     backend.inject_next_dispatch_error(AdapterError::Unavailable);
     assert_eq!(
         coord
-            .dispatch_grant(&f.request(0, "inflight-run0", &one_gib), &wait0)
+            .dispatch_grant(&f.request(0, "inflight-run0", &three_gib), &wait0)
             .await
             .unwrap(),
         DispatchOutcome::Existing {
@@ -2666,17 +2855,219 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
         }
     );
     assert_eq!(
-        metric_count("openmettle.capacity.grants", "outcome", "granted"),
-        grants_before
+        metric_count(
+            &registry,
+            "openmettle.capacity.grants",
+            "outcome",
+            "granted"
+        ),
+        1
     );
     assert_eq!(
-        metric_count("openmettle.capacity.wait.duration", "outcome", "granted"),
-        waits_before
+        metric_count(
+            &registry,
+            "openmettle.capacity.wait.duration",
+            "outcome",
+            "granted",
+        ),
+        1
     );
+    // Clear unused injected error before testing low-level `pending` grant handoff.
+    let _ = backend
+        .dispatch_grant(DispatchGrantCommand {
+            version: ADAPTER_CONTRACT_VERSION.into(),
+            group_id: GROUP.into(),
+            controller_epoch: coord.controller().epoch(),
+            grant_id: g0.clone(),
+            profile: "synthetic-image".into(),
+            footprint: three_gib.to_vec(),
+        })
+        .await;
 
-    // Aging the observation past TTL and attempting a new dispatch increments
-    // `openmettle.capacity.observations.stale{surface="controller"}` (P2 #12).
+    // 7. P1 #1: Low-level `capacity::grant` inserts `dispatch_state = 'pending'`; resuming it via
+    //    `GroupCoordinator::dispatch_grant` MUST dispatch onto the backend (not return Existing!)
+    //    and confirm `'confirmed'`.
+    let g1_pending = granted(
+        capacity::grant(
+            &mut c,
+            coord.controller(),
+            &f.request(1, "lowlevel-pending", &one_gib),
+        )
+        .await
+        .unwrap(),
+    );
+    let pending_state: String = sqlx::query_scalar(
+        "SELECT dispatch_state FROM openmettle.capacity_grants WHERE id = $1::uuid",
+    )
+    .bind(&g1_pending)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(pending_state, "pending");
+    let DispatchOutcome::Dispatched {
+        grant_id: g1_dispatched,
+        replayed: true,
+    } = coord
+        .dispatch_grant(
+            &f.request(1, "lowlevel-pending", &one_gib),
+            &CapacityWait::start(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected low-level pending grant to dispatch via coordinator");
+    };
+    assert_eq!(g1_dispatched, g1_pending);
+    let g1_confirmed: String = sqlx::query_scalar(
+        "SELECT dispatch_state FROM openmettle.capacity_grants WHERE id = $1::uuid",
+    )
+    .bind(&g1_pending)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(g1_confirmed, "confirmed");
+
+    // 8. P1 #6: `capacity_confirm_dispatch` rejects confirming (a) a non-granted row (releasing /
+    //    unknown_allocation) and (b) an earlier epoch's un-reconciled `in_flight` row, never
+    //    advancing `reconciled_epoch`.
+    let confirm_secret = [0x42u8; 32];
+    f.expire_controller_lease().await;
+    let e2: i64 =
+        sqlx::query_scalar("SELECT openmettle.capacity_acquire_controller($1::uuid, $2, 60000)")
+            .bind(GROUP)
+            .bind(confirm_secret.as_slice())
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    // Mark g1_pending as in_flight from epoch 1 (reconciled_epoch = 1 < e2): confirm in e2 MUST fail (23505)!
+    sqlx::query(
+        "UPDATE openmettle.capacity_grants
+            SET dispatch_state = 'in_flight', dispatch_epoch = granted_epoch
+          WHERE id = $1::uuid",
+    )
+    .bind(&g1_pending)
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlstate(
+            sqlx::query("SELECT openmettle.capacity_confirm_dispatch($1::uuid, $2, $3, $4::uuid)")
+                .bind(GROUP)
+                .bind(confirm_secret.as_slice())
+                .bind(e2)
+                .bind(&g1_pending)
+                .execute(&mut c)
+                .await
+        ),
+        "23505"
+    );
+    let g1_reconciled_epoch: i64 = sqlx::query_scalar(
+        "SELECT reconciled_epoch FROM openmettle.capacity_grants WHERE id = $1::uuid",
+    )
+    .bind(&g1_pending)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert!(
+        g1_reconciled_epoch < e2,
+        "failed confirm must never advance reconciled_epoch"
+    );
+    for non_granted in ["releasing", "unknown_allocation"] {
+        sqlx::query(
+            "UPDATE openmettle.capacity_grants
+                SET state = $2, reconciled_epoch = $3, dispatch_state = 'in_flight', dispatch_epoch = $3
+              WHERE id = $1::uuid",
+        )
+        .bind(&g0)
+        .bind(non_granted)
+        .bind(e2)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlstate(
+                sqlx::query(
+                    "SELECT openmettle.capacity_confirm_dispatch($1::uuid, $2, $3, $4::uuid)"
+                )
+                .bind(GROUP)
+                .bind(confirm_secret.as_slice())
+                .bind(e2)
+                .bind(&g0)
+                .execute(&mut c)
+                .await
+            ),
+            "23505",
+            "confirm_dispatch must reject state={non_granted}"
+        );
+    }
+
+    // 9. P1 #4 & P2 #12: Expired controller lease fails `reclaim_kv` with Store(Fenced) BEFORE
+    //    touching the backend; stale observation on a live reconciled coordinator increments
+    //    `openmettle.capacity.observations.stale{surface="controller"}` on isolated metrics!
+    let reclaim_before = gate.reclaim_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        coord.reclaim_kv("fenced-reclaim", &one_gib).await,
+        Err(CoordinatorError::Store(Error::Fenced))
+    );
+    assert_eq!(gate.reclaim_calls.load(Ordering::SeqCst), reclaim_before);
+
+    f.expire_controller_lease().await;
+    let c3 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
+    let coord3 = GroupCoordinator::with_metrics(pool.clone(), c3, gate.clone(), registry.clone());
+    coord3.takeover_and_reconcile().await.unwrap();
+    // Confirming a now-`released` grant (g0 settled during takeover) is also refused (23505).
+    assert_eq!(
+        sqlstate(
+            sqlx::query("SELECT openmettle.capacity_confirm_dispatch($1::uuid, $2, $3, $4::uuid)")
+                .bind(GROUP)
+                .bind(confirm_secret.as_slice())
+                .bind(e2)
+                .bind(&g0)
+                .execute(&mut c)
+                .await
+        ),
+        "OMC01"
+    );
+    // Re-acquire with known secret to prove `released` specifically fails with 23505 (not OMC01).
+    let rel_secret = [0x43u8; 32];
+    f.expire_controller_lease().await;
+    let e4: i64 =
+        sqlx::query_scalar("SELECT openmettle.capacity_acquire_controller($1::uuid, $2, 60000)")
+            .bind(GROUP)
+            .bind(rel_secret.as_slice())
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    assert_eq!(
+        sqlstate(
+            sqlx::query("SELECT openmettle.capacity_confirm_dispatch($1::uuid, $2, $3, $4::uuid)")
+                .bind(GROUP)
+                .bind(rel_secret.as_slice())
+                .bind(e4)
+                .bind(&g0)
+                .execute(&mut c)
+                .await
+        ),
+        "23505"
+    );
+    f.expire_controller_lease().await;
+    let c5 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
+    let coord3 = GroupCoordinator::with_metrics(pool.clone(), c5, gate.clone(), registry.clone());
+    coord3.takeover_and_reconcile().await.unwrap();
+    assert!(
+        publish(
+            &mut c,
+            coord3.controller(),
+            4,
+            0,
+            &backend.observe().unwrap()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(coord3.resume().await.unwrap());
     let stale_before = metric_count(
+        &registry,
         "openmettle.capacity.observations.stale",
         "surface",
         "controller",
@@ -2689,21 +3080,23 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
     )
     .await;
     assert_eq!(
-        coord
+        coord3
             .dispatch_grant(
-                &f.request(1, "stale-run1", &one_gib),
+                &f.request(2, "stale-run2", &one_gib),
                 &CapacityWait::start()
             )
             .await
             .unwrap(),
         DispatchOutcome::Unavailable
     );
-    assert!(
+    assert_eq!(
         metric_count(
+            &registry,
             "openmettle.capacity.observations.stale",
             "surface",
             "controller",
-        ) > stale_before
+        ),
+        stale_before + 1
     );
 }
 
@@ -2712,16 +3105,17 @@ async fn two_phase_in_flight_dispatch_blocks_bursts_rechecks_run_lease_and_dedup
 async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_malformed_reclaim() {
     use openmettle_core::capacity::adapter::{
         self, ADAPTER_CONTRACT_VERSION, AdapterError, BackendDeviceConfig, CapacityAdapter,
-        CapacityWait, DeviceReclaimResult, DispatchGrantCommand, DispatchGrantResponse,
-        DispatchOutcome, EstablishEpochRequest, EstablishEpochResponse, FencedBackend,
-        GroupCoordinator, ReclaimKvCommand, ReclaimKvResponse, ReleaseGrantCommand,
+        CapacityWait, CoordinatorError, DeviceReclaimResult, DispatchGrantCommand,
+        DispatchGrantResponse, DispatchOutcome, EstablishEpochRequest, EstablishEpochResponse,
+        FencedBackend, GroupCoordinator, ReclaimKvCommand, ReclaimKvResponse, ReleaseGrantCommand,
         ReleaseGrantResponse,
     };
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::AtomicBool;
 
     const ROGUE_GRANT: &str = "00000000-0000-4000-8000-00000000c888";
 
-    let mut f = Fixture::new(&[GPU0, GPU1], 2).await;
+    let mut f = Fixture::new(&[GPU0, GPU1], 3).await;
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect_with(role_options(&f.db.0, WORKER))
@@ -2821,9 +3215,9 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
     backend.inject_unknown_release(&g0, GPU1);
 
     // Epoch 2 takeover:
-    // - ROGUE_GRANT fails release -> report.unknown += 1, unresolved_backend_unknown = true.
-    // - g0 has extra rank GPU1 returning Unknown -> MUST NOT settle g0 in PostgreSQL even though
-    //   GPU0 confirmed Released!
+    // - ROGUE_GRANT fails release -> report.unknown += 1, backend_unknown = true in PostgreSQL.
+    // - g0 has extra rank GPU1 persisted in `extra_devices` and returning Unknown -> MUST NOT
+    //   settle g0 in PostgreSQL even though GPU0 confirmed Released!
     // - g1 was absent on backend -> confirmed NotAllocated and released cleanly!
     f.expire_controller_lease().await;
     let c2 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
@@ -2839,31 +3233,46 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
         (0, 1, 0, 2)
     );
     assert!(coord2.has_unresolved_backend_unknown());
+    let db_backend_unknown: bool = sqlx::query_scalar(
+        "SELECT backend_unknown FROM openmettle.capacity_groups WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert!(db_backend_unknown);
     assert_eq!(f.slot(0).await.0, "handoff_committed");
     assert_eq!(f.slot(1).await.0, "released");
-    let g0_state: String =
-        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
-            .bind(&g0)
-            .fetch_one(&mut f.owner)
-            .await
-            .unwrap();
+    let (g0_state, g0_extra): (String, Vec<String>) = sqlx::query_as(
+        "SELECT state, ARRAY(SELECT x::text FROM unnest(extra_devices) AS x ORDER BY x)
+           FROM openmettle.capacity_grants WHERE id = $1::uuid",
+    )
+    .bind(&g0)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
     assert_eq!(g0_state, "unknown_allocation");
+    assert_eq!(g0_extra, vec![GPU1.to_owned()]);
 
-    // Clear g0's extra rank first while keeping ROGUE_GRANT stuck: g0 settles cleanly, leaving
-    // ONLY the backend-only rogue unknown — resume() MUST still return Ok(false)!
-    backend.clear_unknown_release(&g0, GPU1);
-    let report2 = coord2.takeover_and_reconcile().await.unwrap();
+    // P1 #3: Calling `coord2.release_grant(&g0, &[GPU0.into()])` while extra rank GPU1 is STILL
+    // Unknown MUST NOT settle g0 or release its quota slot!
     assert_eq!(
-        (
-            report2.attested,
-            report2.released,
-            report2.rogue_released,
-            report2.unknown
-        ),
-        (0, 1, 0, 1)
+        coord2.release_grant(&g0, &[GPU0.into()]).await.unwrap(),
+        GrantState::UnknownAllocation
+    );
+    assert_eq!(f.slot(0).await.0, "handoff_committed");
+
+    // Once GPU1 clears, calling `coord2.release_grant(&g0, &[GPU0.into()])` releases persisted
+    // extra rank GPU1 too and settles g0 + its quota slot cleanly!
+    backend.clear_unknown_release(&g0, GPU1);
+    assert_eq!(
+        coord2.release_grant(&g0, &[GPU0.into()]).await.unwrap(),
+        GrantState::Released
     );
     assert_eq!(f.slot(0).await.0, "released");
-    assert!(coord2.has_unresolved_backend_unknown());
+
+    // Even with zero durable live grants, backend-only rogue unknown keeps `backend_unknown = true`
+    // in PostgreSQL and refuses both `coord2.resume()` and low-level `capacity::resume`!
     let obs_rogue_only = backend
         .observe_with_commitments(
             &adapter::durable_committed_through(&pool, GROUP, snap.commit_seq)
@@ -2882,12 +3291,14 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
         .await
         .unwrap()
     );
+    assert!(!coord2.resume().await.unwrap());
     assert!(
-        !coord2.resume().await.unwrap(),
-        "resume must stay closed while a backend-only rogue allocation is unresolved"
+        !capacity::resume(&mut c, coord2.controller()).await.unwrap(),
+        "PostgreSQL backend_unknown must block resume even directly in SQL"
     );
 
-    // Clear ROGUE_GRANT: takeover confirms rogue release and resume() now succeeds!
+    // Clear ROGUE_GRANT: takeover confirms rogue release, clears `backend_unknown`, and `resume()`
+    // now succeeds!
     backend.clear_unknown_release(ROGUE_GRANT, GPU0);
     let report3 = coord2.takeover_and_reconcile().await.unwrap();
     assert_eq!(
@@ -2901,6 +3312,121 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
     );
     assert!(!coord2.has_unresolved_backend_unknown());
     assert!(coord2.resume().await.unwrap());
+    assert!(admits(&mut c).await);
+
+    // P1 #7: Cancelling `release_grant` mid-await after freeing 1 rank leaves
+    // `dispatch_state = 'release_in_flight'` durably committed in PostgreSQL so bursts stay
+    // closed until release completes!
+    struct ReleaseCancelAdapter {
+        inner: Arc<FencedBackend>,
+        pause_next_release: AtomicBool,
+        entered: tokio::sync::Notify,
+        release_gate: tokio::sync::Notify,
+    }
+    impl CapacityAdapter for ReleaseCancelAdapter {
+        async fn establish_epoch(
+            &self,
+            request: EstablishEpochRequest,
+        ) -> Result<EstablishEpochResponse, AdapterError> {
+            self.inner.establish_epoch(request).await
+        }
+        async fn dispatch_grant(
+            &self,
+            command: DispatchGrantCommand,
+        ) -> Result<DispatchGrantResponse, AdapterError> {
+            self.inner.dispatch_grant(command).await
+        }
+        async fn reclaim_kv(
+            &self,
+            command: ReclaimKvCommand,
+        ) -> Result<ReclaimKvResponse, AdapterError> {
+            self.inner.reclaim_kv(command).await
+        }
+        async fn release_grant(
+            &self,
+            command: ReleaseGrantCommand,
+        ) -> Result<ReleaseGrantResponse, AdapterError> {
+            if self.pause_next_release.swap(false, Ordering::SeqCst) {
+                // Free GPU0 physically on the backend, then pause before returning so the caller
+                // cancels the future mid-release.
+                let partial = ReleaseGrantCommand {
+                    devices: vec![GPU0.into()],
+                    ..command.clone()
+                };
+                self.inner.release_grant(partial).await?;
+                self.entered.notify_one();
+                self.release_gate.notified().await;
+            }
+            self.inner.release_grant(command).await
+        }
+    }
+
+    let cancel_adapter = Arc::new(ReleaseCancelAdapter {
+        inner: backend.clone(),
+        pause_next_release: AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release_gate: tokio::sync::Notify::new(),
+    });
+    f.expire_controller_lease().await;
+    let c3 = Controller::acquire(&mut c, GROUP, LEASE).await.unwrap();
+    let coord3 = GroupCoordinator::new(pool.clone(), c3, cancel_adapter.clone());
+    coord3.takeover_and_reconcile().await.unwrap();
+    assert!(
+        publish(
+            &mut c,
+            coord3.controller(),
+            3,
+            snap.commit_seq,
+            &backend.observe().unwrap()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(coord3.resume().await.unwrap());
+    let DispatchOutcome::Dispatched { grant_id: g2, .. } = coord3
+        .dispatch_grant(
+            &f.request(2, "cancel-rel-run2", &[bytes(GPU0, GIB), bytes(GPU1, GIB)]),
+            &CapacityWait::start(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected g2 dispatch");
+    };
+    assert!(admits(&mut c).await);
+
+    cancel_adapter
+        .pause_next_release
+        .store(true, Ordering::SeqCst);
+    {
+        let devs = [GPU0.to_owned(), GPU1.to_owned()];
+        let rel_fut = coord3.release_grant(&g2, &devs);
+        tokio::pin!(rel_fut);
+        tokio::select! {
+            _ = &mut rel_fut => panic!("expected release to pause mid-flight"),
+            _ = cancel_adapter.entered.notified() => {}
+        }
+    }
+    let rel_dispatch_state: String = sqlx::query_scalar(
+        "SELECT dispatch_state FROM openmettle.capacity_grants WHERE id = $1::uuid",
+    )
+    .bind(&g2)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(rel_dispatch_state, "release_in_flight");
+    assert!(
+        !admits(&mut c).await,
+        "release_in_flight must close group to bursts"
+    );
+    assert_eq!(
+        coord3
+            .release_grant(&g2, &[GPU0.into(), GPU1.into()])
+            .await
+            .unwrap(),
+        GrantState::Released
+    );
+    assert!(admits(&mut c).await);
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 
     // Malformed reclaim_kv responses (extra/duplicate/wrong device or > target bytes) are
@@ -2977,7 +3503,7 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
         let bad = GroupCoordinator::new(pool.clone(), ctl, MalformedReclaimAdapter { mode });
         assert_eq!(
             bad.reclaim_kv("bad-reclaim", &targets).await,
-            Err(AdapterError::Invalid),
+            Err(CoordinatorError::Adapter(AdapterError::Invalid)),
             "malformed reclaim mode {mode} must be rejected"
         );
     }
@@ -2988,8 +3514,47 @@ async fn takeover_reconciles_rogue_backend_allocations_extra_ranks_and_rejects_m
 async fn capacity_cardinality_triggers_enforce_openapi_bounds() {
     let mut f = Fixture::new(&[], 0).await;
 
-    // 1. capacity_profiles allows 256 rows and refuses the 257th with SQLSTATE 23514.
-    for i in 0..256 {
+    // 0a. P2 #8: `opt_in` profile with NULL `required_capability` is rejected by table CHECK (23514).
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "INSERT INTO openmettle.capacity_profiles
+                     (profile, group_id, per_device_bytes, required_devices, capability_gate)
+                 VALUES ('bad-optin', $1::uuid, $2, 1, 'opt_in')",
+            )
+            .bind(GROUP)
+            .bind(GIB)
+            .execute(&mut f.owner)
+            .await
+        ),
+        "23514"
+    );
+
+    // 0b. P2 #9: REPEATABLE READ inserts into profiles, groups, and devices are refused with 25000.
+    for sql in [
+        format!(
+            "INSERT INTO openmettle.capacity_profiles (profile, group_id, per_device_bytes, required_devices)
+             VALUES ('rr-profile', '{GROUP}'::uuid, {GIB}, 1)"
+        ),
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+         VALUES ('00000000-0000-4000-8000-0000000000fe'::uuid, 60000)"
+            .to_owned(),
+        format!(
+            "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+             VALUES ('00000000-0000-4000-8000-0000d000fffe'::uuid, '{GROUP}'::uuid, {FLOOR})"
+        ),
+    ] {
+        let mut tx = f.owner.begin().await.unwrap();
+        tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .unwrap();
+        assert_eq!(sqlstate(tx.execute(AssertSqlSafe(sql)).await), "25000");
+        tx.rollback().await.unwrap();
+    }
+
+    // 1. capacity_profiles allows 256 rows; two concurrent READ COMMITTED inserts at count 255
+    //    produce exactly 1 winner and 1 SQLSTATE 23514 refusal.
+    for i in 0..255 {
         sqlx::query(
             "INSERT INTO openmettle.capacity_profiles
                  (profile, group_id, per_device_bytes, required_devices)
@@ -3002,24 +3567,49 @@ async fn capacity_cardinality_triggers_enforce_openapi_bounds() {
         .await
         .unwrap();
     }
-    assert_eq!(
-        sqlstate(
-            sqlx::query(
-                "INSERT INTO openmettle.capacity_profiles
-                     (profile, group_id, per_device_bytes, required_devices)
-                 VALUES ('profile-256', $1::uuid, $2, 1)",
-            )
-            .bind(GROUP)
-            .bind(GIB)
-            .execute(&mut f.owner)
-            .await
-        ),
-        "23514"
-    );
+    {
+        let mut o1 = connect(&f.db.0, OWNER).await;
+        let mut o2 = connect(&f.db.0, OWNER).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (barrier.clone(), barrier.clone());
+        let (r1, r2) = tokio::join!(
+            async move {
+                b1.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_profiles
+                         (profile, group_id, per_device_bytes, required_devices)
+                     VALUES ('profile-race-a', $1::uuid, $2, 1)",
+                )
+                .bind(GROUP)
+                .bind(GIB)
+                .execute(&mut o1)
+                .await
+            },
+            async move {
+                b2.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_profiles
+                         (profile, group_id, per_device_bytes, required_devices)
+                     VALUES ('profile-race-b', $1::uuid, $2, 1)",
+                )
+                .bind(GROUP)
+                .bind(GIB)
+                .execute(&mut o2)
+                .await
+            }
+        );
+        let oks = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(oks, 1, "expected 1 winner at profile ceiling");
+        if r1.is_err() {
+            assert_eq!(sqlstate(r1), "23514");
+        } else {
+            assert_eq!(sqlstate(r2), "23514");
+        }
+    }
 
-    // 2. capacity_groups allows 64 rows (Fixture already inserted GROUP and GROUP_B = 2)
-    //    and refuses the 65th with SQLSTATE 23514.
-    for i in 2..64u64 {
+    // 2. capacity_groups allows 64 rows (Fixture already inserted GROUP and GROUP_B = 2); two
+    //    concurrent READ COMMITTED inserts at count 63 produce 1 winner and 1 SQLSTATE 23514.
+    for i in 2..63u64 {
         let id = format!("00000000-0000-4000-8000-{i:012x}");
         sqlx::query(
             "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
@@ -3030,20 +3620,43 @@ async fn capacity_cardinality_triggers_enforce_openapi_bounds() {
         .await
         .unwrap();
     }
-    assert_eq!(
-        sqlstate(
-            sqlx::query(
-                "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
-                 VALUES ('00000000-0000-4000-8000-000000000099'::uuid, 60000)",
-            )
-            .execute(&mut f.owner)
-            .await
-        ),
-        "23514"
-    );
+    {
+        let mut o1 = connect(&f.db.0, OWNER).await;
+        let mut o2 = connect(&f.db.0, OWNER).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (barrier.clone(), barrier.clone());
+        let (r1, r2) = tokio::join!(
+            async move {
+                b1.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+                     VALUES ('00000000-0000-4000-8000-000000000098'::uuid, 60000)",
+                )
+                .execute(&mut o1)
+                .await
+            },
+            async move {
+                b2.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+                     VALUES ('00000000-0000-4000-8000-000000000099'::uuid, 60000)",
+                )
+                .execute(&mut o2)
+                .await
+            }
+        );
+        let oks = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(oks, 1, "expected 1 winner at group ceiling");
+        if r1.is_err() {
+            assert_eq!(sqlstate(r1), "23514");
+        } else {
+            assert_eq!(sqlstate(r2), "23514");
+        }
+    }
 
-    // 3. capacity_devices allows 64 devices per group and refuses the 65th with SQLSTATE 23514.
-    for i in 0..64u64 {
+    // 3. capacity_devices allows 64 devices per group; two concurrent READ COMMITTED inserts at
+    //    count 63 produce 1 winner and 1 SQLSTATE 23514.
+    for i in 0..63u64 {
         let dev_id = format!("00000000-0000-4000-8000-0000d000{:04x}", i);
         sqlx::query(
             "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
@@ -3056,19 +3669,43 @@ async fn capacity_cardinality_triggers_enforce_openapi_bounds() {
         .await
         .unwrap();
     }
-    assert_eq!(
-        sqlstate(
-            sqlx::query(
-                "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
-                 VALUES ('00000000-0000-4000-8000-0000d000ffff'::uuid, $1::uuid, $2)",
-            )
-            .bind(GROUP)
-            .bind(FLOOR)
-            .execute(&mut f.owner)
-            .await
-        ),
-        "23514"
-    );
+    {
+        let mut o1 = connect(&f.db.0, OWNER).await;
+        let mut o2 = connect(&f.db.0, OWNER).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (b1, b2) = (barrier.clone(), barrier.clone());
+        let (r1, r2) = tokio::join!(
+            async move {
+                b1.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+                     VALUES ('00000000-0000-4000-8000-0000d000fffe'::uuid, $1::uuid, $2)",
+                )
+                .bind(GROUP)
+                .bind(FLOOR)
+                .execute(&mut o1)
+                .await
+            },
+            async move {
+                b2.wait().await;
+                sqlx::query(
+                    "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+                     VALUES ('00000000-0000-4000-8000-0000d000ffff'::uuid, $1::uuid, $2)",
+                )
+                .bind(GROUP)
+                .bind(FLOOR)
+                .execute(&mut o2)
+                .await
+            }
+        );
+        let oks = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(oks, 1, "expected 1 winner at device ceiling");
+        if r1.is_err() {
+            assert_eq!(sqlstate(r1), "23514");
+        } else {
+            assert_eq!(sqlstate(r2), "23514");
+        }
+    }
 }
 
 #[tokio::test]

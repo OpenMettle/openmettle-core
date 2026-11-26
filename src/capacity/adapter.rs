@@ -2,20 +2,21 @@
 //!
 //! Every adapter envelope carries [`ADAPTER_CONTRACT_VERSION`], the managed `group_id` and the
 //! controller's monotonic `controller_epoch`, and rejects unknown fields. On takeover, the
-//! successor establishes its epoch with the backend before reconciling durable grants, releasing
-//! any rogue or mismatched backend allocations, or resuming bursts; stale-epoch commands arriving
-//! after that fence can neither allocate nor release.
+//! successor commits a fenced `backend_unknown = true` barrier in PostgreSQL before establishing
+//! its epoch with the backend, reconciles durable grants and backend-only rogue allocations, and
+//! only clears `backend_unknown` once zero unknowns remain; stale-epoch commands arriving after
+//! that fence can neither allocate nor release.
 //!
-//! [`GroupCoordinator`] enforces commit-before-dispatch against a [`PgPool`] using bounded
-//! `READ COMMITTED` transactions (`WriteTransaction::begin_bounded_pool`), serializes per-group
-//! controller operations, keeps every newly prepared grant `in_flight` (blocking concurrent bursts)
-//! until backend dispatch confirms or reconciles, and never discards database reconciliation
-//! errors.
+//! [`GroupCoordinator`] enforces commit-before-dispatch and release-in-flight against a [`PgPool`]
+//! using bounded `READ COMMITTED` transactions (`WriteTransaction::begin_bounded_pool`),
+//! serializes per-group controller operations, refuses `dispatch_grant` and `resume` until
+//! `takeover_and_reconcile` succeeds cleanly, and never discards database reconciliation errors.
 use super::{Controller, DeviceBytes, Error as StoreError, Evidence, GrantRequest, GrantState};
 use crate::{
     runs::{self, WriteTransaction, bounded, is_canonical_uuid},
     telemetry::metrics::{
         self, CapacityOperation, CapacityOutcome, CapacityStaleSurface, CapacityWaitOutcome,
+        Metrics,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -142,35 +143,45 @@ fn map_tx_error(error: runs::Error) -> StoreError {
     }
 }
 
-/// Caller-owned wait timer started when a run begins waiting for burst capacity (ADR 0028 /
-/// ADR 0042). Pass to [`GroupCoordinator::dispatch_grant`] so `openmettle.capacity.wait.duration`
-/// records total caller wait time rather than only the final database/adapter call.
-#[derive(Clone, Copy, Debug)]
+/// Caller-owned single-shot wait timer started when a run begins waiting for burst capacity
+/// (ADR 0028 / ADR 0042). Emits at most one `openmettle.capacity.wait.duration` sample across
+/// retries: [`GroupCoordinator::dispatch_grant`] automatically finishes it on `Dispatched`, while
+/// intermediate `Insufficient`/`Unavailable` retries leave it open until the caller succeeds or
+/// calls [`Self::finish`] on give-up/timeout/cancellation.
+#[derive(Debug)]
 pub struct CapacityWait {
     started_at: Instant,
+    recorded: AtomicBool,
 }
 
 impl CapacityWait {
     pub fn start() -> Self {
-        Self {
-            started_at: Instant::now(),
-        }
+        Self::from_instant(Instant::now())
     }
 
     pub fn from_instant(started_at: Instant) -> Self {
-        Self { started_at }
+        Self {
+            started_at,
+            recorded: AtomicBool::new(false),
+        }
     }
 
     pub fn elapsed(&self) -> Duration {
         self.started_at.elapsed()
     }
 
-    pub fn record(&self, outcome: CapacityWaitOutcome) {
-        metrics::global().record_capacity_wait(outcome, self.elapsed());
+    pub fn is_recorded(&self) -> bool {
+        self.recorded.load(Ordering::Acquire)
     }
 
-    pub fn finish(self, outcome: CapacityWaitOutcome) {
-        self.record(outcome);
+    pub fn finish(&self, outcome: CapacityWaitOutcome) {
+        self.finish_with_metrics(metrics::global(), outcome);
+    }
+
+    pub fn finish_with_metrics(&self, registry: &Metrics, outcome: CapacityWaitOutcome) {
+        if !self.recorded.swap(true, Ordering::AcqRel) {
+            registry.record_capacity_wait(outcome, self.started_at.elapsed());
+        }
     }
 }
 
@@ -1097,6 +1108,7 @@ struct DurableLiveGrant {
     profile: String,
     footprint: BTreeMap<String, i64>,
     unreleased_devices: Vec<String>,
+    extra_devices: Vec<String>,
 }
 
 enum PreparedDispatch {
@@ -1104,6 +1116,12 @@ enum PreparedDispatch {
     AlreadySettled { grant_id: String, state: GrantState },
     Insufficient,
     Unavailable { observation_stale: bool },
+}
+
+struct PreparedRelease {
+    grant_state: GrantState,
+    unreleased_devices: Vec<String>,
+    extra_devices: Vec<String>,
 }
 
 struct VerifiedRelease {
@@ -1157,6 +1175,7 @@ async fn load_live_grants(
 ) -> Result<Vec<(String, DurableLiveGrant)>, StoreError> {
     let rows = sqlx::query(
         "SELECT g.id::text AS grant_id, g.state, g.profile,
+                ARRAY(SELECT x::text FROM unnest(g.extra_devices) AS x ORDER BY x) AS extra_devices,
                 gd.device_id::text AS device_id, gd.bytes,
                 gd.released_at IS NOT NULL AS device_released
            FROM openmettle.capacity_grants g
@@ -1184,6 +1203,7 @@ async fn load_live_grants(
                         profile: row.try_get("profile")?,
                         footprint: BTreeMap::new(),
                         unreleased_devices: Vec::new(),
+                        extra_devices: row.try_get("extra_devices")?,
                     },
                 ));
                 &mut ordered.last_mut().unwrap().1
@@ -1195,6 +1215,73 @@ async fn load_live_grants(
         }
     }
     Ok(ordered)
+}
+
+async fn set_backend_unknown_tx(
+    pool: &PgPool,
+    controller: &Controller,
+    unknown: bool,
+) -> Result<(), StoreError> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+        .await
+        .map_err(map_tx_error)?;
+    sqlx::query("SELECT openmettle.capacity_set_backend_unknown($1::uuid, $2, $3, $4)")
+        .bind(controller.group_id())
+        .bind(controller.secret.as_slice())
+        .bind(controller.epoch())
+        .bind(unknown)
+        .execute(tx.connection().map_err(map_tx_error)?)
+        .await?;
+    tx.commit().await.map_err(map_tx_error)?;
+    Ok(())
+}
+
+async fn check_controller_tx(pool: &PgPool, controller: &Controller) -> Result<(), StoreError> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+        .await
+        .map_err(map_tx_error)?;
+    sqlx::query("SELECT openmettle.capacity_check_controller($1::uuid, $2, $3)")
+        .bind(controller.group_id())
+        .bind(controller.secret.as_slice())
+        .bind(controller.epoch())
+        .execute(tx.connection().map_err(map_tx_error)?)
+        .await?;
+    tx.commit().await.map_err(map_tx_error)?;
+    Ok(())
+}
+
+async fn prepare_release_tx(
+    pool: &PgPool,
+    controller: &Controller,
+    grant_id: &str,
+    extra_devices: &[String],
+) -> Result<PreparedRelease, StoreError> {
+    if !is_canonical_uuid(grant_id) || extra_devices.iter().any(|d| !is_canonical_uuid(d)) {
+        return Err(StoreError::Invalid);
+    }
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+        .await
+        .map_err(map_tx_error)?;
+    let row = sqlx::query(
+        "SELECT grant_state,
+                ARRAY(SELECT x::text FROM unnest(unreleased_devices) AS x ORDER BY x) AS unreleased_devices,
+                ARRAY(SELECT x::text FROM unnest(extra_devices) AS x ORDER BY x) AS extra_devices
+           FROM openmettle.capacity_prepare_release($1::uuid, $2, $3, $4::uuid, $5::uuid[])",
+    )
+    .bind(controller.group_id())
+    .bind(controller.secret.as_slice())
+    .bind(controller.epoch())
+    .bind(grant_id)
+    .bind(extra_devices)
+    .fetch_one(tx.connection().map_err(map_tx_error)?)
+    .await?;
+    tx.commit().await.map_err(map_tx_error)?;
+    let state: String = row.try_get("grant_state")?;
+    Ok(PreparedRelease {
+        grant_state: GrantState::parse(&state)?,
+        unreleased_devices: row.try_get("unreleased_devices")?,
+        extra_devices: row.try_get("extra_devices")?,
+    })
 }
 
 async fn prepare_dispatch_tx(
@@ -1258,7 +1345,7 @@ async fn confirm_dispatch_tx(
     pool: &PgPool,
     controller: &Controller,
     grant_id: &str,
-) -> Result<GrantState, StoreError> {
+) -> Result<(), StoreError> {
     if !is_canonical_uuid(grant_id) {
         return Err(StoreError::Invalid);
     }
@@ -1275,7 +1362,10 @@ async fn confirm_dispatch_tx(
     .fetch_one(tx.connection().map_err(map_tx_error)?)
     .await?;
     tx.commit().await.map_err(map_tx_error)?;
-    GrantState::parse(&state)
+    if GrantState::parse(&state)? != GrantState::Granted {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
 }
 
 async fn reconcile_tx(
@@ -1283,19 +1373,81 @@ async fn reconcile_tx(
     controller: &Controller,
     grant_id: &str,
     evidence: Evidence<'_>,
+    registry: &Metrics,
 ) -> Result<GrantState, StoreError> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
         .await
         .map_err(map_tx_error)?;
-    let state = super::reconcile(
+    let state = super::reconcile_with_metrics(
         tx.connection().map_err(map_tx_error)?,
         controller,
         grant_id,
         evidence,
+        registry,
     )
     .await?;
     tx.commit().await.map_err(map_tx_error)?;
     Ok(state)
+}
+
+async fn grant_needs_inventory_check(
+    pool: &PgPool,
+    group_id: &str,
+    grant_id: &str,
+    epoch: i64,
+) -> Result<bool, StoreError> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, true)
+        .await
+        .map_err(map_tx_error)?;
+    let row = sqlx::query(
+        "SELECT state, reconciled_epoch
+           FROM openmettle.capacity_grants
+          WHERE group_id = $1::uuid AND id = $2::uuid",
+    )
+    .bind(group_id)
+    .bind(grant_id)
+    .fetch_optional(tx.connection().map_err(map_tx_error)?)
+    .await?;
+    tx.commit().await.map_err(map_tx_error)?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let state: String = row.try_get("state")?;
+    let reconciled_epoch: i64 = row.try_get("reconciled_epoch")?;
+    Ok(state == "unknown_allocation" || reconciled_epoch < epoch)
+}
+
+fn parse_establish_inventory(
+    controller: &Controller,
+    response: EstablishEpochResponse,
+) -> Result<BTreeMap<String, CanonicalGrant>, AdapterError> {
+    if response.version != ADAPTER_CONTRACT_VERSION
+        || response.group_id != controller.group_id()
+        || response.established_epoch != controller.epoch()
+    {
+        return Err(AdapterError::Invalid);
+    }
+    let mut backend_live = BTreeMap::new();
+    for alloc in response.allocations {
+        if !is_canonical_uuid(&alloc.grant_id) {
+            return Err(AdapterError::Invalid);
+        }
+        check_profile(&alloc.profile)?;
+        let footprint = canonical_footprint(&alloc.footprint)?;
+        if backend_live
+            .insert(
+                alloc.grant_id,
+                CanonicalGrant {
+                    profile: alloc.profile,
+                    footprint,
+                },
+            )
+            .is_some()
+        {
+            return Err(AdapterError::Invalid);
+        }
+    }
+    Ok(backend_live)
 }
 
 /// Pool-backed, serialized coordinator for one managed capacity group and its fenced backend
@@ -1303,14 +1455,16 @@ async fn reconcile_tx(
 ///
 /// Every database write phase runs in its own committed `READ COMMITTED` bounded transaction
 /// (`WriteTransaction::begin_bounded_pool`) before any adapter call, ensuring durable commits
-/// cannot roll back after backend side effects and concurrent bursts are blocked while any
-/// dispatch is `in_flight`.
+/// cannot roll back after backend side effects. Starts unreconciled (`is_reconciled() == false`):
+/// callers must run [`Self::takeover_and_reconcile`] cleanly before [`Self::dispatch_grant`] or
+/// [`Self::resume`] will open or admit bursts.
 pub struct GroupCoordinator<A: CapacityAdapter> {
     pool: PgPool,
     controller: Controller,
     adapter: A,
+    metrics: Option<Arc<Metrics>>,
     op_lock: tokio::sync::Mutex<()>,
-    unresolved_backend_unknown: AtomicBool,
+    reconciled_clean: AtomicBool,
 }
 
 impl<A: CapacityAdapter> GroupCoordinator<A> {
@@ -1319,8 +1473,32 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             pool,
             controller,
             adapter,
+            metrics: None,
             op_lock: tokio::sync::Mutex::new(()),
-            unresolved_backend_unknown: AtomicBool::new(false),
+            reconciled_clean: AtomicBool::new(false),
+        }
+    }
+
+    pub fn with_metrics(
+        pool: PgPool,
+        controller: Controller,
+        adapter: A,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            pool,
+            controller,
+            adapter,
+            metrics: Some(metrics),
+            op_lock: tokio::sync::Mutex::new(()),
+            reconciled_clean: AtomicBool::new(false),
+        }
+    }
+
+    fn metrics(&self) -> &Metrics {
+        match &self.metrics {
+            Some(m) => m.as_ref(),
+            None => metrics::global(),
         }
     }
 
@@ -1332,8 +1510,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         &self.adapter
     }
 
+    pub fn is_reconciled(&self) -> bool {
+        self.reconciled_clean.load(Ordering::Acquire)
+    }
+
     pub fn has_unresolved_backend_unknown(&self) -> bool {
-        self.unresolved_backend_unknown.load(Ordering::Acquire)
+        !self.is_reconciled()
     }
 
     async fn adapter_release_verified(
@@ -1380,20 +1562,35 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         })
     }
 
-    async fn apply_release_for_grant(
+    async fn prepare_and_apply_release(
         &self,
         grant_id: &str,
-        db_unreleased: &[String],
-        extra_backend: &BTreeSet<String>,
+        extra_candidates: &[String],
+        caller_devices: Option<&BTreeSet<String>>,
     ) -> Result<GrantState, CoordinatorError> {
-        let db_set = canonical_devices(db_unreleased)?;
-        let mut union = db_set.clone();
-        for dev in extra_backend {
-            if !is_canonical_uuid(dev) {
-                return Err(CoordinatorError::Adapter(AdapterError::Invalid));
-            }
-            union.insert(dev.clone());
+        let prepared =
+            prepare_release_tx(&self.pool, &self.controller, grant_id, extra_candidates).await?;
+        if prepared.grant_state == GrantState::Released {
+            return Ok(GrantState::Released);
         }
+
+        let mut reconcile_targets = BTreeSet::new();
+        for d in &prepared.unreleased_devices {
+            reconcile_targets.insert(d.clone());
+        }
+        for d in &prepared.extra_devices {
+            reconcile_targets.insert(d.clone());
+        }
+        let mut union = reconcile_targets.clone();
+        if let Some(caller) = caller_devices {
+            for d in caller {
+                union.insert(d.clone());
+            }
+        }
+        if union.is_empty() {
+            return Err(CoordinatorError::Adapter(AdapterError::Invalid));
+        }
+
         let verified = match self.adapter_release_verified(grant_id, &union).await {
             Ok(verified) => verified,
             Err(err @ (AdapterError::StaleEpoch { .. } | AdapterError::Unfenced)) => {
@@ -1405,73 +1602,62 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                     &self.controller,
                     grant_id,
                     Evidence::UnknownAllocation,
+                    self.metrics(),
                 )
                 .await?;
                 return Err(CoordinatorError::Adapter(err));
             }
         };
 
-        // If any extra backend-only rank failed to confirm release, never settle the durable
-        // grant or its quota slot in PostgreSQL: keep it in `unknown_allocation` so takeover can
-        // retry releasing the union.
-        let extra_unresolved = verified.unknown_ids.iter().any(|dev| !db_set.contains(dev));
-        if extra_unresolved {
-            let state = reconcile_tx(
-                &self.pool,
-                &self.controller,
-                grant_id,
-                Evidence::UnknownAllocation,
-            )
-            .await?;
-            return Ok(state);
-        }
-
-        let db_released: Vec<String> = verified
+        let released_ids: Vec<String> = verified
             .released_ids
             .into_iter()
-            .filter(|d| db_set.contains(d))
+            .filter(|d| reconcile_targets.contains(d))
             .collect();
-        let db_not_allocated: Vec<String> = verified
+        let not_allocated_ids: Vec<String> = verified
             .not_allocated_ids
             .into_iter()
-            .filter(|d| db_set.contains(d))
+            .filter(|d| reconcile_targets.contains(d))
             .collect();
-        let db_has_unknown = verified.unknown_ids.iter().any(|d| db_set.contains(d));
+        let has_unknown = !verified.unknown_ids.is_empty();
 
         let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
             .await
             .map_err(map_tx_error)?;
         let conn = tx.connection().map_err(map_tx_error)?;
         let mut final_state = None;
-        if !db_released.is_empty() {
+        if !released_ids.is_empty() {
             final_state = Some(
-                super::reconcile(
+                super::reconcile_with_metrics(
                     conn,
                     &self.controller,
                     grant_id,
-                    Evidence::Released(&db_released),
+                    Evidence::Released(&released_ids),
+                    self.metrics(),
                 )
                 .await?,
             );
         }
-        if !db_not_allocated.is_empty() {
+        if !not_allocated_ids.is_empty() {
             final_state = Some(
-                super::reconcile(
+                super::reconcile_with_metrics(
                     conn,
                     &self.controller,
                     grant_id,
-                    Evidence::NotAllocated(&db_not_allocated),
+                    Evidence::NotAllocated(&not_allocated_ids),
+                    self.metrics(),
                 )
                 .await?,
             );
         }
-        if db_has_unknown && final_state != Some(GrantState::UnknownAllocation) {
+        if has_unknown && final_state != Some(GrantState::UnknownAllocation) {
             final_state = Some(
-                super::reconcile(
+                super::reconcile_with_metrics(
                     conn,
                     &self.controller,
                     grant_id,
                     Evidence::UnknownAllocation,
+                    self.metrics(),
                 )
                 .await?,
             );
@@ -1480,48 +1666,26 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         Ok(final_state.unwrap_or(GrantState::UnknownAllocation))
     }
 
-    /// Establish the successor controller's epoch on the adapter and reconcile both backend-only
+    /// Durably close the group in PostgreSQL (`backend_unknown = true`, `ready_epoch = NULL`),
+    /// establish the successor controller's epoch on the adapter, and reconcile both backend-only
     /// rogue allocations and every non-released durable grant in PostgreSQL (ADR 0042).
     ///
-    /// If any rogue allocation or mismatched extra rank fails to confirm release, this records
-    /// `has_unresolved_backend_unknown() == true` so [`Self::resume`] refuses to reopen bursts
-    /// until a subsequent takeover confirms release.
+    /// Clears `backend_unknown = false` and marks [`Self::is_reconciled`] true only when
+    /// `report.unknown == 0`.
     pub async fn takeover_and_reconcile(&self) -> Result<TakeoverReport, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
-        // Fail closed if takeover aborts partway through.
-        self.unresolved_backend_unknown
-            .store(true, Ordering::Release);
+        self.reconciled_clean.store(false, Ordering::Release);
+
+        // Committed PostgreSQL fence BEFORE contacting the backend: refuses uncommitted or
+        // expired controller leases and ensures any mid-recovery crash leaves bursts closed.
+        set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
 
         let response = self
             .adapter
             .establish_epoch(EstablishEpochRequest::new(&self.controller))
             .await?;
-        if response.version != ADAPTER_CONTRACT_VERSION
-            || response.group_id != self.controller.group_id()
-            || response.established_epoch != self.controller.epoch()
-        {
-            return Err(CoordinatorError::Adapter(AdapterError::Invalid));
-        }
-        let mut backend_live: BTreeMap<String, CanonicalGrant> = BTreeMap::new();
-        for alloc in response.allocations {
-            if !is_canonical_uuid(&alloc.grant_id) {
-                return Err(CoordinatorError::Adapter(AdapterError::Invalid));
-            }
-            check_profile(&alloc.profile)?;
-            let footprint = canonical_footprint(&alloc.footprint)?;
-            if backend_live
-                .insert(
-                    alloc.grant_id,
-                    CanonicalGrant {
-                        profile: alloc.profile,
-                        footprint,
-                    },
-                )
-                .is_some()
-            {
-                return Err(CoordinatorError::Adapter(AdapterError::Invalid));
-            }
-        }
+        let established_epoch = response.established_epoch;
+        let backend_live = parse_establish_inventory(&self.controller, response)?;
 
         let live_grants = {
             let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, true)
@@ -1538,7 +1702,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         let durable_ids: BTreeSet<&str> = live_grants.iter().map(|(id, _)| id.as_str()).collect();
 
         let mut report = TakeoverReport {
-            established_epoch: response.established_epoch,
+            established_epoch,
             ..TakeoverReport::default()
         };
 
@@ -1566,23 +1730,28 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         // 2. Reconcile every non-released durable grant against fenced backend inventory.
         for (grant_id, durable) in live_grants {
             let exact_match = durable.state == "granted"
+                && durable.extra_devices.is_empty()
                 && durable.unreleased_devices.len() == durable.footprint.len()
                 && backend_live.get(&grant_id).is_some_and(|live| {
                     live.profile == durable.profile && live.footprint == durable.footprint
                 });
             if exact_match {
-                reconcile_tx(&self.pool, &self.controller, &grant_id, Evidence::Allocated).await?;
+                reconcile_tx(
+                    &self.pool,
+                    &self.controller,
+                    &grant_id,
+                    Evidence::Allocated,
+                    self.metrics(),
+                )
+                .await?;
                 report.attested += 1;
                 continue;
             }
 
-            let backend_devices: BTreeSet<String> = backend_live
+            let backend_devices: Vec<String> = backend_live
                 .get(&grant_id)
                 .map(|live| live.footprint.keys().cloned().collect())
                 .unwrap_or_default();
-            let db_set: BTreeSet<String> = durable.unreleased_devices.iter().cloned().collect();
-            let extra_backend: BTreeSet<String> =
-                backend_devices.difference(&db_set).cloned().collect();
 
             // A `granted` row with partial, extra-rank, or byte/profile mismatch transitions to
             // `unknown_allocation` first so bursts stay closed even if release crashes mid-way.
@@ -1592,12 +1761,13 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                     &self.controller,
                     &grant_id,
                     Evidence::UnknownAllocation,
+                    self.metrics(),
                 )
                 .await?;
             }
 
             match self
-                .apply_release_for_grant(&grant_id, &durable.unreleased_devices, &extra_backend)
+                .prepare_and_apply_release(&grant_id, &backend_devices, None)
                 .await
             {
                 Ok(GrantState::Released) => report.released += 1,
@@ -1608,41 +1778,51 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             }
         }
 
-        self.unresolved_backend_unknown
-            .store(report.unknown > 0, Ordering::Release);
+        if report.unknown == 0 {
+            set_backend_unknown_tx(&self.pool, &self.controller, false).await?;
+            self.reconciled_clean.store(true, Ordering::Release);
+        }
         Ok(report)
     }
 
     /// Two-phase commit-before-dispatch (ADR 0042):
     ///
-    /// 1. Commits the durable grant with `dispatch_state = 'in_flight'` (blocking concurrent
-    ///    bursts) and binds the run's `device_reservations` slot in PostgreSQL.
-    /// 2. Dispatches the grant to the fenced adapter after that commit succeeds.
-    /// 3. Commits `capacity_confirm_dispatch` (`dispatch_state = 'confirmed'`) on valid adapter
-    ///    acknowledgement, or reconciles the grant to `unknown_allocation` on ambiguous/failed
-    ///    dispatch (leaving `in_flight` intact on `StaleEpoch`/`Unfenced`).
+    /// 1. Requires [`Self::takeover_and_reconcile`] to have completed cleanly on this coordinator.
+    /// 2. Commits the durable grant with `dispatch_state = 'in_flight'` and
+    ///    `dispatch_epoch = controller.epoch()` (blocking concurrent bursts) and binds the run's
+    ///    `device_reservations` slot in PostgreSQL.
+    /// 3. Dispatches the grant to the fenced adapter after that commit succeeds.
+    /// 4. Commits `capacity_confirm_dispatch` (`dispatch_state = 'confirmed'`) on valid adapter
+    ///    acknowledgement and finishes `wait` once with [`CapacityWaitOutcome::Granted`], or
+    ///    reconciles the grant to `unknown_allocation` on ambiguous/failed dispatch (leaving
+    ///    `in_flight` intact on `StaleEpoch`/`Unfenced`).
     ///
     /// Replaying an already-settled or dispatch-confirmed grant returns [`DispatchOutcome::Existing`]
     /// without calling the backend or recording duplicate grant/wait metrics. Retrying an
-    /// unconfirmed `in_flight` grant re-verifies the run's active claim first.
+    /// unconfirmed (`pending` or `in_flight`) grant re-verifies the run's active claim, readiness,
+    /// watermark, and per-device fit first.
     pub async fn dispatch_grant(
         &self,
         request: &GrantRequest<'_>,
         wait: &CapacityWait,
     ) -> Result<DispatchOutcome, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
+        if !self.reconciled_clean.load(Ordering::Acquire) {
+            self.metrics()
+                .record_capacity_grant(CapacityOperation::Grant, CapacityOutcome::Unavailable);
+            return Ok(DispatchOutcome::Unavailable);
+        }
         let prepared = match prepare_dispatch_tx(&self.pool, &self.controller, request).await {
             Ok(prepared) => prepared,
             Err(err) => {
                 if err == StoreError::Expired {
-                    metrics::global()
+                    self.metrics()
                         .record_capacity_stale_observation(CapacityStaleSurface::Controller);
                 }
-                metrics::global().record_capacity_grant(
+                self.metrics().record_capacity_grant(
                     CapacityOperation::Grant,
                     super::store_error_outcome(&err),
                 );
-                wait.record(CapacityWaitOutcome::Unavailable);
                 return Err(CoordinatorError::Store(err));
             }
         };
@@ -1652,19 +1832,17 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 Ok(DispatchOutcome::Existing { grant_id, state })
             }
             PreparedDispatch::Insufficient => {
-                metrics::global()
+                self.metrics()
                     .record_capacity_grant(CapacityOperation::Grant, CapacityOutcome::Insufficient);
-                wait.record(CapacityWaitOutcome::Busy);
                 Ok(DispatchOutcome::Insufficient)
             }
             PreparedDispatch::Unavailable { observation_stale } => {
                 if observation_stale {
-                    metrics::global()
+                    self.metrics()
                         .record_capacity_stale_observation(CapacityStaleSurface::Controller);
                 }
-                metrics::global()
+                self.metrics()
                     .record_capacity_grant(CapacityOperation::Grant, CapacityOutcome::Unavailable);
-                wait.record(CapacityWaitOutcome::Unavailable);
                 Ok(DispatchOutcome::Unavailable)
             }
             PreparedDispatch::DispatchNow {
@@ -1689,18 +1867,17 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                         if let Err(err) =
                             confirm_dispatch_tx(&self.pool, &self.controller, &grant_id).await
                         {
-                            metrics::global().record_capacity_grant(
+                            self.metrics().record_capacity_grant(
                                 CapacityOperation::Grant,
                                 super::store_error_outcome(&err),
                             );
-                            wait.record(CapacityWaitOutcome::Unavailable);
                             return Err(CoordinatorError::Store(err));
                         }
-                        metrics::global().record_capacity_grant(
+                        self.metrics().record_capacity_grant(
                             CapacityOperation::Grant,
                             CapacityOutcome::Granted,
                         );
-                        wait.record(CapacityWaitOutcome::Granted);
+                        wait.finish_with_metrics(self.metrics(), CapacityWaitOutcome::Granted);
                         Ok(DispatchOutcome::Dispatched {
                             grant_id,
                             replayed: is_replay || resp.replayed,
@@ -1712,31 +1889,29 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                             &self.controller,
                             &grant_id,
                             Evidence::UnknownAllocation,
+                            self.metrics(),
                         )
                         .await
                         {
-                            metrics::global().record_capacity_grant(
+                            self.metrics().record_capacity_grant(
                                 CapacityOperation::Grant,
                                 super::store_error_outcome(&err),
                             );
-                            wait.record(CapacityWaitOutcome::Unavailable);
                             return Err(CoordinatorError::Store(err));
                         }
-                        metrics::global().record_capacity_grant(
+                        self.metrics().record_capacity_grant(
                             CapacityOperation::Grant,
                             CapacityOutcome::UnknownAllocation,
                         );
-                        wait.record(CapacityWaitOutcome::Unavailable);
                         Err(CoordinatorError::Adapter(AdapterError::Invalid))
                     }
                     Err(err @ (AdapterError::StaleEpoch { .. } | AdapterError::Unfenced)) => {
                         // Deposed or unfenced controller leaves the `in_flight` durable charge
                         // intact so bursts remain blocked until takeover reconciles it.
-                        metrics::global().record_capacity_grant(
+                        self.metrics().record_capacity_grant(
                             CapacityOperation::Grant,
                             CapacityOutcome::Fenced,
                         );
-                        wait.record(CapacityWaitOutcome::Unavailable);
                         Err(CoordinatorError::Adapter(err))
                     }
                     Err(err) => {
@@ -1745,21 +1920,20 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                             &self.controller,
                             &grant_id,
                             Evidence::UnknownAllocation,
+                            self.metrics(),
                         )
                         .await
                         {
-                            metrics::global().record_capacity_grant(
+                            self.metrics().record_capacity_grant(
                                 CapacityOperation::Grant,
                                 super::store_error_outcome(&store_err),
                             );
-                            wait.record(CapacityWaitOutcome::Unavailable);
                             return Err(CoordinatorError::Store(store_err));
                         }
-                        metrics::global().record_capacity_grant(
+                        self.metrics().record_capacity_grant(
                             CapacityOperation::Grant,
                             CapacityOutcome::UnknownAllocation,
                         );
-                        wait.record(CapacityWaitOutcome::Unavailable);
                         Err(CoordinatorError::Adapter(err))
                     }
                 }
@@ -1767,13 +1941,14 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         }
     }
 
-    /// Request fenced elastic tail-KV handback from the adapter, strictly verifying the response
-    /// device set and byte bounds, and record the reclaim outcome metric.
+    /// Verify the committed controller lease in PostgreSQL, request fenced elastic tail-KV
+    /// handback from the adapter, strictly validate the response device set and byte bounds, and
+    /// record the reclaim outcome metric.
     pub async fn reclaim_kv(
         &self,
         request_key: &str,
         targets: &[DeviceBytes],
-    ) -> Result<ReclaimKvResponse, AdapterError> {
+    ) -> Result<ReclaimKvResponse, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
         let command = ReclaimKvCommand {
             version: ADAPTER_CONTRACT_VERSION.to_owned(),
@@ -1783,6 +1958,13 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             targets: targets.to_vec(),
         };
         let target_map = command.validate()?;
+        if let Err(err) = check_controller_tx(&self.pool, &self.controller).await {
+            self.metrics().record_capacity_grant(
+                CapacityOperation::Reclaim,
+                super::store_error_outcome(&err),
+            );
+            return Err(CoordinatorError::Store(err));
+        }
         let result = self.adapter.reclaim_kv(command).await;
         let outcome = match &result {
             Ok(resp) => {
@@ -1802,9 +1984,9 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                         }) && seen.len() == target_map.len()
                     };
                 if !valid {
-                    metrics::global()
+                    self.metrics()
                         .record_capacity_grant(CapacityOperation::Reclaim, CapacityOutcome::Error);
-                    return Err(AdapterError::Invalid);
+                    return Err(CoordinatorError::Adapter(AdapterError::Invalid));
                 }
                 CapacityOutcome::Released
             }
@@ -1817,41 +1999,67 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 AdapterError::UnsupportedVersion | AdapterError::Invalid | AdapterError::Conflict,
             ) => CapacityOutcome::Refused,
         };
-        metrics::global().record_capacity_grant(CapacityOperation::Reclaim, outcome);
-        result
+        self.metrics()
+            .record_capacity_grant(CapacityOperation::Reclaim, outcome);
+        result.map_err(CoordinatorError::Adapter)
     }
 
-    /// Commit `releasing` in PostgreSQL, obtain confirmed per-device release evidence behind the
-    /// adapter epoch fence, and settle the durable grant and its device slot only once every
-    /// device has confirmed `Released` or `NotAllocated`.
+    /// Durably close bursts via `dispatch_state = 'release_in_flight'`, merge any persisted or
+    /// live backend extra ranks, obtain confirmed per-device release evidence behind the adapter
+    /// epoch fence, and settle the durable grant and its device slot only once every durable and
+    /// extra device has confirmed `Released` or `NotAllocated`.
     pub async fn release_grant(
         &self,
         grant_id: &str,
         devices: &[String],
     ) -> Result<GrantState, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
-        let current =
-            reconcile_tx(&self.pool, &self.controller, grant_id, Evidence::Releasing).await?;
-        if current == GrantState::Released {
-            return Ok(GrantState::Released);
+        if !is_canonical_uuid(grant_id) {
+            return Err(CoordinatorError::Store(StoreError::Invalid));
         }
-        self.apply_release_for_grant(grant_id, devices, &BTreeSet::new())
+        let caller_set = canonical_devices(devices)?;
+        let mut discovered_extra = Vec::new();
+        if grant_needs_inventory_check(
+            &self.pool,
+            self.controller.group_id(),
+            grant_id,
+            self.controller.epoch(),
+        )
+        .await?
+        {
+            check_controller_tx(&self.pool, &self.controller).await?;
+            let inv = parse_establish_inventory(
+                &self.controller,
+                self.adapter
+                    .establish_epoch(EstablishEpochRequest::new(&self.controller))
+                    .await?,
+            )?;
+            if let Some(live) = inv.get(grant_id) {
+                discovered_extra.extend(live.footprint.keys().cloned());
+            }
+        }
+        self.prepare_and_apply_release(grant_id, &discovered_extra, Some(&caller_set))
             .await
     }
 
-    /// Reopen bursts in PostgreSQL only when no backend-only rogue allocation remains unresolved.
+    /// Reopen bursts in PostgreSQL only after [`Self::takeover_and_reconcile`] completed with zero
+    /// unresolved backend unknowns.
     pub async fn resume(&self) -> Result<bool, StoreError> {
         let _guard = self.op_lock.lock().await;
-        if self.unresolved_backend_unknown.load(Ordering::Acquire) {
-            metrics::global()
+        if !self.reconciled_clean.load(Ordering::Acquire) {
+            self.metrics()
                 .record_capacity_grant(CapacityOperation::Resume, CapacityOutcome::Unavailable);
             return Ok(false);
         }
         let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
             .await
             .map_err(map_tx_error)?;
-        let resumed =
-            super::resume(tx.connection().map_err(map_tx_error)?, &self.controller).await?;
+        let resumed = super::resume_with_metrics(
+            tx.connection().map_err(map_tx_error)?,
+            &self.controller,
+            self.metrics(),
+        )
+        .await?;
         tx.commit().await.map_err(map_tx_error)?;
         Ok(resumed)
     }
@@ -1895,6 +2103,33 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn capacity_wait_emits_at_most_one_histogram_sample() {
+        let registry = Metrics::new();
+        let wait = CapacityWait::start();
+        assert!(!wait.is_recorded());
+        wait.finish_with_metrics(&registry, CapacityWaitOutcome::Granted);
+        assert!(wait.is_recorded());
+        // Second finish call is a strict no-op.
+        wait.finish_with_metrics(&registry, CapacityWaitOutcome::Busy);
+
+        let otlp = registry
+            .encode_otlp(crate::telemetry::Process::Worker, None)
+            .unwrap();
+        let mut total_samples = 0u64;
+        for m in &otlp.resource_metrics[0].scope_metrics[0].metrics {
+            if m.name == "openmettle.capacity.wait.duration"
+                && let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(h)) =
+                    m.data.as_ref()
+            {
+                for dp in &h.data_points {
+                    total_samples += dp.count;
+                }
+            }
+        }
+        assert_eq!(total_samples, 1);
     }
 
     #[test]

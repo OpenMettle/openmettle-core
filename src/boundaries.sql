@@ -288,6 +288,9 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.capacity_enforce_group_limit()',false,ARRAY[]::text[]),
         ('openmettle.capacity_enforce_device_limit()',false,ARRAY[]::text[]),
         ('openmettle.capacity_admits_excluding(uuid,boolean,uuid)',false,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_set_backend_unknown(uuid,bytea,bigint,boolean)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_check_controller(uuid,bytea,bigint)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_prepare_release(uuid,bytea,bigint,uuid,uuid[])',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_prepare_dispatch(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_confirm_dispatch(uuid,bytea,bigint,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_group_observations()',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 40

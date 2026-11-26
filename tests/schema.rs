@@ -414,6 +414,7 @@ enum ColumnDefault {
     Bool(bool),
     Int(i64),
     Str(&'static str),
+    EmptyArray,
     /// Non-null value assigned dynamically at upgrade time (for example `clock_timestamp()`).
     AnyNonNull,
 }
@@ -425,6 +426,7 @@ impl ColumnDefault {
             Self::Bool(expected) => value.as_bool() == Some(expected),
             Self::Int(expected) => value.as_i64() == Some(expected),
             Self::Str(expected) => value.as_str() == Some(expected),
+            Self::EmptyArray => value.as_array().is_some_and(Vec::is_empty),
             Self::AnyNonNull => !value.is_null(),
         }
     }
@@ -435,6 +437,7 @@ impl ColumnDefault {
             Self::Bool(v) => v.to_string(),
             Self::Int(v) => v.to_string(),
             Self::Str(v) => format!("{v:?}"),
+            Self::EmptyArray => "[]".to_owned(),
             Self::AnyNonNull => "a non-null value".to_owned(),
         }
     }
@@ -785,9 +788,27 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
     },
     AdditiveColumn {
         since: 40,
+        table: "capacity_groups",
+        column: "backend_unknown",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 40,
         table: "capacity_grants",
         column: "dispatch_state",
-        default: ColumnDefault::Str("confirmed"),
+        default: ColumnDefault::Str("pending"),
+    },
+    AdditiveColumn {
+        since: 40,
+        table: "capacity_grants",
+        column: "dispatch_epoch",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 40,
+        table: "capacity_grants",
+        column: "extra_devices",
+        default: ColumnDefault::EmptyArray,
     },
 ];
 
@@ -1276,7 +1297,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
         "d34f1040fb87a396806e2a9266c427da37c1414a9a0485d688ff58a6f5c50c56",
         "46279a5049c4e4b9b87a818f545874365bcf8a867bf09fd8005cf6195c7c55fa",
-        "bb7c11faa171c4993de74d776fba4b0c786c3dffb9ba9b14ce9ecf3884d8ebc0",
+        "ba7a053fa1c6efcec0cd6d8d04a708de182e7cea86fb034751ed03001da0418f",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

@@ -84,18 +84,26 @@ async fn load_profiles(tx: &mut PgConnection) -> Result<Vec<ProfileConfig>, Prob
     )
     .fetch_all(tx)
     .await?;
+    if rows.len() > MAX_CAPACITY_PROFILES {
+        return Err(UNAVAILABLE);
+    }
     let mut profiles = Vec::with_capacity(rows.len());
     for row in rows {
         let required_devices: i32 = row.try_get("required_devices")?;
         let required_devices = usize::try_from(required_devices).map_err(|_| INTERNAL)?;
         let gate: String = row.try_get("capability_gate")?;
+        let capability_gate = parse_capability_gate(&gate)?;
+        let required_capability: Option<String> = row.try_get("required_capability")?;
+        if capability_gate == CapabilityGate::OptIn && required_capability.is_none() {
+            return Err(INTERNAL);
+        }
         profiles.push(ProfileConfig {
             profile: row.try_get("profile")?,
             group_id: row.try_get("group_id")?,
             per_device_bytes: row.try_get("per_device_bytes")?,
             required_devices,
-            required_capability: row.try_get("required_capability")?,
-            capability_gate: parse_capability_gate(&gate)?,
+            required_capability,
+            capability_gate,
             model_id: row.try_get("model_id")?,
         });
     }
@@ -119,6 +127,9 @@ async fn load_group_observations(tx: &mut PgConnection) -> Result<Vec<ObservedGr
         let group = match groups.last_mut() {
             Some(last) if last.group_id == group_id => last,
             _ => {
+                if groups.len() >= MAX_CAPACITY_GROUPS {
+                    return Err(UNAVAILABLE);
+                }
                 groups.push(ObservedGroup {
                     group_id,
                     controller_epoch: row.try_get("controller_epoch")?,
@@ -134,6 +145,9 @@ async fn load_group_observations(tx: &mut PgConnection) -> Result<Vec<ObservedGr
         let Some(device_id) = row.try_get::<Option<String>, _>("device_id")? else {
             continue;
         };
+        if group.devices.len() >= MAX_CAPACITY_DEVICES_PER_GROUP {
+            return Err(UNAVAILABLE);
+        }
         group.devices.push(ObservedDevice {
             device_id,
             total_bytes: row.try_get("total_bytes")?,
@@ -158,9 +172,10 @@ fn collect_profile_models<'a>(
     };
     let mut seen = BTreeSet::new();
     for profile in profiles {
-        let candidate = profile.model_id.as_deref().unwrap_or(&profile.profile);
-        if cat.model(candidate).is_some() {
-            seen.insert(candidate);
+        if let Some(model_id) = profile.model_id.as_deref()
+            && cat.model(model_id).is_some()
+        {
+            seen.insert(model_id);
         }
     }
     seen.into_iter().collect()
@@ -173,6 +188,9 @@ fn profile_authorized(
     family_permitted: &BTreeSet<String>,
     profile: &ProfileConfig,
 ) -> bool {
+    if profile.capability_gate == CapabilityGate::OptIn && profile.required_capability.is_none() {
+        return false;
+    }
     if let Some(cap) = profile.required_capability.as_deref()
         && !authz::authorize_capability(principal, platform, cap, profile.capability_gate)
             .is_allowed()
@@ -182,6 +200,7 @@ fn profile_authorized(
     if let Some(model_id) = profile.model_id.as_deref() {
         // Explicit model-backed profiles fail closed when no catalog is loaded, when the model
         // has been removed from the catalog, or when capability or family policy denies it.
+        // Workload profiles (`model_id: None`) never inherit model restrictions by name collision.
         let Some(cat) = model_catalog else {
             return false;
         };
@@ -191,12 +210,6 @@ fn profile_authorized(
         {
             return false;
         }
-    } else if let Some(cat) = model_catalog
-        && cat.model(&profile.profile).is_some()
-        && (!catalog::allowed(cat, principal, platform, &profile.profile, None)
-            || !family_permitted.contains(&profile.profile))
-    {
-        return false;
     }
     true
 }
@@ -592,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn model_backed_profiles_fail_closed_without_catalog_missing_model_or_family_policy() {
+    fn model_backed_profiles_fail_closed_and_workload_profiles_ignore_name_collisions() {
         let user = active_user();
         let platform = PlatformPolicy::default();
         let cat = test_catalog();
@@ -616,6 +629,15 @@ mod tests {
                 model_id: Some("a".into()),
             },
             ProfileConfig {
+                profile: "model.b".into(),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OnByDefault,
+                model_id: Some("b".into()),
+            },
+            ProfileConfig {
                 profile: "model.removed".into(),
                 group_id: GROUP_A.into(),
                 per_device_bytes: GIB,
@@ -624,6 +646,8 @@ mod tests {
                 capability_gate: CapabilityGate::OnByDefault,
                 model_id: Some("does-not-exist".into()),
             },
+            // Workload profile named "b" with `model_id: None` must NOT inherit model "b"'s
+            // family policy restriction via name collision.
             ProfileConfig {
                 profile: "b".into(),
                 group_id: GROUP_A.into(),
@@ -633,9 +657,19 @@ mod tests {
                 capability_gate: CapabilityGate::OnByDefault,
                 model_id: None,
             },
+            // Malformed opt_in without required_capability fails closed.
+            ProfileConfig {
+                profile: "broken.opt_in".into(),
+                group_id: GROUP_A.into(),
+                per_device_bytes: GIB,
+                required_devices: 1,
+                required_capability: None,
+                capability_gate: CapabilityGate::OptIn,
+                model_id: None,
+            },
         ];
 
-        // Without catalog: model_id-backed profiles fail closed; non-model profile stays visible.
+        // Without catalog: model_id-backed profiles fail closed; non-model workload profile stays visible.
         let (no_cat, _) =
             project_user_capacity(&user, &platform, None, &BTreeSet::new(), &profiles, &groups)
                 .unwrap();
@@ -648,8 +682,8 @@ mod tests {
             })
         );
 
-        // With catalog and family policy allowing only "a": "model.a" is shown, "model.removed"
-        // and family-blocked "b" are both omitted.
+        // With catalog and family policy allowing only "a": "model.a" and workload profile "b"
+        // are shown; "model.b", "model.removed", and "broken.opt_in" are omitted.
         let allowed_models: BTreeSet<String> = ["a".to_owned()].into_iter().collect();
         let (filtered, _) = project_user_capacity(
             &user,
@@ -664,7 +698,8 @@ mod tests {
             filtered,
             json!({
                 "profiles": [
-                    { "profile": "model.a", "availability": "ready", "estimated_wait_seconds": null }
+                    { "profile": "model.a", "availability": "ready", "estimated_wait_seconds": null },
+                    { "profile": "b", "availability": "ready", "estimated_wait_seconds": null }
                 ]
             })
         );

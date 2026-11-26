@@ -233,8 +233,8 @@ pub(crate) fn store_error_outcome(error: &Error) -> CapacityOutcome {
     error_outcome(error)
 }
 
-async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> bool {
-    sqlx::query_scalar::<_, bool>(
+async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> Result<bool, Error> {
+    let stale = sqlx::query_scalar::<_, bool>(
         "SELECT coalesce(
              observed_at IS NOT NULL
              AND observed_at + observation_ttl_ms * interval '1 millisecond' <= clock_timestamp(),
@@ -245,16 +245,16 @@ async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> bool {
     )
     .bind(group_id)
     .fetch_optional(c)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+    .await?
+    .unwrap_or(false);
+    Ok(stale)
 }
 
-/// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
-/// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
-/// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
-pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
+pub(super) async fn resume_with_metrics(
+    c: &mut PgConnection,
+    controller: &Controller,
+    m: &metrics::Metrics,
+) -> Result<bool, Error> {
     let result: Result<bool, Error> =
         sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
             .bind(&controller.group_id)
@@ -268,8 +268,15 @@ pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<boo
         Ok(false) => CapacityOutcome::Unavailable,
         Err(err) => error_outcome(err),
     };
-    metrics::global().record_capacity_grant(CapacityOperation::Resume, outcome);
+    m.record_capacity_grant(CapacityOperation::Resume, outcome);
     result
+}
+
+/// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
+/// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
+/// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
+pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
+    resume_with_metrics(c, controller, metrics::global()).await
 }
 
 /// Bytes one grant commits on one device.
@@ -332,7 +339,20 @@ pub async fn grant(
     controller: &Controller,
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
-    let result = grant_inner(&mut *c, controller, request).await;
+    let result = match grant_inner(&mut *c, controller, request).await {
+        Ok(Decision::Unavailable) => {
+            match group_observation_stale(&mut *c, &controller.group_id).await {
+                Ok(true) => {
+                    metrics::global()
+                        .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+                    Ok(Decision::Unavailable)
+                }
+                Ok(false) => Ok(Decision::Unavailable),
+                Err(err) => Err(err),
+            }
+        }
+        other => other,
+    };
     let outcome = match &result {
         Ok(Decision::Grant { state, .. }) => match state {
             GrantState::Granted => CapacityOutcome::Granted,
@@ -341,13 +361,7 @@ pub async fn grant(
             GrantState::Released => CapacityOutcome::Released,
         },
         Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
-        Ok(Decision::Unavailable) => {
-            if group_observation_stale(&mut *c, &controller.group_id).await {
-                metrics::global()
-                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-            }
-            CapacityOutcome::Unavailable
-        }
+        Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
         Err(err) => {
             if *err == Error::Expired {
                 metrics::global()
@@ -423,15 +437,12 @@ pub enum Evidence<'a> {
     NotAllocated(&'a [String]),
 }
 
-/// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
-/// settled in the same transaction, only when every device of its footprint has confirmed. If
-/// the controller lease expires while any step waits for a lock, every change rolls back and it
-/// returns `Fenced`, with the caller's transaction already aborted.
-pub async fn reconcile(
+pub(super) async fn reconcile_with_metrics(
     c: &mut PgConnection,
     controller: &Controller,
     grant_id: &str,
     evidence: Evidence<'_>,
+    m: &metrics::Metrics,
 ) -> Result<GrantState, Error> {
     let result = reconcile_inner(c, controller, grant_id, evidence).await;
     let outcome = match &result {
@@ -444,8 +455,21 @@ pub async fn reconcile(
         },
         Err(err) => error_outcome(err),
     };
-    metrics::global().record_capacity_grant(CapacityOperation::Reconcile, outcome);
+    m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
     result
+}
+
+/// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
+/// settled in the same transaction, only when every device of its footprint has confirmed. If
+/// the controller lease expires while any step waits for a lock, every change rolls back and it
+/// returns `Fenced`, with the caller's transaction already aborted.
+pub async fn reconcile(
+    c: &mut PgConnection,
+    controller: &Controller,
+    grant_id: &str,
+    evidence: Evidence<'_>,
+) -> Result<GrantState, Error> {
+    reconcile_with_metrics(c, controller, grant_id, evidence, metrics::global()).await
 }
 
 async fn reconcile_inner(
