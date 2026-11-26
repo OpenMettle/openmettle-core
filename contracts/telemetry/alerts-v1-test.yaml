@@ -185,7 +185,7 @@ tests:
     interval: 30s
     input_series:
       - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="budgets"}'
-        values: '0x10 2x130'
+        values: '0x10 2x370'
     alert_rule_test:
       - eval_time: 11m
         alertname: OpenMettleStorageQuotaDriftDetected
@@ -198,7 +198,63 @@ tests:
             exp_annotations:
               summary: "OpenMettle storage or quota accounting drift detected"
               description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
-      - eval_time: 66m
+      - eval_time: 186m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts: []
+
+  - name: storage_quota_drift_stays_firing_across_jittered_hourly_sweeps
+    interval: 30s
+    input_series:
+      # Two consecutive drift observations separated by 132m (t=5m30s and t=137m30s), exceeding
+      # both the default >60m jittered interval and max SWEEP_MS=3_600_000 (+20% jitter = 132m).
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="storage_accounts"}'
+        values: '0x10 1x263 2x400'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: storage_accounts
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+      - eval_time: 70m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: storage_accounts
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+      - eval_time: 137m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: storage_accounts
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+      - eval_time: 186m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: storage_accounts
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+      - eval_time: 318m
         alertname: OpenMettleStorageQuotaDriftDetected
         exp_alerts: []
 

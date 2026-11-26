@@ -104,10 +104,11 @@ and excluding `healthz`/`readyz` probes), `OpenMettleDatabaseReadinessFailing`,
 with `for: 5m` so a single collector outage transitions from zero baseline to `firing` and
 resolves cleanly), `OpenMettleProviderTransportFailures`, and
 `OpenMettleStorageQuotaDriftDetected`
-(`sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[1h])) > 0`
+(`sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[3h])) > 0`
 with `for: 5m` so any non-healthy ledger mismatch, filesystem drift, quarantined row,
-verification error or timeout transitions from its worker zero baseline to `firing` and
-resolves cleanly).
+verification error or timeout transitions from its worker zero baseline to `firing`, stays
+continuously firing across jittered hourly maintenance sweeps, and resolves cleanly once
+clear).
 `contracts/telemetry/alerts-v1-test.yaml` supplies deterministic positive and negative
 `promtool test rules` cases for all five alerts, executed alongside `promtool check rules`
 in CI via the pinned Prometheus image.

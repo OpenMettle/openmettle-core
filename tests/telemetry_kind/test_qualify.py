@@ -277,6 +277,64 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         with self.assertRaises(qualify.QualificationFailure):
             qualify.validate_prometheus_series(series, self.contract)
 
+    def test_worker_quota_drift_baseline_requires_exact_eight_zero_outcomes(self):
+        outcomes = (
+            "healthy",
+            "storage_accounts",
+            "budgets",
+            "settlements",
+            "files",
+            "quarantined",
+            "error",
+            "timeout",
+        )
+        baseline = [
+            {
+                "metric": {
+                    "__name__": "openmettle_storage_quota_drift_total",
+                    "job": "openmettle-worker",
+                    "instance": self.uuid_worker,
+                    "outcome": outcome,
+                },
+                "value": [1, "0"],
+            }
+            for outcome in outcomes
+        ]
+        validated = qualify.validate_worker_quota_drift_baseline(baseline, self.contract)
+        self.assertEqual(set(validated.keys()), {self.uuid_worker})
+        self.assertEqual(validated[self.uuid_worker], {o: 0.0 for o in outcomes})
+
+        # Absent series must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, "missing openmettle_storage_quota_drift_total"):
+            qualify.validate_worker_quota_drift_baseline([], self.contract)
+
+        # Missing any single outcome must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, "missing=\\['timeout'\\]"):
+            qualify.validate_worker_quota_drift_baseline(baseline[:-1], self.contract)
+
+        # Non-zero baseline value must fail.
+        nonzero = copy.deepcopy(baseline)
+        nonzero[2]["value"] = [1, "1"]
+        with self.assertRaisesRegex(qualify.QualificationFailure, "zero-initialized"):
+            qualify.validate_worker_quota_drift_baseline(nonzero, self.contract)
+
+        # Undeclared outcome must fail.
+        undeclared = copy.deepcopy(baseline)
+        undeclared[0]["metric"]["outcome"] = "unexpected"
+        with self.assertRaisesRegex(qualify.QualificationFailure, "undeclared outcome"):
+            qualify.validate_worker_quota_drift_baseline(undeclared, self.contract)
+
+        # Unexpected extra label or non-worker job must fail.
+        extra_label = copy.deepcopy(baseline)
+        extra_label[0]["metric"]["extra"] = "bad"
+        with self.assertRaisesRegex(qualify.QualificationFailure, "unexpected label"):
+            qualify.validate_worker_quota_drift_baseline(extra_label, self.contract)
+
+        wrong_job = copy.deepcopy(baseline)
+        wrong_job[0]["metric"]["job"] = "openmettle-api"
+        with self.assertRaisesRegex(qualify.QualificationFailure, "unexpected job"):
+            qualify.validate_worker_quota_drift_baseline(wrong_job, self.contract)
+
     def test_rejects_disallowed_label_substring(self):
         bad = [{
             "metric": {

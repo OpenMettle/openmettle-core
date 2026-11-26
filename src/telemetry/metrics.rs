@@ -1337,7 +1337,7 @@ impl Metrics {
         // 15: openmettle.storage.quota.drift
         // Always emit all 8 closed outcome series (including 0) on `openmettle-worker` from startup
         // so Prometheus records a zero baseline before the first hourly drift, error or timeout
-        // observation; otherwise `increase(...[1h])` treats a first mismatch as a series
+        // observation; otherwise `increase(...[3h])` treats a first mismatch as a series
         // appearance with zero increase. These 8 streams are already counted in `max_series: 8`.
         let mut drift_points = Vec::new();
         for &outcome in QuotaDriftOutcome::ALL {
