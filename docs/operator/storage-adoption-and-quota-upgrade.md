@@ -216,6 +216,80 @@ SELECT two_phase_effect_intents_enabled FROM openmettle.runtime_feature_gates WH
 
 - **Terminal write-intent invariant:** `openmettle.resolve_terminal_write_intents()` rejects any transition to `runs.state = 'succeeded'` while any write operation (`idempotent`, `lookup`, `non_repeatable`) remains in `outcome IN ('intent', 'outcome_unknown')` (including `dispatched_attempts = 0`), and on `failed`, `cancelled`, or `interrupted` transitions any remaining revision-zero write `intent` to `outcome = 'outcome_unknown', revision = 1` with its ADR 0004 observation event strictly before `run-terminal`.
 
+## Upgrade from 0040 to 0041 (restore reconciliation gate)
+
+Migration `0041` ([ADR 0041](../adr/0041-retention-purge-and-deletion-journal.md), V1-16 PR2b) needs no activation step. Apply it with `openmettle-migrate` and roll the API, worker and admin deployments.
+
+- `openmettle.deletion_journal_head.coverage_started_at` is backfilled from migration `28`'s `installed_on` timestamp in `openmettle._sqlx_migrations`, identifying when deletion-journal coverage started on this installation.
+- `openmettle.restore_reconciliation_gate` starts open (`open = true`, `coverage_complete = true`), because a live database is not a restore, and the deletion journal continues the same hash chain unchanged.
+- `openmettle.retention_policy_bump_revision()` is replaced so ordinary grace edits keep incrementing by 1 while restore replay can advance `revision` past any replayed `policy_revision`.
+- `openmettle.authorization_audit` widens its `action` and `target_kind` CHECK constraints under a bounded `NOWAIT` lock retry loop to record `'restore.accept_coverage_gap'` against `'restore_gate'`.
+- Previous-release (`0040`) workers purge as before while the gate is open. Once an operator closes the gate during a restore, their purge claims and confirmations fail with SQLSTATE `OMR02`, logged as `worker.sweep.failed` for `purge_due`, but they still claim runs. Never start a `0040` or earlier worker against a restored database.
+
+## Restore the deletion journal after a database restore
+
+A database cannot detect that it was restored, and a backup carries `openmettle.restore_reconciliation_gate` open. The restore procedure therefore closes the gate before any API or worker starts. While it is closed, no application role can move a revision into `purging` or `purged` (`OMR02`), so nothing appends to the restored journal, and `openmettle-worker` claims no run and runs no purge sweep. The API does not read the gate in this release (V1-16 PR3 adds `503 unavailable`), so keep the API stopped until the gate opens.
+
+**Export.** Run the export continuously and after quiescing writes before planned restores, as `openmettle_owner`, keeping each export file outside the primary storage failure domain for the full backup retention horizon. The command creates the file exclusively with `0600` permissions (on Unix), refuses to overwrite an existing file, `fsync`s both the file and its parent directory, and only then prints the watermark line `watermark <origin_us> <journal_seq> <chain_digest> <exported_at_unix_us>`. Record `<origin_us>`, `<journal_seq>` and `<chain_digest>` independently of the export file (for example in the recovery set manifest). The export carries a SHA-256 checksum that detects damage, not forgery; signing belongs to V1-30.
+
+```sh
+openmettle-admin journal export "$EXPORT_FILE"
+```
+
+**Restore.** With the API and worker stopped and PostgreSQL and the artifact volume restored to the same recovery point:
+
+1. Restore database-level privileges if the restore method does not (`REVOKE ALL ON DATABASE ... FROM PUBLIC` and `GRANT CONNECT` to the application roles). Run `openmettle-migrate` if the backup predates schema `0041`. A backup taken at schema `0028` through `0040` preserves migration `28`'s `installed_on` timestamp and migrates cleanly; a backup taken at schema `0027` or earlier predates the deletion journal and gets a newer `coverage_started_at`, failing closed with `OMR04` as soon as `restore lock` compares `--required-origin`.
+2. Close the restore gate, naming the newest independently recorded installation origin (`<origin_us>`), watermark sequence and 64-character lowercase hex digest. Pass `--export-complete` **only** when the export was taken after primary writes were quiesced so no unexported purge window exists (passing `--export-complete` for a watermark sequence below the restored head or an already-higher locked `required_journal_seq` fails closed with `OMR04`). After catastrophic primary loss without a post-quiesce export, omit `--export-complete` (`coverage_complete = false`). The command prints the minted `restore_run` UUID.
+
+   ```sh
+   openmettle-admin restore lock \
+     --required-origin "$WATERMARK_ORIGIN_US" \
+     --required-seq "$WATERMARK_SEQ" \
+     --required-digest "$WATERMARK_DIGEST" \
+     --export-complete
+   ```
+
+   If the gate is already closed (either to update the same in-progress restore with a newer watermark, or because the backup itself was captured while an earlier restore gate was closed), read the current run ID with `SELECT restore_run_id FROM openmettle.restore_reconciliation_gate;` and pass `--replace-restore-run "$RESTORE_RUN_ID"`. To start a fresh restore over a backup captured with a closed gate (so it never inherits `coverage_complete = true` or stale checkpoints), pass **both** `--replace-restore-run "$RESTORE_RUN_ID"` and `--new-restore`. Updating the same restore without `--new-restore` preserves `snapshot_journal_seq`, never lowers `required_journal_seq`, and retains every previously pinned `(seq, digest)` checkpoint for verification on replay.
+3. If the artifact volume was restored by file copy (`cp -a`, `tar`, `restic` or similar), run [`openmettle-admin storage rebind`](restore-artifact-volume.md) before `restore replay`:
+
+   ```sh
+   openmettle-admin storage rebind "$ARTIFACT_ROOT"
+   ```
+
+   Skipping `storage rebind` on a copied volume causes `restore replay` to fail closed with `run \`openmettle-admin storage rebind\` first`.
+4. If the gate was locked without `--export-complete` (catastrophic primary loss leaving a possible unexported purge window after the last surviving export), inspect the gap against operator records. Only after explicit operator sign-off, record the audited break-glass acceptance bound to the active `--restore-run` UUID:
+
+   ```sh
+   openmettle-admin restore accept-coverage-gap \
+     --restore-run "$RESTORE_RUN_ID" \
+     --operator-id "$OPERATOR_UUID" \
+     --request-key "$REQUEST_KEY" \
+     --reason "$REASON"
+   ```
+
+   This writes an `'operator'` row (`action = 'restore.accept_coverage_gap'`, `target_kind = 'restore_gate'`) to `openmettle.authorization_audit` and sets `coverage_complete = true`. Replaying the exact same arguments with the same `--request-key` is idempotent (`replayed restore.accept_coverage_gap`); changing parameters on a reused `--request-key` fails with SQLSTATE `23505`.
+5. Replay the matching export. Pass the artifact root; omit it only on a storage-disabled deployment where no volume is pinned.
+
+   ```sh
+   openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"
+   ```
+
+   Replay first verifies the export's installation `origin`, `required_journal_seq` and `required_chain_digest`, replays every record, and verifies all pinned checkpoints in one `READ COMMITTED` transaction, rolling everything back on any mismatch. Records at or below the restored head must match verbatim; later records must extend the hash chain, strip resurrected mutable rows in `openmettle.artifact_retention_holds`, advance `openmettle.retention_policy.revision` strictly past each replayed `policy_revision`, and move still-unpurged revisions to `purging` under their original `purge_after` deadline (never a new grace window). Replay then claims the exclusive restore volume-phase lease, deletes resurrected payloads on the volume-pinned path (refusing foreign hard links before truncation), scrubs every `state = 'reserved'` unsettled upload (`reclaim_state IN ('none', 'claiming', 'truncated')`, syncing every file and both artifact directories while holding `storage_volume_control FOR SHARE` and refusing foreign hard links and any remaining unsettled bytes on quarantined or unbound rows), runs `verify_accounting_drift` requiring zero mismatches and zero unsettled payloads, and opens the gate only when `coverage_complete = true` and every journaled revision is `purged`. Rerunning after a fix resumes safely.
+6. Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` and complete the remaining steps of the [database backup restore checklist](../../README.md#database-backup-restore-pre-worker-checklist) before starting `openmettle-api` and `openmettle-worker`.
+
+| Failure | Meaning |
+| --- | --- |
+| `invalid export: ...` | The file is damaged, truncated, missing `origin`/`watermark`, carries mismatched origin or malformed hex/UUIDs, or has out-of-order/gapped records. Use an intact copy. |
+| `OMR02` | The gate state or `restore_run_id` does not match (lock it first before replay/break-glass, pass `--replace-restore-run` to update/replace a closed gate, or wait for an active volume-phase lease to finish). |
+| `OMR03` | The locked watermark digest, a pinned checkpoint, a record, the chain digest, or a revision's content digest disagrees with the restored database or export (wrong, altered, forked or cross-installation export). |
+| `OMR04` | The installation `origin` disagrees (backup predates migration `28` or belongs to another installation), the export sequence does not match the locked `required_journal_seq` (raise the lock requirement first with `--replace-restore-run` if a newer valid export was found), or `coverage_complete` is `false` (investigate and run `restore accept-coverage-gap` if authorized). |
+| `OMR05` | A journaled revision is still unpurged (for example quarantined or missing payload binding). Repair and rerun. |
+| `OMQ03` | An adoption or rebind barrier (`adoption_run_id`) is still held on `storage_volume_control`. Complete `storage rebind` or `storage adopt` first. |
+| `run \`openmettle-admin storage rebind\` first` | The artifact volume was restored by file copy and has not been rebound yet. |
+| `accounting drift detected` | Unsettled payloads, quarantines or volume/ledger drift remain. Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` and repair before rerunning. |
+
+This release journals confirmed purges only. Removals not yet purged (PR3) and revocations/tombstones are not journaled yet and still follow the README's pre-worker restore checklist.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

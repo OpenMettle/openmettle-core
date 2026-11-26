@@ -2,7 +2,10 @@
 //! An open regular file and a durable hard link preserve payload identity across commits.
 pub mod adoption;
 mod drift;
+#[doc(hidden)]
+pub use drift::verify_volume_for_test;
 pub use drift::{Drift, verify_accounting_drift};
+pub(crate) use drift::{verify_ledgers_on, verify_volume_on};
 pub mod rebind;
 mod reclaim;
 mod spill;
@@ -231,6 +234,12 @@ impl Store {
             return Ok(Some(id));
         }
         Ok(None)
+    }
+    pub(crate) async fn prepare_pin_on(
+        &self,
+        c: &mut PgConnection,
+    ) -> Result<Option<String>, Error> {
+        self.prepare_on(c, false).await
     }
     async fn stage(&self, reservation: &str) -> Result<Staged, Error> {
         self.create_stage(reservation, false)
@@ -783,6 +792,8 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
     first_error.map_or(Ok(count), Err)
 }
 
-pub use reclaim::{purge_due, reconcile_expired, reconcile_run_spills};
+pub use reclaim::{
+    purge_due, purge_journaled, reconcile_expired, reconcile_run_spills, scrub_unsettled_on_restore,
+};
 #[cfg(test)]
 mod tests;

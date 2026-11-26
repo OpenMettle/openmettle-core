@@ -226,6 +226,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "api capacity visibility",
         sql: include_str!("../migrations/0040_api_capacity_visibility.sql"),
     },
+    Source {
+        version: 41,
+        description: "restore reconciliation gate",
+        sql: include_str!("../migrations/0041_restore_reconciliation_gate.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

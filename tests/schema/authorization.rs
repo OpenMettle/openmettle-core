@@ -1232,6 +1232,15 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
                             .unwrap()
                             .is_string()
                     );
+                } else if entry.table == "deletion_journal_head" {
+                    assert!(
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("coverage_started_at")
+                            .unwrap()
+                            .is_string()
+                    );
                 }
                 value.to_string()
             })

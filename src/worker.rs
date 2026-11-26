@@ -360,7 +360,17 @@ pub(crate) async fn maintenance(
             if !spills || !uploads {
                 sweep_failed(Sweep::Uploads);
             }
-            if !sweep(artifact_fs::purge_due(pool, store, 100)).await {
+            // ADR 0041: no purge sweep until a restore's journal replay opens the gate.
+            let open = timeout(Duration::from_secs(15), async {
+                crate::restore::gate_open(&mut *pool.acquire().await?).await
+            })
+            .await;
+            let purged = match open {
+                Ok(Ok(true)) => sweep(artifact_fs::purge_due(pool, store, 100)).await,
+                Ok(Ok(false)) => true,
+                _ => false,
+            };
+            if !purged {
                 sweep_failed(Sweep::Retention);
             }
         }
@@ -372,6 +382,10 @@ async fn claim(
     policy: RunPolicy,
 ) -> Result<Option<(ActiveRun, Instant, bool)>, StoreError> {
     let mut c = connection(pool).await?;
+    // ADR 0041: no run is claimed or reclaimed until a restore's journal replay opens the gate.
+    if !crate::restore::gate_open(&mut c).await? {
+        return Ok(None);
+    }
     let sent = Instant::now();
     let (claim, sent, state, recovered) =
         if let Some(old) = leases::reclaim_next(&mut c, &policy.leases).await? {

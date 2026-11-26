@@ -291,3 +291,25 @@ async fn a_child_process_does_not_keep_a_released_store_lock() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+#[test]
+fn unlink_before_refuses_expired_deadline_and_leaves_file_intact() {
+    let dir = Dir::new();
+    let store = store(&dir);
+    let v = &store.volume;
+    let file_path = Path::new(&dir.path("root/staging")).join(RESERVATION);
+    fs::write(&file_path, b"keep-when-fenced").unwrap();
+    let ino = fs::metadata(&file_path).unwrap().ino();
+
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let err = v
+        .unlink_before(&v.staging, RESERVATION, ino, expired)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    assert_eq!(fs::read(&file_path).unwrap(), b"keep-when-fenced");
+
+    let valid = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    v.unlink_before(&v.staging, RESERVATION, ino, valid)
+        .unwrap();
+    assert!(!file_path.exists());
+}
