@@ -6,6 +6,10 @@ does not complete #3: grants remain outstanding. It enables no product API, uplo
 quota policy, retention job or filesystem work. Follow ADR 0003 for migration and role
 provisioning and ADR 0004 for transaction composition. Migrations 1–3 are unchanged.
 
+> *Status update (26 November 2026):* `#3` (V1-02) was completed and closed on 17 November 2026
+> after [ADR 0006](0006-grant-persistence.md) delivered migration 5. Historical notes below
+> retain their 17 November 2026 context.
+
 > [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md) adds the filesystem
 > payloads named by reservation UUID, and migration 17 adds an optional revision `display_name`
 > that `settle` stores and compares on replay.
@@ -206,7 +210,9 @@ passed. Throughput, hot-row contention and sizing are not measured.
 
 ADR 0006 adds project/resource grant persistence with direct and mapped provenance and
 revocation history. V1-04 mapping behavior and V1-05 permission meanings are consumer contracts,
-not prerequisites to this storage vocabulary. V1-02 final acceptance remains open. Other areas
+not prerequisites to this storage vocabulary. V1-02 final acceptance remains open. *(Update,
+26 November 2026: `#3` / V1-02 was completed and closed on 17 November 2026 following
+[ADR 0006](0006-grant-persistence.md).)* Other areas
 stay with their own tickets:
 
 - V1-15: uploads, staging, paths and downloads.

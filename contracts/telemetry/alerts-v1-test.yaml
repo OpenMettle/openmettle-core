@@ -179,3 +179,69 @@ tests:
       - eval_time: 12m
         alertname: OpenMettleProviderTransportFailures
         exp_alerts: []
+
+  # --- OpenMettleStorageQuotaDriftDetected -----------------------------------------------
+  - name: storage_quota_drift_fires_on_drift_and_resolves
+    interval: 30s
+    input_series:
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="budgets"}'
+        values: '0x10 2x130'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: budgets
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+      - eval_time: 66m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts: []
+
+  - name: storage_quota_drift_fires_on_error_and_timeout_ignoring_healthy
+    interval: 30s
+    input_series:
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="healthy"}'
+        values: '0+1x30'
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="error"}'
+        values: '0x10 1x20'
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="timeout"}'
+        values: '0x10 1x20'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: error
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: timeout
+            exp_annotations:
+              summary: "OpenMettle storage or quota accounting drift detected"
+              description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."
+
+  - name: storage_quota_drift_silent_on_healthy_and_flat_counters
+    interval: 30s
+    input_series:
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="healthy"}'
+        values: '0+1x30'
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="files"}'
+        values: '3+0x30'
+      - series: 'openmettle_storage_quota_drift_total{job="openmettle-worker",instance="a",outcome="quarantined"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: OpenMettleStorageQuotaDriftDetected
+        exp_alerts: []

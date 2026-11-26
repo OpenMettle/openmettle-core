@@ -115,6 +115,7 @@ EXPECTED_ALERTS = (
     "OpenMettleDatabaseReadinessFailing",
     "OpenMettleTelemetryDropsDetected",
     "OpenMettleProviderTransportFailures",
+    "OpenMettleStorageQuotaDriftDetected",
 )
 
 OPENSSL_CONFIG = f"""[req]
@@ -1169,7 +1170,7 @@ class TelemetryQualification:
                 f"pod/{gateway_pod}", gateway_spec["port"],
             ))
 
-            # 1. Verify all 4 v1 Prometheus alert rules are loaded and healthy.
+            # 1. Verify all 5 v1 Prometheus alert rules are loaded and healthy.
             def rules_loaded():
                 groups = self.prom_rules(prom_pf.port, allow_transient=True)
                 if not groups:

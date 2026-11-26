@@ -1,8 +1,8 @@
 # 0042 — Shared capacity API and serialized resource grants
 
-Proposed for Wave 21d, V1-18 PR1, 22 November 2026. Refs #18.
-This record defines the controller decision. Store implementation, API conformance
-and runtime qualification have separate delivery gates.
+Status: accepted with its implementation (updated 26 November 2026; originally proposed for
+Wave 21d, V1-18 PR1 on 22 November 2026; implementation merged in PR #141 and PR #184).
+Refs #18. Runtime qualification and owner acceptance remain separate delivery gates.
 
 ## Problem and scope
 

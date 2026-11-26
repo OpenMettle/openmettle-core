@@ -257,6 +257,26 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         with self.assertRaises(qualify.QualificationFailure):
             qualify.validate_prometheus_series(series, self.contract)
 
+    def test_quota_drift_counter_allows_only_declared_outcomes(self):
+        metric = {"__name__": "openmettle_storage_quota_drift_total", "job": "openmettle-worker",
+                  "instance": self.uuid_worker}
+        outcomes = (
+            "healthy",
+            "storage_accounts",
+            "budgets",
+            "settlements",
+            "files",
+            "quarantined",
+            "error",
+            "timeout",
+        )
+        for outcome in outcomes:
+            series = [{"metric": {**metric, "outcome": outcome}, "value": [1, "1"]}]
+            self.assertEqual(qualify.validate_prometheus_series(series, self.contract)["series_count"], 1)
+        series[0]["metric"]["outcome"] = "unknown"
+        with self.assertRaises(qualify.QualificationFailure):
+            qualify.validate_prometheus_series(series, self.contract)
+
     def test_rejects_disallowed_label_substring(self):
         bad = [{
             "metric": {

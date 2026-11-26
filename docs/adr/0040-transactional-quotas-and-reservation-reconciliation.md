@@ -1,11 +1,13 @@
 # 0040 — Transactional quotas and reservation reconciliation
 
-Proposed for V1-17 PR1, 21 November 2026. Refs #17. The base is schema 22 at
-`45df33c60e7a84fe8a2db0a8e2d9b93a8d29e5a5`. This design depends on V1-02 (`#3`), V1-05 (`#6`),
-V1-10 (`#10`), V1-15 (`#15`) and V1-06 (`#7`, [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md)).
-Migration `0023` (`V1-06` PR2 `openmettle_gateway` role provisioning and accepted usage report
-schema) is a prerequisite before the V1-17 PR2 migration. PR1 records the architecture decision.
-PR2 and PR3 own schema, store, worker sweeps, `/v1` routes and verification. Because `Cargo.toml`
+Status: accepted with its implementation (updated 26 November 2026; originally proposed for
+V1-17 PR1 on 21 November 2026 against schema 22 at `45df33c60e7a84fe8a2db0a8e2d9b93a8d29e5a5`;
+implementation merged in PR #136, PR #140, PR #150 and PR #158). Refs #17. This design depends
+on V1-02 (`#3`), V1-05 (`#6`), V1-10 (`#10`), V1-15 (`#15`) and V1-06 (`#7`,
+[ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md)). Migration `0023` (`V1-06`
+PR2 `openmettle_gateway` role provisioning and accepted usage report schema) was a prerequisite
+before the V1-17 PR2 migration. PR1 recorded the architecture decision; PR2 and PR3 delivered
+schema, store, worker sweeps, `/v1` routes and verification. Because `Cargo.toml`
 enforces `unsafe_code = "forbid"`, pinned Rust 1.100 does not stabilize `std::fs::Dir` (`dirfd`),
 and `Cargo.lock` has no safe directory-relative `*at` wrapper crate, PR2 adds **one minimal safe
 POSIX `dirfd` dependency**: `rustix` (`default-features = false, features = ["fs", "std"]`,
@@ -1521,8 +1523,8 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
        (FOR SHARE via SECURITY DEFINER in runtime reserve/settle/release/purge & StagingSweepState;
         FOR UPDATE ONLY in openmettle-admin adoption Steps 1b/3 and internally inside
         API-only SECURITY DEFINER storage_pin_volume_id(uuid))
-  -> quota_budgets (FOR NO KEY UPDATE: scope rows asc (scope_id, resource_kind, window_start, id),
-                    then instance rows asc (resource_kind, window_start, id))
+  -> quota_budgets (FOR NO KEY UPDATE: asc (resource_kind, scope_id ASC NULLS LAST, window_start, id)
+                    — ordered by resource_kind first, then scope rows asc and instance row last within each resource_kind)
   -> storage_accounts (asc scope_id) -> storage_instance (singleton instance row last)
   -> quota_overrides (written only inside SECURITY DEFINER while holding matching dispatch/entity/budget lock)
   -> quota_gateway_handoffs (inserted at COMMIT under already-locked gateway_requests FOR UPDATE,

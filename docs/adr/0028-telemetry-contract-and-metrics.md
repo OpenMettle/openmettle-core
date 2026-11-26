@@ -35,10 +35,10 @@ It records:
   before transaction commit), and exact per-metric and total ceilings.
 - ADR 0033 adds `openmettle.runs.cancellations`. It counts terminal cancellation events
   appended by store helpers before commit. Its reason is `requested` or `revoked`.
-- Reserved future signal namespaces (`openmettle.runs.queue.age`,
-  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-17
-  and V1-30 respectively (`openmettle.capacity.grants` moved into the implemented v1 metrics
-  catalog in V1-18 PR3).
+- Reserved future signal namespaces (`openmettle.runs.queue.age` and
+  `openmettle.backup.runs`), owned by V1-10 and V1-30 respectively
+  (`openmettle.capacity.grants` moved into the implemented v1 metrics catalog in V1-18 PR3,
+  and `openmettle.storage.quota.drift` moved into the implemented v1 metrics catalog in V1-17).
 
 ### Statically bounded metrics registry
 
@@ -47,15 +47,19 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
 
 - Every metric label is a closed Rust enum (`Method`, `RouteClass`, `StatusClass`,
   `ReadinessOutcome`, `ProviderOperation`, `ProviderOutcome`, `StorageOperation`,
-  `StorageOutcome`, `DroppedSignal`, `CancelReason`). No `String`, raw path, user ID, scope ID, run ID, or
-  request ID can be supplied as a metric label.
-- Total worst-case cardinality across all nine v1 metrics is **359**
+  `StorageOutcome`, `DroppedSignal`, `CancelReason`, `GatewayStep`, `GatewayCause`,
+  `CapacityOperation`, `CapacityOutcome`, `CapacityStaleSurface`, `CapacityWaitOutcome`,
+  `QuotaDriftOutcome`, plus the fixed 3-bucket `lag` label for gateway backfill age). No
+  `String`, raw path, user ID, scope ID, run ID, or request ID can be supplied as a metric
+  label.
+- Total worst-case cardinality across all nine original v1 metrics was **359**
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
-  *Update, 25 November 2026:* the contract has since grown to 15 metrics, **468** data-point
-  streams and **1,196** Prometheus series per process (adding V1-18 capacity grant, stale
-  observation and wait duration signals). `policy.max_data_point_streams` and
+  *Update, 26 November 2026:* the contract now defines **16** metrics, **476** data-point
+  streams and **1,204** Prometheus series per process (adding V1-06 gateway failure/backfill
+  signals, V1-17 overdue handoffs and `openmettle.storage.quota.drift`, and V1-18 capacity
+  grant, stale observation and wait duration signals). `policy.max_data_point_streams` and
   `policy.max_prometheus_series_per_process` in `contracts/telemetry/v1.json` define the current
   ceilings; `tests/telemetry_contract.rs` checks them against `metrics::DESCRIPTORS`.
 - Histogram snapshots derive `count` from the sum of loaded bucket counts so the OTLP
@@ -78,10 +82,13 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   or user identities.
 - When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
   cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
-  (`DroppedSignal::ALL`) series from process startup so Prometheus records a zero baseline
-  before any first collector outage, encodes `ExportMetricsServiceRequest` via
-  `opentelemetry-proto` (`metrics` feature enabled with zero new crates in `Cargo.lock`), and
-  POSTs with `Content-Type: application/x-protobuf` over the ADR 0010 `Route`.
+  (`DroppedSignal::ALL`) series from process startup (and, on `openmettle-worker`, the
+  zero-initialized `openmettle.quota.overdue.handoffs` series and all eight
+  `openmettle.storage.quota.drift` `QuotaDriftOutcome::ALL` series) so Prometheus records a
+  zero baseline before any first collector outage or hourly drift event, encodes
+  `ExportMetricsServiceRequest` via `opentelemetry-proto` (`metrics` feature enabled with zero
+  new crates in `Cargo.lock`), and POSTs with `Content-Type: application/x-protobuf` over the
+  ADR 0010 `Route`.
 - Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
   cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
   emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr.
@@ -95,9 +102,14 @@ metrics emitted today: `OpenMettleApiHighServerErrorRatio` (scoped to `job="open
 and excluding `healthz`/`readyz` probes), `OpenMettleDatabaseReadinessFailing`,
 `OpenMettleTelemetryDropsDetected` (`increase(openmettle_telemetry_dropped_total[15m]) > 0`
 with `for: 5m` so a single collector outage transitions from zero baseline to `firing` and
-resolves cleanly), and `OpenMettleProviderTransportFailures`.
+resolves cleanly), `OpenMettleProviderTransportFailures`, and
+`OpenMettleStorageQuotaDriftDetected`
+(`sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[1h])) > 0`
+with `for: 5m` so any non-healthy ledger mismatch, filesystem drift, quarantined row,
+verification error or timeout transitions from its worker zero baseline to `firing` and
+resolves cleanly).
 `contracts/telemetry/alerts-v1-test.yaml` supplies deterministic positive and negative
-`promtool test rules` cases for all four alerts, executed alongside `promtool check rules`
+`promtool test rules` cases for all five alerts, executed alongside `promtool check rules`
 in CI via the pinned Prometheus image.
 
 ## Dependencies

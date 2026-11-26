@@ -34,20 +34,20 @@
 | [0028](docs/adr/0028-telemetry-contract-and-metrics.md) | Telemetry contract v1 and bounded operational metrics | 20 November 2026 |
 | [0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md) | Native sign-in profile, runtime mounting and session authorization context | 20 November 2026 |
 | [0030](docs/adr/0030-session-issuance-database-boundary.md) | Session issuance database boundary | 20 November 2026 |
-| [0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md) | Filesystem artifact storage and streaming multipart uploads | 20 November 2026 |
+| [0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md) | Filesystem artifact storage and streaming multipart uploads (superseded in part by ADR 0040) | 20 November 2026 |
 | [0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md) | Durable run admission and fair PostgreSQL work queue | 20 November 2026 |
 | [0033](docs/adr/0033-worker-leases-deadlines-and-restart-recovery.md) | Worker leases, deadlines, fencing and restart recovery | 20 November 2026 |
 | [0034](docs/adr/0034-ordered-events-and-replayable-sse.md) | Ordered run events, cursor MACs and replayable `/v1` SSE | 20 November 2026 |
 | [0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md) | Approvals, permitted YOLO and the effect ledger | 21 November 2026 |
 | [0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md) | Conversation branches, presets and effective model configuration | 21 November 2026 |
 | [0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md) | Application-owned gateway provisioning and usage reconciliation | 21 November 2026 |
-| [0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) | SGLang and external-provider conformance adapter | 21 November 2026 |
+| [0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) | SGLang and external-provider conformance adapter (superseded in part by ADR 0044) | 21 November 2026 |
 | [0039](docs/adr/0039-scoped-mcp-adapter-and-bounded-tool-results.md) | Scoped MCP adapter, reviewed tool contracts and bounded spill artifacts | 21 November 2026 |
 | [0040](docs/adr/0040-transactional-quotas-and-reservation-reconciliation.md) | Transactional quotas and reservation reconciliation | 21 November 2026 |
 | [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026; PR2a split and audit/journal privilege amendments 23 November 2026 |
 | [0042](docs/adr/0042-shared-capacity-api-and-resource-grants.md) | Shared capacity API and serialized resource grants | 22 November 2026 |
 | [0043](docs/adr/0043-packaged-worker-inference-configuration.md) | Packaged worker inference configuration | 23 November 2026 |
-| [0044](docs/adr/0044-own-inference-proxy-and-binding-free-dispatch.md) | OpenMettle's own inference proxy and binding-free dispatch (supersedes ADR 0037 in part) | 23 November 2026 |
+| [0044](docs/adr/0044-own-inference-proxy-and-binding-free-dispatch.md) | OpenMettle's own inference proxy and binding-free dispatch (supersedes ADRs 0037 and 0038 in part) | 23 November 2026 |
 
 ## 0001 — Repository bootstrap (16 November 2026)
 

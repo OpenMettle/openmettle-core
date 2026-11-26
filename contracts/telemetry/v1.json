@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 468,
-    "max_prometheus_series_per_process": 1196,
+    "max_data_point_streams": 476,
+    "max_prometheus_series_per_process": 1204,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -355,11 +355,30 @@
       "labels": {
         "outcome": ["granted", "busy", "unavailable", "timeout", "cancelled"]
       }
+    },
+    {
+      "name": "openmettle.storage.quota.drift",
+      "prometheus_name": "openmettle_storage_quota_drift_total",
+      "kind": "counter",
+      "unit": "{observation}",
+      "semantics": "accounting_and_volume_drift_observations_per_verification",
+      "max_series": 8,
+      "labels": {
+        "outcome": [
+          "healthy",
+          "storage_accounts",
+          "budgets",
+          "settlements",
+          "files",
+          "quarantined",
+          "error",
+          "timeout"
+        ]
+      }
     }
   ],
   "reserved_signals": [
     {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"},
-    {"name": "openmettle.storage.quota.drift", "owner_ticket": "V1-17", "status": "planned"},
     {"name": "openmettle.backup.runs", "owner_ticket": "V1-30", "status": "planned"}
   ]
 }

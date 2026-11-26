@@ -1,5 +1,12 @@
 # 0031 — Filesystem artifact storage and streaming multipart uploads
 
+> **Superseded in part by [ADR 0040](0040-transactional-quotas-and-reservation-reconciliation.md)
+> (26 November 2026).** `rename`-based publish into the immutable `revisions/<reservation_id>`
+> path is superseded by ADR 0040's `linkat` + `payload_ino` pinning
+> (`migrations/0024_transactional_quotas_and_volume_pinning.sql`, PR #136) and the
+> `openmettle-admin storage rebind` file-copy restore contract (PR #150). The historical
+> decision text below is unchanged.
+
 Status: accepted with its implementation; V1-15 implementation contract. PR1 (storage engine) and PR2 (HTTP routes and
 OpenAPI, [below](#pr2-http-routes)), 20 November 2026. Agent-authored; owner approval,
 independent review and CI acceptance are separate gates. Refs #15; Refs #62. #15 remains open
