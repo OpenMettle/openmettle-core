@@ -2037,8 +2037,10 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     .unwrap();
     assert_eq!((st_no_ref.as_str(), hr_no_ref), ("authorized", true));
 
-    // P1 #2: Post-FOR UPDATE authority recheck when Bob's share is revoked while refresh waits
-    // on the connection row lock -> 0 HTTP requests sent to oauth_as_srv!
+    // P1 #2 + Review #3 P2 #2: Post-FOR UPDATE authority recheck when Bob's share is revoked
+    // while refresh waits on the connection row lock from Bob's own personal scope -> 0 HTTP
+    // requests sent to oauth_as_srv! Synchronize deterministically on pg_locks before revoking.
+    let bob_scope = personal_of(&db, &bob).await;
     vault::share_connection(
         &mut api_conn,
         &ctx(&alice, "sf-share-bob"),
@@ -2052,6 +2054,10 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
     {
         let mut blocker = connect(&db.0, OWNER).await;
         let mut lock_tx = blocker.begin().await.unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *lock_tx)
+            .await
+            .unwrap();
         sqlx::query("SELECT 1 FROM openmettle.external_connections WHERE id = $1::uuid FOR UPDATE")
             .bind(&conn_id)
             .fetch_one(&mut *lock_tx)
@@ -2059,7 +2065,7 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
             .unwrap();
         let p_bob = provider.clone();
         let cid_bob = conn_id.clone();
-        let sc_bob = alice_scope.clone();
+        let sc_bob = bob_scope.clone();
         let uid_bob = bob.user.clone();
         let aid_bob = bob.approval.clone();
         let bob_task = tokio::spawn(async move {
@@ -2075,8 +2081,41 @@ async fn vault_single_flight_refresh_disconnect_race_scope_widening_and_transien
                 })
                 .await
         });
-        // Wait briefly so bob_task passes the REPEATABLE READ snapshot and blocks on Phase 1 FOR UPDATE.
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Poll pg_locks deterministically until bob_task passes the REPEATABLE READ snapshot
+        // and blocks on Phase 1 FOR UPDATE against holder_pid.
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        let mut blocked = false;
+        while Instant::now() < wait_deadline {
+            blocked = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_locks waiter
+                       JOIN pg_locks holder
+                         ON holder.pid = $1
+                        AND holder.granted
+                        AND NOT waiter.granted
+                        AND waiter.pid <> holder.pid
+                        AND (
+                            (waiter.locktype = 'transactionid'
+                             AND waiter.transactionid = holder.transactionid)
+                            OR (waiter.locktype = 'tuple'
+                                AND waiter.relation = 'openmettle.external_connections'::regclass)
+                        )
+                 )",
+            )
+            .bind(holder_pid)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "bob_task must block on Phase 1 FOR UPDATE before revoking share"
+        );
         // Revoke Bob's share inside the same transaction holding the row lock and commit.
         sqlx::query(
             "UPDATE openmettle.external_connection_shares
@@ -4494,7 +4533,11 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
     .await
     .unwrap();
 
-    let numeric_bearer = "9876543210123456";
+    // Use an integer exceeding `u64::MAX` (`10^20`), which `serde_json` otherwise normalizes to
+    // `f64` (`1e+20`), and emit raw JSON wire bodies so the literal 21-digit number reaches
+    // `McpTransport` and `sanitize_tool_success` in both `content` text blocks and
+    // `structuredContent`-only responses (inline and >16 KiB spilled).
+    let numeric_bearer = "100000000000000000000";
     let mcp_mode = Arc::new(Mutex::new("inline_num"));
     let mcp_mode_srv = mcp_mode.clone();
     let mcp_srv = SyntheticTlsServer::start(move |head, body| {
@@ -4528,27 +4571,54 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
             )
         } else {
             let mode = *mcp_mode_srv.lock().unwrap();
-            let payload = match mode {
+            let raw_wire_json = match mode {
                 "inline_num" => {
-                    json!({"echo_num": 9876543210123456u64, "label": "inline"}).to_string()
+                    let payload = format!(
+                        r#"{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42}}"#
+                    );
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": payload}]
+                        }
+                    })
+                    .to_string()
                 }
-                "spill_num" => json!({
-                    "echo_num": 9876543210123456u64,
-                    "pad": "p".repeat(20 * 1024)
-                })
-                .to_string(),
+                "inline_structured" => {
+                    let id_json = serde_json::to_string(id).unwrap();
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"wrapped":1{numeric_bearer}9,"keep":42}}}}}}"#
+                    )
+                }
+                "spill_num" => {
+                    let pad = "p".repeat(20 * 1024);
+                    let payload = format!(
+                        r#"{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42}}"#
+                    );
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": payload}]
+                        }
+                    })
+                    .to_string()
+                }
+                "spill_structured" => {
+                    let id_json = serde_json::to_string(id).unwrap();
+                    let pad = "q".repeat(20 * 1024);
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{numeric_bearer}],"pad":"{pad}","keep":42}}}}}}"#
+                    )
+                }
                 _ => unreachable!(),
             };
-            http_json(
-                200,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{"type": "text", "text": payload}]
-                    }
-                }),
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{raw_wire_json}",
+                raw_wire_json.len()
             )
+            .into_bytes()
         }
     })
     .await;
@@ -4897,68 +4967,85 @@ async fn vault_personal_share_turn_execution_and_numeric_bearer_redaction() {
     };
     let _ = (&bob_effect_session, &mut worker_conn);
 
-    // 1) Inline numeric reflection in Bob's personal scope using Alice's shared personal connection:
-    //    succeeds AND redacts the all-digit bearer token!
-    *mcp_mode.lock().unwrap() = "inline_num";
-    gw_call_tool.store(true, Ordering::SeqCst);
-    let r1 = run_bob_turn(
-        bob_scope.clone(),
-        "bob-ps-inline".into(),
-        "00000000-0000-4000-8000-000000004601".into(),
-    )
-    .await;
-    assert!(matches!(r1, StepResult::Answer(_)));
-    let gw_inline_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
-    assert!(
-        gw_inline_round2.contains("[REDACTED_CREDENTIAL]")
-            && !gw_inline_round2.contains(numeric_bearer),
-        "inline JSON numeric bearer must be redacted: {gw_inline_round2}"
-    );
+    let assert_no_big_num_leak = |label: &str, text: &str| {
+        assert!(
+            text.contains("[REDACTED_CREDENTIAL]"),
+            "{label}: missing redaction marker: {text}"
+        );
+        for forbidden in [numeric_bearer, "1e+20", "1e20", "1E+20", "1E20"] {
+            assert!(
+                !text.contains(forbidden),
+                "{label}: leaked numeric bearer ({forbidden}): {text}"
+            );
+        }
+    };
 
-    // 2) >16 KiB spilled numeric reflection in Bob's personal scope: spills to disk AND redacts
-    //    the all-digit bearer token from BOTH the spilled artifact file and the model summary!
-    *mcp_mode.lock().unwrap() = "spill_num";
-    gw_call_tool.store(true, Ordering::SeqCst);
-    let r2 = run_bob_turn(
-        bob_scope.clone(),
-        "bob-ps-spill".into(),
-        "00000000-0000-4000-8000-000000004602".into(),
-    )
-    .await;
-    assert!(matches!(r2, StepResult::Answer(_)));
-    let gw_spill_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
-    assert!(
-        gw_spill_round2.contains("\"storage\":\"spilled\"")
-            || gw_spill_round2.contains("\\\"storage\\\":\\\"spilled\\\""),
-        "expected spilled artifact envelope: {gw_spill_round2}"
-    );
-    assert!(
-        !gw_spill_round2.contains(numeric_bearer),
-        "spilled tool summary leaked numeric bearer: {gw_spill_round2}"
-    );
-    // Inspect EVERY file written under `art_root/revisions` to prove zero leaked digits on disk.
-    let mut found_spill_file = false;
+    // 1) Inline `> u64::MAX` numeric reflection in BOTH `content` text blocks and
+    //    `structuredContent`-only responses in Bob's personal scope using Alice's shared
+    //    personal connection: succeeds AND redacts before `serde_json` `f64` normalization!
+    for (mode_name, run_key, msg_id) in [
+        (
+            "inline_num",
+            "bob-ps-inline",
+            "00000000-0000-4000-8000-000000004601",
+        ),
+        (
+            "inline_structured",
+            "bob-ps-inline-struct",
+            "00000000-0000-4000-8000-000000004605",
+        ),
+    ] {
+        *mcp_mode.lock().unwrap() = mode_name;
+        gw_call_tool.store(true, Ordering::SeqCst);
+        let r = run_bob_turn(bob_scope.clone(), run_key.into(), msg_id.into()).await;
+        assert!(matches!(r, StepResult::Answer(_)), "{mode_name}");
+        let gw_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+        assert_no_big_num_leak(mode_name, &gw_round2);
+    }
+
+    // 2) >16 KiB spilled `> u64::MAX` numeric reflection in BOTH `content` text blocks and
+    //    `structuredContent`-only responses: spills to disk AND redacts both the model summary
+    //    and every spilled artifact file on disk!
+    for (mode_name, run_key, msg_id) in [
+        (
+            "spill_num",
+            "bob-ps-spill",
+            "00000000-0000-4000-8000-000000004602",
+        ),
+        (
+            "spill_structured",
+            "bob-ps-spill-struct",
+            "00000000-0000-4000-8000-000000004606",
+        ),
+    ] {
+        *mcp_mode.lock().unwrap() = mode_name;
+        gw_call_tool.store(true, Ordering::SeqCst);
+        let r = run_bob_turn(bob_scope.clone(), run_key.into(), msg_id.into()).await;
+        assert!(matches!(r, StepResult::Answer(_)), "{mode_name}");
+        let gw_spill_round2 = gw_srv.captured.lock().unwrap().last().unwrap().1.clone();
+        assert!(
+            gw_spill_round2.contains("\"storage\":\"spilled\"")
+                || gw_spill_round2.contains("\\\"storage\\\":\\\"spilled\\\""),
+            "{mode_name}: expected spilled artifact envelope: {gw_spill_round2}"
+        );
+        assert_no_big_num_leak(&format!("{mode_name} summary"), &gw_spill_round2);
+    }
+    // Inspect EVERY file written under `art_root/revisions` to prove zero leaked digits/exponents.
+    let mut spill_file_count = 0usize;
     for entry in fs::read_dir(art_root.join("revisions")).unwrap() {
         let path = entry.unwrap().path();
         if path.is_file() {
             let bytes = fs::read(&path).unwrap();
             let text = String::from_utf8_lossy(&bytes);
             if text.len() > 16 * 1024 {
-                found_spill_file = true;
-                assert!(
-                    text.contains("[REDACTED_CREDENTIAL]"),
-                    "spilled artifact missing redaction marker"
-                );
-                assert!(
-                    !text.contains(numeric_bearer),
-                    "spilled artifact file leaked all-digit bearer token"
-                );
+                spill_file_count += 1;
+                assert_no_big_num_leak("spilled artifact file", &text);
             }
         }
     }
     assert!(
-        found_spill_file,
-        "expected >16 KiB spilled artifact file on disk"
+        spill_file_count >= 2,
+        "expected >=2 >16 KiB spilled artifact files on disk (content + structuredContent), got {spill_file_count}"
     );
 
     // 3) Strict project isolation: Bob running in his OWN project scope CANNOT use Alice's

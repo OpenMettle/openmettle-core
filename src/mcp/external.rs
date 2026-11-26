@@ -846,8 +846,68 @@ fn choose_safe_marker(handle: &str) -> String {
     choose_safe_marker_with(handle, "[REDACTED]")
 }
 
-fn choose_credential_marker(secret: &str) -> String {
+pub(crate) fn choose_credential_marker(secret: &str) -> String {
     choose_safe_marker_with(secret, "[REDACTED_CREDENTIAL]")
+}
+
+/// Returns `true` iff `s` is non-empty and every byte belongs to the RFC 8259 JSON number token
+/// alphabet (`0-9`, `+`, `-`, `.`, `e`, `E`). No RFC 8259 number literal can ever contain a byte
+/// outside this set.
+pub(crate) fn is_json_number_alphabet(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
+}
+
+/// Scrubs RFC 8259 JSON number tokens outside quoted JSON string literals when the raw numeric
+/// spelling contains `needle`, replacing each matching number token with a JSON string literal
+/// holding the redacted text. Runs BEFORE `serde_json` parses into `Value` so numbers outside
+/// `i64::MIN..=u64::MAX` (or with scientific/decimal notation) cannot be normalized to `f64`
+/// (e.g. `100000000000000000000` -> `1e+20`) before secret matching.
+pub(crate) fn redact_json_number_literals(raw_json: &str, needle: &str, marker: &str) -> String {
+    if !is_json_number_alphabet(needle) || !raw_json.contains(needle) {
+        return raw_json.to_owned();
+    }
+    let mut out = String::with_capacity(raw_json.len());
+    let bytes = raw_json.as_bytes();
+    let mut i = 0;
+    let mut copy_from = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i = (i + 2).min(bytes.len()),
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                let token = &raw_json[start..i];
+                if token.contains(needle) && is_json_number_literal(token) {
+                    out.push_str(&raw_json[copy_from..start]);
+                    let redacted = redact_plain_str_with(token, needle, marker);
+                    out.push_str(&serde_json::to_string(&redacted).expect("json string"));
+                    copy_from = i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&raw_json[copy_from..]);
+    out
 }
 
 fn redact_plain_str_with(input: &str, needle: &str, marker: &str) -> String {
@@ -937,6 +997,12 @@ fn redact_value_strings_with(
             let raw = n.to_string();
             if raw.contains(needle) {
                 *value = Value::String(redact_plain_str_with(&raw, needle, marker));
+            } else if n.is_f64() && is_json_number_alphabet(needle) {
+                // Defense-in-depth: for any already-parsed `Value::Number` whose representation
+                // fell back to `f64` (integers outside `i64::MIN..=u64::MAX`, exponents, floats),
+                // the original wire spelling is unavailable, so withhold when the secret is in
+                // the JSON number alphabet.
+                *value = Value::String(marker.to_owned());
             }
         }
         Value::Bool(b) if redact_primitives => {
@@ -1069,7 +1135,10 @@ fn sanitize_text_block(
         }
         return block.to_owned();
     }
-    if let Ok(mut parsed) = serde_json::from_str::<Value>(block) {
+    let scrubbed =
+        secret.map(|s| redact_json_number_literals(block, s, &choose_credential_marker(s)));
+    let parse_target = scrubbed.as_deref().unwrap_or(block);
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(parse_target) {
         if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
             map.remove(field);
         }
@@ -2259,5 +2328,50 @@ mod tests {
         let parsed_bool: Value = serde_json::from_str(&bool_out).expect("valid JSON");
         assert_eq!(parsed_bool["flag"], "[REDACTED_CREDENTIAL]");
         assert_eq!(parsed_bool["other"], false);
+
+        // Integers exceeding `u64::MAX` (e.g. `10^20`), which `serde_json` otherwise normalizes
+        // to `f64` (`1e+20`), must be redacted before `f64` conversion in `content_blocks` and
+        // withheld via `is_f64()` defense-in-depth in already-parsed `structured` `Value`s.
+        let big_bearer = "100000000000000000000";
+        let big_in_content = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![format!(
+                r#"{{"nested": [{big_bearer}], "wrapped": 1{big_bearer}9, "keep_int": 42}}"#
+            )],
+            structured: None,
+            meta: None,
+        };
+        let (big_c_out, _) =
+            sanitize_tool_success(&big_in_content, None, Some(big_bearer)).unwrap();
+        for forbidden in [big_bearer, "1e+20", "1e20", "1E+20", "1E20", "1E"] {
+            assert!(
+                !big_c_out.contains(forbidden),
+                "big numeric bearer ({forbidden}) leaked in content_blocks: {big_c_out}"
+            );
+        }
+        let parsed_big_c: Value = serde_json::from_str(&big_c_out).expect("valid JSON");
+        assert_eq!(parsed_big_c["nested"][0], "[REDACTED_CREDENTIAL]");
+        assert_eq!(parsed_big_c["wrapped"], "1[REDACTED_CREDENTIAL]9");
+        assert_eq!(parsed_big_c["keep_int"], 42);
+
+        let pre_parsed_big: Value =
+            serde_json::from_str(r#"{"leak": 100000000000000000000, "keep_int": 42}"#).unwrap();
+        let big_in_structured = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(pre_parsed_big),
+            meta: None,
+        };
+        let (big_s_out, _) =
+            sanitize_tool_success(&big_in_structured, None, Some(big_bearer)).unwrap();
+        for forbidden in [big_bearer, "1e+20", "1e20", "1E+20", "1E20", "1E"] {
+            assert!(
+                !big_s_out.contains(forbidden),
+                "big numeric bearer ({forbidden}) leaked in structured: {big_s_out}"
+            );
+        }
+        let parsed_big_s: Value = serde_json::from_str(&big_s_out).expect("valid JSON");
+        assert_eq!(parsed_big_s["leak"], "[REDACTED_CREDENTIAL]");
+        assert_eq!(parsed_big_s["keep_int"], 42);
     }
 }

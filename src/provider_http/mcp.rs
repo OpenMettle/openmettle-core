@@ -315,7 +315,7 @@ impl McpTransport {
             }
         });
         let result = self
-            .send_jsonrpc(headers, body, request_id, deadline, stop)
+            .send_jsonrpc(headers, body, request_id, None, deadline, stop)
             .await?;
         parse_tools_list(&result).ok_or(TransportFault {
             kind: FaultKind::TerminalRefusal,
@@ -375,7 +375,14 @@ impl McpTransport {
             }
         });
         let result = self
-            .send_jsonrpc(headers, body, request.request_id, deadline, stop)
+            .send_jsonrpc(
+                headers,
+                body,
+                request.request_id,
+                request.bearer_token,
+                deadline,
+                stop,
+            )
             .await?;
         parse_tool_call_result(&result).map_err(|kind| TransportFault {
             kind,
@@ -400,6 +407,7 @@ impl McpTransport {
         headers: HeaderMap,
         body_value: Value,
         expected_id: &str,
+        redact_bearer: Option<&str>,
         caller_deadline: Instant,
         stop: &mut watch::Receiver<Option<Stop>>,
     ) -> Result<Value, TransportFault> {
@@ -435,6 +443,7 @@ impl McpTransport {
                 connection,
                 outbound,
                 expected_id,
+                redact_bearer,
                 total,
                 self.timeouts.idle_read,
             )
@@ -550,6 +559,7 @@ async fn exchange_mcp(
     connection: Box<dyn transport::Connection>,
     mut outbound: hyper::Request<Full<Bytes>>,
     expected_id: &str,
+    redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
 ) -> Result<Value, TransportFault> {
@@ -603,7 +613,7 @@ async fn exchange_mcp(
         if interim_count.load(Ordering::SeqCst) > MAX_INTERIM_RESPONSES {
             return Err(post_send(FaultKind::TerminalRefusal));
         }
-        decode_response(res, expected_id, deadline, idle_read).await
+        decode_response(res, expected_id, redact_bearer, deadline, idle_read).await
     };
 
     tokio::pin!(conn, response_fut);
@@ -707,9 +717,35 @@ fn map_body_frame_error(err: Box<dyn std::error::Error + Send + Sync>) -> Transp
     post_send(FaultKind::TerminalRefusal)
 }
 
+fn scrub_final_result(
+    result: Value,
+    raw_bytes: &[u8],
+    redact_bearer: Option<&str>,
+) -> Result<Value, TransportFault> {
+    let Some(secret) = redact_bearer.filter(|s| crate::mcp::external::is_json_number_alphabet(s))
+    else {
+        return Ok(result);
+    };
+    let Ok(raw_utf8) = std::str::from_utf8(raw_bytes) else {
+        return Ok(result);
+    };
+    if !raw_utf8.contains(secret) {
+        return Ok(result);
+    }
+    let marker = crate::mcp::external::choose_credential_marker(secret);
+    let scrubbed = crate::mcp::external::redact_json_number_literals(raw_utf8, secret, &marker);
+    let value = unique(scrubbed.as_bytes()).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
+    value
+        .as_object()
+        .and_then(|obj| obj.get("result"))
+        .cloned()
+        .ok_or_else(|| post_send(FaultKind::TerminalRefusal))
+}
+
 async fn decode_response(
     response: hyper::Response<hyper::body::Incoming>,
     expected_id: &str,
+    redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
 ) -> Result<Value, TransportFault> {
@@ -755,7 +791,9 @@ async fn decode_response(
             }
             let value = unique(&buf).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
             match classify_jsonrpc_message(value, expected_id, false)? {
-                JsonRpcFrame::Final(FinalPayload::Result(result)) => Ok(result),
+                JsonRpcFrame::Final(FinalPayload::Result(result)) => {
+                    scrub_final_result(result, &buf, redact_bearer)
+                }
                 JsonRpcFrame::Final(FinalPayload::InvalidParams) => {
                     Err(post_send(FaultKind::Semantic {
                         is_tool_error: false,
@@ -796,7 +834,13 @@ async fn decode_response(
                         unique(&event.data).map_err(|_| post_send(FaultKind::TerminalRefusal))?;
                     match classify_jsonrpc_message(value, expected_id, true)? {
                         JsonRpcFrame::Progress => {}
-                        JsonRpcFrame::Final(payload) => final_payload = Some(payload),
+                        JsonRpcFrame::Final(FinalPayload::Result(result)) => {
+                            let scrubbed = scrub_final_result(result, &event.data, redact_bearer)?;
+                            final_payload = Some(FinalPayload::Result(scrubbed));
+                        }
+                        JsonRpcFrame::Final(FinalPayload::InvalidParams) => {
+                            final_payload = Some(FinalPayload::InvalidParams);
+                        }
                     }
                 }
             }
@@ -2071,6 +2115,117 @@ mod tests {
             err,
             TransportFault {
                 kind: FaultKind::Transient(RetryAfter::None),
+                bytes_may_have_left: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_call_scrubs_wire_numeric_bearer_before_f64_in_json_and_sse_without_breaking_errors()
+     {
+        let ca = Ca::new();
+        let big_bearer = "100000000000000000000";
+        let server = Server::start(ca.leaf(HOST, false), move |req| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let id = body["id"].as_str().unwrap();
+            let id_json = serde_json::to_string(id).unwrap();
+            match id {
+                "json-big" => {
+                    let payload = format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"wrapped":1{big_bearer}9,"keep":42}}}}}}"#
+                    );
+                    Reply::Bytes(response(
+                        200,
+                        &[("content-type", "application/json")],
+                        payload.as_bytes(),
+                    ))
+                }
+                "sse-big" => {
+                    let frame = format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"structuredContent":{{"nested":[{big_bearer}],"keep":7}}}}}}"#
+                    );
+                    let sse = format!("event: message\ndata: {frame}\n\n");
+                    Reply::Bytes(response(
+                        200,
+                        &[("content-type", "text/event-stream")],
+                        sse.as_bytes(),
+                    ))
+                }
+                "err-32602" => {
+                    let payload = format!(
+                        r#"{{"jsonrpc":"2.0","id":{id_json},"error":{{"code":-32602,"message":"bad params"}}}}"#
+                    );
+                    Reply::Bytes(response(
+                        200,
+                        &[("content-type", "application/json")],
+                        payload.as_bytes(),
+                    ))
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await;
+
+        let transport = mcp_transport(server.port, &ca);
+        let (_tx, mut stop) = stop_rx();
+        let args = json!({});
+        let deadline = || Instant::now() + Duration::from_secs(5);
+
+        for req_id in ["json-big", "sse-big"] {
+            let out = transport
+                .tools_call(
+                    &ToolCallRequest {
+                        request_id: req_id,
+                        tool_name: "echo_num",
+                        arguments: &args,
+                        bearer_token: Some(big_bearer),
+                        idempotency_header: None,
+                        idempotency_meta: None,
+                    },
+                    deadline(),
+                    &mut stop,
+                )
+                .await
+                .unwrap();
+            let structured = out.structured.expect("structuredContent");
+            let serialized = structured.to_string();
+            for forbidden in [big_bearer, "1e+20", "1e20", "1E+20", "1E20"] {
+                assert!(
+                    !serialized.contains(forbidden) && !out.text.contains(forbidden),
+                    "{req_id}: leaked {forbidden} in {serialized}"
+                );
+            }
+            assert_eq!(structured["nested"][0], "[REDACTED_CREDENTIAL]");
+            if req_id == "json-big" {
+                assert_eq!(structured["wrapped"], "1[REDACTED_CREDENTIAL]9");
+                assert_eq!(structured["keep"], 42);
+            } else {
+                assert_eq!(structured["keep"], 7);
+            }
+        }
+
+        // Error classification (`code == -32602`) must remain intact even when bearer == "32602".
+        let err = transport
+            .tools_call(
+                &ToolCallRequest {
+                    request_id: "err-32602",
+                    tool_name: "echo_num",
+                    arguments: &args,
+                    bearer_token: Some("32602"),
+                    idempotency_header: None,
+                    idempotency_meta: None,
+                },
+                deadline(),
+                &mut stop,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TransportFault {
+                kind: FaultKind::Semantic {
+                    is_tool_error: false,
+                },
                 bytes_may_have_left: true,
             }
         );
