@@ -943,21 +943,47 @@ pub async fn check_rebind(pool: &PgPool, store: &Store) -> Result<(), Error> {
 /// via `restore_verify_checkpoints` in ONE `READ COMMITTED` transaction, rolling everything back
 /// on any mismatch. Returns how many journal records were new to the restored journal.
 pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
+    let mut lock_entity_ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for b in &export.baseline {
+        lock_entity_ids.insert(b.entity_id.as_str());
+    }
+    for r in &export.records {
+        lock_entity_ids.insert(r.entity_id.as_str());
+    }
+    let lock_entity_ids: Vec<&str> = lock_entity_ids.into_iter().collect();
+
     let mut tx = read_committed(pool).await?;
     sqlx::query(
-        "SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'))",
+        "SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'), $6::uuid[])",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
     .bind(export.lifecycle_baseline_digest.as_deref())
+    .bind(&lock_entity_ids)
     .execute(&mut *tx)
     .await?;
     if let (Some(lc_origin), Some(lc_baseline)) = (
         export.lifecycle_origin_us,
         export.lifecycle_baseline_digest.as_deref(),
     ) {
+        let mut seen_retained: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut prebaseline_purged: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for r in &export.records {
+            match r.event_kind.as_str() {
+                "artifact_revision.retained" => {
+                    seen_retained.insert(r.entity_id.as_str());
+                }
+                "artifact_revision.purged" if !seen_retained.contains(r.entity_id.as_str()) => {
+                    prebaseline_purged.insert(r.entity_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        let prebaseline_purged_ids: Vec<&str> = prebaseline_purged.into_iter().collect();
+
         let mut entity_ids = Vec::with_capacity(export.baseline.len());
         let mut scope_ids = Vec::with_capacity(export.baseline.len());
         let mut states = Vec::with_capacity(export.baseline.len());
@@ -987,7 +1013,8 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
                         $7,
                         $8,
                         $9,
-                        $10
+                        $10,
+                        $11::uuid[]
                     )",
         )
         .bind(lc_origin)
@@ -1000,6 +1027,7 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
         .bind(&purging_us)
         .bind(&content_digests)
         .bind(&policy_revisions)
+        .bind(&prebaseline_purged_ids)
         .execute(&mut *tx)
         .await?;
     }

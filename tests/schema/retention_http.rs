@@ -2590,6 +2590,85 @@ async fn review2_download_cycle_approvals_lock_messages_tx_and_sse_backpressure(
     drop(dl_body);
     drop(_dl_guard);
 
+    // --- Review #4 P2 #3: online DELETE /v1/artifacts/{id} WITHOUT gate closure aborts mid-stream ---
+    let upload_body2 = form(
+        "r4-big",
+        &[
+            file_part(Some("big2.txt"), "text/plain", &big_payload),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (up_resp2, _up_guard2) = open_req(
+        64 * 1024,
+        "POST",
+        "/v1/artifacts",
+        Some("r4-big-up"),
+        Some("multipart/form-data; boundary=r4-big"),
+        upload_body2.into_bytes(),
+    )
+    .await;
+    assert_eq!(up_resp2.status(), 201);
+    let up_json2: Value =
+        serde_json::from_slice(&up_resp2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let art2_id = up_json2["artifact_id"].as_str().unwrap().to_owned();
+    let rev2_id = up_json2["revision_id"].as_str().unwrap().to_owned();
+
+    let (dl_resp2, _dl_guard2) = open_req(
+        256,
+        "GET",
+        &format!("/v1/artifacts/{art2_id}/revisions/{rev2_id}/content"),
+        None,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(dl_resp2.status(), 200);
+    let mut dl_body2 = dl_resp2.into_body();
+    let first2 = dl_body2
+        .frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(!first2.is_empty());
+    let mut total_downloaded2 = first2.len();
+
+    // Disassociate via DELETE /v1/artifacts/{id} WITHOUT closing the restore gate.
+    let (del_resp2, _del_guard2) = open_req(
+        64 * 1024,
+        "DELETE",
+        &format!("/v1/artifacts/{art2_id}"),
+        Some("r4-big-del"),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(del_resp2.status(), 204);
+    let _ = del_resp2.into_body().collect().await.unwrap();
+
+    let mut saw_error2 = false;
+    while let Some(frame) = dl_body2.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    total_downloaded2 += data.len();
+                }
+            }
+            Err(_) => {
+                saw_error2 = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_error2 && total_downloaded2 < big_len,
+        "expected mid-stream abort after online DELETE /v1/artifacts/{{id}} without gate closure, saw_error={saw_error2} total={total_downloaded2}/{big_len}"
+    );
+    drop(dl_body2);
+    drop(_dl_guard2);
+
     // --- Seed a conversation, branch, waiting run with pending approval via mounted v1 routes ---
     let (conv_resp, _conv_guard) = open_req(
         64 * 1024,

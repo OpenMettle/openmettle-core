@@ -603,20 +603,19 @@ impl HttpBody for Content {
                             .await?;
                         // Canonical lock order (storage.rs): lock artifact_revisions FOR SHARE
                         // before restore_reconciliation_gate FOR SHARE so online disassociation
-                        // serializes cleanly and cannot commit mid-read.
-                        if guard.expected_generation > 0 {
-                            let active: Option<bool> = sqlx::query_scalar(
-                                "SELECT state = 'active'
-                                   FROM openmettle.artifact_revisions
-                                  WHERE id = $1::uuid
-                                    FOR SHARE",
-                            )
-                            .bind(&guard.revision_id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-                            if active != Some(true) {
-                                return Ok::<bool, sqlx::Error>(false);
-                            }
+                        // serializes cleanly and cannot commit mid-read (including pre-41 schemas
+                        // where expected_generation == 0).
+                        let active: Option<bool> = sqlx::query_scalar(
+                            "SELECT state = 'active'
+                               FROM openmettle.artifact_revisions
+                              WHERE id = $1::uuid
+                                FOR SHARE",
+                        )
+                        .bind(&guard.revision_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        if active != Some(true) {
+                            return Ok::<bool, sqlx::Error>(false);
                         }
                         let current = crate::restore::lock_open_gate_generation(&mut tx).await?;
                         Ok(current == Some(guard.expected_generation))
