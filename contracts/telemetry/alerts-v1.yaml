@@ -58,3 +58,15 @@ groups:
         annotations:
           summary: "OpenMettle identity provider transport failures"
           description: "Repeated outbound OIDC provider HTTP requests failed over the ADR 0010 transport."
+
+      - alert: OpenMettleStorageQuotaDriftDetected
+        expr: |
+          sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[3h])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: openmettle-worker
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle storage or quota accounting drift detected"
+          description: "Periodic worker drift verification reported ledger mismatches, filesystem drift, quarantined rows, errors, or timeouts."

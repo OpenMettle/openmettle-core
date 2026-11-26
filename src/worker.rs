@@ -302,6 +302,55 @@ async fn sweep<T, E>(work: impl Future<Output = Result<T, E>>) -> bool {
     matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_)))
 }
 
+fn record_drift_verification<E>(
+    metrics: &crate::telemetry::metrics::Metrics,
+    outcome: Result<Result<artifact_fs::Drift, E>, tokio::time::error::Elapsed>,
+) -> bool {
+    use crate::telemetry::metrics::QuotaDriftOutcome;
+    match outcome {
+        Ok(Ok(report)) if report.healthy() => {
+            metrics.record_quota_drift(QuotaDriftOutcome::Healthy, 1);
+            true
+        }
+        Ok(Ok(report)) => {
+            let mut recorded = false;
+            for (kind, count) in [
+                (QuotaDriftOutcome::StorageAccounts, report.storage_accounts),
+                (QuotaDriftOutcome::Budgets, report.budgets),
+                (QuotaDriftOutcome::Settlements, report.settlements),
+            ] {
+                if let Ok(n) = u64::try_from(count)
+                    && n > 0
+                {
+                    metrics.record_quota_drift(kind, n);
+                    recorded = true;
+                }
+            }
+            for (kind, count) in [
+                (QuotaDriftOutcome::Files, report.files),
+                (QuotaDriftOutcome::Quarantined, report.quarantined),
+            ] {
+                if count > 0 {
+                    metrics.record_quota_drift(kind, count);
+                    recorded = true;
+                }
+            }
+            if !recorded {
+                metrics.record_quota_drift(QuotaDriftOutcome::Error, 1);
+            }
+            false
+        }
+        Ok(Err(_)) => {
+            metrics.record_quota_drift(QuotaDriftOutcome::Error, 1);
+            false
+        }
+        Err(_) => {
+            metrics.record_quota_drift(QuotaDriftOutcome::Timeout, 1);
+            false
+        }
+    }
+}
+
 pub(crate) async fn maintenance(
     pool: &PgPool,
     store: Option<&artifact_fs::Store>,
@@ -340,8 +389,14 @@ pub(crate) async fn maintenance(
         let mut drift_ok = true;
         if Instant::now() >= next_verification {
             next_verification = Instant::now() + verify_interval;
-            drift_ok = matches!(timeout(Duration::from_secs(15),
-                artifact_fs::verify_accounting_drift(pool, store)).await, Ok(Ok(report)) if report.healthy());
+            drift_ok = record_drift_verification(
+                crate::telemetry::metrics::global(),
+                timeout(
+                    Duration::from_secs(15),
+                    artifact_fs::verify_accounting_drift(pool, store),
+                )
+                .await,
+            );
         }
         if !(holds_ok && orphans_ok && unreported_ok && warnings_ok && overdue_ok && drift_ok) {
             crate::telemetry::metrics::quota_sweep_failed();
@@ -1176,6 +1231,45 @@ pub(crate) fn stopped_step(why: Stop) -> StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::{Process, metrics::Metrics};
+    use opentelemetry_proto::tonic::{
+        common::v1::any_value::Value as AnyVal,
+        metrics::v1::{metric, number_data_point::Value as NumVal},
+    };
+    use std::collections::BTreeMap;
+
+    fn drift_counts(store: &Metrics) -> BTreeMap<String, i64> {
+        let req = store
+            .encode_otlp(Process::Api, None)
+            .expect("non-empty metrics");
+        let mut counts = BTreeMap::new();
+        for metric in &req.resource_metrics[0].scope_metrics[0].metrics {
+            if metric.name != "openmettle.storage.quota.drift" {
+                continue;
+            }
+            let Some(metric::Data::Sum(sum)) = metric.data.as_ref() else {
+                panic!("expected Sum for openmettle.storage.quota.drift");
+            };
+            for dp in &sum.data_points {
+                let outcome = dp
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "outcome")
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| v.value.as_ref())
+                    .and_then(|v| match v {
+                        AnyVal::StringValue(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .expect("outcome attribute");
+                let Some(NumVal::AsInt(value)) = dp.value else {
+                    panic!("expected integer counter value");
+                };
+                counts.insert(outcome, value);
+            }
+        }
+        counts
+    }
 
     #[test]
     fn local_stop_point_is_anchored_at_send_and_execution_wins_a_tie() {
@@ -1192,5 +1286,69 @@ mod tests {
                 (sent + secs(expected), cause)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn drift_verification_records_all_eight_outcomes_accurately() {
+        let store = Metrics::new();
+
+        // Healthy report (including non-zero informational pending/unsettled fields) records `healthy: 1`.
+        assert!(record_drift_verification::<()>(
+            &store,
+            Ok(Ok(artifact_fs::Drift {
+                pending_gateway: 4,
+                unsettled_payloads: 2,
+                ..artifact_fs::Drift::default()
+            })),
+        ));
+        assert_eq!(
+            drift_counts(&store),
+            BTreeMap::from([("healthy".to_owned(), 1)])
+        );
+
+        // Unhealthy report records each non-zero mismatch category with its observed count.
+        assert!(!record_drift_verification::<()>(
+            &store,
+            Ok(Ok(artifact_fs::Drift {
+                storage_accounts: 2,
+                budgets: 3,
+                settlements: 4,
+                pending_gateway: 9,
+                files: 5,
+                quarantined: 6,
+                unsettled_payloads: 7,
+            })),
+        ));
+
+        // Verification error records `error: 1`.
+        assert!(!record_drift_verification(&store, Ok(Err("db_error"))));
+
+        // Defensive negative count on an unhealthy report still falls back to `error: 1`.
+        assert!(!record_drift_verification::<()>(
+            &store,
+            Ok(Ok(artifact_fs::Drift {
+                storage_accounts: -1,
+                ..artifact_fs::Drift::default()
+            })),
+        ));
+
+        // Real timeout records `timeout: 1`.
+        let timed_out: Result<Result<artifact_fs::Drift, ()>, _> =
+            timeout(Duration::from_millis(1), std::future::pending()).await;
+        assert!(!record_drift_verification(&store, timed_out));
+
+        assert_eq!(
+            drift_counts(&store),
+            BTreeMap::from([
+                ("budgets".to_owned(), 3),
+                ("error".to_owned(), 2),
+                ("files".to_owned(), 5),
+                ("healthy".to_owned(), 1),
+                ("quarantined".to_owned(), 6),
+                ("settlements".to_owned(), 4),
+                ("storage_accounts".to_owned(), 2),
+                ("timeout".to_owned(), 1),
+            ])
+        );
     }
 }

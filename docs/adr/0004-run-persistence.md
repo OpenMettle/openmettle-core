@@ -5,6 +5,11 @@ Status: accepted with its implementation; V1-02 persistence increment, 17 Novemb
 This does not complete #3 or enable product APIs. Follow ADR 0003 for migration and role
 provisioning. Migrations 1 and 2 are unchanged.
 
+> *Status update (26 November 2026):* `#3` (V1-02) was completed and closed on 17 November 2026
+> after [ADR 0005](0005-artifact-storage-accounting.md) and
+> [ADR 0006](0006-grant-persistence.md) delivered migrations 4 and 5. Historical notes below
+> retain their 17 November 2026 context.
+
 > [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) specifies V1-10 admission,
 > queue deadlines, pre-execution cancellation and the fair worker claim on these tables;
 > migration 19 adds their columns. [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md)
@@ -212,3 +217,6 @@ V1-11 claims/fencing/recovery; V1-12 authorized SSE and replay retention; V1-13 
 V1-15 storage publication; V1-17 quota composition/reconciliation. Schema contracts precede
 those behaviors without requiring their completed services. Inference budgets remain owned
 by the gateway and device-capacity authority remains separate. No dependent API is unblocked.
+
+*(Update, 26 November 2026: `#3` / V1-02 was completed and closed on 17 November 2026 following
+[ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0006](0006-grant-persistence.md).)*

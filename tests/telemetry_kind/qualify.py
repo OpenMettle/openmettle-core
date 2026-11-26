@@ -115,6 +115,7 @@ EXPECTED_ALERTS = (
     "OpenMettleDatabaseReadinessFailing",
     "OpenMettleTelemetryDropsDetected",
     "OpenMettleProviderTransportFailures",
+    "OpenMettleStorageQuotaDriftDetected",
 )
 
 OPENSSL_CONFIG = f"""[req]
@@ -755,6 +756,92 @@ def validate_prometheus_series(series_list: list[dict], telemetry_contract: dict
     }
 
 
+def validate_worker_quota_drift_baseline(
+    series_list: list[dict], telemetry_contract: dict
+) -> dict[str, dict[str, float]]:
+    """Require every live worker instance to expose exact bijective equality with all declared
+    zero-initialized `openmettle_storage_quota_drift_total` outcome series before the first
+    hourly drift verification sweep.
+    """
+    drift_metric = next(
+        (
+            m
+            for m in telemetry_contract.get("metrics", [])
+            if m.get("prometheus_name") == "openmettle_storage_quota_drift_total"
+        ),
+        None,
+    )
+    if drift_metric is None:
+        raise ContractError("telemetry contract missing openmettle_storage_quota_drift_total")
+    expected_outcomes = set(drift_metric.get("labels", {}).get("outcome", []))
+    if not expected_outcomes:
+        raise ContractError("telemetry contract missing outcome labels for quota drift")
+
+    if not series_list:
+        raise QualificationFailure(
+            "missing openmettle_storage_quota_drift_total worker baseline series"
+        )
+
+    expected_label_keys = {"__name__", "job", "instance", "outcome"}
+    by_instance: dict[str, dict[str, float]] = {}
+    for sample in series_list:
+        labels = sample.get("metric") or {}
+        name = labels.get("__name__", "")
+        if name != "openmettle_storage_quota_drift_total":
+            raise QualificationFailure(f"unexpected series in quota drift baseline: {name}")
+        extra_keys = sorted(set(labels) - expected_label_keys)
+        if extra_keys:
+            raise QualificationFailure(
+                f"worker quota drift series contains unexpected label(s): {', '.join(extra_keys)}"
+            )
+        job = labels.get("job")
+        if job != "openmettle-worker":
+            raise QualificationFailure(
+                f"unexpected job in worker quota drift baseline: {job!r}"
+            )
+        instance = labels.get("instance")
+        if not instance or not UUIDV4_RE.fullmatch(instance):
+            raise QualificationFailure(
+                f"worker quota drift series has invalid instance label: {instance!r}"
+            )
+        outcome = labels.get("outcome")
+        if outcome not in expected_outcomes:
+            raise QualificationFailure(
+                f"worker quota drift series has undeclared outcome={outcome!r}"
+            )
+        raw_value = sample.get("value")
+        if not isinstance(raw_value, list) or len(raw_value) < 2:
+            raise QualificationFailure(
+                f"worker quota drift series outcome={outcome!r} missing numeric sample value"
+            )
+        try:
+            value = float(raw_value[1])
+        except (TypeError, ValueError) as exc:
+            raise QualificationFailure(
+                f"worker quota drift series outcome={outcome!r} has non-numeric value {raw_value[1]!r}"
+            ) from exc
+        if value != 0.0:
+            raise QualificationFailure(
+                f"expected zero-initialized worker quota drift baseline for outcome={outcome!r}, got {value}"
+            )
+        inst_outcomes = by_instance.setdefault(instance, {})
+        if outcome in inst_outcomes:
+            raise QualificationFailure(
+                f"duplicate worker quota drift series for instance={instance} outcome={outcome!r}"
+            )
+        inst_outcomes[outcome] = value
+
+    for instance, outcomes in sorted(by_instance.items()):
+        missing = sorted(expected_outcomes - set(outcomes))
+        extra = sorted(set(outcomes) - expected_outcomes)
+        if missing or extra:
+            raise QualificationFailure(
+                f"worker instance {instance} quota drift baseline mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+    return by_instance
+
+
 def parse_alloy_accepted_spans(metrics_text: str) -> float:
     """Sum `otelcol_receiver_accepted_spans[_total]` samples from Alloy `/metrics`."""
     total = 0.0
@@ -1169,7 +1256,7 @@ class TelemetryQualification:
                 f"pod/{gateway_pod}", gateway_spec["port"],
             ))
 
-            # 1. Verify all 4 v1 Prometheus alert rules are loaded and healthy.
+            # 1. Verify all 5 v1 Prometheus alert rules are loaded and healthy.
             def rules_loaded():
                 groups = self.prom_rules(prom_pf.port, allow_transient=True)
                 if not groups:
@@ -1288,6 +1375,11 @@ class TelemetryQualification:
                     'openmettle_db_readiness_checks_total{job="openmettle-worker",outcome="ok"}',
                     allow_transient=True,
                 )
+                worker_drift_baseline = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_storage_quota_drift_total{job="openmettle-worker"}',
+                    allow_transient=True,
+                )
                 gateway_v1 = self.prom_query(
                     prom_pf.port,
                     'openmettle_http_server_requests_total{job="openmettle-gateway",'
@@ -1319,7 +1411,7 @@ class TelemetryQualification:
                     allow_transient=True,
                 )
                 if (
-                    unmatched and readyz and duration and worker
+                    unmatched and readyz and duration and worker and worker_drift_baseline
                     and gateway_v1 and gateway_readyz and gateway_duration
                     and drop_baseline and gateway_drop_baseline
                 ):
@@ -1328,6 +1420,7 @@ class TelemetryQualification:
                         "api_db_ready_ok": float(readyz[0]["value"][1]),
                         "api_duration_count": float(duration[0]["value"][1]),
                         "worker_db_ready_ok": float(worker[0]["value"][1]),
+                        "worker_drift_baseline_series": worker_drift_baseline,
                         "gateway_v1_4xx": float(gateway_v1[0]["value"][1]),
                         "gateway_db_ready_ok": float(gateway_readyz[0]["value"][1]),
                         "gateway_duration_count": float(gateway_duration[0]["value"][1]),
@@ -1340,6 +1433,10 @@ class TelemetryQualification:
                 "Prometheus OTLP metric ingestion for API, worker and gateway",
                 core_metrics_ingested,
                 timeout=90,
+            )
+            worker_drift_series = ingested.pop("worker_drift_baseline_series")
+            drift_by_instance = validate_worker_quota_drift_baseline(
+                worker_drift_series, self.telemetry_contract
             )
             self.expect(
                 ingested["api_drop_baseline"] == 0.0,
@@ -1361,11 +1458,19 @@ class TelemetryQualification:
                 )
                 instances[job] = job_instances[0]
             self.expect(
+                set(drift_by_instance.keys()) == {instances["openmettle-worker"]},
+                f"worker quota drift baseline instances {sorted(drift_by_instance.keys())} "
+                f"did not match live worker instance {[instances['openmettle-worker']]}",
+            )
+            self.expect(
                 len(set(instances.values())) == len(ROLES),
                 f"processes shared a service.instance.id: {instances}",
             )
             self.passed(
                 "Prometheus OTLP metrics ingestion and contract label conformance",
+                worker_quota_drift_baseline_outcomes=len(
+                    drift_by_instance[instances["openmettle-worker"]]
+                ),
                 **ingested,
                 **validation,
             )

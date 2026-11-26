@@ -1,5 +1,12 @@
 # 0038 — SGLang and external-provider conformance adapter
 
+> **Superseded in part by [ADR 0044](0044-own-inference-proxy-and-binding-free-dispatch.md)
+> (26 November 2026).** References below to LiteLLM and per-user `V1-06` gateway credentials
+> (under *Decision and sources*) are superseded by ADR 0044: `openmettle-gateway` is
+> OpenMettle's own inference proxy using binding-free, single-dispatch round bearers
+> (`migrations/0029`–`0037`). The inference wire, streaming, tool-validation, reasoning-replay
+> and conformance rules below stand; the historical text is unchanged.
+
 Accepted with its implementation; recorded for Wave 18d, V1-08 PR1, 21 November 2026. Refs #9. PR1 recorded the design.
 Implementation status: PR2 (`provider_http::inference` bounded gateway inference adapter and
 wire conformance fixtures) is merged on `main`; PR3 qualifies each deployed profile.

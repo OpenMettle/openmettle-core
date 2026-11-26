@@ -1,14 +1,16 @@
 # 0041 — Retention, purge and deletion journal
 
-Status: proposed for Wave 21c, V1-16 PR1, 22 November 2026. Refs #16. Base `main` is
-`e152f8f8d4a382c688ee8e41d197e790ce22b1ee` (schema 23). Dependencies:
+Status: accepted with its implementation in progress (updated 26 November 2026; originally
+proposed for Wave 21c, V1-16 PR1 on 22 November 2026 against `main`
+`e152f8f8d4a382c688ee8e41d197e790ce22b1ee`, schema 23; PR2a merged in PR #142, with PR2b and
+PR3 in progress). Refs #16. Dependencies:
 [V1-15](https://github.com/OpenMettle/openmettle-core/issues/15)
 ([ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)) and
 [V1-17](https://github.com/OpenMettle/openmettle-core/issues/17)
 ([ADR 0040](0040-transactional-quotas-and-reservation-reconciliation.md)); coordinates restore
-barriers with [V1-30](https://github.com/OpenMettle/openmettle-core/issues/27). PR1 records this
-decision; PR2 and PR3 own schema, store, worker, HTTP routes and verification. Issue #16 remains
-open. No new Cargo crate is introduced beyond ADR 0040's `rustix` foundation.
+barriers with [V1-30](https://github.com/OpenMettle/openmettle-core/issues/27). Issue #16
+remains open for PR2b/PR3 and owner acceptance. No new Cargo crate is introduced beyond
+ADR 0040's `rustix` foundation.
 
 ## Triggering problem
 
