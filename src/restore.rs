@@ -24,8 +24,8 @@ use crate::{
     authz::projects::hex,
     runs::{self, digest},
 };
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
-use std::{fmt::Write, future::Future, time::Duration};
+use sqlx::{ConnectOptions, Connection, PgConnection, PgPool, Postgres, Transaction};
+use std::{fmt::Write, future::Future, pin::Pin, time::Duration};
 
 const HEADER: &str = "openmettle.deletion_journal.export/1";
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -501,14 +501,61 @@ async fn release_volume_phase(
     tx.commit().await
 }
 
+/// Sends `pg_cancel_backend` (or `pg_terminate_backend` when `terminate` is true) for
+/// `backend_pid`. Uses `pool` when open and falls back to a direct, pool-independent connection
+/// opened from `pool.connect_options()` so cancellation and termination still succeed when
+/// `pool.close()` is in progress.
+async fn signal_backend(pool: &PgPool, backend_pid: i32, terminate: bool) {
+    let sql = if terminate {
+        "SELECT pg_terminate_backend($1)"
+    } else {
+        "SELECT pg_cancel_backend($1)"
+    };
+    if !pool.is_closed()
+        && tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query(sql).bind(backend_pid).execute(pool),
+        )
+        .await
+        .is_ok_and(|res| res.is_ok())
+    {
+        return;
+    }
+    let options = pool.connect_options();
+    if let Ok(Ok(mut conn)) = tokio::time::timeout(Duration::from_secs(5), options.connect()).await
+    {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query(sql).bind(backend_pid).execute(&mut conn),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), conn.close()).await;
+    }
+}
+
+async fn cancel_and_unwind<T, F>(pool: &PgPool, tx_pin_pid: i32, fut: &mut Pin<&mut F>)
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    signal_backend(pool, tx_pin_pid, false).await;
+    if tokio::time::timeout(Duration::from_secs(5), fut.as_mut())
+        .await
+        .is_err()
+    {
+        signal_backend(pool, tx_pin_pid, true).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), fut.as_mut()).await;
+    }
+}
+
 /// Runs `fut` (which must use only Connection 1 (`tx_pin`, backend `tx_pin_pid`) and filesystem
 /// I/O, never `pool`) while renewing the restore volume-phase lease on `pool` (Connection 2) up
 /// front, on every elapsed `renew_interval` tick, and once on completion. Because `fut` never
 /// borrows from `pool`, a 2-connection pool never contends with itself even while long SQL queries
-/// run on Connection 1. If a heartbeat renewal fails while `fut` is blocked on Backend 1, cancels
-/// (and if needed terminates) `tx_pin_pid` and awaits `fut` unwinding so the caller can
-/// synchronously roll back `tx_pin` and release `storage_volume_control FOR SHARE` before
-/// returning.
+/// run on Connection 1. If a heartbeat renewal fails or `pool.close()` begins while `fut` is
+/// blocked on Backend 1, cancels (and if needed terminates) `tx_pin_pid` via `pool` or a direct
+/// pool-independent connection from `pool.connect_options()` and awaits `fut` unwinding so the
+/// caller can synchronously roll back `tx_pin` and release `storage_volume_control FOR SHARE`
+/// before returning.
 async fn with_volume_phase_heartbeat<T, F>(
     pool: &PgPool,
     tx_pin_pid: i32,
@@ -524,26 +571,19 @@ where
     let mut ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + renew_interval, renew_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let close_event = pool.close_event();
+    tokio::pin!(close_event);
     tokio::pin!(fut);
     loop {
         tokio::select! {
             biased;
+            _ = &mut close_event => {
+                cancel_and_unwind(pool, tx_pin_pid, &mut fut).await;
+                return Err(sqlx::Error::PoolClosed.into());
+            }
             _ = ticker.tick() => {
                 if let Err(renew_err) = renew_volume_phase(pool, restore_run_id, claim_token).await {
-                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
-                        .bind(tx_pin_pid)
-                        .execute(pool)
-                        .await;
-                    if tokio::time::timeout(Duration::from_secs(5), &mut fut)
-                        .await
-                        .is_err()
-                    {
-                        let _ = sqlx::query("SELECT pg_terminate_backend($1)")
-                            .bind(tx_pin_pid)
-                            .execute(pool)
-                            .await;
-                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut fut).await;
-                    }
+                    cancel_and_unwind(pool, tx_pin_pid, &mut fut).await;
                     return Err(renew_err.into());
                 }
             }
@@ -694,14 +734,14 @@ async fn finish_claimed(
     let expected_volume_id = match outcome {
         Ok(expected_volume_id) => expected_volume_id,
         Err(err) => {
-            let _ = tx_pin.rollback().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), tx_pin.rollback()).await;
             return Err(err);
         }
     };
     let mut open_tx = match read_committed(pool).await {
         Ok(tx) => tx,
         Err(err) => {
-            let _ = tx_pin.rollback().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), tx_pin.rollback()).await;
             return Err(err.into());
         }
     };
@@ -717,12 +757,12 @@ async fn finish_claimed(
     .execute(&mut *open_tx)
     .await
     {
-        let _ = open_tx.rollback().await;
-        let _ = tx_pin.rollback().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), open_tx.rollback()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), tx_pin.rollback()).await;
         return Err(err.into());
     }
     if let Err(err) = tx_pin.commit().await {
-        let _ = open_tx.rollback().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), open_tx.rollback()).await;
         return Err(err.into());
     }
     open_tx.commit().await?;

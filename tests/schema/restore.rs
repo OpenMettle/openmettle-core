@@ -3168,4 +3168,78 @@ async fn heartbeat_renewal_failure_cancels_tx_pin_and_releases_volume_lock_synch
     assert!(!gate(&db).await.0);
 
     blocker_tx.rollback().await.unwrap();
+
+    // Review #5 P2 regression: if `pool.close()` begins while `tx_pin` is blocked on
+    // `storage_accounts`, pool-independent cancellation via `pool.connect_options()` aborts
+    // Backend 1 promptly (well under 5 s), rolls back `tx_pin` synchronously, lets `pool.close()`
+    // finish promptly, and releases `storage_volume_control FOR SHARE` while `storage_accounts`
+    // remains locked.
+    let closing_pool = pool(&db, OWNER).await;
+    let mut blocker2 = connect(&db.0, OWNER).await;
+    let blocker2_pid = pid(&mut blocker2).await;
+    let mut blocker2_tx = blocker2.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.storage_accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker2_tx)
+        .await
+        .unwrap();
+
+    let finishing2 = tokio::spawn({
+        let closing_pool = closing_pool.clone();
+        let export = export.clone();
+        async move {
+            restore::finish_with_heartbeat(&closing_pool, None, &export, Duration::from_secs(60))
+                .await
+        }
+    });
+    wait_for_blocked_peer(&db, blocker2_pid).await;
+
+    let mut probe2_tx = probe.begin().await.unwrap();
+    let blocked_rebind2 = sqlx::query(
+        "SELECT volume_id FROM openmettle.storage_volume_control WHERE id FOR UPDATE NOWAIT",
+    )
+    .execute(&mut *probe2_tx)
+    .await;
+    assert_eq!(sqlstate(blocked_rebind2), "55P03");
+    probe2_tx.rollback().await.unwrap();
+
+    let close_started = Instant::now();
+    let closing = tokio::spawn({
+        let closing_pool = closing_pool.clone();
+        async move {
+            closing_pool.close().await;
+        }
+    });
+
+    let err2 = tokio::time::timeout(Duration::from_secs(3), finishing2)
+        .await
+        .expect("finish_with_heartbeat must abort promptly on pool.close()")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err2, restore::Error::Database(sqlx::Error::PoolClosed)),
+        "expected PoolClosed error on pool.close(), got {err2:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(3), closing)
+        .await
+        .expect("pool.close() must complete promptly after tx_pin rolls back")
+        .unwrap();
+    assert!(
+        close_started.elapsed() < Duration::from_secs(3),
+        "pool.close() cleanup should not hit 5 s timeouts, took {:?}",
+        close_started.elapsed()
+    );
+
+    // BEFORE releasing `blocker2_tx`, `storage_volume_control FOR UPDATE NOWAIT` must succeed!
+    let mut rebind_probe2_tx = probe.begin().await.unwrap();
+    let vol2: Option<String> = sqlx::query_scalar(
+        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id FOR UPDATE NOWAIT",
+    )
+    .fetch_one(&mut *rebind_probe2_tx)
+    .await
+    .expect("tx_pin must release storage_volume_control FOR SHARE before pool.close() returns");
+    assert!(vol2.is_none());
+    rebind_probe2_tx.rollback().await.unwrap();
+    assert!(!gate(&db).await.0);
+
+    blocker2_tx.rollback().await.unwrap();
 }
