@@ -35,26 +35,30 @@ ALTER TABLE openmettle.capacity_grants
     ADD CONSTRAINT capacity_grants_released_settled_check
         CHECK (state <> 'released' OR (dispatch_state = 'confirmed' AND cardinality(extra_devices) = 0));
 
--- Locale-independent identifier check matching Rust
--- `runs::bounded(s, max) && s.trim() == s && !s.chars().any(char::is_control)`:
--- 1..=max UTF-8 bytes, no C0/C1 control characters (U+0001..U+001F, U+007F..U+009F; U+0000 is
--- rejected by PostgreSQL text), and no leading or trailing Unicode White_Space (all 25 Unicode
--- White_Space code points, independent of LC_CTYPE).
+-- Locale- and encoding-independent identifier check matching Rust
+-- `runs::bounded(s, max) && s.trim() == s && !s.chars().any(char::is_control)`.
+-- Pure 7-bit ASCII SQL over raw bytes so CREATE FUNCTION succeeds on both UTF8 and SQL_ASCII
+-- databases: enforces 1..=max UTF-8 bytes, strict RFC 3629 UTF-8 with no C0/DEL/C1 control
+-- characters (U+0000..U+001F, U+007F..U+009F), and no leading or trailing Unicode White_Space
+-- (all 25 White_Space code points, independent of LC_CTYPE).
 CREATE FUNCTION openmettle.capacity_valid_name(p_value text, p_max_bytes integer)
 RETURNS boolean
 LANGUAGE sql
-IMMUTABLE
+STABLE
 PARALLEL SAFE
 SET search_path = pg_catalog
 AS $$
-    SELECT p_value IS NOT NULL
-       AND p_max_bytes IS NOT NULL
-       AND octet_length(p_value) BETWEEN 1 AND p_max_bytes
-       AND p_value !~ U&'[\0001-\001f\007f-\009f]'
-       AND btrim(
-               p_value,
-               U&' \0009\000a\000b\000c\000d\0085\00a0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200a\2028\2029\202f\205f\3000'
-           ) = p_value
+    SELECT CASE
+        WHEN p_value IS NULL OR p_max_bytes IS NULL THEN false
+        ELSE (
+            SELECT length(raw) BETWEEN 1 AND p_max_bytes
+               AND hex COLLATE "C" ~ '^([2-6][0-9a-f]|7[0-9a-e]|c2[ab][0-9a-f]|(c[3-9a-f]|d[0-9a-f])[89ab][0-9a-f]|e0[ab][0-9a-f][89ab][0-9a-f]|e[1-9abc][89ab][0-9a-f][89ab][0-9a-f]|ed[89][0-9a-f][89ab][0-9a-f]|e[ef][89ab][0-9a-f][89ab][0-9a-f]|f0[9ab][0-9a-f][89ab][0-9a-f][89ab][0-9a-f]|f[1-3][89ab][0-9a-f][89ab][0-9a-f][89ab][0-9a-f]|f48[0-9a-f][89ab][0-9a-f][89ab][0-9a-f])+$'
+               AND hex COLLATE "C" !~ '^(20|c2a0|e19a80|e2808[0-9a]|e280a[89f]|e2819f|e38080)'
+               AND hex COLLATE "C" !~ '(20|c2a0|e19a80|e2808[0-9a]|e280a[89f]|e2819f|e38080)$'
+              FROM (SELECT convert_to(p_value, getdatabaseencoding()::name) AS raw) r,
+                   LATERAL (SELECT encode(r.raw, 'hex') AS hex) h
+        )
+    END
 $$;
 REVOKE ALL ON FUNCTION openmettle.capacity_valid_name(text, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.capacity_valid_name(text, integer) TO openmettle_api, openmettle_worker;
@@ -495,7 +499,7 @@ DECLARE
     v_id uuid;
 BEGIN
     IF p_request_key IS NULL OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
-       OR NOT openmettle.capacity_valid_name(p_profile, 128)
+       OR p_profile IS NULL OR octet_length(p_profile) NOT BETWEEN 1 AND 128
        OR jsonb_typeof(p_footprint) IS DISTINCT FROM 'array'
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
@@ -518,6 +522,9 @@ BEGIN
         END IF;
         RETURN QUERY SELECT v_existing.id, v_existing.state;
         RETURN;
+    END IF;
+    IF NOT openmettle.capacity_valid_name(p_profile, 128) THEN
+        RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
     END IF;
 
     PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
@@ -644,7 +651,7 @@ DECLARE
     v_stale boolean;
 BEGIN
     IF p_request_key IS NULL OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
-       OR NOT openmettle.capacity_valid_name(p_profile, 128)
+       OR p_profile IS NULL OR octet_length(p_profile) NOT BETWEEN 1 AND 128
        OR jsonb_typeof(p_footprint) IS DISTINCT FROM 'array'
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
@@ -670,6 +677,9 @@ BEGIN
         IF v_existing.state <> 'granted' OR v_existing.dispatch_state = 'confirmed' THEN
             RETURN QUERY SELECT v_existing.id, v_existing.state, 'already_settled'::text, true, false;
             RETURN;
+        END IF;
+        IF NOT openmettle.capacity_valid_name(p_profile, 128) THEN
+            RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
         END IF;
         -- Prior reservation was never confirmed on the backend ('pending' or 'in_flight'):
         -- require an active run claim, current epoch readiness, an unwatermarked commit_seq and
@@ -715,6 +725,9 @@ BEGIN
         PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
         RETURN QUERY SELECT v_existing.id, 'granted'::text, 'dispatch_now'::text, true, false;
         RETURN;
+    END IF;
+    IF NOT openmettle.capacity_valid_name(p_profile, 128) THEN
+        RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
     END IF;
 
     PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);

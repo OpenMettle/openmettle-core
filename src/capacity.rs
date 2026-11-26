@@ -409,7 +409,7 @@ async fn grant_inner(
 ) -> Result<Decision, Error> {
     ids(&[request.scope_id, request.run_id, request.claim_token])?;
     if !crate::runs::bounded(request.request_key, 128)
-        || !valid_capacity_name(request.profile)
+        || !crate::runs::bounded(request.profile, 128)
         || request
             .footprint
             .iter()

@@ -1187,11 +1187,14 @@ async fn load_live_grants(
 ) -> Result<Vec<(String, DurableLiveGrant)>, StoreError> {
     let rows = sqlx::query(
         "SELECT g.id::text AS grant_id, g.state, g.dispatch_state, g.granted_epoch, g.profile,
-                (r.state = 'running'
-                 AND r.cancel_reason IS NULL
-                 AND r.claim_token IS NOT NULL
-                 AND r.claim_token = g.claim_token
-                 AND r.lease_expires_at > clock_timestamp()) AS run_eligible,
+                coalesce(
+                    r.state = 'running'
+                    AND r.cancel_reason IS NULL
+                    AND r.claim_token IS NOT NULL
+                    AND r.claim_token = g.claim_token
+                    AND r.lease_expires_at > clock_timestamp(),
+                    false
+                ) AS run_eligible,
                 ARRAY(SELECT x::text FROM unnest(g.extra_devices) AS x ORDER BY x) AS extra_devices,
                 gd.device_id::text AS device_id, gd.bytes,
                 gd.released_at IS NOT NULL AS device_released
@@ -1315,10 +1318,10 @@ async fn prepare_dispatch_tx(
         || !is_canonical_uuid(request.run_id)
         || !is_canonical_uuid(request.claim_token)
         || !bounded(request.request_key, 128)
+        || !bounded(request.profile, 128)
     {
         return Err(StoreError::Invalid);
     }
-    check_profile(request.profile).map_err(|_| StoreError::Invalid)?;
     canonical_footprint(request.footprint).map_err(|_| StoreError::Invalid)?;
     let footprint = serde_json::to_string(request.footprint).map_err(|_| StoreError::Invalid)?;
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
@@ -1593,6 +1596,14 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
     ) -> Result<GrantState, CoordinatorError> {
         let prepared =
             prepare_release_tx(&self.pool, &self.controller, grant_id, extra_candidates).await?;
+        self.apply_prepared_release(grant_id, prepared).await
+    }
+
+    async fn apply_prepared_release(
+        &self,
+        grant_id: &str,
+        prepared: PreparedRelease,
+    ) -> Result<GrantState, CoordinatorError> {
         if prepared.grant_state == GrantState::Released {
             return Ok(GrantState::Released);
         }
@@ -2046,7 +2057,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         let Some(state) = state else {
             return Err(CoordinatorError::Store(StoreError::Invalid));
         };
-        // Reject caller-supplied devices outside this group before touching backend_unknown so bad
+        // Reject caller-supplied devices outside this group before touching durable state so bad
         // caller input never closes a healthy group.
         if !caller_set.is_subset(&group_device_ids) {
             return Err(CoordinatorError::Store(StoreError::Invalid));
@@ -2055,9 +2066,20 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             return Ok(GrantState::Released);
         }
 
+        // Durably commit `release_in_flight` (and caller target ranks) BEFORE inspecting backend
+        // inventory so bursts remain closed in PostgreSQL even if `establish_epoch` or a later
+        // `set_backend_unknown_tx` call fails or times out on a row lock.
+        let caller_devices: Vec<String> = caller_set.iter().cloned().collect();
+        let mut prepared =
+            prepare_release_tx(&self.pool, &self.controller, grant_id, &caller_devices).await?;
+        if prepared.grant_state == GrantState::Released {
+            return Ok(GrantState::Released);
+        }
+
         // Always inspect fenced backend inventory for any non-released grant so unexpected extra
         // ranks, foreign-group devices, rogue allocations, and missing durable allocations are
-        // discovered before settlement. Any non-StaleEpoch inventory failure durably closes bursts.
+        // discovered before settlement. Clear `reconciled_clean` BEFORE `set_backend_unknown_tx`
+        // on every non-StaleEpoch failure so lock timeouts never leave this coordinator open.
         let inv = match self
             .adapter
             .establish_epoch(EstablishEpochRequest::new(&self.controller))
@@ -2069,8 +2091,8 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 return Err(CoordinatorError::Adapter(err));
             }
             Err(err) => {
-                set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
                 self.reconciled_clean.store(false, Ordering::Release);
+                set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
                 return Err(CoordinatorError::Adapter(err));
             }
         };
@@ -2082,8 +2104,8 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             .values()
             .any(|live| live.footprint.keys().any(|d| !group_device_ids.contains(d)))
         {
-            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
             self.reconciled_clean.store(false, Ordering::Release);
+            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
             let target_has_foreign = inv
                 .get(grant_id)
                 .is_some_and(|live| live.footprint.keys().any(|d| !group_device_ids.contains(d)));
@@ -2137,17 +2159,26 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 && !is_eligible_same_epoch_pending(durable, self.controller.epoch())
         });
         if backend_mismatch || missing_durable {
-            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
             self.reconciled_clean.store(false, Ordering::Release);
+            set_backend_unknown_tx(&self.pool, &self.controller, true).await?;
         }
 
-        let mut all_candidates = caller_set;
+        // Persist any newly discovered backend ranks for `grant_id` into `extra_devices` before
+        // calling the adapter release command.
         if let Some(live) = inv.get(grant_id) {
-            all_candidates.extend(live.footprint.keys().cloned());
+            let has_new_rank = live.footprint.keys().any(|d| {
+                !prepared.unreleased_devices.contains(d) && !prepared.extra_devices.contains(d)
+            });
+            if has_new_rank {
+                let mut all_candidates = caller_set;
+                all_candidates.extend(live.footprint.keys().cloned());
+                let extra_candidates: Vec<String> = all_candidates.into_iter().collect();
+                prepared =
+                    prepare_release_tx(&self.pool, &self.controller, grant_id, &extra_candidates)
+                        .await?;
+            }
         }
-        let extra_candidates: Vec<String> = all_candidates.into_iter().collect();
-        self.prepare_and_apply_release(grant_id, &extra_candidates)
-            .await
+        self.apply_prepared_release(grant_id, prepared).await
     }
 
     /// Reopen bursts in PostgreSQL only after [`Self::takeover_and_reconcile`] completed with zero
