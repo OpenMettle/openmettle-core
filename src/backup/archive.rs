@@ -20,6 +20,7 @@ const ENTRY_FILE: u8 = 0x01;
 const ENTRY_END: u8 = 0x00;
 const VOLUME_SENTINEL: &str = ".openmettle-volume-id";
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BACKUP_META_BYTES: usize = 64 * 1024;
 const COPY_BUF_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -90,6 +91,29 @@ pub fn open_regular_nofollow(path: &Path) -> Result<fs::File, ArchiveError> {
         return Err(ArchiveError::Invalid("expected a regular file"));
     }
     Ok(file)
+}
+
+/// Read an entire regular file without following symlinks or blocking on FIFOs, enforcing an
+/// explicit upper size bound before and during reading.
+pub(crate) fn read_regular_bounded_nofollow(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ArchiveError> {
+    let file = open_regular_nofollow(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return Err(ArchiveError::Invalid(
+            "regular file exceeds maximum allowed size",
+        ));
+    }
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(max_bytes) + 1);
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(ArchiveError::Invalid(
+            "regular file exceeds maximum allowed size",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Open a directory descriptor without following symlinks and with `O_CLOEXEC`.
@@ -510,6 +534,32 @@ pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), ArchiveEr
     Ok(())
 }
 
+/// Create or truncate a `0600` regular file (without following symlinks), write all bytes, and
+/// `fsync` it. Used for atomic `backup-meta.json.tmp` replacement before renaming into place.
+pub(crate) fn write_file_0600_replace(path: &Path, bytes: &[u8]) -> Result<(), ArchiveError> {
+    let parent = path
+        .parent()
+        .ok_or(ArchiveError::Invalid("file path missing parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(ArchiveError::Invalid("file path missing file name"))?;
+    let dir = open_dir_nofollow(at::CWD, parent)?;
+    let fd = at::openat(
+        &dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let mut f = fs::File::from(fd);
+    if !f.metadata()?.is_file() {
+        return Err(ArchiveError::Invalid("expected a regular file"));
+    }
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 pub(crate) fn fsync_dir(path: &Path) -> Result<(), ArchiveError> {
     let dir = open_dir_nofollow(at::CWD, path)?;
     at::fsync(&dir)?;
@@ -616,29 +666,42 @@ pub fn validate_destination_root(
     }
 
     // Refuse overlap with backup keyring config or key files (and enforce separate device when
-    // requested so DB-only captures also catch unmounted local mountpoints).
+    // requested so DB-only captures and individually mounted key files fail closed).
     for key_path in keyring_paths
         .config_path
         .iter()
         .chain(keyring_paths.key_files.iter())
     {
-        if let Ok(kc) = fs::canonicalize(key_path)
-            && let Some(kdir) = kc.parent()
-        {
-            if paths_overlap(&dest_canon, kdir) {
-                return Err(ArchiveError::Invalid(
-                    "--destination-root must not overlap backup key custody directory",
-                ));
-            }
-            if require_separate_device
-                && let Ok(kmeta) = fs::metadata(kdir)
-                && dest_meta.dev() == kmeta.dev()
-            {
+        let kc = fs::canonicalize(key_path)
+            .map_err(|_| ArchiveError::Invalid("backup key path could not be canonicalized"))?;
+        let kdir = kc.parent().ok_or(ArchiveError::Invalid(
+            "backup key path has no parent directory",
+        ))?;
+        if paths_overlap(&dest_canon, kdir) {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must not overlap backup key custody directory",
+            ));
+        }
+        if require_separate_device {
+            let kmeta = fs::metadata(kdir).map_err(|_| {
+                ArchiveError::Invalid("backup key custody directory metadata unreadable")
+            })?;
+            if dest_meta.dev() == kmeta.dev() {
                 return Err(ArchiveError::Invalid(
                     "--destination-root must reside on a separate storage device from backup key custody directory",
                 ));
             }
         }
+    }
+    if require_separate_device
+        && keyring_paths
+            .protected_inodes
+            .iter()
+            .any(|&(dev, _)| dev == dest_meta.dev())
+    {
+        return Err(ArchiveError::Invalid(
+            "--destination-root must reside on a separate storage device from backup key files",
+        ));
     }
 
     Ok(dest_canon)
@@ -990,7 +1053,8 @@ pub fn prune_destination_with_verifier(
         }
         let dir_path = entry.path();
         let meta_path = dir_path.join("backup-meta.json");
-        let Ok(meta_bytes) = fs::read(&meta_path) else {
+        let Ok(meta_bytes) = read_regular_bounded_nofollow(&meta_path, MAX_BACKUP_META_BYTES)
+        else {
             skipped_unverified.push(name);
             continue;
         };
@@ -1179,6 +1243,80 @@ mod tests {
             load_non_secret_config_files(&[("priv.txt".into(), bad_pem)], &KeyRingPaths::default())
                 .is_err()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_skips_fifo_symlink_and_oversized_backup_meta_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("om-backup-prune-meta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let fifo_dir = dir.join("backup-20261126T010000Z-11111111-1111-4111-8111-111111111111");
+        fs::create_dir_all(&fifo_dir).unwrap();
+        let fifo_path = fifo_dir.join("backup-meta.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo should be available on unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let sym_dir = dir.join("backup-20261126T020000Z-22222222-2222-4222-8222-222222222222");
+        fs::create_dir_all(&sym_dir).unwrap();
+        let target = dir.join("outside.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, sym_dir.join("backup-meta.json")).unwrap();
+
+        let big_dir = dir.join("backup-20261126T030000Z-33333333-3333-4333-8333-333333333333");
+        fs::create_dir_all(&big_dir).unwrap();
+        fs::write(
+            big_dir.join("backup-meta.json"),
+            vec![b' '; MAX_BACKUP_META_BYTES + 16],
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let report =
+            prune_destination_with_verifier(&dir, GfsPolicy::default(), None, false, |_, _| true)
+                .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "prune blocked on non-regular backup-meta.json"
+        );
+        assert_eq!(report.skipped_unverified.len(), 3, "{report:?}");
+        assert!(report.kept.is_empty());
+        assert!(report.pruned.is_empty());
+        assert!(fifo_dir.exists() && sym_dir.exists() && big_dir.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn destination_validation_fails_closed_on_missing_key_path_and_same_device_protected_inode() {
+        let dir = std::env::temp_dir().join(format!("om-backup-dest-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest_meta = fs::metadata(&dir).unwrap();
+
+        // Missing/un-canonicalizable key path must fail closed rather than silently skipping.
+        let missing_ring = KeyRingPaths {
+            config_path: Some(dir.join("nonexistent-keyring.json")),
+            key_files: Vec::new(),
+            protected_inodes: BTreeSet::new(),
+        };
+        assert!(validate_destination_root(&dir, None, &missing_ring, false, true).is_err());
+
+        // Same-device protected inode (e.g., individually mounted key file) must fail closed when
+        // `require_separate_device` is requested.
+        let mut protected_inodes = BTreeSet::new();
+        protected_inodes.insert((dest_meta.dev(), 999_999));
+        let same_dev_ring = KeyRingPaths {
+            config_path: None,
+            key_files: Vec::new(),
+            protected_inodes,
+        };
+        assert!(validate_destination_root(&dir, None, &same_dev_ring, true, true).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -372,6 +372,10 @@ pub(crate) async fn maintenance(
     let mut unreported = crate::quotas::Pass::default();
     let verify_interval = Duration::from_secs(3600);
     let mut next_verification = Instant::now() + verify_interval;
+    // Seed durable backup outcome totals from PostgreSQL before the first OTLP export so a
+    // restarted worker never emits a premature `0` baseline ahead of historical failure/overdue
+    // counts.
+    let _ = sweep(crate::backup::observe_telemetry(pool)).await;
     loop {
         sleep(jitter(period)).await;
         let queued =

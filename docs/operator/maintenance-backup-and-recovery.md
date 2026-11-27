@@ -63,7 +63,7 @@ What happens during capture:
 1. **Pre-flight validation:** Validates destination isolation, non-secret config files (refusing PEM private keys, secret JSON keys, or keyring/vault paths), and optional `--neo4j-dump` before closing admission.
 2. **Admission closes (`maintenance_active = true`):** `openmettle-api` answers `503 unavailable` on mutating `/v1` routes and session issuance while keeping `/healthz`, `/readyz`, `/v1` reads, and settlement of already-started uploads/runs/gateway reports open. `openmettle-worker` stops claiming runs and skips `purge_due`.
 3. **Drain & drift verification:** Polls until active runs, open reservations, active purges, unsettled gateway requests, active external-connection refreshes, and unconfirmed capacity grants all hit `0`, confirms `restore_reconciliation_gate.open = true` and zero adoption/rebind barrier, and runs `verify_accounting_drift()`.
-4. **Encrypted capture & atomic publish:** Streams `pg.dump.enc`, `gateway-entitlements.json.enc`, `deletion-journal.bin.enc`, `artifacts.bin.enc` (POSIX `OMART01` archive verified live by SHA-256), optional `neo4j.dump.enc`, `config.json.enc`, and `manifest.json.enc` (AEAD `OMBKUP01`) into `.staging.<run_id>`, writes non-secret `backup-meta.json`, `fsync`s, atomically renames to `backup-<YYYYMMDDTHHMMSSZ>-<run_id>`, and records `backup_runs.state = 'succeeded'`.
+4. **Encrypted capture, staged publication & atomic publish:** Streams `pg.dump.enc`, `gateway-entitlements.json.enc`, `deletion-journal.bin.enc`, `artifacts.bin.enc` (POSIX `OMART01` archive verified live by SHA-256), optional `neo4j.dump.enc`, `config.json.enc`, and `manifest.json.enc` (AEAD `OMBKUP01`) into `.staging.<run_id>`, `fsync`s both `.staging.<run_id>` and the destination root, stages publication in PostgreSQL (`backup_runs.state = 'publishing'`), atomically writes non-secret `backup-meta.json` (via `backup-meta.json.tmp` + `fsync` + rename), renames `.staging.<run_id>` to `backup-<YYYYMMDDTHHMMSSZ>-<run_id>`, `fsync`s the destination root, and confirms `backup_runs.state = 'succeeded'`. Only `succeeded` runs increment the `succeeded` metric and reset the 24h RPO clock.
 5. **GFS pruning & release:** Applies `7 daily, 4 weekly, 3 monthly` pruning (always keeping the newest completed set and ignoring foreign/incomplete directories), then releases `maintenance_active` when `--release-on-success` is set.
 
 ### Optional Graphiti / Neo4j offline dump
@@ -107,7 +107,9 @@ openmettle-admin backup prune \
 
 ## Failure and explicit maintenance recovery
 
-A capture failure (for example `drain_timeout`, `drift_detected`, or destination I/O error) cleans up `.staging.<run_id>`, marks `backup_runs.state = 'failed'`, and **intentionally leaves `maintenance_active = true`** so admission does not reopen blindly after an abnormal condition. Likewise, if a backup host crashes mid-capture, the worker expires its lease to `incomplete` while keeping `maintenance_active = true`.
+A capture failure before staging publication (for example `drain_timeout`, `drift_detected`, or destination I/O error) cleans up `.staging.<run_id>`, marks `backup_runs.state = 'failed'`, and **intentionally leaves `maintenance_active = true`** so admission does not reopen blindly after an abnormal condition. Likewise, if a backup host crashes mid-capture, the worker expires its lease to `incomplete` while keeping `maintenance_active = true`.
+
+If a failure or process crash happens *after* PostgreSQL stages publication (`backup_runs.state = 'publishing'`, visible in `openmettle-admin backup status`), the encrypted set stays preserved in `.staging.<run_id>`, `succeeded` is **not** incremented, and the 24h RPO clock is **not** reset. To finish publishing without re-dumping PostgreSQL or artifacts (and without needing `--neo4j-dump` or `--config-file` on disk again), re-run `openmettle-admin backup capture` with the **exact same `--request-key`, `--operator-id`, `--destination-domain`, and `--reason`**. If the destination cannot be recovered and you want to abandon the unpublished run instead, release maintenance with `--abort-active-run` (transitioning the `publishing` run to `incomplete` with `failure_code = 'publication_aborted'`).
 
 1. Inspect the gate and latest run:
 
@@ -115,17 +117,18 @@ A capture failure (for example `drain_timeout`, `drift_detected`, or destination
    openmettle-admin backup status
    ```
 
-2. Resolve the underlying issue (stuck run, drift, or destination mount failure).
+2. Resolve the underlying issue (stuck run, drift, or destination mount failure), or retry a `publishing` run with the exact same `--request-key`.
 3. Release maintenance explicitly once safe:
 
    ```sh
-   # Normal release when no active leased capture run exists:
+   # Normal release when no active leased or publishing capture run exists:
    openmettle-admin backup release-maintenance \
      --operator-id "$OPERATOR_ID" \
      --request-key "release-2026-11-26-1" \
      --reason "Verified system healthy after backup drain timeout"
 
-   # If a crashed capture process still holds an unexpired lease (confirm the process exited first):
+   # If a crashed capture process still holds an unexpired lease or stopped in `publishing`
+   # (confirm the process exited first):
    openmettle-admin backup release-maintenance \
      --operator-id "$OPERATOR_ID" \
      --request-key "release-abort-2026-11-26-1" \
@@ -161,10 +164,10 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
 
 3. **Select ONE authoritative deletion journal export (`SELECTED_JOURNAL`) and close `restore_reconciliation_gate`:**
 
-   Choose a single verified journal export file and carry that exact `"$SELECTED_JOURNAL"` through both `restore lock` (this step) and `restore replay` (step 5):
+   Choose a single verified journal export file (either a newer post-backup `openmettle-admin journal export` file if available, or `/var/restore/openmettle-recovery/deletion-journal.bin` from the unpacked backup) and carry that exact `"$SELECTED_JOURNAL"` through both `restore lock` (this step) and `restore replay` (step 5):
 
-   - **Preferred (zero post-backup gap):** If a newer post-backup `openmettle-admin journal export` file exists from before primary loss, set `SELECTED_JOURNAL=/path/to/latest-journal-export.txt` and pass `--export-complete` to `restore lock`.
-   - **Fallback (backup-time journal only):** Otherwise set `SELECTED_JOURNAL=/var/restore/openmettle-recovery/deletion-journal.bin`. If writes or purges may have occurred after the backup was captured, omit `--export-complete` on `restore lock` and run audited `openmettle-admin restore accept-coverage-gap` before `restore replay` (see [Restore the deletion journal](storage-adoption-and-quota-upgrade.md#restore-the-deletion-journal-after-a-database-restore)).
+   - **When to pass `--export-complete`:** Pass `--export-complete` on `restore lock` **only** when `"$SELECTED_JOURNAL"`'s `(seq, digest)` matches an independently recorded watermark captured *after* all primary writes, purges, and connection revocations stopped (for example, a clean coordinated maintenance backup with zero post-backup primary writes before loss, or a fresh `openmettle-admin journal export` taken from an intact stopped primary). Do **not** pass `--export-complete` merely because an external export is newer than the backup.
+   - **When post-export primary activity may have occurred:** Whenever writes, purges, or external-connection revocations could have happened on the primary *after* `"$SELECTED_JOURNAL"` was exported and *before* primary loss, **omit `--export-complete`** on `restore lock` and run audited `openmettle-admin restore accept-coverage-gap` before `restore replay` (see [Restore the deletion journal](storage-adoption-and-quota-upgrade.md#restore-the-deletion-journal-after-a-database-restore)).
 
    Extract the watermark headers (`origin`, `lifecycle_origin`, `lifecycle_baseline`, `connection_origin`, and `watermark <origin> <seq> <digest> <ts>`) directly from `"$SELECTED_JOURNAL"` and run `openmettle-admin restore lock` with those exact values.
 

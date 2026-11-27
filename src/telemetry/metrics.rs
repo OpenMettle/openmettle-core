@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::{
 use std::{
     sync::{
         LazyLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -995,6 +995,7 @@ pub struct Metrics {
     capacity_wait_duration: [HistogramSlot; CAPACITY_WAIT_SLOTS],
     quota_drift: [AtomicU64; QUOTA_DRIFT_SLOTS],
     backup_runs: [AtomicU64; BACKUP_RUN_SLOTS],
+    backup_runs_seeded: AtomicBool,
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -1038,6 +1039,7 @@ impl Metrics {
             capacity_wait_duration: std::array::from_fn(|_| HistogramSlot::new()),
             quota_drift: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_runs: std::array::from_fn(|_| AtomicU64::new(0)),
+            backup_runs_seeded: AtomicBool::new(false),
         }
     }
 
@@ -1130,14 +1132,41 @@ impl Metrics {
     pub fn record_backup_run(&self, outcome: BackupRunOutcome, count: u64) {
         if count > 0 {
             self.backup_runs[outcome.index()].fetch_add(count, Ordering::Relaxed);
+            self.backup_runs_seeded.store(true, Ordering::Release);
         }
     }
 
-    /// Monotonically synchronize `openmettle.backup.runs` with PostgreSQL's durable cumulative
-    /// outcome total (`fetch_max`) so worker restarts before an OTLP flush never lose failure or
-    /// overdue counts.
+    /// Mark `openmettle.backup.runs` seeded so a worker with all-zero durable PostgreSQL totals
+    /// starts emitting its 4-stream zero baseline in OTLP exports.
+    pub fn mark_backup_runs_seeded(&self) {
+        self.backup_runs_seeded.store(true, Ordering::Release);
+    }
+
+    /// Monotonically synchronize all four `openmettle.backup.runs` outcome slots with PostgreSQL's
+    /// durable cumulative totals (`fetch_max`) and then publish the seeded flag with `Release`
+    /// ordering so an OTLP export on a restarted worker never emits a premature `0` ahead of
+    /// pre-existing historical failure, incomplete, or overdue counts.
+    pub fn sync_backup_run_totals(
+        &self,
+        succeeded: u64,
+        failed: u64,
+        incomplete: u64,
+        overdue: u64,
+    ) {
+        self.backup_runs[BackupRunOutcome::Succeeded.index()]
+            .fetch_max(succeeded, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Failed.index()].fetch_max(failed, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Incomplete.index()]
+            .fetch_max(incomplete, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Overdue.index()].fetch_max(overdue, Ordering::Relaxed);
+        self.backup_runs_seeded.store(true, Ordering::Release);
+    }
+
+    /// Monotonically synchronize one `openmettle.backup.runs` outcome with PostgreSQL's durable
+    /// cumulative total (`fetch_max`) and mark the metric seeded.
     pub fn observe_backup_run_total(&self, outcome: BackupRunOutcome, durable_total: u64) {
         self.backup_runs[outcome.index()].fetch_max(durable_total, Ordering::Relaxed);
+        self.backup_runs_seeded.store(true, Ordering::Release);
     }
 
     pub fn backup_run_count(&self, outcome: BackupRunOutcome) -> u64 {
@@ -1414,14 +1443,17 @@ impl Metrics {
         push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
 
         // 16: openmettle.backup.runs
-        // Always emit all 4 closed outcome series (including 0) on `openmettle-worker` from startup
-        // so Prometheus records a zero baseline before any first backup failure, incomplete run,
-        // or RPO overdue observation; otherwise `increase(...[15m])` treats the first failure as
-        // a series appearance with zero increase. These 4 streams are counted in `max_series: 4`.
+        // Emit all 4 closed outcome series (including 0) on `openmettle-worker` ONLY once durable
+        // totals have been seeded from PostgreSQL (`backup_runs_seeded`), so a restarted worker
+        // never exports a premature `0` ahead of pre-existing historical `failed`/`incomplete`/
+        // `overdue` totals (which would look like a fresh `0 -> N` increase to Prometheus), while
+        // still establishing a zero baseline immediately after startup seeding on clean DBs.
+        let backup_seeded =
+            role == Process::Worker && self.backup_runs_seeded.load(Ordering::Acquire);
         let mut backup_points = Vec::new();
         for &outcome in BackupRunOutcome::ALL {
             let value = self.backup_runs[outcome.index()].load(Ordering::Relaxed);
-            if value > 0 || role == Process::Worker {
+            if value > 0 || backup_seeded {
                 backup_points.push(counter_point(
                     start,
                     now,

@@ -5,8 +5,9 @@
 -- transaction with search_path pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
 --
 -- Lock order (deadlock-free pure sink relative to all runtime tables):
---   - Runtime mutating transactions (openmettle_api, openmettle_worker, openmettle_issuance)
---     call openmettle.backup_maintenance_lock_open(), taking FOR SHARE on
+--   - Runtime mutating transactions (openmettle_api, openmettle_worker, and openmettle_issuance
+--     via the SECURITY DEFINER trigger on local_sessions/native_handoffs) invoke
+--     openmettle.backup_maintenance_lock_open(), taking FOR SHARE on
 --     openmettle.backup_maintenance_gate (and raising OMM01 when maintenance_active).
 --   - Owner maintenance/capture transitions and worker telemetry observation lock ONLY
 --     openmettle.backup_maintenance_gate (FIRST, FOR UPDATE) -> openmettle.backup_runs
@@ -17,17 +18,19 @@
 -- Role boundaries (verified by src/boundaries.sql):
 --   - Zero table or column privileges on backup_maintenance_gate or backup_runs for any
 --     runtime role or PUBLIC.
+--   - Zero new privileges of any kind for openmettle_issuance or openmettle_gateway.
 --   - openmettle.backup_maintenance_is_active() SECURITY DEFINER: EXECUTE for
---     openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway.
+--     openmettle_api, openmettle_worker.
 --   - openmettle.backup_maintenance_lock_open() SECURITY DEFINER: EXECUTE for
---     openmettle_api, openmettle_worker, openmettle_issuance.
+--     openmettle_api, openmettle_worker.
+--   - openmettle.enforce_issuance_maintenance_gate() SECURITY DEFINER trigger: PUBLIC revoked,
+--     zero runtime grants.
 --   - openmettle.backup_observe_telemetry() SECURITY DEFINER: EXECUTE for openmettle_worker.
 --   - All maintenance, RPO, capture lifecycle, and trigger functions are owner-only with
 --     PUBLIC EXECUTE revoked.
 
--- Acquire ACCESS EXCLUSIVE on the only pre-existing table modified by migration 45 in one
--- bounded NOWAIT retry loop at the top of the transaction so concurrent writers cannot
--- deadlock with DDL.
+-- Acquire DDL locks on every pre-existing table modified by migration 45 in one bounded NOWAIT
+-- retry loop at the top of the transaction so concurrent writers cannot deadlock with DDL.
 DO $$
 DECLARE
     v_timeout interval;
@@ -44,6 +47,10 @@ BEGIN
         BEGIN
             LOCK TABLE openmettle.authorization_audit
                 IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE openmettle.local_sessions
+                IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE openmettle.native_handoffs
+                IN SHARE ROW EXCLUSIVE MODE NOWAIT;
             EXIT;
         EXCEPTION
             WHEN lock_not_available THEN
@@ -68,7 +75,7 @@ CREATE TABLE openmettle.backup_runs (
         ),
     operator_id uuid NOT NULL,
     state text NOT NULL
-        CHECK (state IN ('draining', 'capturing', 'succeeded', 'failed', 'incomplete')),
+        CHECK (state IN ('draining', 'capturing', 'publishing', 'succeeded', 'failed', 'incomplete')),
     started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     lease_until timestamptz,
     quiesced_at timestamptz,
@@ -140,6 +147,19 @@ CREATE TABLE openmettle.backup_runs (
             AND manifest_digest IS NULL
         )
         OR (
+            state = 'publishing'
+            AND lease_until IS NULL
+            AND quiesced_at IS NOT NULL
+            AND completed_at IS NULL
+            AND failure_code IS NULL
+            AND encryption_key_id IS NOT NULL
+            AND bundle_digest IS NOT NULL
+            AND manifest_digest IS NOT NULL
+            AND journal_origin_us IS NOT NULL
+            AND journal_seq IS NOT NULL
+            AND journal_chain_digest IS NOT NULL
+        )
+        OR (
             state = 'succeeded'
             AND lease_until IS NULL
             AND quiesced_at IS NOT NULL
@@ -203,9 +223,29 @@ BEGIN
     END IF;
 
     IF OLD.state = 'capturing'
-       AND NEW.state NOT IN ('capturing', 'succeeded', 'failed', 'incomplete') THEN
+       AND NEW.state NOT IN ('capturing', 'publishing', 'failed', 'incomplete') THEN
         RAISE EXCEPTION 'capturing backup run cannot transition to %', NEW.state
             USING ERRCODE = 'OMB01';
+    END IF;
+
+    IF OLD.state = 'publishing' THEN
+        IF NEW.state NOT IN ('succeeded', 'incomplete') THEN
+            RAISE EXCEPTION 'publishing backup run cannot transition to %', NEW.state
+                USING ERRCODE = 'OMB01';
+        END IF;
+        IF NEW.encryption_key_id IS DISTINCT FROM OLD.encryption_key_id
+           OR NEW.bundle_digest IS DISTINCT FROM OLD.bundle_digest
+           OR NEW.manifest_digest IS DISTINCT FROM OLD.manifest_digest
+           OR NEW.journal_origin_us IS DISTINCT FROM OLD.journal_origin_us
+           OR NEW.journal_seq IS DISTINCT FROM OLD.journal_seq
+           OR NEW.journal_chain_digest IS DISTINCT FROM OLD.journal_chain_digest
+           OR NEW.lifecycle_origin_us IS DISTINCT FROM OLD.lifecycle_origin_us
+           OR NEW.lifecycle_baseline_digest IS DISTINCT FROM OLD.lifecycle_baseline_digest
+           OR NEW.connection_origin_us IS DISTINCT FROM OLD.connection_origin_us
+           OR NEW.manifest_summary IS DISTINCT FROM OLD.manifest_summary THEN
+            RAISE EXCEPTION 'staged publication metadata on backup_runs is immutable'
+                USING ERRCODE = '22023';
+        END IF;
     END IF;
 
     RETURN NEW;
@@ -336,7 +376,7 @@ RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalo
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_maintenance_is_active() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.backup_maintenance_is_active()
-    TO openmettle_api, openmettle_worker, openmettle_issuance, openmettle_gateway;
+    TO openmettle_api, openmettle_worker;
 
 -- Runtime admission fence: acquires FOR SHARE on backup_maintenance_gate and raises OMM01 when
 -- maintenance is active. Deadlock-free because owner maintenance functions never lock runtime
@@ -358,7 +398,30 @@ END
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_maintenance_lock_open() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.backup_maintenance_lock_open()
-    TO openmettle_api, openmettle_worker, openmettle_issuance;
+    TO openmettle_api, openmettle_worker;
+
+-- Session issuance and native handoff maintenance fence: attached directly to local_sessions
+-- (BEFORE INSERT) and native_handoffs (BEFORE INSERT OR UPDATE) so openmettle_issuance needs
+-- zero new EXECUTE grants while session minting and handoff writes still fail closed with
+-- SQLSTATE OMM01 during maintenance.
+CREATE FUNCTION openmettle.enforce_issuance_maintenance_gate()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    PERFORM openmettle.backup_maintenance_lock_open();
+    RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.enforce_issuance_maintenance_gate() FROM PUBLIC;
+
+CREATE TRIGGER enforce_local_sessions_maintenance_gate
+    BEFORE INSERT ON openmettle.local_sessions
+    FOR EACH ROW
+    EXECUTE FUNCTION openmettle.enforce_issuance_maintenance_gate();
+
+CREATE TRIGGER enforce_native_handoffs_maintenance_gate
+    BEFORE INSERT OR UPDATE ON openmettle.native_handoffs
+    FOR EACH ROW
+    EXECUTE FUNCTION openmettle.enforce_issuance_maintenance_gate();
 
 -- Worker telemetry observer for openmettle.backup.runs (ADR 0028 / ADR 0046).
 -- Canonical lock order: backup_maintenance_gate (FOR UPDATE SKIP LOCKED) -> backup_runs.
@@ -613,11 +676,26 @@ BEGIN
     FOR r IN
         SELECT *
           FROM openmettle.backup_runs
-         WHERE state IN ('draining', 'capturing')
+         WHERE state IN ('draining', 'capturing', 'publishing')
          ORDER BY id
            FOR UPDATE
     LOOP
-        IF r.lease_until > v_now THEN
+        IF r.state = 'publishing' THEN
+            v_live_count := v_live_count + 1;
+            IF NOT p_abort_active_run THEN
+                RAISE EXCEPTION 'backup run % is awaiting publication; retry capture with its request key or pass --abort-active-run to mark it incomplete',
+                    r.id USING ERRCODE = 'OMB02';
+            END IF;
+            UPDATE openmettle.backup_runs
+               SET state = 'incomplete',
+                   completed_at = v_now,
+                   lease_until = NULL,
+                   failure_code = 'publication_aborted'
+             WHERE id = r.id;
+            IF v_aborted IS NULL OR r.id = g.backup_run_id THEN
+                v_aborted := r.id;
+            END IF;
+        ELSIF r.lease_until > v_now THEN
             v_live_count := v_live_count + 1;
             IF NOT p_abort_active_run THEN
                 RAISE EXCEPTION 'active backup run % holds a live lease; pass --abort-active-run to mark it incomplete',
@@ -745,10 +823,11 @@ BEGIN
     IF EXISTS (
         SELECT 1
           FROM openmettle.backup_runs br
-         WHERE br.state IN ('draining', 'capturing')
-           AND br.lease_until > v_now
+         WHERE br.state = 'publishing'
+            OR (br.state IN ('draining', 'capturing') AND br.lease_until > v_now)
     ) THEN
-        RAISE EXCEPTION 'another active backup run holds a live lease' USING ERRCODE = 'OMB02';
+        RAISE EXCEPTION 'another active or publishing backup run owns the maintenance window'
+            USING ERRCODE = 'OMB02';
     END IF;
 
     UPDATE openmettle.backup_maintenance_gate
@@ -931,10 +1010,14 @@ BEGIN
     FOR r IN
         SELECT *
           FROM openmettle.backup_runs
-         WHERE state IN ('draining', 'capturing')
+         WHERE state IN ('draining', 'capturing', 'publishing')
          ORDER BY id
            FOR UPDATE
     LOOP
+        IF r.state = 'publishing' THEN
+            RAISE EXCEPTION 'backup run % is awaiting publication; retry with its request key or abort via release-maintenance --abort-active-run',
+                r.id USING ERRCODE = 'OMB02';
+        END IF;
         IF r.lease_until > v_now THEN
             RAISE EXCEPTION 'backup run % already holds an active lease', r.id
                 USING ERRCODE = 'OMB02';
@@ -1124,9 +1207,10 @@ END
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_mark_quiesced(uuid, integer) FROM PUBLIC;
 
--- Owner only: record verified backup bundle completion and audit backup.capture_succeeded.
--- Maintenance remains active until an explicit backup_release_maintenance call.
-CREATE FUNCTION openmettle.backup_complete_capture(
+-- Owner only: stage verified backup bundle digests and watermarks (`capturing -> publishing`)
+-- before writing `backup-meta.json` and renaming `.staging.<run_id>` on disk. Does NOT count as
+-- `succeeded` or reset the RPO clock until `backup_confirm_publication` commits.
+CREATE FUNCTION openmettle.backup_stage_publication(
     p_backup_run_id uuid,
     p_encryption_key_id text,
     p_bundle_digest bytea,
@@ -1137,24 +1221,22 @@ CREATE FUNCTION openmettle.backup_complete_capture(
     p_lifecycle_origin_us bigint DEFAULT NULL,
     p_lifecycle_baseline_digest bytea DEFAULT NULL,
     p_connection_origin_us bigint DEFAULT NULL,
-    p_manifest_summary jsonb DEFAULT '{}'::jsonb,
-    p_reason text DEFAULT 'coordinated backup capture completed')
-RETURNS timestamptz
+    p_manifest_summary jsonb DEFAULT '{}'::jsonb)
+RETURNS void
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.backup_maintenance_gate%ROWTYPE;
     r openmettle.backup_runs%ROWTYPE;
     v_now timestamptz;
-    v_details jsonb;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
-        RAISE EXCEPTION 'backup capture completion requires READ COMMITTED' USING ERRCODE = '25000';
+        RAISE EXCEPTION 'backup publication staging requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
     IF NOT (
         pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
         AND pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
     ) THEN
-        RAISE EXCEPTION 'only openmettle_owner may complete backup capture' USING ERRCODE = '42501';
+        RAISE EXCEPTION 'only openmettle_owner may stage backup publication' USING ERRCODE = '42501';
     END IF;
     IF p_backup_run_id IS NULL
        OR p_encryption_key_id IS NULL
@@ -1170,9 +1252,8 @@ BEGIN
        OR (p_connection_origin_us IS NOT NULL AND p_connection_origin_us < 0)
        OR p_manifest_summary IS NULL
        OR jsonb_typeof(p_manifest_summary) <> 'object'
-       OR octet_length(p_manifest_summary::text) > 16384
-       OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
-        RAISE EXCEPTION 'invalid backup completion parameters' USING ERRCODE = '22023';
+       OR octet_length(p_manifest_summary::text) > 16384 THEN
+        RAISE EXCEPTION 'invalid backup publication staging parameters' USING ERRCODE = '22023';
     END IF;
 
     SELECT * INTO STRICT g FROM openmettle.backup_maintenance_gate WHERE id FOR UPDATE;
@@ -1191,11 +1272,8 @@ BEGIN
             USING ERRCODE = 'OMB02';
     END IF;
 
-    v_now := greatest(v_now, r.quiesced_at);
-
     UPDATE openmettle.backup_runs
-       SET state = 'succeeded',
-           completed_at = v_now,
+       SET state = 'publishing',
            lease_until = NULL,
            encryption_key_id = p_encryption_key_id,
            bundle_digest = p_bundle_digest,
@@ -1212,14 +1290,72 @@ BEGIN
     UPDATE openmettle.backup_maintenance_gate
        SET updated_at = v_now
      WHERE id;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.backup_stage_publication(
+    uuid, text, bytea, bytea, bigint, bigint, bytea, bigint, bytea, bigint, jsonb
+) FROM PUBLIC;
+
+-- Owner only: confirm durable filesystem publication (`publishing -> succeeded`) and audit
+-- `backup.capture_succeeded`. Idempotent if the run is already `succeeded`.
+CREATE FUNCTION openmettle.backup_confirm_publication(
+    p_backup_run_id uuid,
+    p_reason text DEFAULT 'coordinated backup capture completed')
+RETURNS timestamptz
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.backup_maintenance_gate%ROWTYPE;
+    r openmettle.backup_runs%ROWTYPE;
+    v_now timestamptz;
+    v_details jsonb;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'backup publication confirmation requires READ COMMITTED'
+            USING ERRCODE = '25000';
+    END IF;
+    IF NOT (
+        pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
+        AND pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
+    ) THEN
+        RAISE EXCEPTION 'only openmettle_owner may confirm backup publication' USING ERRCODE = '42501';
+    END IF;
+    IF p_backup_run_id IS NULL OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
+        RAISE EXCEPTION 'invalid backup publication confirmation parameters' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT * INTO STRICT g FROM openmettle.backup_maintenance_gate WHERE id FOR UPDATE;
+    SELECT * INTO r FROM openmettle.backup_runs WHERE id = p_backup_run_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'backup run not found' USING ERRCODE = 'P0002';
+    END IF;
+    IF r.state = 'succeeded' THEN
+        RETURN r.completed_at;
+    END IF;
+    IF NOT g.maintenance_active
+       OR g.backup_run_id IS DISTINCT FROM p_backup_run_id
+       OR r.state <> 'publishing' THEN
+        RAISE EXCEPTION 'backup run % is not awaiting publication under this maintenance window',
+            p_backup_run_id USING ERRCODE = 'OMB02';
+    END IF;
+
+    v_now := greatest(pg_catalog.clock_timestamp(), r.quiesced_at);
+
+    UPDATE openmettle.backup_runs
+       SET state = 'succeeded',
+           completed_at = v_now
+     WHERE id = p_backup_run_id;
+
+    UPDATE openmettle.backup_maintenance_gate
+       SET updated_at = v_now
+     WHERE id;
 
     v_details := jsonb_build_object(
         'destination_domain', r.destination_domain,
-        'encryption_key_id', p_encryption_key_id,
-        'bundle_digest', encode(p_bundle_digest, 'hex'),
-        'manifest_digest', encode(p_manifest_digest, 'hex'),
-        'journal_origin_us', p_journal_origin_us,
-        'journal_seq', p_journal_seq
+        'encryption_key_id', r.encryption_key_id,
+        'bundle_digest', encode(r.bundle_digest, 'hex'),
+        'manifest_digest', encode(r.manifest_digest, 'hex'),
+        'journal_origin_us', r.journal_origin_us,
+        'journal_seq', r.journal_seq
     );
     INSERT INTO openmettle.authorization_audit
         (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
@@ -1231,9 +1367,7 @@ BEGIN
     RETURN v_now;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.backup_complete_capture(
-    uuid, text, bytea, bytea, bigint, bigint, bytea, bigint, bytea, bigint, jsonb, text
-) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.backup_confirm_publication(uuid, text) FROM PUBLIC;
 
 -- Owner only: mark a draining/capturing backup run failed and audit backup.capture_failed.
 -- Always keeps backup_maintenance_gate.maintenance_active = true for explicit operator recovery.
@@ -1270,6 +1404,10 @@ BEGIN
     SELECT * INTO r FROM openmettle.backup_runs WHERE id = p_backup_run_id FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'backup run not found' USING ERRCODE = 'P0002';
+    END IF;
+    IF r.state = 'publishing' THEN
+        RAISE EXCEPTION 'publishing backup run % cannot be marked failed; retry capture or abort explicitly',
+            p_backup_run_id USING ERRCODE = 'OMB01';
     END IF;
     IF r.state IN ('succeeded', 'failed', 'incomplete') THEN
         RETURN r.completed_at;

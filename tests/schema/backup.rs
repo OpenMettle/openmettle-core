@@ -17,15 +17,18 @@ use openmettle_core::{
     },
     backup::{
         self, ArtifactVolumeManifest, BackupError, BackupManifest, CaptureOptions, CliPgDumpRunner,
-        ComponentManifest, DEFAULT_LEASE_SECONDS, GATEWAY_CONSISTENCY_MODE, GraphitiManifest,
-        GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT, PgDumpRunner,
-        REBUILDABLE_INDEXES,
+        ComponentManifest, DEFAULT_LEASE_SECONDS, DumpCancel, GATEWAY_CONSISTENCY_MODE,
+        GraphitiManifest, GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT,
+        PgDumpRunner, REBUILDABLE_INDEXES,
         archive::{BackupMeta, GfsPolicy},
         crypto::{BackupKeyRing, StreamEncryptor},
     },
     runs::{self, RunInput, WriteTransaction},
     storage::{self, ReservationInput, Settlement},
-    telemetry::metrics::{BackupRunOutcome, Metrics},
+    telemetry::{
+        Process,
+        metrics::{BackupRunOutcome, Metrics},
+    },
     vault::{self, AuthorizeConnectionInput, CreateConnectionInput, VaultKeyRing},
 };
 use serde_json::{Value, json};
@@ -243,19 +246,28 @@ fn resolve_pg18_tools(
 }
 
 fn run_pg_restore(mode: &PgRestoreMode, restored: &TestDb, dump_path: &Path) -> Output {
-    match mode {
-        PgRestoreMode::Local => run_cli(
-            Command::new("pg_restore")
-                .args(["--no-owner", "--exit-on-error", "--dbname"])
-                .arg(restored.url(OWNER))
-                .arg(dump_path)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-            "pg_restore into fresh database",
-        ),
+    let dump_len = fs::metadata(dump_path)
+        .expect("unpacked pg.dump must exist")
+        .len();
+    assert!(
+        dump_len > 100,
+        "unpacked pg.dump unexpectedly small ({dump_len} bytes)"
+    );
+    let dump_file = fs::File::open(dump_path).unwrap();
+    let (mut cmd, label) = match mode {
+        PgRestoreMode::Local => {
+            let mut cmd = Command::new("pg_restore");
+            cmd.args([
+                "--format=custom",
+                "--no-owner",
+                "--exit-on-error",
+                "--dbname",
+            ])
+            .arg(restored.url(OWNER));
+            (cmd, "pg_restore into fresh database")
+        }
         PgRestoreMode::Docker { container } => {
             let parsed = backup::parse_validated_pg_uri(&restored.url(OWNER)).unwrap();
-            let dump_file = fs::File::open(dump_path).unwrap();
             let mut cmd = Command::new("docker");
             cmd.args(["exec", "-i", "-e", "PGSSLMODE=disable"]);
             if let Some(pw) = parsed.password.as_deref() {
@@ -263,6 +275,7 @@ fn run_pg_restore(mode: &PgRestoreMode, restored: &TestDb, dump_path: &Path) -> 
             }
             cmd.arg(container).args([
                 "pg_restore",
+                "--format=custom",
                 "--no-owner",
                 "--exit-on-error",
                 "--host",
@@ -274,12 +287,16 @@ fn run_pg_restore(mode: &PgRestoreMode, restored: &TestDb, dump_path: &Path) -> 
                 "--dbname",
                 &restored.0,
             ]);
-            cmd.stdin(Stdio::from(dump_file))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            run_cli(&mut cmd, "docker exec pg_restore into fresh database")
+            (cmd, "docker exec pg_restore into fresh database")
         }
-    }
+    };
+    cmd.stdin(Stdio::from(dump_file))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn process for {label}: {err}"));
+    wait_output(Process(child), label)
 }
 
 struct SyntheticPgDumpRunner;
@@ -288,6 +305,7 @@ impl PgDumpRunner for SyntheticPgDumpRunner {
         &self,
         _database_url: &str,
         snapshot_id: Option<&str>,
+        _cancel: &DumpCancel,
         writer: &mut dyn IoWrite,
     ) -> Result<u64, BackupError> {
         assert!(
@@ -605,12 +623,29 @@ async fn maintenance_window_closes_mutations_keeps_reads_probes_and_in_flight_se
                 "role {role} unexpectedly allowed `{sql}`: {err}"
             );
         }
-        // `backup_maintenance_is_active()` is permitted for all four runtime roles.
-        let active: bool = sqlx::query_scalar("SELECT openmettle.backup_maintenance_is_active()")
-            .fetch_one(&mut cn)
-            .await
-            .unwrap();
-        assert!(!active);
+        // `backup_maintenance_is_active()` is granted ONLY to `openmettle_api` and
+        // `openmettle_worker`; `openmettle_issuance` and `openmettle_gateway` receive zero new
+        // privileges from migration 45.
+        if matches!(role, API | WORKER) {
+            let active: bool =
+                sqlx::query_scalar("SELECT openmettle.backup_maintenance_is_active()")
+                    .fetch_one(&mut cn)
+                    .await
+                    .unwrap();
+            assert!(!active);
+        } else {
+            for fn_sql in [
+                "SELECT openmettle.backup_maintenance_is_active()",
+                "SELECT openmettle.backup_maintenance_lock_open()",
+            ] {
+                let err = sqlx::query(fn_sql).execute(&mut cn).await.unwrap_err();
+                assert_eq!(
+                    err.as_database_error().unwrap().code().as_deref(),
+                    Some("42501"),
+                    "role {role} must have zero EXECUTE privilege on `{fn_sql}`"
+                );
+            }
+        }
 
         // `openmettle-admin backup status` must fail for non-owner roles.
         let out = admin_as(&db, role, &["backup", "status"], &[]);
@@ -620,22 +655,11 @@ async fn maintenance_window_closes_mutations_keeps_reads_probes_and_in_flight_se
         );
     }
 
-    // `backup_observe_telemetry()` is restricted to openmettle_worker; `backup_maintenance_lock_open()`
-    // is denied to openmettle_gateway.
+    // `backup_observe_telemetry()` is restricted to openmettle_worker.
     {
         let mut api_cn = connect(&db.0, API).await;
         let err = sqlx::query("SELECT * FROM openmettle.backup_observe_telemetry()")
             .execute(&mut api_cn)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.as_database_error().unwrap().code().as_deref(),
-            Some("42501")
-        );
-
-        let mut gw_cn = connect(&db.0, "openmettle_gateway").await;
-        let err = sqlx::query("SELECT openmettle.backup_maintenance_lock_open()")
-            .execute(&mut gw_cn)
             .await
             .unwrap_err();
         assert_eq!(
@@ -750,11 +774,42 @@ async fn maintenance_window_closes_mutations_keeps_reads_probes_and_in_flight_se
     assert_eq!(status, 503, "{problem}");
     assert_eq!(problem["code"], "unavailable", "{problem}");
 
-    // `openmettle_issuance` maintenance lock fails closed (SQLSTATE OMM01 -> Ok(false)).
+    // `openmettle_issuance` session minting fails closed via the BEFORE INSERT trigger
+    // `enforce_local_sessions_maintenance_gate` (SQLSTATE OMM01) with zero extra role grants.
     {
+        let (provider_id, identity_id): (String, String) = sqlx::query_as(
+            "SELECT provider_id::text, identity_id::text
+               FROM openmettle.local_identity_approvals
+              WHERE id = $1::uuid",
+        )
+        .bind(&user.approval)
+        .fetch_one(&mut db.admin().await)
+        .await
+        .unwrap();
         let mut iss_cn = connect(&db.0, ISSUANCE).await;
         let mut tx = iss_cn.begin().await.unwrap();
-        assert!(!backup::lock_open_maintenance(&mut tx).await.unwrap());
+        let err = sqlx::query(
+            "INSERT INTO openmettle.local_sessions
+                (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
+                 issued_client, issued_epoch, issued_revision, provider_generation,
+                 approval_generation, user_generation, created_ms, expires_ms)
+             VALUES
+                ('maint-blocked-session', $1, 'maint-login', $2::uuid, $3::uuid, $4::uuid,
+                 $5::uuid, 'browser', 1, 1, 1, 1, 1, 1, 2)",
+        )
+        .bind([0x11u8; 32].as_slice())
+        .bind(&provider_id)
+        .bind(&identity_id)
+        .bind(&user.approval)
+        .bind(&user.user)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.as_database_error().unwrap().code().as_deref(),
+            Some("OMM01"),
+            "session issuance insert must be fenced by maintenance trigger: {err}"
+        );
         tx.rollback().await.unwrap();
     }
 
@@ -2080,6 +2135,7 @@ async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflig
             &self,
             _database_url: &str,
             _snapshot_id: Option<&str>,
+            _cancel: &DumpCancel,
             writer: &mut dyn IoWrite,
         ) -> Result<u64, BackupError> {
             // Mutate/truncate the held Neo4j dump file in-place before step 6e reads it.
@@ -2536,4 +2592,429 @@ async fn maintenance_finishes_inflight_purges_without_claiming_new_ones_and_fenc
     .unwrap();
     let (status_open, _, _) = api.raw(&raw_req);
     assert_eq!(status_open, 403);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_abort() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let worker_pool = pool(&db, WORKER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-publishing"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-pub", &[("bk-pub", [0x92; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    // Helper to stage a valid encrypted `.staging.<run_id>` directory and commit
+    // `openmettle.backup_stage_publication(...)` (`capturing -> publishing`) directly.
+    async fn stage_run(
+        owner_pool: &PgPool,
+        dest: &Path,
+        keyring: &BackupKeyRing,
+        req_key: &str,
+        reason: &str,
+    ) -> (String, String, PathBuf, PathBuf) {
+        let (run_id, _rpo, installation_id): (String, i32, String) = sqlx::query_as(
+            "SELECT backup_run_id::text, rpo_target_seconds, installation_id::text
+               FROM openmettle.backup_start_capture($1::uuid, $2, $3, 'offhost-pub', 300)",
+        )
+        .bind(OPERATOR_1)
+        .bind(req_key)
+        .bind(reason)
+        .fetch_one(owner_pool)
+        .await
+        .unwrap();
+
+        let quiesced_at: String = sqlx::query_scalar(
+            "SELECT to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+               FROM openmettle.backup_mark_quiesced($1::uuid, 300)",
+        )
+        .bind(&run_id)
+        .fetch_one(owner_pool)
+        .await
+        .unwrap();
+
+        let staging_dir = dest.join(format!(".staging.{run_id}"));
+        fs::create_dir(&staging_dir).unwrap();
+        fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut components = BTreeMap::new();
+        for (file_name, role, body) in [
+            ("pg.dump.enc", "pg_dump", b"PGDMP-STAGED".as_slice()),
+            (
+                "gateway-entitlements.json.enc",
+                "gateway_entitlements",
+                b"{}".as_slice(),
+            ),
+            (
+                "deletion-journal.bin.enc",
+                "deletion_journal",
+                b"version 1\n".as_slice(),
+            ),
+            ("artifacts.bin.enc", "artifacts", b"OMART01\0\0\0".as_slice()),
+            (
+                "config.json.enc",
+                "config",
+                br#"{"format":"openmettle-backup-config/v1","vault_required_key_ids":[],"files":[]}"#
+                    .as_slice(),
+            ),
+        ] {
+            let mut out = fs::File::create(staging_dir.join(file_name)).unwrap();
+            let mut enc = StreamEncryptor::start(keyring, &run_id, role, &mut out).unwrap();
+            enc.write_all(body).unwrap();
+            let stats = enc.finish().unwrap();
+            components.insert(
+                file_name.to_owned(),
+                ComponentManifest {
+                    role: role.to_owned(),
+                    plaintext_bytes: stats.plaintext_bytes,
+                    plaintext_sha256: hex_encode(&stats.plaintext_sha256),
+                    ciphertext_bytes: stats.ciphertext_bytes,
+                    ciphertext_sha256: hex_encode(&stats.ciphertext_sha256),
+                },
+            );
+        }
+
+        let mut parts: Vec<&[u8]> = Vec::new();
+        for (file_name, comp) in &components {
+            parts.push(file_name.as_bytes());
+            parts.push(comp.ciphertext_sha256.as_bytes());
+        }
+        parts.push(b"");
+        let pre_bundle = hex_encode(&framed_digest(b"openmettle.backup.bundle/1\0", &parts));
+
+        let completed_at = "2026-11-26T03:00:00Z".to_owned();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT.to_owned(),
+            installation_id: installation_id.clone(),
+            backup_run_id: run_id.clone(),
+            quiesced_at,
+            completed_at: completed_at.clone(),
+            schema_version: 45,
+            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            destination_domain: "offhost-pub".to_owned(),
+            rpo_target_seconds: 86_400,
+            encryption_key_id: keyring.active_key_id().to_owned(),
+            bundle_digest: pre_bundle,
+            components: components.clone(),
+            deletion_journal: JournalWatermarkManifest {
+                origin_us: 1,
+                journal_seq: 0,
+                chain_digest: openmettle_core::restore::GENESIS.to_owned(),
+                lifecycle_origin_us: None,
+                lifecycle_baseline_digest: None,
+                connection_origin_us: None,
+            },
+            artifact_volume: ArtifactVolumeManifest {
+                volume_id: None,
+                revision_count: 0,
+                payload_bytes: 0,
+            },
+            vault_required_key_ids: Vec::new(),
+            gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
+            graphiti_neo4j: GraphitiManifest::NotProvisioned,
+            rebuildable_indexes: REBUILDABLE_INDEXES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let mut mf = fs::File::create(staging_dir.join("manifest.json.enc")).unwrap();
+        let mut menc = StreamEncryptor::start(keyring, &run_id, "manifest", &mut mf).unwrap();
+        menc.write_all(&manifest_bytes).unwrap();
+        let mstats = menc.finish().unwrap();
+        let mct_hex = hex_encode(&mstats.ciphertext_sha256);
+
+        let mut fparts: Vec<&[u8]> = Vec::new();
+        for (file_name, comp) in &components {
+            fparts.push(file_name.as_bytes());
+            fparts.push(comp.ciphertext_sha256.as_bytes());
+        }
+        fparts.push(mct_hex.as_bytes());
+        let final_bundle_bytes = framed_digest(b"openmettle.backup.bundle/1\0", &fparts);
+        let final_bundle_hex = hex_encode(&final_bundle_bytes);
+        let final_dir_name = format!("backup-20261126T030000Z-{run_id}");
+        let final_dir = dest.join(&final_dir_name);
+        let summary_text = json!({
+            "format": MANIFEST_FORMAT,
+            "installation_id": installation_id,
+            "completed_at": completed_at,
+            "manifest_ciphertext_sha256": mct_hex,
+            "schema_version": 45,
+            "crate_version": env!("CARGO_PKG_VERSION"),
+            "destination_domain": "offhost-pub",
+            "reason": reason,
+            "encryption_key_id": keyring.active_key_id(),
+            "artifact_revision_count": 0,
+            "artifact_payload_bytes": 0,
+            "vault_required_key_ids": [],
+            "rebuildable_indexes": REBUILDABLE_INDEXES,
+            "backup_dir_name": final_dir_name,
+        })
+        .to_string();
+
+        sqlx::query(
+            "SELECT openmettle.backup_stage_publication(
+                $1::uuid, $2, $3, $4, 1, 0, $5, NULL, NULL, NULL, $6::jsonb
+            )",
+        )
+        .bind(&run_id)
+        .bind(keyring.active_key_id())
+        .bind(final_bundle_bytes.as_slice())
+        .bind(mstats.plaintext_sha256.as_slice())
+        .bind([0u8; 32].as_slice())
+        .bind(&summary_text)
+        .execute(owner_pool)
+        .await
+        .unwrap();
+
+        (run_id, final_bundle_hex, staging_dir, final_dir)
+    }
+
+    // 1. Stage run 1 in `publishing`.
+    let (run1, bundle1, staging1, final1) = stage_run(
+        &owner_pool,
+        &dest,
+        &keyring,
+        "pub-retry-key-1",
+        "publish retry test",
+    )
+    .await;
+
+    let st = backup::status(&owner_pool).await.unwrap();
+    assert!(st.maintenance_active);
+    assert_eq!(st.latest_run_id.as_deref(), Some(run1.as_str()));
+    assert_eq!(st.latest_run_state.as_deref(), Some("publishing"));
+    assert!(st.last_succeeded_run_id.is_none());
+    assert!(st.last_succeeded_at.is_none());
+
+    // 2. P1 #3: `publishing` must NOT count as `succeeded`, must NOT expire as `incomplete`, and
+    //    must NOT reset the 24h RPO overdue clock.
+    sqlx::query(
+        "UPDATE openmettle.backup_maintenance_gate
+            SET rpo_tracking_armed_at = clock_timestamp() - interval '25 hours'
+          WHERE id",
+    )
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    let metrics = Metrics::new();
+    let obs = backup::observe_telemetry_into(&worker_pool, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(obs.succeeded, 0);
+    assert_eq!(obs.failed, 0);
+    assert_eq!(obs.incomplete, 0);
+    assert_eq!(
+        obs.overdue, 1,
+        "unpublished `publishing` run must not reset the 24h RPO clock"
+    );
+
+    // 3. Releasing maintenance without `--abort-active-run` refuses a `publishing` run with OMB02.
+    let err = backup::release_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "rel-refuse-pub",
+        "should refuse publishing",
+        false,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        BackupError::Database(sqlx::Error::Database(d)) => {
+            assert_eq!(d.code().as_deref(), Some("OMB02"));
+        }
+        other => panic!("expected OMB02 refusal for publishing run, got {other:?}"),
+    }
+
+    // 4. P2 #1: Simulate a crash mid-write leaving corrupt/partial `backup-meta.json` and
+    //    `backup-meta.json.tmp` in `.staging.<run_id>`, AND pass nonexistent `--neo4j-dump` and
+    //    `--config-file` paths plus a panicking PgDumpRunner. Exact-key retry must finalize
+    //    without touching source files or re-dumping.
+    fs::write(staging1.join("backup-meta.json.tmp"), b"{truncated").unwrap();
+    fs::write(staging1.join("backup-meta.json"), b"{corrupt").unwrap();
+
+    struct PanicPgDumpRunner;
+    impl PgDumpRunner for PanicPgDumpRunner {
+        fn dump(
+            &self,
+            _database_url: &str,
+            _snapshot_id: Option<&str>,
+            _cancel: &DumpCancel,
+            _writer: &mut dyn IoWrite,
+        ) -> Result<u64, BackupError> {
+            panic!("publishing retry must not re-run pg_dump");
+        }
+    }
+
+    let retry_report = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-pub".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "pub-retry-key-1".to_owned(),
+            reason: "publish retry test".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::OfflineDump(PathBuf::from(dir.path("deleted-neo4j.dump"))),
+            config_files: vec![(
+                "missing.json".to_owned(),
+                PathBuf::from(dir.path("deleted-config.json")),
+            )],
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(PanicPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry_report.backup_run_id, run1);
+    assert_eq!(retry_report.bundle_digest, bundle1);
+    assert_eq!(retry_report.backup_dir, final1);
+    assert!(retry_report.released_maintenance);
+    assert!(!staging1.exists());
+    assert!(final1.is_dir());
+    backup::verify_backup(&final1, &keyring).unwrap();
+
+    let obs_after = backup::observe_telemetry_into(&worker_pool, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(obs_after.succeeded, 1);
+    let st_after = backup::status(&owner_pool).await.unwrap();
+    assert!(!st_after.maintenance_active);
+    assert_eq!(
+        st_after.last_succeeded_run_id.as_deref(),
+        Some(run1.as_str())
+    );
+
+    // 5. Explicit abort of a `publishing` run via `--abort-active-run` transitions it to
+    //    `incomplete` with `failure_code = 'publication_aborted'`.
+    let (run2, _, _, _) = stage_run(
+        &owner_pool,
+        &dest,
+        &keyring,
+        "pub-abort-key-2",
+        "publish abort test",
+    )
+    .await;
+    let (released, aborted) = backup::release_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "rel-abort-pub-2",
+        "aborting unrecoverable publication",
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(released);
+    assert_eq!(aborted.as_deref(), Some(run2.as_str()));
+    let (state2, failure2): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, failure_code FROM openmettle.backup_runs WHERE id = $1::uuid",
+    )
+    .bind(&run2)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(state2, "incomplete");
+    assert_eq!(failure2.as_deref(), Some("publication_aborted"));
+    let obs_final = backup::observe_telemetry_into(&worker_pool, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(obs_final.incomplete, 1);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn worker_restart_with_historical_failure_never_emits_zero_before_seeding() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let worker_pool = pool(&db, WORKER).await;
+
+    // Seed one durable historical failed backup run in PostgreSQL.
+    let (run_id,): (String,) = sqlx::query_as(
+        "SELECT backup_run_id::text
+           FROM openmettle.backup_start_capture(
+               $1::uuid, 'hist-fail-1', 'historical failure test', 'offhost-hist', 300
+           )",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "SELECT openmettle.backup_fail_capture($1::uuid, 'io_error', 'synthetic io error')",
+    )
+    .bind(&run_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Fresh Metrics store simulates a restarted worker process before its startup DB seed runs.
+    let fresh_metrics = Metrics::new();
+    let instance_id = "33333333-4444-4555-8666-777777777777";
+    let pre = fresh_metrics
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("worker emits non-backup baseline metrics before seeding");
+    assert!(
+        !pre.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .any(|m| m.name == "openmettle.backup.runs"),
+        "restarted worker must not emit 0 for openmettle.backup.runs prior to DB seeding"
+    );
+
+    // Startup telemetry seed populates durable PostgreSQL counts and enables emission atomically.
+    let observed = backup::observe_telemetry_into(&worker_pool, &fresh_metrics)
+        .await
+        .unwrap();
+    assert_eq!(observed.failed, 1);
+    assert_eq!(fresh_metrics.backup_run_count(BackupRunOutcome::Failed), 1);
+
+    let post = fresh_metrics
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("seeded worker emits openmettle.backup.runs");
+    let backup_metric = post.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == "openmettle.backup.runs")
+        .expect("seeded worker must emit openmettle.backup.runs");
+    match backup_metric.data.as_ref().unwrap() {
+        opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len());
+            let failed_dp = sum
+                .data_points
+                .iter()
+                .find(|dp| {
+                    dp.attributes.iter().any(|kv| {
+                        kv.key == "outcome"
+                            && matches!(
+                                kv.value.as_ref().and_then(|v| v.value.as_ref()),
+                                Some(
+                                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)
+                                ) if s == "failed"
+                            )
+                    })
+                })
+                .expect("failed data point missing");
+            assert!(
+                matches!(
+                    failed_dp.value,
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(1)
+                    )
+                ),
+                "first emitted failed sample on restart must be 1 (never 0 -> 1), got {:?}",
+                failed_dp.value
+            );
+        }
+        other => panic!("expected Sum metric for openmettle.backup.runs, got {other:?}"),
+    }
 }

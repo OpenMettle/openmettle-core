@@ -288,11 +288,31 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
     }
 
-    // Worker baseline additionally emits zero-initialized overdue handoffs, all 8 quota drift
-    // outcomes, and all 4 backup run outcomes.
-    let worker_baseline = store
+    // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs
+    // and all 8 quota drift outcomes, omitting `openmettle.backup.runs` until the worker seeds
+    // durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on restart).
+    let worker_unseeded = store
         .encode_otlp(Process::Worker, Some(instance_id))
         .expect("fresh worker registry emits zero-initialized baseline series");
+    let unseeded_names: Vec<&str> = worker_unseeded.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(
+        unseeded_names,
+        [
+            "openmettle.telemetry.dropped",
+            "openmettle.quota.overdue.handoffs",
+            "openmettle.storage.quota.drift",
+        ]
+    );
+
+    // Once seeded from PostgreSQL, worker baseline additionally emits all 4 backup run outcomes.
+    store.mark_backup_runs_seeded();
+    let worker_baseline = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("seeded worker registry emits zero-initialized baseline series");
     let worker_metrics = &worker_baseline.resource_metrics[0].scope_metrics[0].metrics;
     let worker_names: Vec<&str> = worker_metrics.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
@@ -638,4 +658,70 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         found_metrics.contains("openmettle_backup_runs_total"),
         "expected alert covering openmettle_backup_runs_total; got {found_metrics:?}"
     );
+}
+
+#[test]
+fn backup_runs_omitted_until_seeded_and_never_emits_zero_before_historical_totals() {
+    let instance_id = "22222222-3333-4444-8555-666666666666";
+    let store = Metrics::new();
+
+    // Before the worker seeds durable PostgreSQL totals, `openmettle.backup.runs` must not be
+    // emitted so a restarted worker never exports a `0 -> N` jump for pre-existing failures.
+    let pre_seed = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("worker emits non-backup baseline metrics before seeding");
+    let pre_names: Vec<&str> = pre_seed.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(
+        !pre_names.contains(&"openmettle.backup.runs"),
+        "unseeded worker must omit openmettle.backup.runs; got {pre_names:?}"
+    );
+
+    // Seed with a pre-existing historical failed backup (failed = 1).
+    store.sync_backup_run_totals(0, 1, 0, 0);
+    let post_seed = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("seeded worker emits backup runs");
+    let backup_metric = post_seed.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == "openmettle.backup.runs")
+        .expect("seeded worker must emit openmettle.backup.runs");
+    match backup_metric.data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len());
+            let mut by_outcome = BTreeMap::new();
+            for dp in &sum.data_points {
+                let outcome = dp
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "outcome")
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| match v.value.as_ref() {
+                        Some(
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                s,
+                            ),
+                        ) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap();
+                let val = match dp.value {
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(v),
+                    ) => v,
+                    other => panic!("unexpected value {other:?}"),
+                };
+                by_outcome.insert(outcome.to_owned(), val);
+            }
+            assert_eq!(by_outcome["succeeded"], 0);
+            assert_eq!(by_outcome["failed"], 1);
+            assert_eq!(by_outcome["incomplete"], 0);
+            assert_eq!(by_outcome["overdue"], 0);
+        }
+        other => panic!("expected Sum for openmettle.backup.runs, got {other:?}"),
+    }
 }

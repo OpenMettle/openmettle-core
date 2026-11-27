@@ -81,12 +81,14 @@
 -- restore verification/replay/open functions with unchanged signatures, security and privileges
 -- (ADR 0040 / ADR 0041, issue #154).
 -- Version 45 adds `backup_runs` and singleton `backup_maintenance_gate` (owner-only, zero table
--- or column privileges for any runtime role or PUBLIC), widens `authorization_audit` CHECK
--- constraints for operator backup actions, adds runtime SECURITY DEFINER helpers
--- `backup_maintenance_is_active()` (`openmettle_api`, `openmettle_worker`, `openmettle_issuance`,
--- `openmettle_gateway`), `backup_maintenance_lock_open()` (`openmettle_api`, `openmettle_worker`,
--- `openmettle_issuance`), and `backup_observe_telemetry()` (`openmettle_worker`), plus owner-only
--- maintenance/capture/RPO functions and immutability trigger (ADR 0046, V1-30).
+-- or column privileges for any runtime role or PUBLIC, and zero new grants for
+-- `openmettle_issuance` or `openmettle_gateway`), widens `authorization_audit` CHECK constraints
+-- for operator backup actions, adds runtime SECURITY DEFINER helpers
+-- `backup_maintenance_is_active()` (`openmettle_api`, `openmettle_worker`),
+-- `backup_maintenance_lock_open()` (`openmettle_api`, `openmettle_worker`),
+-- `enforce_issuance_maintenance_gate()` (trigger only, zero runtime grants), and
+-- `backup_observe_telemetry()` (`openmettle_worker`), plus owner-only maintenance/capture/RPO
+-- functions and immutability trigger (ADR 0046, V1-30).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -414,8 +416,9 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.storage_declare_payload_lost(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 44
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.enforce_backup_runs_transitions()',false,ARRAY[]::text[]),
-        ('openmettle.backup_maintenance_is_active()',true,ARRAY['openmettle_api','openmettle_worker','openmettle_issuance','openmettle_gateway']::text[]),
-        ('openmettle.backup_maintenance_lock_open()',true,ARRAY['openmettle_api','openmettle_worker','openmettle_issuance']::text[]),
+        ('openmettle.backup_maintenance_is_active()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.backup_maintenance_lock_open()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.enforce_issuance_maintenance_gate()',true,ARRAY[]::text[]),
         ('openmettle.backup_observe_telemetry()',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.backup_enter_maintenance(uuid,text,text)',false,ARRAY[]::text[]),
         ('openmettle.backup_release_maintenance(uuid,text,text,boolean)',false,ARRAY[]::text[]),
@@ -424,7 +427,8 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.backup_start_capture(uuid,text,text,text,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_renew_lease(uuid,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_mark_quiesced(uuid,integer)',false,ARRAY[]::text[]),
-        ('openmettle.backup_complete_capture(uuid,text,bytea,bytea,bigint,bigint,bytea,bigint,bytea,bigint,jsonb,text)',false,ARRAY[]::text[]),
+        ('openmettle.backup_stage_publication(uuid,text,bytea,bytea,bigint,bigint,bytea,bigint,bytea,bigint,jsonb)',false,ARRAY[]::text[]),
+        ('openmettle.backup_confirm_publication(uuid,text)',false,ARRAY[]::text[]),
         ('openmettle.backup_fail_capture(uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 45
 ),
 gateway_functions (signature,definer,roles) AS (

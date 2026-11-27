@@ -381,9 +381,6 @@ pub(crate) async fn issue(
         let assertion_deadline = started.checked_add(proof.assertion);
         let mut tx = transaction(c).await?;
         let result: Result<(Credential, Option<native::Release>), Error> = async {
-        if !crate::backup::lock_open_maintenance(tx.connection()?).await? {
-            return Err(Error::Database);
-        }
         let gate = sqlx::query("SELECT binding,expires_ms,consumed,session_issued FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
             .bind(input.login).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         if !gate.try_get::<bool,_>("consumed")? || gate.try_get::<bool,_>("session_issued")?

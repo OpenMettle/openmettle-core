@@ -9,13 +9,14 @@ use crate::{
     authz::{projects::hex, store::StoreError},
     restore::{self, Export},
     runs,
-    telemetry::metrics::{BackupRunOutcome, Metrics},
+    telemetry::metrics::Metrics,
 };
 use archive::{
-    ArchiveError, ArtifactArchiveSummary, BackupMeta, BundledConfigFile, GfsPolicy, PruneReport,
-    SettledArtifactRecord, create_dir_0700, fsync_dir, load_non_secret_config_files,
-    open_new_file_0600, open_regular_nofollow, prune_destination_with_verifier,
-    unpack_artifact_archive, validate_destination_root, write_artifact_archive, write_file_0600,
+    ArchiveError, ArtifactArchiveSummary, BackupMeta, BundledConfigFile, GfsPolicy,
+    MAX_BACKUP_META_BYTES, PruneReport, SettledArtifactRecord, create_dir_0700, fsync_dir,
+    load_non_secret_config_files, open_new_file_0600, open_regular_nofollow,
+    prune_destination_with_verifier, read_regular_bounded_nofollow, unpack_artifact_archive,
+    validate_destination_root, write_artifact_archive, write_file_0600, write_file_0600_replace,
 };
 use chrono::{DateTime, Utc};
 use crypto::{BackupKeyRing, CryptoError, EncryptedStats, StreamEncryptor};
@@ -31,12 +32,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    net::IpAddr,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -154,10 +154,12 @@ pub async fn observe_telemetry_into(
         incomplete: u64::try_from(i).unwrap_or(0),
         overdue: u64::try_from(o).unwrap_or(0),
     };
-    metrics.observe_backup_run_total(BackupRunOutcome::Succeeded, observed.succeeded);
-    metrics.observe_backup_run_total(BackupRunOutcome::Failed, observed.failed);
-    metrics.observe_backup_run_total(BackupRunOutcome::Incomplete, observed.incomplete);
-    metrics.observe_backup_run_total(BackupRunOutcome::Overdue, observed.overdue);
+    metrics.sync_backup_run_totals(
+        observed.succeeded,
+        observed.failed,
+        observed.incomplete,
+        observed.overdue,
+    );
     Ok(observed)
 }
 
@@ -199,6 +201,7 @@ pub enum BackupError {
     GateNotReady(&'static str),
     PgDump(&'static str),
     Integrity(&'static str),
+    CommitOutcomeUnknown,
     Io(io::Error),
 }
 
@@ -217,6 +220,7 @@ impl BackupError {
             Self::GateNotReady(_) => "gate_not_ready",
             Self::PgDump(_) => "pg_dump_failed",
             Self::Integrity(_) => "integrity_failed",
+            Self::CommitOutcomeUnknown => "commit_outcome_unknown",
             Self::Io(_) => "io_error",
         }
     }
@@ -254,6 +258,9 @@ impl fmt::Display for BackupError {
             Self::GateNotReady(msg) => f.write_str(msg),
             Self::PgDump(msg) => write!(f, "pg_dump failed: {msg}"),
             Self::Integrity(msg) => write!(f, "backup integrity verification failed: {msg}"),
+            Self::CommitOutcomeUnknown => f.write_str(
+                "backup publication commit outcome unknown; staging preserved for exact-request-key retry",
+            ),
             Self::Io(_) => f.write_str("backup I/O error"),
         }
     }
@@ -294,17 +301,17 @@ impl From<io::Error> for BackupError {
 
 // --- strict PostgreSQL URL validation & pluggable PgDumpRunner --------------------------------
 
-/// Validated PostgreSQL connection parameters shared between `sqlx` and `pg_dump` so unknown,
-/// duplicate, or multi-host connection parameters fail closed before entering maintenance.
-#[derive(Clone, Default, PartialEq, Eq)]
+/// Validated PostgreSQL connection parameters shared identically between `sqlx` and `pg_dump`
+/// so unknown, duplicate, `hostaddr`, or multi-host connection parameters fail closed before
+/// entering maintenance and neither client inherits conflicting ambient `PG*` defaults.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ValidatedPgConfig {
-    pub host: Option<String>,
-    pub hostaddr: Option<String>,
-    pub port: Option<u16>,
-    pub database: Option<String>,
-    pub username: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
     pub password: Option<String>,
-    pub sslmode: Option<String>,
+    pub sslmode: String,
     pub sslrootcert: Option<String>,
     pub sslcert: Option<String>,
     pub sslkey: Option<String>,
@@ -315,7 +322,6 @@ impl fmt::Debug for ValidatedPgConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValidatedPgConfig")
             .field("host", &self.host)
-            .field("hostaddr", &self.hostaddr)
             .field("port", &self.port)
             .field("database", &self.database)
             .field("username", &self.username)
@@ -331,38 +337,63 @@ impl fmt::Debug for ValidatedPgConfig {
 
 impl ValidatedPgConfig {
     fn parsed_ssl_mode(&self) -> Result<PgSslMode, BackupError> {
-        match self.sslmode.as_deref() {
-            None | Some("prefer") => Ok(PgSslMode::Prefer),
-            Some("disable") => Ok(PgSslMode::Disable),
-            Some("allow") => Ok(PgSslMode::Allow),
-            Some("require") => Ok(PgSslMode::Require),
-            Some("verify-ca") => Ok(PgSslMode::VerifyCa),
-            Some("verify-full") => Ok(PgSslMode::VerifyFull),
-            Some(_) => Err(BackupError::PgDump("invalid sslmode in database URL")),
+        match self.sslmode.as_str() {
+            "prefer" => Ok(PgSslMode::Prefer),
+            "disable" => Ok(PgSslMode::Disable),
+            "allow" => Ok(PgSslMode::Allow),
+            "require" => Ok(PgSslMode::Require),
+            "verify-ca" => Ok(PgSslMode::VerifyCa),
+            "verify-full" => Ok(PgSslMode::VerifyFull),
+            _ => Err(BackupError::PgDump("invalid sslmode in database URL")),
         }
     }
 
-    /// Build `sqlx::postgres::PgConnectOptions` matching the exact validated connection settings
-    /// passed to `pg_dump`.
+    /// Build `sqlx::postgres::PgConnectOptions` via `PgConnectOptions::new_without_pgpass()`
+    /// with every endpoint and TLS parameter set explicitly from `self`, matching the exact
+    /// values passed to `pg_dump`. Fails closed if any ambient optional `PG*` env var that
+    /// `new_without_pgpass()` reads would diverge from the scrubbed `pg_dump` environment.
     pub fn to_sqlx_options(&self) -> Result<PgConnectOptions, BackupError> {
-        let mut opts = PgConnectOptions::new_without_pgpass().ssl_mode(self.parsed_ssl_mode()?);
-        if let Some(hostaddr) = &self.hostaddr {
-            opts = opts.host(hostaddr);
-        } else if let Some(host) = &self.host {
-            if host.starts_with('/') {
-                opts = opts.socket(host);
-            } else {
-                opts = opts.host(host);
-            }
+        let ssl_mode = self.parsed_ssl_mode()?;
+        if std::env::var_os("PGOPTIONS").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGOPTIONS environment variable is not supported for backup capture",
+            ));
         }
-        if let Some(port) = self.port {
-            opts = opts.port(port);
+        if self.password.is_none() && std::env::var_os("PGPASSWORD").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGPASSWORD environment variable conflicts with database URL without password",
+            ));
         }
-        if let Some(database) = &self.database {
-            opts = opts.database(database);
+        if self.sslrootcert.is_none() && std::env::var_os("PGSSLROOTCERT").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGSSLROOTCERT environment variable conflicts with database URL without sslrootcert",
+            ));
         }
-        if let Some(username) = &self.username {
-            opts = opts.username(username);
+        if self.sslcert.is_none() && std::env::var_os("PGSSLCERT").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGSSLCERT environment variable conflicts with database URL without sslcert",
+            ));
+        }
+        if self.sslkey.is_none() && std::env::var_os("PGSSLKEY").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGSSLKEY environment variable conflicts with database URL without sslkey",
+            ));
+        }
+        if self.application_name.is_none() && std::env::var_os("PGAPPNAME").is_some() {
+            return Err(BackupError::PgDump(
+                "ambient PGAPPNAME environment variable conflicts with database URL without application_name",
+            ));
+        }
+
+        let mut opts = PgConnectOptions::new_without_pgpass()
+            .port(self.port)
+            .username(&self.username)
+            .database(&self.database)
+            .ssl_mode(ssl_mode);
+        if self.host.starts_with('/') {
+            opts = opts.socket(&self.host);
+        } else {
+            opts = opts.host(&self.host);
         }
         if let Some(password) = &self.password {
             opts = opts.password(password);
@@ -418,10 +449,11 @@ fn percent_decode(input: &str) -> Result<String, BackupError> {
     String::from_utf8(out).map_err(|_| BackupError::PgDump("non-UTF-8 database URL component"))
 }
 
-/// Strictly parse a PostgreSQL URI against a closed allow-list (`host`, `hostaddr`, `port`,
-/// `dbname`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey`,
-/// `application_name`), rejecting multi-host URIs, fragments, duplicate or unknown query
-/// parameters, invalid `sslmode`/`hostaddr`/`port`, and control characters.
+/// Strictly parse a PostgreSQL URI against a closed allow-list (`host`, `port`, `dbname`, `user`,
+/// `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `application_name`), requiring
+/// explicit non-empty `host`, `user`, and `dbname`, defaulting `port` to `5432` and `sslmode` to
+/// `"prefer"`, and rejecting `hostaddr`, multi-host URIs, fragments, duplicate or unknown query
+/// parameters, invalid `sslmode`/`port`, and control characters.
 pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupError> {
     if url.contains('#') {
         return Err(BackupError::PgDump(
@@ -445,7 +477,17 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
         None => (None, authority),
     };
 
-    let mut out = ValidatedPgConfig::default();
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut database: Option<String> = None;
+    let mut username: Option<String> = None;
+    let mut password: Option<String> = None;
+    let mut sslmode: Option<String> = None;
+    let mut sslrootcert: Option<String> = None;
+    let mut sslcert: Option<String> = None;
+    let mut sslkey: Option<String> = None;
+    let mut application_name: Option<String> = None;
+
     if let Some(u) = userinfo {
         match u.split_once(':') {
             Some((user, pass)) => {
@@ -454,13 +496,13 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                     if contains_ctrl_or_nul(&decoded) {
                         return Err(BackupError::PgDump("invalid control character in username"));
                     }
-                    out.username = Some(decoded);
+                    username = Some(decoded);
                 }
                 let decoded_pw = percent_decode(pass)?;
                 if contains_ctrl_or_nul(&decoded_pw) {
                     return Err(BackupError::PgDump("invalid control character in password"));
                 }
-                out.password = Some(decoded_pw);
+                password = Some(decoded_pw);
             }
             None => {
                 if !u.is_empty() {
@@ -468,7 +510,7 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                     if contains_ctrl_or_nul(&decoded) {
                         return Err(BackupError::PgDump("invalid control character in username"));
                     }
-                    out.username = Some(decoded);
+                    username = Some(decoded);
                 }
             }
         }
@@ -481,16 +523,20 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
             ));
         }
         if let Some(after_open) = hostport.strip_prefix('[') {
-            let (host, tail) = after_open
+            let (parsed_host, tail) = after_open
                 .split_once(']')
                 .ok_or(BackupError::PgDump("unclosed IPv6 host in database URL"))?;
-            if host.is_empty() || host.contains('[') || host.contains(']') || host.contains(',') {
+            if parsed_host.is_empty()
+                || parsed_host.contains('[')
+                || parsed_host.contains(']')
+                || parsed_host.contains(',')
+            {
                 return Err(BackupError::PgDump("invalid IPv6 host in database URL"));
             }
-            if contains_ctrl_or_nul(host) {
+            if contains_ctrl_or_nul(parsed_host) {
                 return Err(BackupError::PgDump("invalid control character in host"));
             }
-            out.host = Some(host.to_owned());
+            host = Some(parsed_host.to_owned());
             if !tail.is_empty() {
                 let port_str = tail
                     .strip_prefix(':')
@@ -501,18 +547,18 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                 if p == 0 {
                     return Err(BackupError::PgDump("invalid port in database URL"));
                 }
-                out.port = Some(p);
+                port = Some(p);
             }
-        } else if let Some((host, port_str)) = hostport.rsplit_once(':') {
-            if host.contains(':') {
+        } else if let Some((parsed_host, port_str)) = hostport.rsplit_once(':') {
+            if parsed_host.contains(':') {
                 return Err(BackupError::PgDump("unbracketed IPv6 host in database URL"));
             }
-            if !host.is_empty() {
-                let decoded = percent_decode(host)?;
+            if !parsed_host.is_empty() {
+                let decoded = percent_decode(parsed_host)?;
                 if decoded.contains(',') || contains_ctrl_or_nul(&decoded) {
                     return Err(BackupError::PgDump("invalid host in database URL"));
                 }
-                out.host = Some(decoded);
+                host = Some(decoded);
             }
             if !port_str.is_empty() {
                 let p: u16 = port_str
@@ -521,14 +567,14 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                 if p == 0 {
                     return Err(BackupError::PgDump("invalid port in database URL"));
                 }
-                out.port = Some(p);
+                port = Some(p);
             }
         } else {
             let decoded = percent_decode(hostport)?;
             if decoded.contains(',') || contains_ctrl_or_nul(&decoded) {
                 return Err(BackupError::PgDump("invalid host in database URL"));
             }
-            out.host = Some(decoded);
+            host = Some(decoded);
         }
     }
 
@@ -544,7 +590,7 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                 "invalid control character in database name",
             ));
         }
-        out.database = Some(decoded);
+        database = Some(decoded);
     }
 
     if let Some(q) = query {
@@ -578,13 +624,12 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                             "multi-host PostgreSQL URLs are not supported",
                         ));
                     }
-                    out.host = Some(v);
+                    host = Some(v);
                 }
                 "hostaddr" => {
-                    if v.contains(',') || v.parse::<IpAddr>().is_err() {
-                        return Err(BackupError::PgDump("invalid hostaddr in database URL"));
-                    }
-                    out.hostaddr = Some(v);
+                    return Err(BackupError::PgDump(
+                        "hostaddr URI parameter is not supported; specify a resolvable host or IP in the URI",
+                    ));
                 }
                 "port" => {
                     if v.contains(',') {
@@ -598,11 +643,11 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                     if p == 0 {
                         return Err(BackupError::PgDump("invalid query port"));
                     }
-                    out.port = Some(p);
+                    port = Some(p);
                 }
-                "dbname" => out.database = Some(v),
-                "user" => out.username = Some(v),
-                "password" => out.password = Some(v),
+                "dbname" => database = Some(v),
+                "user" => username = Some(v),
+                "password" => password = Some(v),
                 "sslmode" => {
                     if !matches!(
                         v.as_str(),
@@ -610,12 +655,12 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
                     ) {
                         return Err(BackupError::PgDump("invalid sslmode in database URL"));
                     }
-                    out.sslmode = Some(v);
+                    sslmode = Some(v);
                 }
-                "sslrootcert" => out.sslrootcert = Some(v),
-                "sslcert" => out.sslcert = Some(v),
-                "sslkey" => out.sslkey = Some(v),
-                "application_name" => out.application_name = Some(v),
+                "sslrootcert" => sslrootcert = Some(v),
+                "sslcert" => sslcert = Some(v),
+                "sslkey" => sslkey = Some(v),
+                "application_name" => application_name = Some(v),
                 _ => {
                     return Err(BackupError::PgDump(
                         "unsupported query parameter in database URL",
@@ -625,7 +670,73 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
         }
     }
 
-    Ok(out)
+    let host = host.filter(|h| !h.is_empty()).ok_or(BackupError::PgDump(
+        "database URL requires an explicit host",
+    ))?;
+    let username = username
+        .filter(|u| !u.is_empty())
+        .ok_or(BackupError::PgDump(
+            "database URL requires an explicit username",
+        ))?;
+    let database = database
+        .filter(|d| !d.is_empty())
+        .ok_or(BackupError::PgDump(
+            "database URL requires an explicit database name",
+        ))?;
+    let cfg = ValidatedPgConfig {
+        host,
+        port: port.unwrap_or(5432),
+        database,
+        username,
+        password,
+        sslmode: sslmode.unwrap_or_else(|| "prefer".to_owned()),
+        sslrootcert,
+        sslcert,
+        sslkey,
+        application_name,
+    };
+    cfg.parsed_ssl_mode()?;
+    Ok(cfg)
+}
+
+/// Cooperative cancellation handle shared between the async capture supervisor and blocking
+/// `pg_dump` or streaming tasks. Calling [`DumpCancel::cancel`] marks the token cancelled and
+/// sends `SIGKILL` to any registered child process so a stalled `pg_dump` exits and is reaped
+/// immediately before staging cleanup.
+#[derive(Clone, Default)]
+pub struct DumpCancel {
+    cancelled: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl DumpCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill();
+        }
+    }
+
+    fn register_child(&self, mut child: Child) {
+        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+        }
+        *guard = Some(child);
+    }
+
+    fn take_child(&self) -> Option<Child> {
+        self.child.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 /// Pluggable PostgreSQL logical dump runner so production runs real
@@ -636,6 +747,7 @@ pub trait PgDumpRunner: Send + Sync {
         &self,
         database_url: &str,
         snapshot_id: Option<&str>,
+        cancel: &DumpCancel,
         writer: &mut dyn Write,
     ) -> Result<u64, BackupError>;
 }
@@ -699,39 +811,15 @@ impl EphemeralPgPass {
         let dir = std::env::temp_dir().join(format!("om-pgpass-{}", hex(&rnd)));
         create_dir_0700(&dir)?;
         let file = dir.join("pgpass");
-        let port = parsed
-            .port
-            .map_or_else(|| "*".to_owned(), |p| p.to_string());
-        let db = parsed
-            .database
-            .as_deref()
-            .map_or_else(|| "*".to_owned(), escape_pgpass);
-        let user = parsed
-            .username
-            .as_deref()
-            .map_or_else(|| "*".to_owned(), escape_pgpass);
+        let host = escape_pgpass(&parsed.host);
+        let port = parsed.port.to_string();
+        let db = escape_pgpass(&parsed.database);
+        let user = escape_pgpass(&parsed.username);
         let pass = parsed
             .password
             .as_deref()
             .map_or_else(String::new, escape_pgpass);
-
-        let mut hosts = Vec::new();
-        if let Some(h) = parsed.host.as_deref() {
-            hosts.push(escape_pgpass(h));
-        }
-        if let Some(ha) = parsed.hostaddr.as_deref() {
-            let escaped = escape_pgpass(ha);
-            if !hosts.contains(&escaped) {
-                hosts.push(escaped);
-            }
-        }
-        if hosts.is_empty() {
-            hosts.push("*".to_owned());
-        }
-        let mut content = String::new();
-        for h in hosts {
-            content.push_str(&format!("{h}:{port}:{db}:{user}:{pass}\n"));
-        }
+        let content = format!("{host}:{port}:{db}:{user}:{pass}\n");
         if let Err(err) = write_file_0600(&file, content.as_bytes()) {
             let _ = fs::remove_dir_all(&dir);
             return Err(err.into());
@@ -752,8 +840,12 @@ impl PgDumpRunner for CliPgDumpRunner {
         &self,
         database_url: &str,
         snapshot_id: Option<&str>,
+        cancel: &DumpCancel,
         writer: &mut dyn Write,
     ) -> Result<u64, BackupError> {
+        if cancel.is_cancelled() {
+            return Err(BackupError::GateNotReady("backup capture cancelled"));
+        }
         let parsed = parse_validated_pg_uri(database_url)?;
         if let Some(snap) = snapshot_id
             && !valid_snapshot_id(snap)
@@ -779,26 +871,13 @@ impl PgDumpRunner for CliPgDumpRunner {
         if let Some(snap) = snapshot_id {
             cmd.arg(format!("--snapshot={snap}"));
         }
-        if let Some(host) = &parsed.host {
-            cmd.arg("--host").arg(host);
-        }
-        if let Some(hostaddr) = &parsed.hostaddr {
-            cmd.env("PGHOSTADDR", hostaddr);
-        }
-        if let Some(port) = parsed.port {
-            cmd.arg("--port").arg(port.to_string());
-        }
-        if let Some(user) = &parsed.username {
-            cmd.arg("--username").arg(user);
-        }
-        if let Some(db) = &parsed.database {
-            cmd.arg("--dbname").arg(db);
-        }
+        cmd.arg("--host").arg(&parsed.host);
+        cmd.arg("--port").arg(parsed.port.to_string());
+        cmd.arg("--username").arg(&parsed.username);
+        cmd.arg("--dbname").arg(&parsed.database);
+        cmd.env("PGSSLMODE", &parsed.sslmode);
         if let Some(pass) = &pgpass {
             cmd.env("PGPASSFILE", &pass.file);
-        }
-        if let Some(sslmode) = &parsed.sslmode {
-            cmd.env("PGSSLMODE", sslmode);
         }
         if let Some(ca) = &parsed.sslrootcert {
             cmd.env("PGSSLROOTCERT", ca);
@@ -827,6 +906,7 @@ impl PgDumpRunner for CliPgDumpRunner {
             .stderr
             .take()
             .ok_or(BackupError::PgDump("pg_dump stderr unavailable"))?;
+        cancel.register_child(child);
 
         // Drain stderr on a helper thread so a noisy stderr cannot deadlock stdout streaming.
         let stderr_handle = std::thread::spawn(move || {
@@ -838,9 +918,20 @@ impl PgDumpRunner for CliPgDumpRunner {
         let mut buf = vec![0u8; crypto::CHUNK_SIZE];
         let mut total: u64 = 0;
         let copy_result: Result<(), BackupError> = loop {
+            if cancel.is_cancelled() {
+                break Err(BackupError::GateNotReady("backup capture cancelled"));
+            }
             match stdout.read(&mut buf) {
-                Ok(0) => break Ok(()),
+                Ok(0) => {
+                    if cancel.is_cancelled() {
+                        break Err(BackupError::GateNotReady("backup capture cancelled"));
+                    }
+                    break Ok(());
+                }
                 Ok(n) => {
+                    if cancel.is_cancelled() {
+                        break Err(BackupError::GateNotReady("backup capture cancelled"));
+                    }
                     if let Err(e) = writer.write_all(&buf[..n]) {
                         break Err(e.into());
                     }
@@ -853,13 +944,17 @@ impl PgDumpRunner for CliPgDumpRunner {
             }
         };
 
-        // Always close the stdout read pipe and terminate the child on write/read error before
-        // waiting, so a broken consumer never deadlocks waiting for a blocked pg_dump writer.
+        // Always close the stdout read pipe, terminate on error/cancellation, and reap the child
+        // before joining stderr and unlinking PGPASSFILE.
         drop(stdout);
-        if copy_result.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait();
+        let status = if let Some(mut child) = cancel.take_child() {
+            if copy_result.is_err() || cancel.is_cancelled() {
+                let _ = child.kill();
+            }
+            child.wait()
+        } else {
+            Err(io::Error::other("pg_dump child handle missing"))
+        };
         let _ = stderr_handle.join();
         drop(pgpass);
 
@@ -875,29 +970,28 @@ impl PgDumpRunner for CliPgDumpRunner {
     }
 }
 
-/// Write adapter that aborts blocking streaming steps promptly if the background capture lease
-/// heartbeat reports lease loss.
+/// Write adapter that aborts blocking streaming steps promptly when cancellation is signaled.
 struct CancelCheckingWriter<'a, W: Write> {
     inner: &'a mut W,
-    cancel: Arc<AtomicBool>,
+    cancel: DumpCancel,
 }
 
 impl<W: Write> Write for CancelCheckingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "backup capture lease lost",
+                "backup capture cancelled",
             ));
         }
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "backup capture lease lost",
+                "backup capture cancelled",
             ));
         }
         self.inner.flush()
@@ -1277,6 +1371,17 @@ async fn mark_quiesced(
     Ok(quiesced_at)
 }
 
+async fn confirm_publication(pool: &PgPool, run_id: &str, reason: &str) -> Result<(), BackupError> {
+    let mut tx = read_committed(pool).await?;
+    sqlx::query("SELECT openmettle.backup_confirm_publication($1::uuid, $2)")
+        .bind(run_id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn fail_capture(pool: &PgPool, run_id: &str, failure_code: &str, reason: &str) {
     if let Ok(mut tx) = read_committed(pool).await {
         let res = sqlx::query("SELECT openmettle.backup_fail_capture($1::uuid, $2, $3)")
@@ -1357,23 +1462,27 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
-/// Run a blocking capture step (`pg_dump`, artifact archive, etc.) on the blocking pool while
-/// sending lightweight `SELECT 1` keepalives on `snap_tx` (protecting against
-/// `idle_in_transaction_session_timeout`) and monitoring `lease_lost`.
-async fn await_blocking_with_keepalive<T, F>(
+/// Run a blocking capture step (`pg_dump`, artifact archive, companion file encryption/fsync) on
+/// the blocking pool while sending lightweight `SELECT 1` keepalives on `snap_tx` (protecting
+/// against `idle_in_transaction_session_timeout`) and monitoring `lease_lost`. On cancellation,
+/// signals [`DumpCancel`] (sending `SIGKILL` to any running `pg_dump` child) and awaits the
+/// blocking handle so the child is reaped and file descriptors are closed before staging cleanup.
+async fn run_blocking_with_keepalive<T, F>(
     snap_tx: &mut Transaction<'static, Postgres>,
     lease_lost: &AtomicBool,
     work: F,
 ) -> Result<T, BackupError>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, BackupError> + Send + 'static,
+    F: FnOnce(DumpCancel) -> Result<T, BackupError> + Send + 'static,
 {
-    let mut handle = tokio::task::spawn_blocking(work);
+    let cancel = DumpCancel::new();
+    let cancel_bg = cancel.clone();
+    let mut handle = tokio::task::spawn_blocking(move || work(cancel_bg));
     let mut keepalive = tokio::time::interval(SNAPSHOT_KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // consume immediate first tick
-    let mut cancel_poll = tokio::time::interval(Duration::from_millis(250));
+    let mut cancel_poll = tokio::time::interval(Duration::from_millis(100));
     cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     cancel_poll.tick().await;
     loop {
@@ -1386,11 +1495,52 @@ where
                 return Ok(out);
             }
             _ = keepalive.tick() => {
-                sqlx::query("SELECT 1").execute(&mut **snap_tx).await?;
+                if let Err(err) = sqlx::query("SELECT 1").execute(&mut **snap_tx).await {
+                    cancel.cancel();
+                    let _ = (&mut handle).await;
+                    return Err(err.into());
+                }
             }
             _ = cancel_poll.tick() => {
                 if lease_lost.load(Ordering::Acquire) {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
+                    cancel.cancel();
+                    let _ = (&mut handle).await;
+                    return Err(BackupError::GateNotReady("backup capture lease lost"));
+                }
+            }
+        }
+    }
+}
+
+/// Run a post-snapshot blocking I/O step (Neo4j/config/manifest encryption, `fsync_dir`) off the
+/// Tokio executor thread so `LeaseHeartbeat` is never starved on slow destinations.
+async fn run_blocking_with_lease_check<T, F>(
+    lease_lost: &AtomicBool,
+    work: F,
+) -> Result<T, BackupError>
+where
+    T: Send + 'static,
+    F: FnOnce(DumpCancel) -> Result<T, BackupError> + Send + 'static,
+{
+    let cancel = DumpCancel::new();
+    let cancel_bg = cancel.clone();
+    let mut handle = tokio::task::spawn_blocking(move || work(cancel_bg));
+    let mut cancel_poll = tokio::time::interval(Duration::from_millis(100));
+    cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    cancel_poll.tick().await;
+    loop {
+        tokio::select! {
+            res = &mut handle => {
+                let out = res.map_err(|_| BackupError::PgDump("backup worker task failed"))??;
+                if lease_lost.load(Ordering::Acquire) {
+                    return Err(BackupError::GateNotReady("backup capture lease lost"));
+                }
+                return Ok(out);
+            }
+            _ = cancel_poll.tick() => {
+                if lease_lost.load(Ordering::Acquire) {
+                    cancel.cancel();
+                    let _ = (&mut handle).await;
                     return Err(BackupError::GateNotReady("backup capture lease lost"));
                 }
             }
@@ -1728,35 +1878,62 @@ pub async fn capture(
 }
 
 enum CaptureFailure {
-    /// Failed before PostgreSQL committed `backup_complete_capture`: safe to delete staging and
-    /// record `backup_fail_capture`.
+    /// Failed before PostgreSQL committed `backup_stage_publication` (or confirmed via a `FOR
+    /// SHARE` read that publication did not commit): safe to delete staging and record
+    /// `backup_fail_capture`.
     BeforeCommit(BackupError),
-    /// Failed after PostgreSQL committed `backup_complete_capture` (or after an ambiguous commit
-    /// error whose DB state could not be read): preserve staging for exact-request-key retry and
+    /// Failed after PostgreSQL committed `backup_stage_publication` (or after an ambiguous stage
+    /// commit whose DB state could not be read): preserve staging for exact-request-key retry and
     /// do not attempt to mark the run failed.
     PreserveStaging(BackupError),
 }
 
-/// If an earlier invocation with the exact same `request_key`, `operator_id`, and
-/// `destination_domain` already committed `state = 'succeeded'` in PostgreSQL but crashed before
-/// writing `backup-meta.json` / renaming `.staging.<run_id>` (or before pruning/releasing),
-/// idempotently verify and finalize publication on disk.
-async fn try_finalize_committed_retry(
+/// Atomically publish `backup-meta.json` inside `staging_dir` (via `backup-meta.json.tmp` ->
+/// `sync_all()` -> rename -> `fsync_dir(staging_dir)`), rename `staging_dir` -> `final_dir`, and
+/// `fsync_dir(dest_root)`. Safely overwrites any partial `backup-meta.json.tmp` or
+/// `backup-meta.json` left by an interrupted prior publication attempt.
+fn publish_staged_dir_blocking(
+    dest_root: &Path,
+    staging_dir: &Path,
+    final_dir: &Path,
+    meta: &BackupMeta,
+) -> Result<(), BackupError> {
+    let meta_bytes = serde_json::to_vec_pretty(meta)
+        .map_err(|_| BackupError::Integrity("backup-meta serialization failed"))?;
+    let tmp_path = staging_dir.join("backup-meta.json.tmp");
+    let meta_path = staging_dir.join("backup-meta.json");
+    write_file_0600_replace(&tmp_path, &meta_bytes)?;
+    fs::rename(&tmp_path, &meta_path)?;
+    fsync_dir(staging_dir)?;
+    fs::rename(staging_dir, final_dir)?;
+    fsync_dir(dest_root)?;
+    Ok(())
+}
+
+/// If an earlier invocation with the exact same `request_key`, `operator_id`, `destination_domain`,
+/// and `reason` already reached `state IN ('publishing', 'succeeded')` in PostgreSQL before a crash
+/// or destination error during marker write, rename, confirmation, pruning, or release,
+/// idempotently verify and finalize publication on disk WITHOUT reopening `--neo4j-dump` or
+/// `--config-file`.
+async fn try_finalize_staged_or_succeeded_retry(
     pool: &PgPool,
     keyring: &BackupKeyRing,
     opts: &CaptureOptions,
     dest_root: &Path,
 ) -> Result<Option<CaptureReport>, BackupError> {
+    let mut tx = read_committed(pool).await?;
     let row = sqlx::query(
         "SELECT id::text, operator_id::text, destination_domain, state,
                 encryption_key_id, encode(bundle_digest, 'hex'), encode(manifest_digest, 'hex'),
                 journal_seq, manifest_summary::text
            FROM openmettle.backup_runs
-          WHERE request_key = $1",
+          WHERE request_key = $1
+            FOR SHARE",
     )
     .bind(&opts.request_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let Some(row) = row else {
         return Ok(None);
@@ -1766,7 +1943,7 @@ async fn try_finalize_committed_retry(
     let existing_operator: String = row.try_get(1)?;
     let existing_domain: String = row.try_get(2)?;
     let state: String = row.try_get(3)?;
-    if state != "succeeded"
+    if !matches!(state.as_str(), "publishing" | "succeeded")
         || existing_operator != opts.operator_id
         || existing_domain != opts.destination_domain
     {
@@ -1792,6 +1969,9 @@ async fn try_finalize_committed_retry(
     let summary_text: String = row.try_get(8)?;
     let summary: Value = serde_json::from_str(&summary_text)
         .map_err(|_| BackupError::Integrity("committed run summary malformed"))?;
+    if summary.get("reason").and_then(Value::as_str) != Some(opts.reason.as_str()) {
+        return Ok(None);
+    }
 
     let installation_id = summary
         .get("installation_id")
@@ -1842,52 +2022,63 @@ async fn try_finalize_committed_retry(
     let staging_dir = dest_root.join(format!(".staging.{existing_run_id}"));
     let final_dir = dest_root.join(&final_dir_name);
 
-    if final_dir.exists() {
-        let (disk_meta, _) = load_and_verify_manifest(&final_dir, keyring)?;
-        if disk_meta != expected_meta
-            || !verify_backup_dir_for_prune(&final_dir, &disk_meta, keyring)
-        {
-            return Err(BackupError::Integrity(
-                "published backup directory disagrees with committed backup_runs record",
-            ));
-        }
-    } else if staging_dir.is_dir() {
-        verify_staged_dir_against_meta(&staging_dir, &expected_meta, keyring)?;
-        let meta_path = staging_dir.join("backup-meta.json");
-        if meta_path.exists() {
-            let mut f = open_regular_nofollow(&meta_path)
-                .map_err(|_| BackupError::Integrity("staged backup-meta.json unreadable"))?;
-            let mut raw = Vec::new();
-            f.read_to_end(&mut raw)?;
-            let staged_meta: BackupMeta = serde_json::from_slice(&raw)
-                .map_err(|_| BackupError::Integrity("staged backup-meta.json malformed"))?;
-            if staged_meta != expected_meta {
+    {
+        let dest_root_bg = dest_root.to_path_buf();
+        let staging_dir_bg = staging_dir.clone();
+        let final_dir_bg = final_dir.clone();
+        let expected_meta_bg = expected_meta.clone();
+        let keyring_bg = keyring.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), BackupError> {
+            if final_dir_bg.exists() {
+                let (disk_meta, _) = load_and_verify_manifest(&final_dir_bg, &keyring_bg)?;
+                if disk_meta != expected_meta_bg
+                    || !verify_backup_dir_for_prune(&final_dir_bg, &disk_meta, &keyring_bg)
+                {
+                    return Err(BackupError::Integrity(
+                        "published backup directory disagrees with committed backup_runs record",
+                    ));
+                }
+            } else if staging_dir_bg.is_dir() {
+                verify_staged_dir_against_meta(&staging_dir_bg, &expected_meta_bg, &keyring_bg)?;
+                publish_staged_dir_blocking(
+                    &dest_root_bg,
+                    &staging_dir_bg,
+                    &final_dir_bg,
+                    &expected_meta_bg,
+                )?;
+            } else {
                 return Err(BackupError::Integrity(
-                    "staged backup-meta.json disagrees with committed backup_runs record",
+                    "committed backup set missing both staging and final directories on retry",
                 ));
             }
-        } else {
-            let meta_bytes = serde_json::to_vec_pretty(&expected_meta)
-                .map_err(|_| BackupError::Integrity("backup-meta serialization failed"))?;
-            write_file_0600(&meta_path, &meta_bytes)?;
-        }
-        fsync_dir(&staging_dir)?;
-        fs::rename(&staging_dir, &final_dir)?;
-        fsync_dir(dest_root)?;
-    } else {
-        return Err(BackupError::Integrity(
-            "committed backup set missing both staging and final directories on retry",
-        ));
+            Ok(())
+        })
+        .await
+        .map_err(|_| BackupError::PgDump("retry publication task failed"))??;
     }
 
+    // Confirm publication (`publishing -> succeeded`; idempotent when already `succeeded`).
+    confirm_publication(pool, &existing_run_id, &opts.reason).await?;
+
     let pruned = match opts.prune_policy {
-        Some(policy) => Some(prune_destination_with_verifier(
-            dest_root,
-            policy,
-            Some((installation_id.as_str(), opts.destination_domain.as_str())),
-            false,
-            |dir, m| verify_backup_dir_for_prune(dir, m, keyring),
-        )?),
+        Some(policy) => {
+            let dest_root_bg = dest_root.to_path_buf();
+            let inst_bg = installation_id.clone();
+            let dom_bg = opts.destination_domain.clone();
+            let keyring_bg = keyring.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                prune_destination_with_verifier(
+                    &dest_root_bg,
+                    policy,
+                    Some((inst_bg.as_str(), dom_bg.as_str())),
+                    false,
+                    |dir, m| verify_backup_dir_for_prune(dir, m, &keyring_bg),
+                )
+            })
+            .await
+            .map_err(|_| BackupError::PgDump("prune task failed"))??;
+            Some(report)
+        }
         None => None,
     };
 
@@ -1920,21 +2111,22 @@ async fn try_finalize_committed_retry(
 }
 
 /// Run the full coordinated maintenance-window backup capture with a pluggable [`PgDumpRunner`].
-/// On any failure before committing `backup_runs.state = 'succeeded'`, partial staging files are
-/// removed, `backup_runs` transitions to `failed`, and `backup_maintenance_gate.maintenance_active`
-/// stays `true` for explicit operator recovery.
+/// On any failure confirmed before PostgreSQL stages publication (`backup_stage_publication`),
+/// partial staging files are removed, `backup_runs` transitions to `failed`, and
+/// `backup_maintenance_gate.maintenance_active` stays `true` for explicit operator recovery.
 pub async fn capture_with_runner(
     pool: &PgPool,
     keyring: &BackupKeyRing,
     opts: &CaptureOptions,
     pg_dump: Arc<dyn PgDumpRunner>,
 ) -> Result<CaptureReport, BackupError> {
-    // 1. Validate arguments, database URL allow-list, destination isolation, non-secret configs,
-    //    and Neo4j dump BEFORE touching the database maintenance window.
+    // 1. Validate arguments, database URL allow-list + SQLx parity, and destination isolation
+    //    BEFORE touching the database maintenance window or external source files.
     runs::uuid(&opts.operator_id)
         .map_err(|_| BackupError::Invalid("invalid --operator-id UUID"))?;
     validate_destination_domain(&opts.destination_domain)?;
-    let _validated_pg = parse_validated_pg_uri(&opts.database_url)?;
+    let validated_pg = parse_validated_pg_uri(&opts.database_url)?;
+    let _ = validated_pg.to_sqlx_options()?;
     if !(30..=3600).contains(&opts.lease_seconds) {
         return Err(BackupError::Invalid(
             "lease seconds must be between 30 and 3600",
@@ -1950,19 +2142,24 @@ pub async fn capture_with_runner(
         opts.require_separate_device,
         opts.allow_local_test_paths,
     )?;
+
+    // 2. Check for an existing `publishing` or `succeeded` run for this exact request_key BEFORE
+    //    opening `--neo4j-dump` or reading `--config-file`, so retrying an interrupted publication
+    //    works even after source files have moved or changed.
+    if let Some(report) =
+        try_finalize_staged_or_succeeded_retry(pool, keyring, opts, &dest_root).await?
+    {
+        return Ok(report);
+    }
+
+    // 3. Validate non-secret config files and optional Neo4j dump BEFORE entering maintenance.
     let bundled_configs = load_non_secret_config_files(&opts.config_files, keyring.paths())?;
     let opened_neo4j = match &opts.graphiti_mode {
         GraphitiMode::NotProvisioned => None,
         GraphitiMode::OfflineDump(neo4j_path) => Some(OpenedNeo4jDump::open(neo4j_path)?),
     };
 
-    // 2. If this exact request_key already committed `succeeded` in PostgreSQL before a crash
-    //    between DB commit and rename, finalize publication idempotently.
-    if let Some(report) = try_finalize_committed_retry(pool, keyring, opts, &dest_root).await? {
-        return Ok(report);
-    }
-
-    // 3. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
+    // 4. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
     //    `draining` backup_runs row.
     let started = start_capture(
         pool,
@@ -1991,7 +2188,8 @@ pub async fn capture_with_runner(
     match outcome {
         Ok(report) => Ok(report),
         Err(CaptureFailure::BeforeCommit(err)) => {
-            let _ = fs::remove_dir_all(&staging_dir);
+            let staging_cleanup = staging_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || fs::remove_dir_all(&staging_cleanup)).await;
             let fail_reason = format!("backup capture failed ({})", err.failure_code());
             fail_capture(pool, &started.run_id, err.failure_code(), &fail_reason).await;
             Err(err)
@@ -2004,6 +2202,13 @@ fn is_serialization_failure(err: &sqlx::Error) -> bool {
     matches!(
         err,
         sqlx::Error::Database(db) if db.code().as_deref() == Some("40001")
+    )
+}
+
+fn is_lock_timeout(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03")
     )
 }
 
@@ -2026,9 +2231,10 @@ async fn capture_body(
     let heartbeat = LeaseHeartbeat::spawn(pool.clone(), run_id.clone(), opts.lease_seconds);
     let lease_lost = heartbeat.lost_flag();
 
-    // 4. Poll drain loop and acquire one exported REPEATABLE READ snapshot holding FOR SHARE on
-    //    `restore_reconciliation_gate` and `storage_volume_control` once quiesced.
+    // 5. Poll drain loop and acquire one exported REPEATABLE READ snapshot holding bounded
+    //    `FOR SHARE` locks on `restore_reconciliation_gate` and `storage_volume_control`.
     let deadline = Instant::now() + opts.drain_timeout;
+    let tokio_deadline = tokio::time::Instant::from_std(deadline);
     let (mut snap_tx, snapshot_id, pinned_volume_id) = loop {
         if heartbeat.is_lost() {
             return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
@@ -2048,6 +2254,16 @@ async fn capture_body(
             continue;
         }
 
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                counts,
+            )));
+        }
+        let remaining_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+
         let mut tx = pool
             .begin()
             .await
@@ -2065,17 +2281,40 @@ async fn capture_body(
             .await
             .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
 
+        // Bound both FOR SHARE waits by the remaining drain deadline via PostgreSQL lock_timeout
+        // and Tokio timeout_at so a stuck DDL/restore transaction fails cleanly with DrainTimeout.
+        sqlx::query("SELECT pg_catalog.set_config('lock_timeout', $1, true)")
+            .bind(format!("{remaining_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
+
         // Lock restore_reconciliation_gate and storage_volume_control FOR SHARE inside the
         // exported snapshot transaction so neither restore lock nor storage adoption/rebind can
         // race with snapshot verification, pg_dump, journal export, or artifact streaming.
-        let gate_open: bool = match sqlx::query_scalar(
-            "SELECT open FROM openmettle.restore_reconciliation_gate WHERE id FOR SHARE",
+        let gate_open: bool = match tokio::time::timeout_at(
+            tokio_deadline,
+            sqlx::query_scalar::<_, bool>(
+                "SELECT open FROM openmettle.restore_reconciliation_gate WHERE id FOR SHARE",
+            )
+            .fetch_one(&mut *tx),
         )
-        .fetch_one(&mut *tx)
         .await
         {
-            Ok(v) => v,
-            Err(e) if is_serialization_failure(&e) => {
+            Ok(Ok(v)) => v,
+            Err(_) => {
+                let _ = tx.rollback().await;
+                return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                    counts,
+                )));
+            }
+            Ok(Err(e)) if is_lock_timeout(&e) => {
+                let _ = tx.rollback().await;
+                return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                    counts,
+                )));
+            }
+            Ok(Err(e)) if is_serialization_failure(&e) => {
                 let _ = tx.rollback().await;
                 if Instant::now() >= deadline {
                     return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
@@ -2085,7 +2324,7 @@ async fn capture_body(
                 tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
                 continue;
             }
-            Err(e) => return Err(CaptureFailure::BeforeCommit(e.into())),
+            Ok(Err(e)) => return Err(CaptureFailure::BeforeCommit(e.into())),
         };
         if !gate_open {
             let _ = tx.rollback().await;
@@ -2094,34 +2333,72 @@ async fn capture_body(
             )));
         }
 
-        let (vol_id, adoption_run_id): (Option<String>, Option<String>) = match sqlx::query_as(
-            "SELECT volume_id::text, adoption_run_id::text
-               FROM openmettle.storage_volume_control
-              WHERE id
-                FOR SHARE",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) if is_serialization_failure(&e) => {
-                let _ = tx.rollback().await;
-                if Instant::now() >= deadline {
-                    return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
-                        "storage_volume_control changed concurrently during quiesce",
+        let remaining_vol = deadline.saturating_duration_since(Instant::now());
+        if remaining_vol.is_zero() {
+            let _ = tx.rollback().await;
+            return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                counts,
+            )));
+        }
+        let remaining_vol_ms = u64::try_from(remaining_vol.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        sqlx::query("SELECT pg_catalog.set_config('lock_timeout', $1, true)")
+            .bind(format!("{remaining_vol_ms}ms"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
+
+        let (vol_id, adoption_run_id): (Option<String>, Option<String>) =
+            match tokio::time::timeout_at(
+                tokio_deadline,
+                sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT volume_id::text, adoption_run_id::text
+                       FROM openmettle.storage_volume_control
+                      WHERE id
+                        FOR SHARE",
+                )
+                .fetch_one(&mut *tx),
+            )
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Err(_) => {
+                    let _ = tx.rollback().await;
+                    return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                        counts,
                     )));
                 }
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
-                continue;
-            }
-            Err(e) => return Err(CaptureFailure::BeforeCommit(e.into())),
-        };
+                Ok(Err(e)) if is_lock_timeout(&e) => {
+                    let _ = tx.rollback().await;
+                    return Err(CaptureFailure::BeforeCommit(BackupError::DrainTimeout(
+                        counts,
+                    )));
+                }
+                Ok(Err(e)) if is_serialization_failure(&e) => {
+                    let _ = tx.rollback().await;
+                    if Instant::now() >= deadline {
+                        return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
+                            "storage_volume_control changed concurrently during quiesce",
+                        )));
+                    }
+                    tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+                    continue;
+                }
+                Ok(Err(e)) => return Err(CaptureFailure::BeforeCommit(e.into())),
+            };
         if adoption_run_id.is_some() {
             let _ = tx.rollback().await;
             return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
                 "storage adoption or rebind barrier is active",
             )));
         }
+
+        // Clear lock_timeout now that both quiesce barrier locks are held.
+        sqlx::query("SELECT pg_catalog.set_config('lock_timeout', '0', true)")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
 
         let snap_counts = poll_drain_counts_conn(&mut tx)
             .await
@@ -2140,7 +2417,7 @@ async fn capture_body(
         break (tx, snap_id, vol_id);
     };
 
-    // 5. Verify accounting and filesystem drift inside the exact exported snapshot BEFORE marking
+    // 6. Verify accounting and filesystem drift inside the exact exported snapshot BEFORE marking
     //    the backup run `capturing`.
     if pinned_volume_id.is_some() && opts.artifact_root.is_none() {
         let _ = snap_tx.rollback().await;
@@ -2207,12 +2484,21 @@ async fn capture_body(
         .await
         .map_err(CaptureFailure::BeforeCommit)?;
 
-    // 6. Capture and stream-encrypt all recovery-set components into `.staging.<run_id>` from
-    //    the single exported snapshot while background lease heartbeat and snapshot keepalive run.
-    create_dir_0700(staging_dir).map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
+    // 7. Capture and stream-encrypt all recovery-set components into `.staging.<run_id>` from
+    //    the single exported snapshot, routing all blocking disk/process I/O onto `spawn_blocking`
+    //    so `LeaseHeartbeat` and snapshot keepalives are never starved.
+    {
+        let staging_dir_bg = staging_dir.to_path_buf();
+        run_blocking_with_keepalive(&mut snap_tx, &lease_lost, move |_cancel| {
+            create_dir_0700(&staging_dir_bg)?;
+            Ok(())
+        })
+        .await
+        .map_err(CaptureFailure::BeforeCommit)?;
+    }
     let mut components: BTreeMap<String, ComponentManifest> = BTreeMap::new();
 
-    // 6a. PostgreSQL logical custom dump (`pg.dump.enc`) synchronized to `snapshot_id`.
+    // 7a. PostgreSQL logical custom dump (`pg.dump.enc`) synchronized to `snapshot_id`.
     let pg_stats = {
         let pg_dump_path = staging_dir.join("pg.dump.enc");
         let keyring_bg = keyring.clone();
@@ -2220,17 +2506,16 @@ async fn capture_body(
         let db_url_bg = opts.database_url.clone();
         let snap_id_bg = snapshot_id.clone();
         let runner_bg = Arc::clone(&pg_dump);
-        let cancel_bg = Arc::clone(&lease_lost);
-        await_blocking_with_keepalive(&mut snap_tx, &lease_lost, move || {
+        run_blocking_with_keepalive(&mut snap_tx, &lease_lost, move |cancel| {
             let mut out_file = open_new_file_0600(&pg_dump_path)?;
             let mut enc =
                 StreamEncryptor::start(&keyring_bg, &run_id_bg, "pg_dump", &mut out_file)?;
             {
                 let mut guarded = CancelCheckingWriter {
                     inner: &mut enc,
-                    cancel: cancel_bg,
+                    cancel: cancel.clone(),
                 };
-                runner_bg.dump(&db_url_bg, Some(&snap_id_bg), &mut guarded)?;
+                runner_bg.dump(&db_url_bg, Some(&snap_id_bg), &cancel, &mut guarded)?;
             }
             let stats = enc.finish()?;
             out_file.sync_all()?;
@@ -2244,43 +2529,60 @@ async fn capture_body(
         component_manifest("pg_dump", &pg_stats),
     );
 
-    // 6b. Authoritative PostgreSQL gateway entitlements & usage snapshot (`gateway-entitlements.json.enc`).
+    // 7b. Authoritative PostgreSQL gateway entitlements & usage snapshot (`gateway-entitlements.json.enc`).
     let gw_bytes = export_gateway_entitlements_json_conn(&mut snap_tx)
         .await
         .map_err(CaptureFailure::BeforeCommit)?;
-    let gw_stats = encrypt_bytes_to_file(
-        keyring,
-        run_id,
-        "gateway_entitlements",
-        &gw_bytes,
-        &staging_dir.join("gateway-entitlements.json.enc"),
-    )
-    .map_err(CaptureFailure::BeforeCommit)?;
+    let gw_stats = {
+        let gw_path = staging_dir.join("gateway-entitlements.json.enc");
+        let keyring_bg = keyring.clone();
+        let run_id_bg = run_id.clone();
+        run_blocking_with_keepalive(&mut snap_tx, &lease_lost, move |_cancel| {
+            encrypt_bytes_to_file(
+                &keyring_bg,
+                &run_id_bg,
+                "gateway_entitlements",
+                &gw_bytes,
+                &gw_path,
+            )
+        })
+        .await
+        .map_err(CaptureFailure::BeforeCommit)?
+    };
     components.insert(
         "gateway-entitlements.json.enc".to_owned(),
         component_manifest("gateway_entitlements", &gw_stats),
     );
 
-    // 6c. Deletion journal export (`deletion-journal.bin.enc`) from the same exported snapshot.
+    // 7c. Deletion journal export (`deletion-journal.bin.enc`) from the same exported snapshot.
     let journal_text = restore::export_conn(&mut snap_tx)
         .await
         .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
     let parsed_export =
         Export::parse(&journal_text).map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
-    let journal_stats = encrypt_bytes_to_file(
-        keyring,
-        run_id,
-        "deletion_journal",
-        journal_text.as_bytes(),
-        &staging_dir.join("deletion-journal.bin.enc"),
-    )
-    .map_err(CaptureFailure::BeforeCommit)?;
+    let journal_stats = {
+        let journal_path = staging_dir.join("deletion-journal.bin.enc");
+        let keyring_bg = keyring.clone();
+        let run_id_bg = run_id.clone();
+        let journal_bytes = journal_text.into_bytes();
+        run_blocking_with_keepalive(&mut snap_tx, &lease_lost, move |_cancel| {
+            encrypt_bytes_to_file(
+                &keyring_bg,
+                &run_id_bg,
+                "deletion_journal",
+                &journal_bytes,
+                &journal_path,
+            )
+        })
+        .await
+        .map_err(CaptureFailure::BeforeCommit)?
+    };
     components.insert(
         "deletion-journal.bin.enc".to_owned(),
         component_manifest("deletion_journal", &journal_stats),
     );
 
-    // 6d. Generic PVC POSIX artifact archive (`artifacts.bin.enc`), live SHA-256 verified while
+    // 7d. Generic PVC POSIX artifact archive (`artifacts.bin.enc`), live SHA-256 verified while
     //     `snap_tx` still holds `FOR SHARE` on `restore_reconciliation_gate` & `storage_volume_control`.
     let (artifact_summary, artifact_stats) = {
         let artifacts_path = staging_dir.join("artifacts.bin.enc");
@@ -2288,15 +2590,14 @@ async fn capture_body(
         let run_id_bg = run_id.clone();
         let art_root_bg = opts.artifact_root.clone();
         let vol_id_bg = pinned_volume_id.clone();
-        let cancel_bg = Arc::clone(&lease_lost);
-        await_blocking_with_keepalive(&mut snap_tx, &lease_lost, move || {
+        run_blocking_with_keepalive(&mut snap_tx, &lease_lost, move |cancel| {
             let mut out_file = open_new_file_0600(&artifacts_path)?;
             let mut enc =
                 StreamEncryptor::start(&keyring_bg, &run_id_bg, "artifacts", &mut out_file)?;
             let summary = {
                 let mut guarded = CancelCheckingWriter {
                     inner: &mut enc,
-                    cancel: cancel_bg,
+                    cancel,
                 };
                 write_artifact_archive(
                     art_root_bg.as_deref(),
@@ -2332,7 +2633,7 @@ async fn capture_body(
         .await
         .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
 
-    // 6e. Optional Graphiti / Neo4j offline dump (`neo4j.dump.enc`) from the preflight-opened
+    // 7e. Optional Graphiti / Neo4j offline dump (`neo4j.dump.enc`) from the preflight-opened
     //     descriptor, verified unchanged across encryption.
     let graphiti_manifest = match opened_neo4j {
         None => GraphitiManifest::NotProvisioned,
@@ -2340,37 +2641,32 @@ async fn capture_body(
             let neo4j_out_path = staging_dir.join("neo4j.dump.enc");
             let keyring_bg = keyring.clone();
             let run_id_bg = run_id.clone();
-            let cancel_bg = Arc::clone(&lease_lost);
-            let stats =
-                tokio::task::spawn_blocking(move || -> Result<EncryptedStats, BackupError> {
-                    neo4j.file.seek(SeekFrom::Start(0))?;
-                    let mut out = open_new_file_0600(&neo4j_out_path)?;
-                    let mut enc =
-                        StreamEncryptor::start(&keyring_bg, &run_id_bg, "neo4j_dump", &mut out)?;
-                    let mut buf = vec![0u8; crypto::CHUNK_SIZE];
-                    {
-                        let mut guarded = CancelCheckingWriter {
-                            inner: &mut enc,
-                            cancel: cancel_bg,
-                        };
-                        loop {
-                            let n = neo4j.file.read(&mut buf)?;
-                            if n == 0 {
-                                break;
-                            }
-                            guarded.write_all(&buf[..n])?;
+            let stats = run_blocking_with_lease_check(&lease_lost, move |cancel| {
+                neo4j.file.seek(SeekFrom::Start(0))?;
+                let mut out = open_new_file_0600(&neo4j_out_path)?;
+                let mut enc =
+                    StreamEncryptor::start(&keyring_bg, &run_id_bg, "neo4j_dump", &mut out)?;
+                let mut buf = vec![0u8; crypto::CHUNK_SIZE];
+                {
+                    let mut guarded = CancelCheckingWriter {
+                        inner: &mut enc,
+                        cancel,
+                    };
+                    loop {
+                        let n = neo4j.file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
                         }
+                        guarded.write_all(&buf[..n])?;
                     }
-                    let stats = enc.finish()?;
-                    out.sync_all()?;
-                    neo4j.verify_unchanged(stats.plaintext_bytes)?;
-                    Ok(stats)
-                })
-                .await
-                .map_err(|_| {
-                    CaptureFailure::BeforeCommit(BackupError::PgDump("neo4j task failed"))
-                })?
-                .map_err(CaptureFailure::BeforeCommit)?;
+                }
+                let stats = enc.finish()?;
+                out.sync_all()?;
+                neo4j.verify_unchanged(stats.plaintext_bytes)?;
+                Ok(stats)
+            })
+            .await
+            .map_err(CaptureFailure::BeforeCommit)?;
             let comp = component_manifest("neo4j_dump", &stats);
             let gm = GraphitiManifest::OfflineDump {
                 component: "neo4j.dump.enc".to_owned(),
@@ -2382,7 +2678,7 @@ async fn capture_body(
         }
     };
 
-    // 6f. Non-secret config files + required vault key-ID inventory (`config.json.enc`).
+    // 7f. Non-secret config files + required vault key-ID inventory (`config.json.enc`).
     let config_bundle = ConfigBundle {
         format: "openmettle-backup-config/v1".to_owned(),
         vault_required_key_ids: vault_required_key_ids.clone(),
@@ -2391,22 +2687,30 @@ async fn capture_body(
     let config_bytes = serde_json::to_vec_pretty(&config_bundle).map_err(|_| {
         CaptureFailure::BeforeCommit(BackupError::Integrity("config bundle serialization failed"))
     })?;
-    let config_stats = encrypt_bytes_to_file(
-        keyring,
-        run_id,
-        "config",
-        &config_bytes,
-        &staging_dir.join("config.json.enc"),
-    )
-    .map_err(CaptureFailure::BeforeCommit)?;
+    let config_stats = {
+        let config_path = staging_dir.join("config.json.enc");
+        let keyring_bg = keyring.clone();
+        let run_id_bg = run_id.clone();
+        run_blocking_with_lease_check(&lease_lost, move |_cancel| {
+            encrypt_bytes_to_file(
+                &keyring_bg,
+                &run_id_bg,
+                "config",
+                &config_bytes,
+                &config_path,
+            )
+        })
+        .await
+        .map_err(CaptureFailure::BeforeCommit)?
+    };
     components.insert(
         "config.json.enc".to_owned(),
         component_manifest("config", &config_stats),
     );
 
-    // 6g. Build and encrypt manifest (`manifest.json.enc`) and fsync staging BEFORE committing in
-    //     PostgreSQL. `backup-meta.json` and the atomic rename happen ONLY AFTER PostgreSQL
-    //     commits `backup_runs.state = 'succeeded'`.
+    // 7g. Build and encrypt manifest (`manifest.json.enc`) and `fsync` BOTH `staging_dir` and
+    //     `dest_root` BEFORE staging publication in PostgreSQL (`capturing -> publishing`) so
+    //     `.staging.<run_id>`'s directory entry is durable on disk before DB commit.
     let completed_at_str: String = sqlx::query_scalar(
         "SELECT to_char(greatest(clock_timestamp(), $1::timestamptz) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
     )
@@ -2458,15 +2762,27 @@ async fn capture_body(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|_| {
         CaptureFailure::BeforeCommit(BackupError::Integrity("manifest serialization failed"))
     })?;
-    let manifest_stats = encrypt_bytes_to_file(
-        keyring,
-        run_id,
-        "manifest",
-        &manifest_bytes,
-        &staging_dir.join("manifest.json.enc"),
-    )
-    .map_err(CaptureFailure::BeforeCommit)?;
-    fsync_dir(staging_dir).map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
+    let manifest_stats = {
+        let manifest_path = staging_dir.join("manifest.json.enc");
+        let staging_dir_bg = staging_dir.to_path_buf();
+        let dest_root_bg = dest_root.to_path_buf();
+        let keyring_bg = keyring.clone();
+        let run_id_bg = run_id.clone();
+        run_blocking_with_lease_check(&lease_lost, move |_cancel| {
+            let stats = encrypt_bytes_to_file(
+                &keyring_bg,
+                &run_id_bg,
+                "manifest",
+                &manifest_bytes,
+                &manifest_path,
+            )?;
+            fsync_dir(&staging_dir_bg)?;
+            fsync_dir(&dest_root_bg)?;
+            Ok(stats)
+        })
+        .await
+        .map_err(CaptureFailure::BeforeCommit)?
+    };
 
     let manifest_ct_hex = hex(&manifest_stats.ciphertext_sha256);
     let final_bundle_digest = compute_bundle_digest(&components, &manifest_ct_hex);
@@ -2475,17 +2791,18 @@ async fn capture_body(
     let final_dir_name = format!("backup-{}-{run_id}", completed_dt.format("%Y%m%dT%H%M%SZ"));
     let final_dir = dest_root.join(&final_dir_name);
 
-    // Stop the background lease heartbeat cleanly before committing completion so no concurrent
-    // renewal races with `backup_complete_capture`.
+    // Stop the background lease heartbeat cleanly before staging publication so no concurrent
+    // renewal races with `backup_stage_publication`.
     let lost_before_commit = heartbeat.is_lost();
     heartbeat.stop().await;
     if lost_before_commit {
         return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
-            "backup capture lease lost before completion commit",
+            "backup capture lease lost before staging publication",
         )));
     }
 
-    // 7. Commit `backup_runs.state = 'succeeded'` in PostgreSQL FIRST (commit-before-marker).
+    // 8. Stage publication (`capturing -> publishing`) in PostgreSQL FIRST. `publishing` does NOT
+    //    increment `succeeded` telemetry or reset the RPO clock until step 10 confirms publication.
     let journal_chain_bytes =
         decode_hex_32(&parsed_export.digest).map_err(CaptureFailure::BeforeCommit)?;
     let lifecycle_baseline_bytes = parsed_export
@@ -2502,6 +2819,7 @@ async fn capture_body(
         "schema_version": schema_version,
         "crate_version": env!("CARGO_PKG_VERSION"),
         "destination_domain": opts.destination_domain,
+        "reason": opts.reason,
         "encryption_key_id": keyring.active_key_id(),
         "artifact_revision_count": artifact_summary.revision_count,
         "artifact_payload_bytes": artifact_summary.payload_bytes,
@@ -2511,11 +2829,11 @@ async fn capture_body(
     });
     let summary_text = summary_json.to_string();
 
-    let commit_res: Result<(), sqlx::Error> = async {
+    let stage_res: Result<(), sqlx::Error> = async {
         let mut tx = read_committed(pool).await?;
         sqlx::query(
-            "SELECT openmettle.backup_complete_capture(
-                $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12
+            "SELECT openmettle.backup_stage_publication(
+                $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb
             )",
         )
         .bind(run_id)
@@ -2529,47 +2847,59 @@ async fn capture_body(
         .bind(lifecycle_baseline_bytes.as_ref().map(<[u8; 32]>::as_slice))
         .bind(parsed_export.connection_origin_us)
         .bind(&summary_text)
-        .bind(&opts.reason)
         .execute(&mut *tx)
         .await?;
         tx.commit().await
     }
     .await;
 
-    if let Err(commit_err) = commit_res {
+    if let Err(stage_err) = stage_res {
         // Explicit database refusal (e.g., OMB02 lease lost/aborted) definitely rolled back.
-        if matches!(commit_err, sqlx::Error::Database(_)) {
-            return Err(CaptureFailure::BeforeCommit(commit_err.into()));
+        if matches!(stage_err, sqlx::Error::Database(_)) {
+            return Err(CaptureFailure::BeforeCommit(stage_err.into()));
         }
-        // Ambiguous transport/commit error: inspect backup_runs before deciding whether to publish
-        // or abort.
-        match sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT state, encode(bundle_digest, 'hex')
-               FROM openmettle.backup_runs
-              WHERE id = $1::uuid",
-        )
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await
-        {
+        // Ambiguous transport/commit error: perform a locking FOR SHARE read in a fresh READ
+        // COMMITTED transaction so we wait for any in-flight commit on the original connection to
+        // settle before deciding whether to publish, preserve staging, or abort.
+        let probe: Result<Option<(String, Option<String>)>, sqlx::Error> = async {
+            let mut probe_tx = read_committed(pool).await?;
+            let row = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT state, encode(bundle_digest, 'hex')
+                   FROM openmettle.backup_runs
+                  WHERE id = $1::uuid
+                    FOR SHARE",
+            )
+            .bind(run_id)
+            .fetch_optional(&mut *probe_tx)
+            .await?;
+            probe_tx.commit().await?;
+            Ok(row)
+        }
+        .await;
+        match probe {
             Ok(Some((state, Some(db_bundle))))
-                if state == "succeeded" && db_bundle == final_bundle_hex =>
+                if matches!(state.as_str(), "publishing" | "succeeded")
+                    && db_bundle == final_bundle_hex =>
             {
-                // Commit actually landed in PostgreSQL; proceed to publish marker & rename.
+                // Staged publication actually landed in PostgreSQL; proceed to publish on disk.
             }
             Ok(_) => {
-                // Confirmed not committed in PostgreSQL; safe to remove staging and fail.
-                return Err(CaptureFailure::BeforeCommit(commit_err.into()));
+                // Locking read proved stage publication did not commit; safe to clean staging and fail.
+                return Err(CaptureFailure::BeforeCommit(stage_err.into()));
             }
             Err(_) => {
-                // Database unreachable after commit attempt: preserve staging for idempotent retry.
-                return Err(CaptureFailure::PreserveStaging(commit_err.into()));
+                // Database unreachable / commit outcome genuinely uncertain: preserve staging and do
+                // NOT call `fail_capture`.
+                return Err(CaptureFailure::PreserveStaging(
+                    BackupError::CommitOutcomeUnknown,
+                ));
             }
         }
     }
 
-    // 8. PostgreSQL has committed `succeeded`: write `backup-meta.json`, fsync staging, atomically
-    //    rename into the published `backup-*` directory, and fsync the destination root.
+    // 9. PostgreSQL staged `publishing`: atomically write `backup-meta.json` via temp file + rename,
+    //    `fsync` staging, atomically rename into `backup-*`, and `fsync` destination root on the
+    //    blocking pool.
     let meta = BackupMeta {
         format: META_FORMAT.to_owned(),
         installation_id: installation_id.clone(),
@@ -2581,28 +2911,48 @@ async fn capture_body(
         bundle_digest: final_bundle_hex.clone(),
         state: "complete".to_owned(),
     };
-    let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(|_| {
-        CaptureFailure::PreserveStaging(BackupError::Integrity("backup-meta serialization failed"))
-    })?;
-    write_file_0600(&staging_dir.join("backup-meta.json"), &meta_bytes)
-        .map_err(|e| CaptureFailure::PreserveStaging(e.into()))?;
-    fsync_dir(staging_dir).map_err(|e| CaptureFailure::PreserveStaging(e.into()))?;
-    fs::rename(staging_dir, &final_dir).map_err(|e| CaptureFailure::PreserveStaging(e.into()))?;
-    fsync_dir(dest_root).map_err(|e| CaptureFailure::PreserveStaging(e.into()))?;
+    {
+        let dest_root_bg = dest_root.to_path_buf();
+        let staging_dir_bg = staging_dir.to_path_buf();
+        let final_dir_bg = final_dir.clone();
+        let meta_bg = meta.clone();
+        tokio::task::spawn_blocking(move || {
+            publish_staged_dir_blocking(&dest_root_bg, &staging_dir_bg, &final_dir_bg, &meta_bg)
+        })
+        .await
+        .map_err(|_| CaptureFailure::PreserveStaging(BackupError::PgDump("publish task failed")))?
+        .map_err(CaptureFailure::PreserveStaging)?;
+    }
 
-    // 9. Run verified GFS retention pruning scoped to this `(installation_id, destination_domain)`,
-    //    then optionally release maintenance strictly if this capture run opened the window.
+    // 10. Confirm publication (`publishing -> succeeded`) in PostgreSQL now that the published
+    //     backup directory is durable on disk.
+    confirm_publication(pool, run_id, &opts.reason)
+        .await
+        .map_err(CaptureFailure::PreserveStaging)?;
+
+    // 11. Run verified GFS retention pruning on the blocking pool scoped to this
+    //     `(installation_id, destination_domain)`, then optionally release maintenance strictly if
+    //     this capture run opened the window.
     let pruned = match opts.prune_policy {
-        Some(policy) => Some(
-            prune_destination_with_verifier(
-                dest_root,
-                policy,
-                Some((installation_id.as_str(), opts.destination_domain.as_str())),
-                false,
-                |dir, m| verify_backup_dir_for_prune(dir, m, keyring),
-            )
-            .map_err(|e| CaptureFailure::PreserveStaging(e.into()))?,
-        ),
+        Some(policy) => {
+            let dest_root_bg = dest_root.to_path_buf();
+            let inst_bg = installation_id.clone();
+            let dom_bg = opts.destination_domain.clone();
+            let keyring_bg = keyring.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                prune_destination_with_verifier(
+                    &dest_root_bg,
+                    policy,
+                    Some((inst_bg.as_str(), dom_bg.as_str())),
+                    false,
+                    |dir, m| verify_backup_dir_for_prune(dir, m, &keyring_bg),
+                )
+            })
+            .await
+            .map_err(|_| CaptureFailure::PreserveStaging(BackupError::PgDump("prune task failed")))?
+            .map_err(|e| CaptureFailure::PreserveStaging(e.into()))?;
+            Some(report)
+        }
         None => None,
     };
 
@@ -2914,10 +3264,9 @@ fn load_and_verify_manifest(
             "--backup-dir must be an existing non-symlink directory",
         ));
     }
-    let mut meta_file = open_regular_nofollow(&backup_dir.join("backup-meta.json"))
-        .map_err(|_| BackupError::Integrity("backup-meta.json missing"))?;
-    let mut meta_bytes = Vec::new();
-    meta_file.read_to_end(&mut meta_bytes)?;
+    let meta_bytes =
+        read_regular_bounded_nofollow(&backup_dir.join("backup-meta.json"), MAX_BACKUP_META_BYTES)
+            .map_err(|_| BackupError::Integrity("backup-meta.json missing"))?;
     let meta: BackupMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|_| BackupError::Integrity("backup-meta.json malformed"))?;
     let manifest = decrypt_and_validate_manifest_file(backup_dir, &meta, keyring)?;
@@ -3032,18 +3381,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_validated_pg_uri_handles_allowed_fields_and_rejects_unknown_or_multihost() {
+    fn parse_validated_pg_uri_handles_allowed_fields_and_rejects_hostaddr_or_missing_parts() {
         let p = parse_validated_pg_uri(
-            "postgresql://openmettle_owner:s%3Aec%5Cret@db.example.test:55447/om_db?hostaddr=127.0.0.1&sslmode=verify-full&sslrootcert=/etc/ca.pem&sslcert=/etc/client.pem&sslkey=/etc/client.key&application_name=om-backup",
+            "postgresql://openmettle_owner:s%3Aec%5Cret@db.example.test:55447/om_db?sslmode=verify-full&sslrootcert=/etc/ca.pem&sslcert=/etc/client.pem&sslkey=/etc/client.key&application_name=om-backup",
         )
         .unwrap();
-        assert_eq!(p.username.as_deref(), Some("openmettle_owner"));
+        assert_eq!(p.username, "openmettle_owner");
         assert_eq!(p.password.as_deref(), Some("s:ec\\ret"));
-        assert_eq!(p.host.as_deref(), Some("db.example.test"));
-        assert_eq!(p.hostaddr.as_deref(), Some("127.0.0.1"));
-        assert_eq!(p.port, Some(55447));
-        assert_eq!(p.database.as_deref(), Some("om_db"));
-        assert_eq!(p.sslmode.as_deref(), Some("verify-full"));
+        assert_eq!(p.host, "db.example.test");
+        assert_eq!(p.port, 55447);
+        assert_eq!(p.database, "om_db");
+        assert_eq!(p.sslmode, "verify-full");
         assert_eq!(p.sslrootcert.as_deref(), Some("/etc/ca.pem"));
         assert_eq!(p.sslcert.as_deref(), Some("/etc/client.pem"));
         assert_eq!(p.sslkey.as_deref(), Some("/etc/client.key"));
@@ -3053,19 +3401,24 @@ mod tests {
         // Debug redacts password.
         assert!(!format!("{p:?}").contains("s:ec\\ret"));
 
-        let v6 = parse_validated_pg_uri("postgres://user:pw@[::1]:5432/db").unwrap();
-        assert_eq!(v6.host.as_deref(), Some("::1"));
-        assert_eq!(v6.port, Some(5432));
+        let v6 = parse_validated_pg_uri("postgres://user:pw@[::1]/db").unwrap();
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, 5432);
+        assert_eq!(v6.sslmode, "prefer");
 
-        // Rejected: unknown query params, multi-host, duplicate params, invalid sslmode,
-        // invalid hostaddr, malformed query pair, fragment, newline in password.
+        // Rejected: hostaddr, missing host/user/db, unknown query params, multi-host, duplicate
+        // params, invalid sslmode, malformed query pair, fragment, newline in password.
         for bad in [
+            "postgres://u:p@db.example.test:5432/db?hostaddr=127.0.0.1",
+            "postgres://u:p@127.0.0.1:5432/db?hostaddr=not-an-ip",
+            "postgres://127.0.0.1:5432/db",
+            "postgres://u:p@127.0.0.1:5432/",
+            "postgres://u:p@/db",
             "postgres://u:p@127.0.0.1:5432/db?channel_binding=require",
             "postgres://u:p@127.0.0.1:5432/db?options=-c%20search_path=public",
             "postgres://u:p@host1:5432,host2:5432/db",
             "postgres://u:p@127.0.0.1:5432/db?host=a,b",
             "postgres://u:p@127.0.0.1:5432/db?sslmode=bogus",
-            "postgres://u:p@127.0.0.1:5432/db?hostaddr=not-an-ip",
             "postgres://u:p@127.0.0.1:5432/db?sslmode=require&sslmode=disable",
             "postgres://u:p@127.0.0.1:5432/db?sslmode",
             "postgres://u:p@127.0.0.1:5432/db#frag",
@@ -3076,6 +3429,95 @@ mod tests {
                 "expected URI to be rejected: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn pg_uri_ignores_ambient_pgport_and_pg_env_in_both_sqlx_and_pg_dump() {
+        if std::env::var_os("OPENMETTLE_TEST_PGPORT_CHILD").is_some() {
+            let uri = "postgres://openmettle_owner:pw@db.example.test/om_db";
+            let cfg = parse_validated_pg_uri(uri).unwrap();
+            assert_eq!(cfg.port, 5432);
+            assert_eq!(cfg.sslmode, "prefer");
+            let opts = cfg.to_sqlx_options().unwrap();
+            assert_eq!(opts.get_host(), "db.example.test");
+            assert_eq!(opts.get_port(), 5432);
+            assert_eq!(opts.get_username(), "openmettle_owner");
+            assert_eq!(opts.get_database(), Some("om_db"));
+            assert!(matches!(opts.get_ssl_mode(), PgSslMode::Prefer));
+
+            // Verify CliPgDumpRunner also passes explicit port 5432 / sslmode prefer and scrubs PG*.
+            let mut rnd = [0u8; 4];
+            SystemRandom::new().fill(&mut rnd).unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "om-pgport-child-{}-{:02x}{:02x}{:02x}{:02x}",
+                std::process::id(),
+                rnd[0],
+                rnd[1],
+                rnd[2],
+                rnd[3]
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("fake-pg-dump.sh");
+            let observed = dir.join("observed.txt");
+            let body = format!(
+                "#!/bin/sh\nset -eu\n\
+                 printf 'ARGS=%s\\n' \"$*\" > \"{}\"\n\
+                 printf 'PGPORT=%s\\n' \"${{PGPORT:-}}\" >> \"{}\"\n\
+                 printf 'PGHOST=%s\\n' \"${{PGHOST:-}}\" >> \"{}\"\n\
+                 printf 'PGSSLMODE=%s\\n' \"${{PGSSLMODE:-}}\" >> \"{}\"\n\
+                 printf 'OK'\n",
+                observed.display(),
+                observed.display(),
+                observed.display(),
+                observed.display(),
+            );
+            fs::write(&script, body).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let runner = CliPgDumpRunner::with_program(&script);
+            let mut out = Vec::new();
+            runner
+                .dump(uri, None, &DumpCancel::new(), &mut out)
+                .unwrap();
+            let obs = fs::read_to_string(&observed).unwrap();
+            assert!(
+                obs.contains(
+                    "--host db.example.test --port 5432 --username openmettle_owner --dbname om_db"
+                ),
+                "unexpected argv: {obs}"
+            );
+            assert!(obs.contains("PGPORT=\n"), "PGPORT leaked: {obs}");
+            assert!(obs.contains("PGHOST=\n"), "PGHOST leaked: {obs}");
+            assert!(obs.contains("PGSSLMODE=prefer\n"), "PGSSLMODE wrong: {obs}");
+
+            // Ambient PGOPTIONS / PGSSLROOTCERT without matching URI setting must fail closed.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Re-exec this single unit test with hostile ambient PG* variables (zero unsafe code).
+        let exe = std::env::current_exe().unwrap();
+        let out = Command::new(&exe)
+            .args([
+                "--exact",
+                "backup::tests::pg_uri_ignores_ambient_pgport_and_pg_env_in_both_sqlx_and_pg_dump",
+            ])
+            .env("OPENMETTLE_TEST_PGPORT_CHILD", "1")
+            .env("PGPORT", "55439")
+            .env("PGHOST", "wrong.invalid")
+            .env("PGHOSTADDR", "127.0.0.2")
+            .env("PGUSER", "wrong_user")
+            .env("PGDATABASE", "wrong_db")
+            .env("PGSSLMODE", "disable")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "PGPORT isolation subprocess failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -3099,13 +3541,11 @@ mod tests {
              printf 'ARGS=%s\\n' \"$*\" > \"{}\"\n\
              printf 'PGPASSFILE=%s\\n' \"${{PGPASSFILE:-}}\" >> \"{}\"\n\
              printf 'PGPASSWORD=%s\\n' \"${{PGPASSWORD:-}}\" >> \"{}\"\n\
-             printf 'PGHOSTADDR=%s\\n' \"${{PGHOSTADDR:-}}\" >> \"{}\"\n\
              printf 'PGSSLMODE=%s\\n' \"${{PGSSLMODE:-}}\" >> \"{}\"\n\
              printf 'PGSSLROOTCERT=%s\\n' \"${{PGSSLROOTCERT:-}}\" >> \"{}\"\n\
              printf 'PGAPPNAME=%s\\n' \"${{PGAPPNAME:-}}\" >> \"{}\"\n\
              printf 'CONTENT=%s\\n' \"$(tr '\\n' '|' < \"$PGPASSFILE\")\" >> \"{}\"\n\
              printf 'PGDMP-SYNTHETIC-PAYLOAD'\n",
-            observed.display(),
             observed.display(),
             observed.display(),
             observed.display(),
@@ -3121,8 +3561,9 @@ mod tests {
         let mut out = Vec::new();
         let written = runner
             .dump(
-                "postgres://openmettle_owner:supersecret:pw@db.example.test:55447/openmettle?hostaddr=127.0.0.1&sslmode=verify-ca&sslrootcert=/etc/ca.pem&application_name=om-backup",
+                "postgres://openmettle_owner:supersecret:pw@db.example.test:55447/openmettle?sslmode=verify-ca&sslrootcert=/etc/ca.pem&application_name=om-backup",
                 Some("00000003-00000010-1"),
+                &DumpCancel::new(),
                 &mut out,
             )
             .unwrap();
@@ -3150,13 +3591,12 @@ mod tests {
         assert!(!pgpass_line.is_empty());
         assert!(!Path::new(pgpass_line).exists());
         assert!(obs.contains("PGPASSWORD=\n"));
-        assert!(obs.contains("PGHOSTADDR=127.0.0.1\n"));
         assert!(obs.contains("PGSSLMODE=verify-ca\n"));
         assert!(obs.contains("PGSSLROOTCERT=/etc/ca.pem\n"));
         assert!(obs.contains("PGAPPNAME=om-backup\n"));
         assert!(
             obs.contains(
-                r"CONTENT=db.example.test:55447:openmettle:openmettle_owner:supersecret\:pw|127.0.0.1:55447:openmettle:openmettle_owner:supersecret\:pw|"
+                r"CONTENT=db.example.test:55447:openmettle:openmettle_owner:supersecret\:pw|"
             ),
             "unexpected pgpass content: {obs}"
         );
@@ -3185,6 +3625,7 @@ mod tests {
             .dump(
                 "postgres://openmettle_owner:pw@127.0.0.1:55447/openmettle?sslmode=disable",
                 None,
+                &DumpCancel::new(),
                 &mut FailingWriter,
             )
             .unwrap_err();
@@ -3192,6 +3633,95 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "pg_dump write error stalled instead of killing child"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_pg_dump_runner_cancel_kills_and_reaps_stalled_child_promptly() {
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-pgdump-cancel-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let pid_file = dir.join("child.pid");
+        let pgpass_record = dir.join("pgpass.path");
+        let stalled = dir.join("stalled-pg-dump.sh");
+        let body = format!(
+            "#!/bin/sh\nset -eu\n\
+             printf '%s' \"$$\" > \"{}\"\n\
+             printf '%s' \"${{PGPASSFILE:-}}\" > \"{}\"\n\
+             exec sleep 60\n",
+            pid_file.display(),
+            pgpass_record.display(),
+        );
+        fs::write(&stalled, body).unwrap();
+        fs::set_permissions(&stalled, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cancel = DumpCancel::new();
+        let cancel_trigger = cancel.clone();
+        let pid_wait = pid_file.clone();
+        let trigger_thread = std::thread::spawn(move || {
+            for _ in 0..200 {
+                if fs::read_to_string(&pid_wait)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel_trigger.cancel();
+        });
+
+        let started = Instant::now();
+        let runner = CliPgDumpRunner::with_program(&stalled);
+        let mut out = Vec::new();
+        let err = runner
+            .dump(
+                "postgres://openmettle_owner:pw@127.0.0.1:55447/openmettle?sslmode=disable",
+                None,
+                &cancel,
+                &mut out,
+            )
+            .unwrap_err();
+        trigger_thread.join().unwrap();
+        assert!(
+            matches!(err, BackupError::GateNotReady(_)),
+            "expected GateNotReady cancellation error, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stalled pg_dump cancellation took too long: {:?}",
+            started.elapsed()
+        );
+
+        let pgpass_path = fs::read_to_string(&pgpass_record).unwrap();
+        assert!(
+            !pgpass_path.is_empty() && !Path::new(&pgpass_path).exists(),
+            "PGPASSFILE must be unlinked after cancellation"
+        );
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        assert!(!pid.is_empty());
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !alive,
+            "stalled pg_dump child PID {pid} must be killed and reaped before dump() returns"
         );
 
         let _ = fs::remove_dir_all(&dir);
