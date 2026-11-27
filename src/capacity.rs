@@ -371,37 +371,47 @@ pub(super) async fn resume_query(
         .map_err(Error::from)
 }
 
-/// Detects whether `c` is currently inside a caller-owned SQL transaction (such as a literal
-/// `BEGIN` block that bypassed SQLx's `Transaction` API, where `c.is_in_transaction()` stays
-/// `false`).
+/// Confirms that `c` is idle in autocommit mode (not inside a caller-owned SQL transaction such
+/// as a literal `BEGIN` block that bypassed SQLx's `Transaction` API, where
+/// `c.is_in_transaction()` stays `false`). Never returns an error: a failing telemetry probe
+/// suppresses telemetry instead of replacing an already-committed or already-decided result.
 ///
 /// - When the write `succeeded`, every `Ok` path in `openmettle.capacity_resume`,
 ///   `openmettle.capacity_grant`, and `openmettle.capacity_reconcile` runs `capacity_fence` ->
 ///   `capacity_lock_group` (`FOR NO KEY UPDATE`), assigning a PostgreSQL transaction ID (`xid`).
 ///   In autocommit mode that statement has already committed, so `pg_current_xact_id_if_assigned()`
-///   is `NULL` in the follow-up query; inside an uncommitted `BEGIN` block it remains non-`NULL`.
+///   is `NULL` (`Ok(false)`); inside an uncommitted `BEGIN` block it remains non-`NULL`.
 /// - When the write failed (`!succeeded`), it may have failed before touching PostgreSQL (such as
-///   `Error::Invalid`) or aborted an outer `BEGIN` block (`25P02`). A brief pause ensures
-///   `statement_timestamp() > transaction_timestamp()` inside an open transaction; any probe error
-///   (including `25P02`) likewise indicates a caller-owned transaction.
-async fn caller_owns_transaction(c: &mut PgConnection, succeeded: bool) -> Result<bool, Error> {
+///   `Error::Invalid`) or aborted an outer `BEGIN` block (`25P02`). Uses PostgreSQL's Simple Query
+///   Protocol (`sqlx::raw_sql`) rather than Extended Query Protocol so an idle autocommit probe
+///   sets `transaction_timestamp() = statement_timestamp()` identically (Extended Query's `Bind`
+///   and `Execute` refresh `statement_timestamp()` separately). After a 1 ms pause, an idle
+///   autocommit connection returns `"0"`, whereas an open `BEGIN` block returns `"1"` and an
+///   aborted `BEGIN` block (`25P02`) or probe failure returns `Err(_)`.
+async fn autocommit_confirmed(c: &mut PgConnection, succeeded: bool) -> bool {
     if succeeded {
-        let in_tx: bool = sqlx::query_scalar("SELECT pg_current_xact_id_if_assigned() IS NOT NULL")
-            .fetch_one(&mut *c)
-            .await?;
-        Ok(in_tx)
+        matches!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_current_xact_id_if_assigned() IS NOT NULL")
+                .fetch_one(&mut *c)
+                .await,
+            Ok(false)
+        )
     } else {
-        tokio::time::sleep(Duration::from_micros(2)).await;
-        match sqlx::query_scalar::<_, bool>(
-            "SELECT pg_current_xact_id_if_assigned() IS NOT NULL \
-                 OR transaction_timestamp() < statement_timestamp()",
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let probe = sqlx::raw_sql(
+            "SELECT CASE WHEN pg_current_xact_id_if_assigned() IS NOT NULL \
+                 OR transaction_timestamp() < statement_timestamp() \
+                 THEN '1' ELSE '0' END",
         )
         .fetch_one(&mut *c)
-        .await
-        {
-            Ok(in_tx) => Ok(in_tx),
-            Err(_) => Ok(true),
-        }
+        .await;
+        matches!(
+            probe
+                .as_ref()
+                .ok()
+                .and_then(|row| row.try_get::<&str, _>(0).ok()),
+            Some("0")
+        )
     }
 }
 
@@ -434,7 +444,7 @@ async fn resume_with_metrics(
     }
     let started = Instant::now();
     let result = resume_query(&mut *c, controller).await;
-    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+    if !autocommit_confirmed(&mut *c, result.is_ok()).await {
         return result;
     }
     let outcome = match &result {
@@ -535,19 +545,17 @@ pub async fn grant(
         return grant_inner(c, controller, request).await;
     }
     let started = Instant::now();
-    let mut result = grant_inner(&mut *c, controller, request).await;
-    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+    let result = grant_inner(&mut *c, controller, request).await;
+    if !autocommit_confirmed(&mut *c, result.is_ok()).await {
         return result;
     }
-    if matches!(result, Ok(Decision::Unavailable)) {
-        match group_observation_stale(&mut *c, &controller.group_id).await {
-            Ok(true) => {
-                metrics::global()
-                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-            }
-            Ok(false) => {}
-            Err(err) => result = Err(err),
-        }
+    if matches!(result, Ok(Decision::Unavailable))
+        && matches!(
+            group_observation_stale(&mut *c, &controller.group_id).await,
+            Ok(true)
+        )
+    {
+        metrics::global().record_capacity_stale_observation(CapacityStaleSurface::Controller);
     }
     let (grant_id, outcome) = match &result {
         Ok(Decision::Grant { grant_id, state }) => {
@@ -673,7 +681,7 @@ async fn reconcile_with_metrics(
     }
     let started = Instant::now();
     let result = reconcile_inner(&mut *c, controller, grant_id, evidence).await;
-    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+    if !autocommit_confirmed(&mut *c, result.is_ok()).await {
         return result;
     }
     let outcome = reconcile_outcome(&result, evidence);

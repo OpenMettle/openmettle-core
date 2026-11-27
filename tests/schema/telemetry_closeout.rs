@@ -1511,6 +1511,18 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
         .await
         .unwrap();
     let mut worker_conn = worker(&db).await;
+    let stale_controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.capacity_groups
+            SET lease_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     let controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
         .await
         .unwrap();
@@ -1641,9 +1653,81 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
         st.events.clear();
     }
 
+    // 2a. Autocommit failures (both pre-SQL `Error::Invalid` and DB-raised `Error::Fenced`) MUST
+    //     emit telemetry via Simple Query Protocol confirmation rather than false-suppressing.
+    let before_auto_refused =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Refused);
+    let before_auto_fenced =
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Fenced);
+    let invalid_req = GrantRequest {
+        scope_id: "not-a-uuid",
+        run_id: &claims[1].run_id,
+        claim_token: &claims[1].claim_token,
+        request_key: "autocommit-invalid-grant",
+        profile: "synthetic-image",
+        footprint: &footprint,
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            capacity::grant(&mut worker_conn, coord.controller(), &invalid_req).await,
+            Err(capacity::Error::Invalid)
+        );
+    }
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Refused),
+        before_auto_refused + 5,
+        "idle autocommit Error::Invalid calls must record Refused telemetry every time"
+    );
+    {
+        let mut st = recorder.state.lock().unwrap();
+        assert_eq!(st.closed_spans.len(), 5);
+        assert_eq!(st.events.len(), 5);
+        for span in &st.closed_spans {
+            assert_eq!(
+                span.get("operation.outcome").map(String::as_str),
+                Some("refused")
+            );
+        }
+        for event in &st.events {
+            assert_eq!(
+                event.get("operation.outcome").map(String::as_str),
+                Some("refused")
+            );
+        }
+        st.closed_spans.clear();
+        st.events.clear();
+    }
+    assert_eq!(
+        capacity::resume(&mut worker_conn, &stale_controller).await,
+        Err(capacity::Error::Fenced)
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Fenced),
+        before_auto_fenced + 1,
+        "idle autocommit DB-raised Error::Fenced must record Fenced telemetry"
+    );
+    {
+        let mut st = recorder.state.lock().unwrap();
+        assert_eq!(st.closed_spans.len(), 1);
+        assert_eq!(
+            st.closed_spans[0]
+                .get("operation.outcome")
+                .map(String::as_str),
+            Some("fenced")
+        );
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(
+            st.events[0].get("operation.outcome").map(String::as_str),
+            Some("fenced")
+        );
+        st.closed_spans.clear();
+        st.events.clear();
+    }
+
     // 2b. Literal SQL `BEGIN` on a raw `PgConnection` bypasses SQLx's `is_in_transaction()` flag;
     //     `capacity::resume`, `capacity::grant`, and `capacity::reconcile` (including pre-SQL
-    //     `Error::Invalid`) must still suppress telemetry and roll back cleanly.
+    //     `Error::Invalid` and DB-aborted `25P02` `Error::Fenced`) must suppress telemetry and
+    //     roll back cleanly.
     let before_raw_granted =
         metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted);
     let before_raw_refused =
@@ -1652,6 +1736,8 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
         metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed);
     let before_raw_releasing = metrics::global()
         .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing);
+    let before_raw_fenced =
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Fenced);
     {
         let mut raw_conn = worker(&db).await;
         sqlx::query("BEGIN").execute(&mut raw_conn).await.unwrap();
@@ -1706,6 +1792,18 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
             .execute(&mut raw_conn)
             .await
             .unwrap();
+
+        // Aborted literal `BEGIN` (`25P02` after DB-raised `Error::Fenced`) must also suppress
+        // telemetry cleanly and preserve the original `Error::Fenced`.
+        sqlx::query("BEGIN").execute(&mut raw_conn).await.unwrap();
+        assert_eq!(
+            capacity::resume(&mut raw_conn, &stale_controller).await,
+            Err(capacity::Error::Fenced)
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut raw_conn)
+            .await
+            .unwrap();
     }
     assert_eq!(
         metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
@@ -1727,6 +1825,11 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
             .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing),
         before_raw_releasing,
         "rolled-back literal BEGIN must not emit global Releasing metric"
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Fenced),
+        before_raw_fenced,
+        "aborted literal BEGIN (25P02) must not emit global Fenced metric"
     );
     {
         let st = recorder.state.lock().unwrap();
@@ -1819,6 +1922,261 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
         assert_eq!(
             st.events[0].get("operation.outcome").map(String::as_str),
             Some("error")
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn capacity_probe_failures_never_replace_committed_results() {
+    use openmettle_core::{
+        capacity::{
+            self, Controller, Decision, DeviceBytes, DeviceObservation, Evidence, GrantRequest,
+            GrantState, Observation,
+        },
+        telemetry::metrics::{CapacityOperation, CapacityOutcome},
+    };
+    use std::sync::Arc;
+
+    struct DbPrivilegeRestore {
+        db: String,
+        statements: Vec<String>,
+    }
+    impl Drop for DbPrivilegeRestore {
+        fn drop(&mut self) {
+            admin_blocking(Some(self.db.clone()), self.statements.clone());
+        }
+    }
+
+    const GROUP: &str = "00000000-0000-4000-8000-00000000d031";
+    const GPU0: &str = "00000000-0000-4000-8000-00000000d0d3";
+    const GIB: i64 = 1 << 30;
+    const TOTAL: i64 = 24 * GIB;
+    const FLOOR: i64 = 16 * GIB;
+    const HEADROOM: i64 = GIB;
+
+    let db = TestDb::migrated_exclusive().await;
+    let _restore = DbPrivilegeRestore {
+        db: db.0.clone(),
+        statements: vec![
+            "GRANT SELECT ON openmettle.capacity_groups TO openmettle_worker".to_owned(),
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_xact_id_if_assigned() TO PUBLIC"
+                .to_owned(),
+        ],
+    };
+
+    let mut superuser = admin(Some(&db.0)).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let (scope, claims) =
+        seed_capacity_group_and_claimed_runs(&db, &mut owner, GROUP, GPU0, FLOOR, 1).await;
+
+    let mut worker_conn = worker(&db).await;
+    let controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    capacity::set_backend_unknown(&mut worker_conn, &controller, false)
+        .await
+        .unwrap();
+    let now_us: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+            .fetch_one(&mut worker_conn)
+            .await
+            .unwrap();
+    let obs = [DeviceObservation {
+        device_id: GPU0.into(),
+        total_bytes: TOTAL,
+        committed_bytes: 0,
+        actual_used_bytes: FLOOR,
+        reclaimable_bytes: 0,
+        safety_headroom_bytes: HEADROOM,
+        active_chat_floor_bytes: FLOOR,
+        grantable_bytes: TOTAL - FLOOR - HEADROOM,
+    }];
+    assert!(
+        capacity::publish(
+            &mut worker_conn,
+            &controller,
+            &Observation {
+                revision: 1,
+                observed_at_us: now_us,
+                commit_watermark: 0,
+                devices: &obs,
+            },
+        )
+        .await
+        .unwrap()
+    );
+
+    let footprint = [DeviceBytes {
+        device_id: GPU0.into(),
+        bytes: 2 * GIB,
+    }];
+    let req0 = GrantRequest {
+        scope_id: &scope,
+        run_id: &claims[0].run_id,
+        claim_token: &claims[0].claim_token,
+        request_key: "probe-failure-resilience-grant",
+        profile: "synthetic-image",
+        footprint: &footprint,
+    };
+
+    let recorder = Arc::new(CapacityTraceRecorder::default());
+    let _sub_guard = tracing::subscriber::set_default(recorder.clone());
+
+    // 1. Before `resume`, `capacity::grant` returns `Ok(Decision::Unavailable)`. Revoking
+    //    `SELECT ON openmettle.capacity_groups` from `openmettle_worker` makes the post-decision
+    //    `group_observation_stale` probe fail with 42501; `grant` MUST still return
+    //    `Ok(Decision::Unavailable)` and emit `Unavailable` telemetry.
+    let before_unavailable = metrics::global()
+        .capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Unavailable);
+    sqlx::query("REVOKE SELECT ON openmettle.capacity_groups FROM openmettle_worker")
+        .execute(&mut superuser)
+        .await
+        .unwrap();
+    assert_eq!(
+        capacity::grant(&mut worker_conn, &controller, &req0)
+            .await
+            .unwrap(),
+        Decision::Unavailable
+    );
+    sqlx::query("GRANT SELECT ON openmettle.capacity_groups TO openmettle_worker")
+        .execute(&mut superuser)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics::global()
+            .capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Unavailable),
+        before_unavailable + 1
+    );
+    {
+        let mut st = recorder.state.lock().unwrap();
+        assert_eq!(st.closed_spans.len(), 1);
+        assert_eq!(
+            st.closed_spans[0]
+                .get("operation.outcome")
+                .map(String::as_str),
+            Some("unavailable")
+        );
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(
+            st.events[0].get("operation.outcome").map(String::as_str),
+            Some("unavailable")
+        );
+        st.closed_spans.clear();
+        st.events.clear();
+    }
+
+    // 2. Revoking `EXECUTE` on `pg_catalog.pg_current_xact_id_if_assigned()` causes the post-write
+    //    autocommit confirmation probe to fail; autocommit `resume`, `grant`, and `reconcile` MUST
+    //    all still return `Ok(...)` and persist their state changes in PostgreSQL while cleanly
+    //    suppressing telemetry.
+    let before_resumed =
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed);
+    let before_granted =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted);
+    let before_releasing = metrics::global()
+        .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing);
+    let before_resume_err =
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error);
+    let before_grant_err =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Error);
+    let before_reconcile_err = metrics::global()
+        .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error);
+
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_current_xact_id_if_assigned() FROM PUBLIC",
+    )
+    .execute(&mut superuser)
+    .await
+    .unwrap();
+
+    assert!(
+        capacity::resume(&mut worker_conn, &controller)
+            .await
+            .unwrap()
+    );
+    let ready: bool = sqlx::query_scalar(
+        "SELECT ready_epoch IS NOT NULL AND ready_epoch = controller_epoch
+           FROM openmettle.capacity_groups
+          WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(ready, "resume must persist ready_epoch despite probe error");
+
+    let decision = capacity::grant(&mut worker_conn, &controller, &req0)
+        .await
+        .unwrap();
+    let Decision::Grant {
+        grant_id,
+        state: GrantState::Granted,
+    } = decision
+    else {
+        panic!("expected Ok(Decision::Grant {{ state: Granted }}) despite probe error");
+    };
+    let persisted_granted: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
+            .bind(&grant_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(persisted_granted, "granted");
+
+    let reconciled = capacity::reconcile(
+        &mut worker_conn,
+        &controller,
+        &grant_id,
+        Evidence::Releasing,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reconciled, GrantState::Releasing);
+    let persisted_releasing: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
+            .bind(&grant_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(persisted_releasing, "releasing");
+
+    sqlx::query("GRANT EXECUTE ON FUNCTION pg_catalog.pg_current_xact_id_if_assigned() TO PUBLIC")
+        .execute(&mut superuser)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+        before_resumed
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        before_granted
+    );
+    assert_eq!(
+        metrics::global()
+            .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing),
+        before_releasing
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
+        before_resume_err
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Error),
+        before_grant_err
+    );
+    assert_eq!(
+        metrics::global()
+            .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error),
+        before_reconcile_err
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert!(
+            st.closed_spans.is_empty() && st.events.is_empty(),
+            "failing autocommit probe must suppress telemetry rather than emitting spans/events"
         );
     }
 }
