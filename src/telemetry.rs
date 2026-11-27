@@ -947,12 +947,20 @@ pub(crate) fn capacity_grant_span(
     )
 }
 
+/// Records the validated public capacity `grant_id` UUID as `lease_id` directly on `span` once
+/// durable grant identity is known. Recording on the explicit span handle works under every
+/// `tracing::Subscriber`, including lightweight subscribers that do not track `Span::current()`.
+pub(crate) fn record_capacity_span_grant_id_on(span: &tracing::Span, grant_id: &str) {
+    if let Some(id) = valid_uuid(grant_id) {
+        span.record("lease_id", id);
+    }
+}
+
 /// Records the validated public capacity `grant_id` UUID as `lease_id` on the current
 /// `capacity.grant` span once durable grant identity is known.
+#[cfg(test)]
 pub(crate) fn record_capacity_span_grant_id(grant_id: &str) {
-    if let Some(id) = valid_uuid(grant_id) {
-        tracing::Span::current().record("lease_id", id);
-    }
+    record_capacity_span_grant_id_on(&tracing::Span::current(), grant_id);
 }
 
 /// Structured lifecycle log emitted when a capacity controller grant, reconciliation, reclaim,

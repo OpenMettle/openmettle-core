@@ -1089,30 +1089,39 @@ impl Relay {
 
     /// Reads the upstream body to its end. The caller gets every chunk until it leaves or stops
     /// reading; after that the rest is read only while the usage may still be in hand, checked
-    /// after every read, and reading stops once one idle timeout has passed since then (classified
-    /// as `CallerDisconnected`, not an upstream timeout). A body that ends as that deadline falls
-    /// still counts. Otherwise the upstream connection is dropped.
+    /// after every read, and reading stops once one idle timeout has passed since then.
+    ///
+    /// The per-frame upstream idle deadline (`idle_by`) is preserved across caller detachment so a
+    /// stalled upstream still times out as `UpstreamTimeout` (when `idle_by <= drain_by`), whereas
+    /// an actively streaming upstream whose bounded detached drain window expires first stops as
+    /// `CallerDisconnected`. A body that ends as the active deadline falls still counts.
     async fn copy(&mut self) -> Result<(), UsageGap> {
+        let mut idle_by = Instant::now() + self.idle;
         loop {
-            let drain_by = self.drain_by;
+            let (deadline, timeout_gap) = match self.drain_by {
+                Some(drain_by) if drain_by < idle_by => (drain_by, UsageGap::CallerDisconnected),
+                _ => (idle_by, UsageGap::UpstreamTimeout),
+            };
             let frame = tokio::select! {
+                biased;
+                frame = self.upstream.drive(self.body.frame()) => Ok(frame),
                 () = self.frames.closed(), if self.delivering => {
-                    self.detach()?;
+                    self.detach(Instant::now())?;
                     continue;
                 }
-                () = sleep_until(drain_by.unwrap_or_else(Instant::now)), if drain_by.is_some() => {
-                    return Err(UsageGap::CallerDisconnected);
-                }
-                frame = self.upstream.drive(timeout(self.idle, self.body.frame())) => frame,
+                () = sleep_until(deadline) => Err(timeout_gap),
             };
             let data = match frame {
-                Err(_) => return Err(UsageGap::UpstreamTimeout),
+                Err(gap) => return Err(gap),
                 Ok(None) => return Ok(()),
                 Ok(Some(Err(_))) => return Err(UsageGap::Incomplete),
                 Ok(Some(Ok(frame))) => match frame.into_data() {
                     Ok(data) => data,
                     // Trailers carry no body bytes.
-                    Err(_) => continue,
+                    Err(_) => {
+                        idle_by = Instant::now() + self.idle;
+                        continue;
+                    }
                 },
             };
             if let Some(extract) = &mut self.extract {
@@ -1121,22 +1130,28 @@ impl Relay {
             if self.delivering {
                 // A caller that takes no chunk for an idle timeout is treated as gone.
                 if !matches!(timeout(self.idle, self.frames.send(data)).await, Ok(Ok(()))) {
-                    self.detach()?;
+                    let now = Instant::now();
+                    self.detach(now)?;
+                    idle_by = now + self.idle;
+                } else {
+                    idle_by = Instant::now() + self.idle;
                 }
             } else if !self.draining() {
                 return Err(UsageGap::CallerDisconnected);
+            } else {
+                idle_by = Instant::now() + self.idle;
             }
         }
     }
 
     /// The caller has gone or stopped reading, so it will not get the rest. Reading on is worth
     /// it only while the usage may already be in hand.
-    fn detach(&mut self) -> Result<(), UsageGap> {
+    fn detach(&mut self, now: Instant) -> Result<(), UsageGap> {
         self.delivering = false;
         if !self.draining() {
             return Err(UsageGap::CallerDisconnected);
         }
-        self.drain_by = Some(Instant::now() + self.idle);
+        self.drain_by = Some(now + self.idle);
         Ok(())
     }
 
@@ -2209,6 +2224,61 @@ mod tests {
         assert_eq!(
             unrecorded[0]["error.type"].as_str(),
             Some("caller_disconnected")
+        );
+    }
+
+    /// When the upstream stalls after sending a chunk and the caller disconnects mid-wait (before
+    /// the per-frame idle deadline expires), `Relay::copy` must preserve the existing per-frame
+    /// `idle_by` deadline (`idle_by <= drain_by`), deterministically returning `UpstreamTimeout`
+    /// and incrementing `openmettle_gateway_failures_total{step="policy",cause="timeout"}`.
+    #[tokio::test]
+    async fn stalled_upstream_after_mid_wait_caller_disconnect_preserves_idle_deadline_and_counts_timeout()
+     {
+        use crate::telemetry::{Format, Verbosity, metrics, tests::Capture};
+
+        let _metric_lock = GATEWAY_METRIC_LOCK.lock().await;
+
+        // 1. Direct `copy()` check: 120ms idle limit, upstream stalls after chunk 1, caller
+        //    disconnects 70ms after chunk 1 -> `idle_by` (~120ms) expires BEFORE `drain_by`
+        //    (~190ms) and deterministically reports `UpstreamTimeout`.
+        let (_hold_tx1, hold_rx1) = oneshot::channel::<()>();
+        let (addr1, task1) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx1).await;
+        let (mut r1, mut rx1) = relay(&addr1, Duration::from_millis(120)).await;
+        let leave1 = async move {
+            rx1.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            drop(rx1);
+        };
+        let (copied, ()) = tokio::join!(r1.copy(), leave1);
+        task1.abort();
+        assert_eq!(copied, Err(UsageGap::UpstreamTimeout));
+
+        // 2. Full `Relay::run()` check: increments `(GatewayStep::Policy, GatewayCause::Timeout)`
+        //    by +1 and logs `gateway.usage.unrecorded` with `error.type = "upstream_timeout"`.
+        let (_hold_tx2, hold_rx2) = oneshot::channel::<()>();
+        let (addr2, task2) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx2).await;
+        let (r2, mut rx2) = relay(&addr2, Duration::from_millis(120)).await;
+        r2.pool.close().await;
+        let before_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout);
+        let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+        let leave2 = async move {
+            rx2.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            drop(rx2);
+        };
+        tokio::join!(r2.run(), leave2);
+        task2.abort();
+
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout),
+            before_timeout + 1
+        );
+        let unrecorded = capture.events("gateway.usage.unrecorded");
+        assert_eq!(unrecorded.len(), 1, "{}", capture.text());
+        assert_eq!(
+            unrecorded[0]["error.type"].as_str(),
+            Some("upstream_timeout")
         );
     }
 }

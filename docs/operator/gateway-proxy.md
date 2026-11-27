@@ -166,11 +166,11 @@ one alone:
 | `upstream_connect` | No | No connection to the upstream was made, in time or at all (`502 provider_failure` or `504 timeout`), or the caller left before one was |
 | `not_dispatched` | No (worker sweep, revision 0) | The request was handed off without a binding, never dispatched, and its run can no longer dispatch it (failed, cancelled, reclaimed, or past its lease or execution deadline) |
 | `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
-| `upstream_timeout` | Yes or unknown | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
+| `upstream_timeout` | Yes or unknown | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived); after a `200` head, the active per-frame idle deadline is preserved even if the caller leaves, and expiry increments `openmettle_gateway_failures_total{step="policy",cause="timeout"}` |
 | `upstream_status` | Yes | The upstream answered with a status other than 200; the upstream body is closed without relaying and the caller receives a value-free problem document (`429`, `503`, `504` or `502`) |
 | `upstream_encoding` | Yes | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (`502 provider_failure`) |
 | `incomplete` | Yes | The body broke off, or a stream ended without `[DONE]` |
-| `caller_disconnected` | Yes or unknown | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
+| `caller_disconnected` | Yes or unknown | The caller left or stopped reading before the usage was in hand, the usage went out of reach while the relay read on, or the upstream kept streaming past the bounded post-disconnect drain window (one idle timeout after detach) without finishing; the upstream connection is closed and `openmettle_gateway_failures_total` is not incremented |
 | `no_usage` | Yes | The response completed without a usage object, for example a stream requested without `stream_options.include_usage`, or a stream whose last data event before `[DONE]` carried none |
 | `unparsable` | Yes | A parse bound was exceeded, or the usage was not a valid usage object |
 | `unreported` | Yes or unknown (worker sweep, revision 0) | The request was dispatched without a binding and had no settlement 15 minutes past its run's execution deadline (`dispatch_unconfirmed`, `gateway.usage.failed`, or a proxy stop mid-relay). A late proxy report at revision `1` supersedes it |
