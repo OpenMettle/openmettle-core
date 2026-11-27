@@ -116,6 +116,7 @@ EXPECTED_ALERTS = (
     "OpenMettleTelemetryDropsDetected",
     "OpenMettleProviderTransportFailures",
     "OpenMettleStorageQuotaDriftDetected",
+    "OpenMettleBackupFailedOrOverdue",
 )
 
 OPENSSL_CONFIG = f"""[req]

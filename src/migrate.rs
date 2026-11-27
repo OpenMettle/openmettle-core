@@ -246,6 +246,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "declare lost artifact payload",
         sql: include_str!("../migrations/0044_declare_lost_artifact_payload.sql"),
     },
+    Source {
+        version: 45,
+        description: "maintenance backup coordination",
+        sql: include_str!("../migrations/0045_maintenance_backup_coordination.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
@@ -648,6 +653,17 @@ async fn migrate_within_boundaries(
         .await
         .map_err(Failure::Check)?;
     let applied = applied_version(connection).await.map_err(Failure::Check)?;
+    // Reapply migration 1's global and schema-scoped owner default function ACLs (pg_dump
+    // --schema=openmettle omits global defaclnamespace = 0 entries; ADR 0046 / ADR 0003).
+    if applied >= 1 {
+        connection
+            .execute(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+                 ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA openmettle REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+            )
+            .await
+            .map_err(Failure::Check)?;
+    }
     let violations = boundary_violations(connection, applied)
         .await
         .map_err(Failure::Check)?;

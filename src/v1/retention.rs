@@ -121,7 +121,7 @@ fn map_retention_sql_error(err: sqlx::Error) -> Problem {
             Some("P0002") => return NOT_FOUND,
             Some("OMR06") => return CONFLICT,
             Some("23505") => return KEY_CONFLICT,
-            Some("OMR02") => return UNAVAILABLE,
+            Some("OMR02" | "OMM01") => return UNAVAILABLE,
             _ => {}
         }
     }
@@ -228,6 +228,7 @@ impl Api {
                 let (revision, min_grace, max_grace): (i64, i32, i32) = self
                     .with_connection(async |c| {
                         with_retention_tx(c, async |conn| {
+                            crate::backup::require_open_maintenance(conn).await?;
                             let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             let rev: i64 = sqlx::query_scalar(
@@ -316,6 +317,7 @@ impl Api {
                 let (affected_revisions, affected_bytes, policy_revision): (i64, i64, i64) = self
                     .with_connection(async |c| {
                         with_retention_tx(c, async |conn| {
+                            crate::backup::require_open_maintenance(conn).await?;
                             let p = principal(conn, &context).await?;
                             check_manage_retention(&p)?;
                             sqlx::query_as(

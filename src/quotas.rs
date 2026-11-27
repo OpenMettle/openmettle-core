@@ -1521,6 +1521,9 @@ async fn authorize_manage_quotas_and_check_upgrade<'a>(
     crate::restore::require_open_gate(c)
         .await
         .map_err(QuotaError::Store)?;
+    crate::backup::require_open_maintenance(c)
+        .await
+        .map_err(QuotaError::Store)?;
     // Acquire FOR SHARE on storage_volume_control so override writes serialize against adoption
     // and never overlap an active adoption run (OMQ03 -> 503 unavailable).
     sqlx::query("SELECT openmettle.storage_lock_not_adopting()")

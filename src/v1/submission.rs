@@ -454,6 +454,7 @@ pub(super) async fn submit(
     let ctx = call.context;
     let actor = principal(c, ctx).await?;
     crate::restore::require_open_gate(c).await?;
+    crate::backup::require_open_maintenance(c).await?;
     let visible = projects::read_resource(
         c,
         &actor,
@@ -520,6 +521,7 @@ async fn admission(
 ) -> Result<(Admission, bool, i64), Problem> {
     let c = tx.connection()?;
     crate::restore::require_open_gate(c).await?;
+    crate::backup::require_open_maintenance(c).await?;
     let ctx = call.context;
     let (personal_owner, project_id) =
         queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;

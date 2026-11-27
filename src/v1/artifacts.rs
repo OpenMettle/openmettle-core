@@ -336,6 +336,7 @@ impl Api {
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
                     restore::require_open_gate(c).await?;
+                    crate::backup::require_open_maintenance(c).await?;
                     projects::authorize_create_in_scope(c, &principal, scope, now).await?;
                     Ok(storage::upload_artifact(c, scope, actor, &key).await?)
                 })
@@ -346,6 +347,7 @@ impl Api {
                 .database(async |c| {
                     let principal = principal(c, &context).await?;
                     restore::require_open_gate(c).await?;
+                    crate::backup::require_open_maintenance(c).await?;
                     projects::authorize_artifact(c, &principal, target, Action::Write, now).await
                 })
                 .await?;

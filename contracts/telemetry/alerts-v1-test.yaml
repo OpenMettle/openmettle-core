@@ -301,3 +301,66 @@ tests:
       - eval_time: 11m
         alertname: OpenMettleStorageQuotaDriftDetected
         exp_alerts: []
+
+  # --- OpenMettleBackupFailedOrOverdue ---------------------------------------------------
+  - name: backup_failed_incomplete_and_overdue_fire_immediately_from_zero_baseline
+    interval: 30s
+    input_series:
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="succeeded"}'
+        values: '0+1x40'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="failed"}'
+        values: '0x10 1x30'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="incomplete"}'
+        values: '0x10 1x30'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="overdue"}'
+        values: '0x10 1x30'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: OpenMettleBackupFailedOrOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              component: backup
+              signal_contract: v1
+              outcome: failed
+            exp_annotations:
+              summary: "OpenMettle coordinated backup failed, incomplete, or overdue"
+              description: "Coordinated maintenance-window backup capture reported a failed or incomplete run, or exceeded its configured RPO target."
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              component: backup
+              signal_contract: v1
+              outcome: incomplete
+            exp_annotations:
+              summary: "OpenMettle coordinated backup failed, incomplete, or overdue"
+              description: "Coordinated maintenance-window backup capture reported a failed or incomplete run, or exceeded its configured RPO target."
+          - exp_labels:
+              severity: critical
+              service: openmettle-worker
+              component: backup
+              signal_contract: v1
+              outcome: overdue
+            exp_annotations:
+              summary: "OpenMettle coordinated backup failed, incomplete, or overdue"
+              description: "Coordinated maintenance-window backup capture reported a failed or incomplete run, or exceeded its configured RPO target."
+      - eval_time: 21m
+        alertname: OpenMettleBackupFailedOrOverdue
+        exp_alerts: []
+
+  - name: backup_alert_silent_when_only_succeeded_increments_and_failure_counters_flat
+    interval: 30s
+    input_series:
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="succeeded"}'
+        values: '0+1x40'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="failed"}'
+        values: '2+0x40'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="incomplete"}'
+        values: '0x40'
+      - series: 'openmettle_backup_runs_total{job="openmettle-worker",instance="a",outcome="overdue"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: OpenMettleBackupFailedOrOverdue
+        exp_alerts: []

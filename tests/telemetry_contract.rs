@@ -3,10 +3,10 @@
 use openmettle_core::telemetry::{
     self, Process,
     metrics::{
-        self, CONTRACT_VERSION, CapacityOperation, CapacityOutcome, CapacityStaleSurface,
-        CapacityWaitOutcome, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind, Metrics,
-        ProviderOperation, ProviderOutcome, QuotaDriftOutcome, ReadinessOutcome, RouteClass,
-        StatusClass, StorageOperation, StorageOutcome,
+        self, BackupRunOutcome, CONTRACT_VERSION, CapacityOperation, CapacityOutcome,
+        CapacityStaleSurface, CapacityWaitOutcome, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal,
+        InstrumentKind, Metrics, ProviderOperation, ProviderOutcome, QuotaDriftOutcome,
+        ReadinessOutcome, RouteClass, StatusClass, StorageOperation, StorageOutcome,
     },
 };
 use opentelemetry_proto::tonic::metrics::v1::metric;
@@ -225,8 +225,8 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         Some(total_prom_series as u64)
     );
 
-    // Both capacity.grants (V1-18) and storage.quota.drift (V1-17) are now implemented in
-    // `metrics`; only V1-10 queue age and V1-30 backup runs remain reserved.
+    // capacity.grants (V1-18), storage.quota.drift (V1-17) and backup.runs (V1-30) are now
+    // implemented in `metrics`; only V1-10 queue age remains reserved.
     let reserved = contract["reserved_signals"].as_array().unwrap();
     let mut reserved_by_name = BTreeMap::new();
     for entry in reserved {
@@ -245,11 +245,8 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         reserved_by_name.get("openmettle.runs.queue.age"),
         Some(&"V1-10")
     );
-    assert_eq!(
-        reserved_by_name.get("openmettle.backup.runs"),
-        Some(&"V1-30")
-    );
-    assert_eq!(reserved_by_name.len(), 2);
+    assert_eq!(reserved_by_name.len(), 1);
+    assert!(!reserved_by_name.contains_key("openmettle.backup.runs"));
     assert!(!reserved_by_name.contains_key("openmettle.storage.quota.drift"));
     assert!(!reserved_by_name.contains_key("openmettle.capacity.grants"));
     for implemented in [
@@ -257,6 +254,7 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         "openmettle.capacity.observations.stale",
         "openmettle.capacity.wait.duration",
         "openmettle.storage.quota.drift",
+        "openmettle.backup.runs",
     ] {
         assert!(
             seen_otel.contains(implemented),
@@ -290,10 +288,31 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
     }
 
-    // Worker baseline additionally emits zero-initialized overdue handoffs and all 8 quota drift outcomes.
-    let worker_baseline = store
+    // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs
+    // and all 8 quota drift outcomes, omitting `openmettle.backup.runs` until the worker seeds
+    // durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on restart).
+    let worker_unseeded = store
         .encode_otlp(Process::Worker, Some(instance_id))
         .expect("fresh worker registry emits zero-initialized baseline series");
+    let unseeded_names: Vec<&str> = worker_unseeded.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(
+        unseeded_names,
+        [
+            "openmettle.telemetry.dropped",
+            "openmettle.quota.overdue.handoffs",
+            "openmettle.storage.quota.drift",
+        ]
+    );
+
+    // Once seeded from PostgreSQL, worker baseline additionally emits all 4 backup run outcomes.
+    store.mark_backup_runs_seeded();
+    let worker_baseline = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("seeded worker registry emits zero-initialized baseline series");
     let worker_metrics = &worker_baseline.resource_metrics[0].scope_metrics[0].metrics;
     let worker_names: Vec<&str> = worker_metrics.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
@@ -302,6 +321,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.telemetry.dropped",
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
+            "openmettle.backup.runs",
         ]
     );
     match worker_metrics[2].data.as_ref().unwrap() {
@@ -317,6 +337,20 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             }));
         }
         other => panic!("expected Sum for openmettle.storage.quota.drift, got {other:?}"),
+    }
+    match worker_metrics[3].data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len());
+            assert!(sum.data_points.iter().all(|dp| {
+                matches!(
+                    dp.value,
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+                    )
+                )
+            }));
+        }
+        other => panic!("expected Sum for openmettle.backup.runs, got {other:?}"),
     }
 
     // An overdue handoff can be observed again on a later sweep.
@@ -372,6 +406,9 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
     for &outcome in QuotaDriftOutcome::ALL {
         store.record_quota_drift(outcome, 1);
+    }
+    for &outcome in BackupRunOutcome::ALL {
+        store.record_backup_run(outcome, 1);
     }
 
     let request = store
@@ -512,7 +549,7 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         .lines()
         .filter(|line| line.trim_start().starts_with("- alert:"))
         .count();
-    assert!(alert_count >= 5, "expected at least 5 v1 alert rules");
+    assert!(alert_count >= 6, "expected at least 6 v1 alert rules");
     assert!(yaml.contains("signal_contract: v1"));
 
     let exprs = extract_alert_exprs(&yaml);
@@ -610,11 +647,81 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         }
     }
     assert!(
-        found_metrics.len() >= 5,
-        "expected alerts covering HTTP, DB readiness, telemetry drops, provider transport and quota drift; got {found_metrics:?}"
+        found_metrics.len() >= 6,
+        "expected alerts covering HTTP, DB readiness, telemetry drops, provider transport, quota drift and backup runs; got {found_metrics:?}"
     );
     assert!(
         found_metrics.contains("openmettle_storage_quota_drift_total"),
         "expected alert covering openmettle_storage_quota_drift_total; got {found_metrics:?}"
     );
+    assert!(
+        found_metrics.contains("openmettle_backup_runs_total"),
+        "expected alert covering openmettle_backup_runs_total; got {found_metrics:?}"
+    );
+}
+
+#[test]
+fn backup_runs_omitted_until_seeded_and_never_emits_zero_before_historical_totals() {
+    let instance_id = "22222222-3333-4444-8555-666666666666";
+    let store = Metrics::new();
+
+    // Before the worker seeds durable PostgreSQL totals, `openmettle.backup.runs` must not be
+    // emitted so a restarted worker never exports a `0 -> N` jump for pre-existing failures.
+    let pre_seed = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("worker emits non-backup baseline metrics before seeding");
+    let pre_names: Vec<&str> = pre_seed.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(
+        !pre_names.contains(&"openmettle.backup.runs"),
+        "unseeded worker must omit openmettle.backup.runs; got {pre_names:?}"
+    );
+
+    // Seed with a pre-existing historical failed backup (failed = 1).
+    store.sync_backup_run_totals(0, 1, 0, 0);
+    let post_seed = store
+        .encode_otlp(Process::Worker, Some(instance_id))
+        .expect("seeded worker emits backup runs");
+    let backup_metric = post_seed.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == "openmettle.backup.runs")
+        .expect("seeded worker must emit openmettle.backup.runs");
+    match backup_metric.data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len());
+            let mut by_outcome = BTreeMap::new();
+            for dp in &sum.data_points {
+                let outcome = dp
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "outcome")
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| match v.value.as_ref() {
+                        Some(
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                s,
+                            ),
+                        ) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap();
+                let val = match dp.value {
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(v),
+                    ) => v,
+                    other => panic!("unexpected value {other:?}"),
+                };
+                by_outcome.insert(outcome.to_owned(), val);
+            }
+            assert_eq!(by_outcome["succeeded"], 0);
+            assert_eq!(by_outcome["failed"], 1);
+            assert_eq!(by_outcome["incomplete"], 0);
+            assert_eq!(by_outcome["overdue"], 0);
+        }
+        other => panic!("expected Sum for openmettle.backup.runs, got {other:?}"),
+    }
 }

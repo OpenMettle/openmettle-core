@@ -80,6 +80,15 @@
 -- `storage_declare_payload_lost(...)` and `restore_verify_lost_journal_tail(...)`, and replaces
 -- restore verification/replay/open functions with unchanged signatures, security and privileges
 -- (ADR 0040 / ADR 0041, issue #154).
+-- Version 45 adds `backup_runs`, singleton `backup_maintenance_gate`, and singleton
+-- `backup_rpo_telemetry_state` (owner-only, zero table or column privileges for any runtime role
+-- or PUBLIC, and zero new grants for `openmettle_issuance` or `openmettle_gateway`), widens `authorization_audit` CHECK constraints
+-- for operator backup actions, adds runtime SECURITY DEFINER helpers
+-- `backup_maintenance_is_active()` (`openmettle_api`, `openmettle_worker`),
+-- `backup_maintenance_lock_open()` (`openmettle_api`, `openmettle_worker`),
+-- `enforce_issuance_maintenance_gate()` (trigger only, zero runtime grants), and
+-- `backup_observe_telemetry()` (`openmettle_worker`), plus owner-only maintenance/capture/RPO
+-- functions and immutability trigger (ADR 0046, V1-30).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -405,6 +414,22 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.enforce_artifact_revision_lost_owner_only()',false,ARRAY[]::text[]),
         ('openmettle.restore_verify_lost_journal_tail(bigint,bytea,uuid)',false,ARRAY[]::text[]),
         ('openmettle.storage_declare_payload_lost(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 44
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.enforce_backup_runs_transitions()',false,ARRAY[]::text[]),
+        ('openmettle.backup_maintenance_is_active()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.backup_maintenance_lock_open()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.enforce_issuance_maintenance_gate()',true,ARRAY[]::text[]),
+        ('openmettle.backup_observe_telemetry()',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.backup_enter_maintenance(uuid,text,text)',false,ARRAY[]::text[]),
+        ('openmettle.backup_release_maintenance(uuid,text,text,boolean)',false,ARRAY[]::text[]),
+        ('openmettle.backup_release_capture_maintenance(uuid,uuid,text)',false,ARRAY[]::text[]),
+        ('openmettle.backup_arm_rpo(uuid,text,text,integer)',false,ARRAY[]::text[]),
+        ('openmettle.backup_start_capture(uuid,text,text,text,integer)',false,ARRAY[]::text[]),
+        ('openmettle.backup_renew_lease(uuid,integer)',false,ARRAY[]::text[]),
+        ('openmettle.backup_mark_quiesced(uuid,timestamptz,integer)',false,ARRAY[]::text[]),
+        ('openmettle.backup_stage_publication(uuid,text,bytea,bytea,bigint,bigint,bytea,bigint,bytea,bigint,jsonb)',false,ARRAY[]::text[]),
+        ('openmettle.backup_confirm_publication(uuid,text)',false,ARRAY[]::text[]),
+        ('openmettle.backup_fail_capture(uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 45
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES
@@ -960,7 +985,8 @@ violations (violation) AS (
                     OR ($1>=35 AND g.object_name LIKE 'family\_polic%')
                     OR ($1>=39 AND g.object_name='runtime_feature_gates')
                     OR ($1>=41 AND g.object_name LIKE 'restore\_%')
-                    OR ($1>=43 AND g.object_name LIKE 'external\_connection%'))
+                    OR ($1>=43 AND g.object_name LIKE 'external\_connection%')
+                    OR ($1>=45 AND g.object_name LIKE 'backup\_%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1

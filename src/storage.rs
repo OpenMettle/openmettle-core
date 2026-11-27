@@ -129,6 +129,13 @@ async fn reserve_inner(
                 "restore reconciliation pending".into(),
             )));
         }
+        // ADR 0046: close fresh client upload reservations during maintenance while allowing
+        // in-flight draining worker runs (`r.run.is_some()`) to settle spill artifacts.
+        if r.run.is_none() && !crate::backup::lock_open_maintenance(&mut sp).await? {
+            return Err(Error::Database(sqlx::Error::Protocol(
+                "service is in maintenance window".into(),
+            )));
+        }
         // On a pinned deployment serialize acquisition with adoption before locking counters.
         // Existing unpinned HTTP uploads can proceed while the fleet is being replaced.
         sqlx::query("SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
@@ -686,6 +693,11 @@ pub async fn retain_revision(
     lifecycle(StorageOperation::Retain, tx, scope, revision, async |sp| {
         let (state, size, deadline, _) = lock_revision(sp, scope, revision).await?;
         let gate_open = crate::restore::lock_open_gate(sp).await?;
+        if !crate::backup::lock_open_maintenance(sp).await? {
+            return Err(Error::Database(sqlx::Error::Protocol(
+                "service is in maintenance window".into(),
+            )));
+        }
         if state != "active" {
             if !gate_open {
                 return Err(Error::Database(sqlx::Error::Protocol(
@@ -720,6 +732,11 @@ pub async fn restore_revision(
     lifecycle(StorageOperation::Restore, tx, scope, revision, async |sp| {
         let (state, size, ..) = lock_revision(sp, scope, revision).await?;
         let gate_open = crate::restore::lock_open_gate(sp).await?;
+        if !crate::backup::lock_open_maintenance(sp).await? {
+            return Err(Error::Database(sqlx::Error::Protocol(
+                "service is in maintenance window".into(),
+            )));
+        }
         match state.as_str() {
             "active" => {
                 if !gate_open {
@@ -798,7 +815,13 @@ pub async fn begin_purge(
             match state.as_str() {
                 _ if !eligible => return Err(Error::NotEligible),
                 "purging" | "purged" => return Ok(()),
-                _ if retained => {}
+                _ if retained => {
+                    if !crate::backup::lock_open_maintenance(sp).await? {
+                        return Err(Error::Database(sqlx::Error::Protocol(
+                            "service is in maintenance window".into(),
+                        )));
+                    }
+                }
                 _ => return Err(Error::NotEligible),
             }
             let claimed = sqlx::query(

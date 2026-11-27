@@ -152,6 +152,10 @@ impl Api {
         self.dir
     }
 
+    pub(super) fn bind(&self) -> &str {
+        &self.bind
+    }
+
     /// The sorted file names in `staging` or `revisions`.
     fn files(&self, sub: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(Path::new(&self.dir.path("artifacts")).join(sub))
@@ -164,7 +168,7 @@ impl Api {
     }
 
     /// One raw request on a new connection: the status, the lowercase head and the body.
-    fn raw(&self, request: &str) -> (u16, String, String) {
+    pub(super) fn raw(&self, request: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(&self.bind).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(15)))

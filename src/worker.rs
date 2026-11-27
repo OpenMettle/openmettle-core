@@ -372,6 +372,10 @@ pub(crate) async fn maintenance(
     let mut unreported = crate::quotas::Pass::default();
     let verify_interval = Duration::from_secs(3600);
     let mut next_verification = Instant::now() + verify_interval;
+    // Seed durable backup outcome totals from PostgreSQL before the first OTLP export so a
+    // restarted worker never emits a premature `0` baseline ahead of historical failure/overdue
+    // counts.
+    let _ = sweep(crate::backup::observe_telemetry(pool)).await;
     loop {
         sleep(jitter(period)).await;
         let queued =
@@ -426,20 +430,30 @@ pub(crate) async fn maintenance(
             if !spills || !uploads {
                 sweep_failed(Sweep::Uploads);
             }
-            // ADR 0041: no purge sweep until a restore's journal replay opens the gate.
-            let open = timeout(Duration::from_secs(15), async {
-                crate::restore::gate_open(&mut *pool.acquire().await?).await
+            // ADR 0041 & ADR 0046: when restore gate is closed, run no purge work; when
+            // maintenance is active (and restore gate is open), finish already-claimed `purging`
+            // revisions and `.purge.<id>` anchors so drain completes without claiming new purges.
+            let gate_state = timeout(Duration::from_secs(15), async {
+                let mut conn = pool.acquire().await?;
+                let restore_open = crate::restore::gate_open(&mut conn).await?;
+                let maint_active = crate::backup::maintenance_active(&mut conn).await?;
+                Ok::<(bool, bool), sqlx::Error>((restore_open, maint_active))
             })
             .await;
-            let purged = match open {
-                Ok(Ok(true)) => sweep(artifact_fs::purge_due(pool, store, 100)).await,
-                Ok(Ok(false)) => true,
+            let purged = match gate_state {
+                Ok(Ok((true, false))) => sweep(artifact_fs::purge_due(pool, store, 100)).await,
+                Ok(Ok((true, true))) => {
+                    sweep(artifact_fs::finish_inflight_purges(pool, store, 100)).await
+                }
+                Ok(Ok((false, _))) => true,
                 _ => false,
             };
             if !purged {
                 sweep_failed(Sweep::Retention);
             }
         }
+        // ADR 0046 / ADR 0028: observe completed/failed/expired backup runs and RPO overdue state.
+        let _ = sweep(crate::backup::observe_telemetry(pool)).await;
     }
 }
 
@@ -448,8 +462,10 @@ async fn claim(
     policy: RunPolicy,
 ) -> Result<Option<(ActiveRun, Instant, bool)>, StoreError> {
     let mut c = connection(pool).await?;
-    // ADR 0041: no run is claimed or reclaimed until a restore's journal replay opens the gate.
-    if !crate::restore::gate_open(&mut c).await? {
+    // ADR 0041 & ADR 0046: no run is claimed or reclaimed while restore is pending or maintenance is active.
+    if !crate::restore::gate_open(&mut c).await?
+        || crate::backup::maintenance_active(&mut c).await?
+    {
         return Ok(None);
     }
     let sent = Instant::now();

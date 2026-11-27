@@ -1224,7 +1224,10 @@ pub async fn authorize_connection(
         ctx.validate()?;
         let mut tx = store::begin(c).await?;
         let gate = match tx.connection() {
-            Ok(conn) => crate::restore::require_open_gate(conn).await,
+            Ok(conn) => match crate::restore::require_open_gate(conn).await {
+                Ok(()) => crate::backup::require_open_maintenance(conn).await,
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err.into()),
         };
         if let Err(err) = gate {

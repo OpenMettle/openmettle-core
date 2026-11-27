@@ -145,6 +145,11 @@ async fn claim(
 ) -> Result<(Credential, tokio::time::Instant), Error> {
     let mut tx = super::transaction(db).await?;
     let result = async {
+        // ADR 0046: fence native code redemption during maintenance before consuming the
+        // one-use handoff envelope so clients receive 503 unavailable without losing the code.
+        if !crate::backup::lock_open_maintenance(tx.connection()?).await? {
+            return Err(Error::Database);
+        }
         // Sampled before the query is sent. The clock in the target list can be read before
         // a row-lock wait, so the wait is charged to the grant, never added to it.
         let start = tokio::time::Instant::now();

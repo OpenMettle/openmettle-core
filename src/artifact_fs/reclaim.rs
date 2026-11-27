@@ -711,6 +711,54 @@ async fn expiry_page(
     error.map_or(Ok(count), Err)
 }
 
+/// Finish already-claimed `state = 'purging'` revisions and `.purge.<id>` anchors during a
+/// coordinated backup maintenance window without claiming any new `state = 'retained'` rows
+/// (ADR 0046).
+pub async fn finish_inflight_purges(
+    pool: &PgPool,
+    store: &Store,
+    limit: i64,
+) -> Result<usize, Error> {
+    batch(limit)?;
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Ok(0);
+    };
+    let anchors = sweep_anchors(pool, store, &pin, limit, true, None)
+        .await
+        .map(|_| ());
+    let page: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
+           FROM openmettle.artifact_revisions r
+           JOIN openmettle.storage_reservations sr
+             ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
+          WHERE NOT sr.adoption_unverified
+            AND sr.payload_ino IS NOT NULL
+            AND r.state = 'purging'
+          ORDER BY r.id
+          LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let pin = pin.as_str();
+    let count = sweep_items(page, |(id, scope, res, ino)| async move {
+        purge_one(
+            pool,
+            store,
+            pin,
+            &scope,
+            &id,
+            &res,
+            ino.parse().map_err(|_| Error::Io)?,
+            None,
+        )
+        .await
+    })
+    .await;
+    anchors?;
+    count
+}
+
 pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize, Error> {
     batch(limit)?;
     let Some(pin) = store.prepare(pool, false).await? else {

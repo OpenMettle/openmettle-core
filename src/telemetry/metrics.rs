@@ -17,7 +17,7 @@ use opentelemetry_proto::tonic::{
 use std::{
     sync::{
         LazyLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -563,6 +563,34 @@ impl QuotaDriftOutcome {
     }
 }
 
+/// Closed outcome set for coordinated maintenance-window backups and RPO checks (ADR 0046).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupRunOutcome {
+    Succeeded,
+    Failed,
+    Incomplete,
+    Overdue,
+}
+
+impl BackupRunOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Succeeded,
+        Self::Failed,
+        Self::Incomplete,
+        Self::Overdue,
+    ];
+    pub const NAMES: &'static [&'static str] = &["succeeded", "failed", "incomplete", "overdue"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Instrument kind recorded in telemetry contract v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -859,6 +887,18 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.backup.runs",
+        prometheus_name: "openmettle_backup_runs_total",
+        kind: InstrumentKind::Counter,
+        unit: "{run}",
+        description: "Coordinated maintenance-window backup capture outcomes and RPO overdue observations.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: BackupRunOutcome::NAMES,
+        }],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -894,6 +934,7 @@ const CAPACITY_GRANT_SLOTS: usize = CapacityOperation::NAMES.len() * CapacityOut
 const CAPACITY_STALE_SLOTS: usize = CapacityStaleSurface::NAMES.len();
 const CAPACITY_WAIT_SLOTS: usize = CapacityWaitOutcome::NAMES.len();
 const QUOTA_DRIFT_SLOTS: usize = QuotaDriftOutcome::NAMES.len();
+const BACKUP_RUN_SLOTS: usize = BackupRunOutcome::NAMES.len();
 
 struct HistogramSlot {
     buckets: [AtomicU64; BUCKET_SLOTS],
@@ -953,6 +994,8 @@ pub struct Metrics {
     capacity_stale_observations: [AtomicU64; CAPACITY_STALE_SLOTS],
     capacity_wait_duration: [HistogramSlot; CAPACITY_WAIT_SLOTS],
     quota_drift: [AtomicU64; QUOTA_DRIFT_SLOTS],
+    backup_runs: [AtomicU64; BACKUP_RUN_SLOTS],
+    backup_runs_seeded: AtomicBool,
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -995,6 +1038,8 @@ impl Metrics {
             capacity_stale_observations: std::array::from_fn(|_| AtomicU64::new(0)),
             capacity_wait_duration: std::array::from_fn(|_| HistogramSlot::new()),
             quota_drift: std::array::from_fn(|_| AtomicU64::new(0)),
+            backup_runs: std::array::from_fn(|_| AtomicU64::new(0)),
+            backup_runs_seeded: AtomicBool::new(false),
         }
     }
 
@@ -1082,6 +1127,50 @@ impl Metrics {
         if count > 0 {
             self.quota_drift[outcome.index()].fetch_add(count, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_backup_run(&self, outcome: BackupRunOutcome, count: u64) {
+        if count > 0 {
+            self.backup_runs[outcome.index()].fetch_add(count, Ordering::Relaxed);
+            self.backup_runs_seeded.store(true, Ordering::Release);
+        }
+    }
+
+    /// Mark `openmettle.backup.runs` seeded so a worker with all-zero durable PostgreSQL totals
+    /// starts emitting its 4-stream zero baseline in OTLP exports.
+    pub fn mark_backup_runs_seeded(&self) {
+        self.backup_runs_seeded.store(true, Ordering::Release);
+    }
+
+    /// Monotonically synchronize all four `openmettle.backup.runs` outcome slots with PostgreSQL's
+    /// durable cumulative totals (`fetch_max`) and then publish the seeded flag with `Release`
+    /// ordering so an OTLP export on a restarted worker never emits a premature `0` ahead of
+    /// pre-existing historical failure, incomplete, or overdue counts.
+    pub fn sync_backup_run_totals(
+        &self,
+        succeeded: u64,
+        failed: u64,
+        incomplete: u64,
+        overdue: u64,
+    ) {
+        self.backup_runs[BackupRunOutcome::Succeeded.index()]
+            .fetch_max(succeeded, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Failed.index()].fetch_max(failed, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Incomplete.index()]
+            .fetch_max(incomplete, Ordering::Relaxed);
+        self.backup_runs[BackupRunOutcome::Overdue.index()].fetch_max(overdue, Ordering::Relaxed);
+        self.backup_runs_seeded.store(true, Ordering::Release);
+    }
+
+    /// Monotonically synchronize one `openmettle.backup.runs` outcome with PostgreSQL's durable
+    /// cumulative total (`fetch_max`) and mark the metric seeded.
+    pub fn observe_backup_run_total(&self, outcome: BackupRunOutcome, durable_total: u64) {
+        self.backup_runs[outcome.index()].fetch_max(durable_total, Ordering::Relaxed);
+        self.backup_runs_seeded.store(true, Ordering::Release);
+    }
+
+    pub fn backup_run_count(&self, outcome: BackupRunOutcome) -> u64 {
+        self.backup_runs[outcome.index()].load(Ordering::Relaxed)
     }
 
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
@@ -1353,6 +1442,28 @@ impl Metrics {
         }
         push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
 
+        // 16: openmettle.backup.runs
+        // Gate ALL `openmettle.backup.runs` export strictly on `backup_runs_seeded` (`Acquire`),
+        // paired with `sync_backup_run_totals`'s `Release` store after all 4 slots are updated.
+        // This guarantees a concurrent export never emits a partial subset of slots mid-seed and
+        // restarted workers never export a premature `0` ahead of pre-existing historical
+        // `failed`/`incomplete`/`overdue` counts.
+        let mut backup_points = Vec::new();
+        if self.backup_runs_seeded.load(Ordering::Acquire) {
+            for &outcome in BackupRunOutcome::ALL {
+                let value = self.backup_runs[outcome.index()].load(Ordering::Relaxed);
+                if value > 0 || role == Process::Worker {
+                    backup_points.push(counter_point(
+                        start,
+                        now,
+                        value,
+                        &[("outcome", outcome.as_str())],
+                    ));
+                }
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[16], backup_points);
+
         if metrics.is_empty() {
             return None;
         }
@@ -1477,4 +1588,48 @@ fn push_histogram(
 
 pub(crate) fn quota_sweep_failed() {
     tracing::warn!(target: super::TARGET, event="worker.sweep.failed", role="worker", "error.type"="reconcile_stale_quotas");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_runs_never_exports_any_slot_before_seeded_flag_is_published() {
+        let store = Metrics::new();
+        // Simulate mid-seed partial counter update before `backup_runs_seeded` becomes `true`.
+        store.backup_runs[BackupRunOutcome::Failed.index()].store(3, Ordering::Relaxed);
+
+        for role in [Process::Worker, Process::Api] {
+            let encoded = store
+                .encode_otlp(role, Some("44444444-5555-4666-8777-888888888888"))
+                .expect("baseline dropped telemetry is always emitted");
+            assert!(
+                !encoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.backup.runs"),
+                "unseeded registry must never export openmettle.backup.runs for {role:?}"
+            );
+        }
+
+        store.mark_backup_runs_seeded();
+        let worker = store
+            .encode_otlp(
+                Process::Worker,
+                Some("44444444-5555-4666-8777-888888888888"),
+            )
+            .unwrap();
+        let metric = worker.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .find(|m| m.name == "openmettle.backup.runs")
+            .expect("seeded worker must emit openmettle.backup.runs");
+        match metric.data.as_ref().unwrap() {
+            metric::Data::Sum(sum) => {
+                assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len())
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
+    }
 }
