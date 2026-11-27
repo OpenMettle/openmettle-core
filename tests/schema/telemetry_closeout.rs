@@ -151,9 +151,14 @@ fn assert_decided_age_delta(outcome: RunQueueAgeOutcome, before: (u64, f64, Vec<
         (1.0..15.0).contains(&sum_delta),
         "expected {outcome:?} age measured from decided_at (~2s, not created_at 120s), got sum_delta={sum_delta}"
     );
-    // QUEUE_AGE_BUCKETS indices 0..=7 cover <= 15.0s; indices 8..12 cover > 15.0s.
-    let le_15_delta: u64 = (0..=7).map(|i| after.2[i] - before.2[i]).sum();
-    let gt_15_delta: u64 = (8..after.2.len()).map(|i| after.2[i] - before.2[i]).sum();
+    let le_15_idx = metrics::QUEUE_AGE_BUCKETS
+        .iter()
+        .position(|&b| b == 15.0)
+        .expect("15.0s bucket present in QUEUE_AGE_BUCKETS");
+    let le_15_delta: u64 = (0..=le_15_idx).map(|i| after.2[i] - before.2[i]).sum();
+    let gt_15_delta: u64 = ((le_15_idx + 1)..after.2.len())
+        .map(|i| after.2[i] - before.2[i])
+        .sum();
     assert_eq!(
         le_15_delta, 1,
         "expected +1 in <=15s buckets for {outcome:?}"

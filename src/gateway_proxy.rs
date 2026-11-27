@@ -1106,7 +1106,11 @@ impl Relay {
                 biased;
                 frame = self.upstream.drive(self.body.frame()) => Ok(frame),
                 () = self.frames.closed(), if self.delivering => {
-                    self.detach(Instant::now())?;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(timeout_gap);
+                    }
+                    self.detach(now)?;
                     continue;
                 }
                 () = sleep_until(deadline) => Err(timeout_gap),
@@ -1115,14 +1119,19 @@ impl Relay {
                 Err(gap) => return Err(gap),
                 Ok(None) => return Ok(()),
                 Ok(Some(Err(_))) => return Err(UsageGap::Incomplete),
-                Ok(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => data,
-                    // Trailers carry no body bytes.
-                    Err(_) => {
-                        idle_by = Instant::now() + self.idle;
-                        continue;
+                Ok(Some(Ok(frame))) => {
+                    if Instant::now() >= deadline {
+                        return Err(timeout_gap);
                     }
-                },
+                    match frame.into_data() {
+                        Ok(data) => data,
+                        // Trailers carry no body bytes.
+                        Err(_) => {
+                            idle_by = Instant::now() + self.idle;
+                            continue;
+                        }
+                    }
+                }
             };
             if let Some(extract) = &mut self.extract {
                 extract.feed(&data);
@@ -2279,6 +2288,129 @@ mod tests {
         assert_eq!(
             unrecorded[0]["error.type"].as_str(),
             Some("upstream_timeout")
+        );
+    }
+
+    /// Even when a late JSON data frame and an elapsed detached drain deadline are both ready on
+    /// the same poll, `Relay::copy` must reject the post-deadline data frame with
+    /// `UsageGap::CallerDisconnected`, whereas a clean EOF (`0\r\n\r\n`) ready at or after the
+    /// deadline after all body bytes arrived in time must still succeed with extracted usage.
+    #[tokio::test]
+    async fn detached_drain_rejects_late_data_frame_at_deadline_while_allowing_eof() {
+        const CHUNKED_JSON: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+            transfer-encoding: chunked\r\n\r\n";
+
+        // 1. Late data frame arrives after the detached drain deadline while `copy()` is paused,
+        //    so both `body.frame()` (`Some(Ok(frame))`) and `sleep_until(drain_by)` are ready on
+        //    the exact same poll -> MUST return `Err(UsageGap::CallerDisconnected)`.
+        let (gate1, open1) = oneshot::channel::<()>();
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap().to_string();
+        let chunk2_sent1 = Arc::new(tokio::sync::Notify::new());
+        let chunk2_sent1_tx = chunk2_sent1.clone();
+        let up1 = tokio::spawn(async move {
+            let (mut socket, _) = listener1.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut b).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                req.push(b[0]);
+            }
+            socket.write_all(CHUNKED_JSON.as_bytes()).await.unwrap();
+            socket.write_all(&chunk(b"{\"usage\":")).await.unwrap();
+            // Send a second small chunk after detach so `idle_by` advances past `drain_by`.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket.write_all(&chunk(b" ")).await.unwrap();
+            chunk2_sent1_tx.notify_one();
+            let _ = open1.await;
+            let _ = socket
+                .write_all(&chunk(b"{\"prompt_tokens\":5,\"completion_tokens\":7}}"))
+                .await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (mut r1, mut rx1) = relay(&addr1, Duration::from_millis(60)).await;
+        {
+            let mut copy_fut = std::pin::pin!(r1.copy());
+            let drive_until_detached_and_chunk2 = async {
+                rx1.recv().await.unwrap();
+                drop(rx1);
+                chunk2_sent1.notified().await;
+                // Allow `copy_fut` to read the whitespace chunk and advance `idle_by > drain_by`.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            tokio::select! {
+                res = &mut copy_fut => panic!("copy finished unexpectedly early: {res:?}"),
+                () = drive_until_detached_and_chunk2 => {}
+            }
+            // Pause polling `copy_fut`, wait past `drain_by` (60ms from detach), and release the
+            // late JSON body so BOTH the data frame and the elapsed timer are ready together.
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            let _ = gate1.send(());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let res = copy_fut.await;
+            assert_eq!(res, Err(UsageGap::CallerDisconnected));
+        }
+        up1.abort();
+
+        // 2. Clean EOF (`0\r\n\r\n`) arrives after the body bytes were already read before the
+        //    deadline, so both `body.frame()` (`None`) and `sleep_until(drain_by)` are ready on
+        //    the same poll -> MUST still return `Ok(())` with extracted usage.
+        let (gate2, open2) = oneshot::channel::<()>();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap().to_string();
+        let body_sent2 = Arc::new(tokio::sync::Notify::new());
+        let body_sent2_tx = body_sent2.clone();
+        let up2 = tokio::spawn(async move {
+            let (mut socket, _) = listener2.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut b).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                req.push(b[0]);
+            }
+            socket.write_all(CHUNKED_JSON.as_bytes()).await.unwrap();
+            socket.write_all(&chunk(b"{\"usage\":")).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket
+                .write_all(&chunk(b"{\"prompt_tokens\":5,\"completion_tokens\":7}}"))
+                .await
+                .unwrap();
+            body_sent2_tx.notify_one();
+            let _ = open2.await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (mut r2, mut rx2) = relay(&addr2, Duration::from_millis(60)).await;
+        {
+            let mut copy_fut = std::pin::pin!(r2.copy());
+            let drive_until_body_read = async {
+                rx2.recv().await.unwrap();
+                drop(rx2);
+                body_sent2.notified().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            tokio::select! {
+                res = &mut copy_fut => panic!("copy finished before EOF: {res:?}"),
+                () = drive_until_body_read => {}
+            }
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            let _ = gate2.send(());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(copy_fut.await, Ok(()));
+        }
+        up2.abort();
+        assert_eq!(
+            r2.extract.take().unwrap().finish(),
+            Ok(Usage {
+                prompt: 5,
+                completion: 7,
+                reasoning: None,
+            })
         );
     }
 }

@@ -283,37 +283,35 @@ impl ProviderTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
-        let started = std::time::Instant::now();
-        let result = async {
-            self.admit(&request)?;
-            let route = Route {
-                endpoint: &self.endpoint,
-                allowed: &self.allowed,
-                tls: Some(&self.tls),
-                lookup: &self.lookup,
-                slots: &self.slots,
-                #[cfg(test)]
-                loopback: self.loopback,
-            };
-            let limits = Limits {
-                request_body: MAX_REQUEST_BODY_BYTES,
-                response_body: MAX_RESPONSE_BYTES,
-                response_headers: MAX_RESPONSE_HEADERS,
-                response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
-                setup: self.setup,
-                total: self.total,
-            };
-            let (parts, body) = request.into_parts();
-            route
-                .send(parts.method, &parts.headers, body, &limits)
-                .await
+        let metric = ProviderMetricSlot::new(self.operation);
+        if let Err(err) = self.admit(&request) {
+            metric.arm();
+            metric.finish(provider_error_outcome(err));
+            return Err(err);
         }
-        .await;
-        crate::telemetry::metrics::global().record_provider_http(
-            self.operation,
-            provider_outcome(&result),
-            started.elapsed(),
-        );
+        metric.arm();
+        let route = Route {
+            endpoint: &self.endpoint,
+            allowed: &self.allowed,
+            tls: Some(&self.tls),
+            lookup: &self.lookup,
+            slots: &self.slots,
+            #[cfg(test)]
+            loopback: self.loopback,
+        };
+        let limits = Limits {
+            request_body: MAX_REQUEST_BODY_BYTES,
+            response_body: MAX_RESPONSE_BYTES,
+            response_headers: MAX_RESPONSE_HEADERS,
+            response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
+            setup: self.setup,
+            total: self.total,
+        };
+        let (parts, body) = request.into_parts();
+        let result = route
+            .send(parts.method, &parts.headers, body, &limits)
+            .await;
+        metric.finish(provider_outcome(&result));
         result
     }
 }
