@@ -110,10 +110,18 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   or user identities.
 - When `OTLP_METRICS_ENDPOINT` is set, exporter startup synchronously pre-captures an
   immutable zero-valued startup baseline at `time_unix_nano == start_time_unix_nano` and
-  delivers it immediately on task start (retaining it ahead of the first live snapshot if the
-  collector is momentarily unreachable) while subsequent periodic snapshots carry
+  delivers it immediately on task start, while subsequent periodic snapshots carry
   `time_unix_nano >= start_time_unix_nano + 1ms` (strictly newer at Prometheus millisecond
-  resolution). Zero-initialized baselines cover all three `openmettle.telemetry.dropped`
+  resolution). On retryable failures (`429`/`502`/`503`/`504` or transport/timeout errors
+  before an HTTP response), the startup zero baseline is retained ahead of the first live
+  snapshot on the next cycle; on permanent rejections (`400` and all other non-2xx HTTP
+  responses per the OTLP/HTTP specification), it is discarded immediately so live snapshots
+  are never blocked behind a permanently rejected baseline. Downstream collectors forwarding
+  cumulative metrics to Prometheus `/api/v1/otlp` must serialize delivery (for example
+  `sending_queue { enabled = true, num_consumers = 1 }` on Grafana Alloy
+  `otelcol.exporter.otlphttp` / OpenTelemetry Collector `otlphttpexporter`, or a bounded
+  Prometheus `out_of_order_time_window`) so a delayed baseline cannot be overtaken by the
+  next cumulative snapshot. Zero-initialized baselines cover all three `openmettle.telemetry.dropped`
   (`DroppedSignal::ALL`) series on every role, all three `openmettle.db.readiness.checks`
   (`ReadinessOutcome::ALL`) series on serving roles (`api`, `worker`, `gateway`), all 42
   `openmettle.provider.http.requests` (`ProviderOperation::ALL × ProviderOutcome::ALL`)
@@ -129,8 +137,10 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   new crates in `Cargo.lock`), and POSTed with `Content-Type: application/x-protobuf` over the
   ADR 0010 `Route`.
 - Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
-  cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
-  emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr.
+  cycle without inline retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`,
+  and emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr (with only
+  the pre-captured startup baseline retained across cycles on retryable failures and discarded
+  immediately on permanent rejections).
 - On shutdown, trace and metrics export tasks drain concurrently within the existing half-slice
   of `shutdown_budget` and are aborted on deadline expiry.
 
@@ -188,11 +198,14 @@ package enters `Cargo.lock`, and the ADR 0026 banned-crate guard in
 - `.github/workflows/telemetry-qualification.yml` and `tests/telemetry_kind/qualify.py`
   (V1-29 increment 4 of 4) run `tests/telemetry_kind/test_qualify.py`, execute `promtool check
   rules` and `promtool test rules` against `contracts/telemetry/alerts-v1-test.yaml`, and
-  qualify live `openmettle-api` and `openmettle-worker` pods against pinned Grafana Alloy
-  (`v1.10.0`) and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP
-  trace and metrics ingestion with synthetic CA, inbound `traceparent` / secret redaction,
-  per-process UUIDv4 `instance` separation, closed-enum contract label verification on every
-  live `openmettle_*` series, single-outage collector resilience (zero probe failures and zero
-  restarts while `telemetry.dropped` is logged, `openmettle_telemetry_dropped_total` rises
+  qualify live `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` pods against
+  pinned Grafana Alloy (`v1.10.0`, with `sending_queue { enabled = true, num_consumers = 1 }`)
+  and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP trace and metrics
+  ingestion with synthetic CA, inbound `traceparent` / secret redaction, per-process UUIDv4
+  `instance` separation, closed-enum contract label verification on every live `openmettle_*`
+  series, live delayed-first-POST serialization through an in-cluster HTTP/1.1 delay relay
+  confirming `[0, 1]` sample preservation and `increase(...[10m]) >= 1` with zero Prometheus
+  `4xx` out-of-order rejections, single-outage collector resilience (zero probe failures and
+  zero restarts while `telemetry.dropped` is logged, `openmettle_telemetry_dropped_total` rises
   from its zero baseline, and `OpenMettleTelemetryDropsDetected` reaches `firing` in
   Prometheus), and clean SIGTERM shutdown.

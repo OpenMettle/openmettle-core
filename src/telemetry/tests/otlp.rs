@@ -1252,6 +1252,162 @@ async fn metrics_export_retains_zero_baseline_across_initial_collector_outage() 
 }
 
 #[tokio::test]
+async fn metrics_export_discards_permanently_rejected_baseline_and_delivers_live_snapshot() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    // Case 1: Collector returns 503 at startup, then recovers with a timestamp cutoff that
+    // permanently rejects the stale zero baseline (`time == start_time`) with 400 while
+    // accepting live snapshots (`time > start_time`) with 200.
+    let ca = Ca::new();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_srv = recovered.clone();
+    let seen = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen_srv = seen.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")],
+        );
+        let is_baseline = ts == start;
+        let status = if !recovered_srv.load(AtomicOrdering::Acquire) {
+            503
+        } else if is_baseline {
+            400
+        } else {
+            200
+        };
+        seen_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Worker, store.clone());
+
+    // Wait for the initial 503 startup baseline failure.
+    until(|| {
+        let log = seen.lock().unwrap();
+        !log.is_empty() && log[0].0 == 503 && log[0].1
+    })
+    .await;
+
+    // Record a slow queue exit while the collector was unavailable, then recover collector
+    // with the 400 cutoff on the stale baseline timestamp.
+    store.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 90.0);
+    recovered.store(true, AtomicOrdering::Release);
+
+    // Wait for at least one live snapshot to succeed (200) after the 400 rejection.
+    until(|| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(code, is_base, _)| *code == 200 && !*is_base)
+    })
+    .await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let history = seen.lock().unwrap().clone();
+    let baseline_statuses: Vec<u16> = history
+        .iter()
+        .filter(|(_, is_base, _)| *is_base)
+        .map(|(code, _, _)| *code)
+        .collect();
+    assert_eq!(
+        baseline_statuses,
+        vec![503, 400],
+        "stale baseline must be attempted only on retryable 503 and discarded permanently after 400 (never retried, including on stop)"
+    );
+
+    let first_live_body = history
+        .iter()
+        .find(|(code, is_base, _)| *code == 200 && !*is_base)
+        .map(|(_, _, body)| body)
+        .expect("expected 200 live snapshot immediately after 400 baseline rejection");
+    let first_live = ExportMetricsServiceRequest::decode(first_live_body.as_slice()).unwrap();
+    let (slow_val, slow_start, slow_ts) = find_counter_point(
+        &first_live,
+        "openmettle.runs.queue.slow_exits",
+        &[("outcome", "claimed")],
+    );
+    assert_eq!(slow_val, 1);
+    assert!(slow_ts > slow_start);
+    let (drop_val, _, _) = find_counter_point(
+        &first_live,
+        "openmettle.telemetry.dropped",
+        &[("signal", "metric_exports")],
+    );
+    assert_eq!(
+        drop_val, 2,
+        "dropped metric_exports must count both the initial 503 and the permanent 400 rejection"
+    );
+
+    // Case 2: Collector returns 400 immediately on the initial t=0 startup baseline POST, then
+    // 200 for live snapshots; baseline must be sent only once and live snapshot delivered on stop.
+    let seen2 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen2_srv = seen2.clone();
+    let server2 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let status = if is_baseline { 400 } else { 200 };
+        seen2_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], b""))
+    })
+    .await;
+
+    let store2 = Arc::new(metrics::Metrics::new());
+    let tuning2 = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest2 = metrics_destination(server2.port, &ca, tuning2);
+    let (_, exporter2) = otlp::start_with_metrics(dest2, Process::Api, store2.clone());
+    until(|| !seen2.lock().unwrap().is_empty()).await;
+    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(4));
+    exporter2
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let history2 = seen2.lock().unwrap().clone();
+    assert_eq!(
+        history2.len(),
+        2,
+        "expected single 400 baseline + 200 shutdown live flush"
+    );
+    assert_eq!((history2[0].0, history2[0].1), (400, true));
+    assert_eq!((history2[1].0, history2[1].1), (200, false));
+    let live2 = ExportMetricsServiceRequest::decode(history2[1].2.as_slice()).unwrap();
+    let (err_val, _, _) = find_counter_point(
+        &live2,
+        "openmettle.db.readiness.checks",
+        &[("outcome", "error")],
+    );
+    let (drop_val2, _, _) = find_counter_point(
+        &live2,
+        "openmettle.telemetry.dropped",
+        &[("signal", "metric_exports")],
+    );
+    assert_eq!(err_val, 1);
+    assert_eq!(drop_val2, 1);
+}
+
+#[tokio::test]
 async fn metrics_export_drops_on_collector_failure_and_reports_to_stderr() {
     let ca = Ca::new();
     let server = Server::start(ca.leaf(COLLECTOR, false), |_| {

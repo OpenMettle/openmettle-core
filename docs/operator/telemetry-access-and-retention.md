@@ -74,6 +74,15 @@ compliance/audit stores:
   series per process) are recorded directly in-process and exported independently of
   whether traces are enabled or downstream-sampled. Never reconstruct request, error, or
   queue counts by summing sampled traces.
+- **Serialized downstream collector delivery to Prometheus:** Each process emits an
+  immediate startup zero baseline (`time == start_time`) ahead of subsequent cumulative
+  snapshots (`time >= start_time + 1 ms`). OTLP collectors forwarding cumulative metrics to
+  Prometheus OTLP ingestion (`/api/v1/otlp`) must serialize downstream delivery (for
+  example `sending_queue { enabled = true, num_consumers = 1 }` on Grafana Alloy
+  `otelcol.exporter.otlphttp` or OpenTelemetry Collector `otlphttpexporter`, or a bounded
+  Prometheus `out_of_order_time_window`); multi-consumer queues (`num_consumers > 1`, the
+  upstream default of `10`) can reorder a delayed baseline behind the next snapshot,
+  causing Prometheus to reject the baseline with `400 out of order sample`.
 
 ## 4. Pre-enablement operator confirmation checklist
 
@@ -90,6 +99,12 @@ production deployment, the infrastructure operator must confirm and record each 
 - [ ] **TLS and private egress pinned:** `OTLP_CA_FILE` pins the collector CA bundle (or
       verified platform roots) and `OTLP_PRIVATE_RANGES` restricts private CIDRs strictly
       to the collector subnet.
+- [ ] **Collector downstream ordering configured:** OTLP collectors forwarding cumulative
+      metrics to Prometheus `/api/v1/otlp` serialize downstream delivery
+      (`sending_queue { enabled = true, num_consumers = 1 }` on Grafana Alloy
+      `otelcol.exporter.otlphttp` / OpenTelemetry Collector `otlphttpexporter`, or a
+      bounded Prometheus `out_of_order_time_window`) so startup zero baselines cannot be
+      overtaken by subsequent cumulative snapshots.
 - [ ] **Ingress/proxy redaction verified:** Edge proxies do not log query strings,
       `Cookie`, `Authorization`, callback codes, or request/response bodies.
 - [ ] **Alert rules loaded:** All 8 rules in `contracts/telemetry/alerts-v1.yaml` are
