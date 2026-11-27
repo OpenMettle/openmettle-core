@@ -1305,10 +1305,37 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         }
                     }
                 };
-                turn_dispatch
-                    .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
-                    .await
-                    .map_err(inference::Error::step_result)?
+                let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
+                let op_id = turn_dispatch.id().to_owned();
+                let op_started = std::time::Instant::now();
+                let op_span = worker_operation_span(
+                    &run.claim.run_id,
+                    &lease_id,
+                    &op_id,
+                    WorkerOperationKind::Inference,
+                );
+                async {
+                    let sent = turn_dispatch
+                        .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
+                        .await
+                        .map_err(inference::Error::step_result);
+                    let outcome = match &sent {
+                        Ok(_) => WorkerOperationOutcome::Ok,
+                        Err(step) => operation_outcome(step),
+                    };
+                    tracing::Span::current().record("operation.outcome", outcome.as_str());
+                    worker_operation_completed(
+                        &run.claim.run_id,
+                        &lease_id,
+                        &op_id,
+                        WorkerOperationKind::Inference,
+                        outcome,
+                        op_started.elapsed(),
+                    );
+                    sent
+                }
+                .instrument(op_span)
+                .await?
             } else {
                 if cx.stop.borrow().is_some() {
                     return Err(StepResult::Stopped);
@@ -1346,18 +1373,47 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         .map_err(|_| FAILED)?;
                     }
                 }
-                route
-                    .gateway
-                    .server(
-                        &self.catalog,
-                        &config.effective,
-                        &request,
-                        Credential::Bearer(&route.bearer),
-                        RunStop::from_worker(run, cx.stop.clone()),
-                        |_| async {},
-                    )
-                    .await
-                    .map_err(inference::Error::step_result)?
+                let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
+                let op_id = crate::telemetry::RequestId::generate()
+                    .map(|id| id.to_string())
+                    .unwrap_or_default();
+                let op_started = std::time::Instant::now();
+                let op_span = worker_operation_span(
+                    &run.claim.run_id,
+                    &lease_id,
+                    &op_id,
+                    WorkerOperationKind::Inference,
+                );
+                async {
+                    let sent = route
+                        .gateway
+                        .server(
+                            &self.catalog,
+                            &config.effective,
+                            &request,
+                            Credential::Bearer(&route.bearer),
+                            RunStop::from_worker(run, cx.stop.clone()),
+                            |_| async {},
+                        )
+                        .await
+                        .map_err(inference::Error::step_result);
+                    let outcome = match &sent {
+                        Ok(_) => WorkerOperationOutcome::Ok,
+                        Err(step) => operation_outcome(step),
+                    };
+                    tracing::Span::current().record("operation.outcome", outcome.as_str());
+                    worker_operation_completed(
+                        &run.claim.run_id,
+                        &lease_id,
+                        &op_id,
+                        WorkerOperationKind::Inference,
+                        outcome,
+                        op_started.elapsed(),
+                    );
+                    sent
+                }
+                .instrument(op_span)
+                .await?
             };
             let [answer]: [_; 1] = turn.answers.try_into().map_err(|_| FAILED)?;
             match answer.calls {

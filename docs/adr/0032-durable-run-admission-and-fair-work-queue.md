@@ -339,6 +339,16 @@ run `INSERT` and an append for a run row the caller already holds.
   `Option<ClaimedRun { scope_id, run_id, claim_token, actor_approval_id, round_limit }>`.
 - Bare `create_run` still names only the pre-19 columns, so its rows keep `NULL` admission
   columns and it also works against an older schema.
+- *Update, 27 November 2026 (`openmettle.runs.queue.age`):* `claim_next`, `expire_queued`,
+  `cancel_run`, `recheck_run`, `cancel_scope_runs` (`archive_project`/`delete_project`),
+  `cancel_user_runs` (`disable_user`), and approval wait invalidation project PostgreSQL
+  clock queue wait durations in SQL and record `openmettle.runs.queue.age`
+  (`openmettle_runs_queue_age_seconds`, `QUEUE_AGE_BUCKETS` up to `300.0` s) strictly
+  **after transaction commit** (`claimed` from `runs.created_at`, `resumed` from
+  `run_approval_decisions.decided_at`, `expired` from `runs.created_at`, and `cancelled`
+  only for runs cancelled while `queued` or while `waiting` with an eligible decided
+  `'approve'` approval—never when cancelling an executing run or an undecided
+  human-approval wait, and never on a rolled-back transaction).
 
 ## Delivery and evidence
 

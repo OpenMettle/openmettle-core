@@ -115,6 +115,8 @@ EXPECTED_ALERTS = (
     "OpenMettleDatabaseReadinessFailing",
     "OpenMettleTelemetryDropsDetected",
     "OpenMettleProviderTransportFailures",
+    "OpenMettleGatewayFailuresDetected",
+    "OpenMettleRunQueueHighAge",
     "OpenMettleStorageQuotaDriftDetected",
     "OpenMettleBackupFailedOrOverdue",
 )

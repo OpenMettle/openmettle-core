@@ -160,24 +160,136 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
-              service: openmettle-api
+              service: openmettle-core
               signal_contract: v1
               operation: jwks
               outcome: timeout
             exp_annotations:
-              summary: "OpenMettle identity provider transport failures"
-              description: "Repeated outbound OIDC provider HTTP requests failed over the ADR 0010 transport."
+              summary: "OpenMettle outbound provider transport failures"
+              description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
+
+  - name: provider_transport_failures_covers_inference_mcp_and_oauth_refresh
+    interval: 30s
+    input_series:
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="inference",outcome="http_error"}'
+        values: '0+1x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="mcp",outcome="transport"}'
+        values: '0+1x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="oauth_refresh",outcome="timeout"}'
+        values: '0+1x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="inference",outcome="ok"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleProviderTransportFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-core
+              signal_contract: v1
+              operation: inference
+              outcome: http_error
+            exp_annotations:
+              summary: "OpenMettle outbound provider transport failures"
+              description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
+          - exp_labels:
+              severity: warning
+              service: openmettle-core
+              signal_contract: v1
+              operation: mcp
+              outcome: transport
+            exp_annotations:
+              summary: "OpenMettle outbound provider transport failures"
+              description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
+          - exp_labels:
+              severity: warning
+              service: openmettle-core
+              signal_contract: v1
+              operation: oauth_refresh
+              outcome: timeout
+            exp_annotations:
+              summary: "OpenMettle outbound provider transport failures"
+              description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
 
   - name: provider_transport_failures_silent_on_ok_or_below_threshold
     interval: 30s
     input_series:
       - series: 'openmettle_provider_http_requests_total{job="openmettle-api",instance="a",operation="discovery",outcome="ok"}'
         values: '0+10x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="mcp",outcome="ok"}'
+        values: '0+10x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="oauth_refresh",outcome="ok"}'
+        values: '0+10x30'
       - series: 'openmettle_provider_http_requests_total{job="openmettle-api",instance="a",operation="token",outcome="transport"}'
         values: '0+0.1x30'
     alert_rule_test:
       - eval_time: 12m
         alertname: OpenMettleProviderTransportFailures
+        exp_alerts: []
+
+  # --- OpenMettleGatewayFailuresDetected -------------------------------------------------
+  - name: gateway_failures_detected_fires_on_repeated_failures
+    interval: 30s
+    input_series:
+      - series: 'openmettle_gateway_failures_total{job="openmettle-gateway",instance="g",step="usage",cause="timeout"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenMettleGatewayFailuresDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-gateway
+              signal_contract: v1
+              step: usage
+              cause: timeout
+            exp_annotations:
+              summary: "OpenMettle gateway failures detected"
+              description: "Repeated inference gateway failures were recorded by step and cause over the last 5 minutes."
+
+  - name: gateway_failures_detected_silent_below_threshold_or_flat
+    interval: 30s
+    input_series:
+      - series: 'openmettle_gateway_failures_total{job="openmettle-gateway",instance="g",step="policy",cause="policy"}'
+        values: '0+0.1x30'
+      - series: 'openmettle_gateway_failures_total{job="openmettle-gateway",instance="g",step="key",cause="transport"}'
+        values: '4+0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: OpenMettleGatewayFailuresDetected
+        exp_alerts: []
+
+  # --- OpenMettleRunQueueHighAge ---------------------------------------------------------
+  - name: run_queue_high_age_fires_when_runs_wait_over_60s
+    interval: 30s
+    input_series:
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
+        values: '0x30'
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleRunQueueHighAge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: claimed
+            exp_annotations:
+              summary: "OpenMettle runs waiting over 60s in durable work queue"
+              description: "One or more runs waited longer than 60 seconds in the durable work queue before leaving the queue over the last 10 minutes."
+
+  - name: run_queue_high_age_silent_when_all_runs_under_60s
+    interval: 30s
+    input_series:
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
+        values: '0+2x30'
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
+        values: '0+2x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleRunQueueHighAge
         exp_alerts: []
 
   # --- OpenMettleStorageQuotaDriftDetected -----------------------------------------------

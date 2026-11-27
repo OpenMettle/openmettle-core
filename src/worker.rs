@@ -14,7 +14,11 @@ use crate::{
         store::StoreError,
     },
     runs::{Observation, Payload, record_observation},
-    telemetry::{Sweep, sweep_failed},
+    telemetry::{
+        Sweep, WorkerOperationKind, WorkerOperationOutcome, WorkerRunOutcome, derive_run_lease_id,
+        sweep_failed, worker_operation_completed, worker_operation_span, worker_run_claimed,
+        worker_run_settled, worker_run_span,
+    },
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::{PgPool, Postgres, pool::PoolConnection};
@@ -28,6 +32,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
+use tracing::Instrument;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -669,6 +674,7 @@ async fn reconcile<E: Executor>(
     run: &ActiveRun,
     executor: &E,
     context: &RunContext,
+    lease_id: &str,
 ) -> Result<WorkEnd, LeaseError> {
     let lease = run.claim.lease();
     let mut after = None;
@@ -683,34 +689,93 @@ async fn reconcile<E: Executor>(
             if let Some(why) = context.stopped() {
                 return Ok(WorkEnd::Stop(why));
             }
-            if let Some(o) = executor.reconcile(run, op, context.step()).await {
-                let mut c = connection(pool).await?;
-                if context.stopped() == Some(Stop::LeaseLost) {
-                    return Ok(WorkEnd::Stop(Stop::LeaseLost));
+            let op_started = std::time::Instant::now();
+            let op_span = worker_operation_span(
+                lease.run_id,
+                lease_id,
+                &op.id,
+                WorkerOperationKind::Reconcile,
+            );
+            let step_result: Result<Option<WorkEnd>, LeaseError> = async {
+                let res = if let Some(o) = executor.reconcile(run, op, context.step()).await {
+                    let mut c = connection(pool).await?;
+                    if context.stopped() == Some(Stop::LeaseLost) {
+                        Ok((
+                            WorkerOperationOutcome::LeaseLost,
+                            Some(WorkEnd::Stop(Stop::LeaseLost)),
+                        ))
+                    } else {
+                        leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
+                            record_observation(
+                                tx,
+                                &Observation {
+                                    scope: lease.scope_id,
+                                    run: lease.run_id,
+                                    operation: &op.id,
+                                    key: &o.key,
+                                    expected_revision: op.revision,
+                                    outcome: &o.outcome,
+                                    handle: o.handle.as_deref(),
+                                    evidence: Payload {
+                                        format: &o.format,
+                                        version: o.version,
+                                        bytes: &o.evidence,
+                                    },
+                                },
+                            )
+                            .await
+                        })
+                        .await?;
+                        Ok((WorkerOperationOutcome::Ok, None))
+                    }
+                } else if let Some(why) = context.stopped() {
+                    let outcome = if why == Stop::LeaseLost {
+                        WorkerOperationOutcome::LeaseLost
+                    } else {
+                        WorkerOperationOutcome::Stopped
+                    };
+                    Ok((outcome, Some(WorkEnd::Stop(why))))
+                } else {
+                    Ok((WorkerOperationOutcome::Handoff, None))
+                };
+                match res {
+                    Ok((outcome, end)) => {
+                        tracing::Span::current().record("operation.outcome", outcome.as_str());
+                        worker_operation_completed(
+                            lease.run_id,
+                            lease_id,
+                            &op.id,
+                            WorkerOperationKind::Reconcile,
+                            outcome,
+                            op_started.elapsed(),
+                        );
+                        Ok(end)
+                    }
+                    Err(err) => {
+                        let outcome = match err {
+                            LeaseError::Stopping(_) => WorkerOperationOutcome::Stopped,
+                            LeaseError::StaleClaim
+                            | LeaseError::Expired
+                            | LeaseError::Terminal { .. } => WorkerOperationOutcome::LeaseLost,
+                            LeaseError::Store(_) => WorkerOperationOutcome::Failed,
+                        };
+                        tracing::Span::current().record("operation.outcome", outcome.as_str());
+                        worker_operation_completed(
+                            lease.run_id,
+                            lease_id,
+                            &op.id,
+                            WorkerOperationKind::Reconcile,
+                            outcome,
+                            op_started.elapsed(),
+                        );
+                        Err(err)
+                    }
                 }
-                leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
-                    record_observation(
-                        tx,
-                        &Observation {
-                            scope: lease.scope_id,
-                            run: lease.run_id,
-                            operation: &op.id,
-                            key: &o.key,
-                            expected_revision: op.revision,
-                            outcome: &o.outcome,
-                            handle: o.handle.as_deref(),
-                            evidence: Payload {
-                                format: &o.format,
-                                version: o.version,
-                                bytes: &o.evidence,
-                            },
-                        },
-                    )
-                    .await
-                })
-                .await?;
-            } else if let Some(why) = context.stopped() {
-                return Ok(WorkEnd::Stop(why));
+            }
+            .instrument(op_span)
+            .await;
+            if let Some(end) = step_result? {
+                return Ok(end);
             }
         }
         if page.len() < 100 {
@@ -736,9 +801,10 @@ async fn execute<E: Executor>(
     recovered: bool,
     settings: &LeaseSettings,
     context: &RunContext,
+    lease_id: &str,
 ) -> Result<WorkEnd, LeaseError> {
     if run.state == ExecState::Reconciling {
-        return reconcile(pool, run, adapters.executor, context).await;
+        return reconcile(pool, run, adapters.executor, context, lease_id).await;
     }
     if run.state == ExecState::Cancelling
         || (recovered
@@ -850,6 +916,22 @@ async fn execute<E: Executor>(
     }
 }
 
+fn settled_run_outcome(result: &Result<Settled, LeaseError>) -> WorkerRunOutcome {
+    match result {
+        Ok(Settled::Terminal { state: "succeeded" }) => WorkerRunOutcome::Succeeded,
+        Ok(Settled::Terminal { state: "cancelled" }) => WorkerRunOutcome::Cancelled,
+        Ok(Settled::Terminal {
+            state: "interrupted",
+        }) => WorkerRunOutcome::Interrupted,
+        Ok(Settled::Terminal { .. }) => WorkerRunOutcome::Failed,
+        Ok(Settled::Reconciling { .. }) => WorkerRunOutcome::Reconciling,
+        Err(LeaseError::Expired | LeaseError::StaleClaim | LeaseError::Terminal { .. }) => {
+            WorkerRunOutcome::LeaseLost
+        }
+        Err(_) => WorkerRunOutcome::Aborted,
+    }
+}
+
 async fn run_one<E: Executor>(
     pool: &PgPool,
     adapters: Adapters<'_, E>,
@@ -857,8 +939,36 @@ async fn run_one<E: Executor>(
     sent: Instant,
     recovered: bool,
     settings: LeaseSettings,
-    mut shutdown: watch::Receiver<Option<Instant>>,
+    shutdown: watch::Receiver<Option<Instant>>,
 ) {
+    let started = std::time::Instant::now();
+    let run_id = run.claim.run_id.clone();
+    let lease_id = derive_run_lease_id(&run_id, &run.claim.claim_token);
+    let span = worker_run_span(&run_id, &lease_id);
+    async {
+        worker_run_claimed(&run_id, &lease_id);
+        let outcome = run_one_inner(
+            pool, adapters, run, sent, recovered, settings, shutdown, &lease_id,
+        )
+        .await;
+        tracing::Span::current().record("run.outcome", outcome.as_str());
+        worker_run_settled(&run_id, &lease_id, outcome, started.elapsed());
+    }
+    .instrument(span)
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_inner<E: Executor>(
+    pool: &PgPool,
+    adapters: Adapters<'_, E>,
+    run: ActiveRun,
+    sent: Instant,
+    recovered: bool,
+    settings: LeaseSettings,
+    mut shutdown: watch::Receiver<Option<Instant>>,
+    lease_id: &str,
+) -> WorkerRunOutcome {
     let lease = run.claim.lease();
     let children = StepTasks::default();
     let (stop, rx) = watch::channel(None);
@@ -875,7 +985,11 @@ async fn run_one<E: Executor>(
         tasks: children.handle(),
     };
     let mut work = Box::pin(async {
-        match execute(pool, adapters, &run, recovered, &settings, &context).await {
+        match execute(
+            pool, adapters, &run, recovered, &settings, &context, lease_id,
+        )
+        .await
+        {
             Ok(end) => end,
             Err(LeaseError::Stopping(_)) => WorkEnd::Stop(Stop::Cancel),
             Err(_) => WorkEnd::Stop(Stop::LeaseLost),
@@ -938,10 +1052,10 @@ async fn run_one<E: Executor>(
     // Cancel any pending renewal and return its connection before settling.
     drop(renewal);
     if cause == Some(Stop::LeaseLost) || matches!(end, WorkEnd::Stop(Stop::LeaseLost)) {
-        return;
+        return WorkerRunOutcome::LeaseLost;
     }
     let Ok(mut c) = connection(pool).await else {
-        return;
+        return WorkerRunOutcome::Aborted;
     };
     let input = match end {
         WorkEnd::Answer(answer) if cause.is_none() => {
@@ -952,20 +1066,21 @@ async fn run_one<E: Executor>(
                 }
                 Ok(Settled::Reconciling { .. }) => {
                     let _ = leases::release_lease(&mut c, &lease).await;
-                    return;
+                    return WorkerRunOutcome::Reconciling;
                 }
-                _ => return,
+                other => return settled_run_outcome(&other),
             }
         }
         WorkEnd::Invalidated(settled) => {
             if matches!(settled, Settled::Reconciling { .. }) {
                 let _ = leases::release_lease(&mut c, &lease).await;
+                return WorkerRunOutcome::Reconciling;
             }
-            return;
+            return WorkerRunOutcome::Invalidated;
         }
         WorkEnd::Handoff => {
             let _ = leases::handoff(&mut c, &lease, &settings).await;
-            return;
+            return WorkerRunOutcome::Handoff;
         }
         WorkEnd::Complete(input @ (Settle::Succeeded | Settle::Failed(_))) => input,
         WorkEnd::Complete(Settle::Stopped) if run.state == ExecState::Reconciling => {
@@ -973,7 +1088,7 @@ async fn run_one<E: Executor>(
         }
         _ if cause == Some(Stop::Shutdown) => {
             let _ = leases::handoff(&mut c, &lease, &settings).await;
-            return;
+            return WorkerRunOutcome::Handoff;
         }
         _ => Settle::Stopped,
     };
@@ -986,6 +1101,7 @@ async fn run_one<E: Executor>(
     if matches!(settled, Ok(Settled::Reconciling { .. })) {
         let _ = leases::release_lease(&mut c, &lease).await;
     }
+    settled_run_outcome(&settled)
 }
 
 /// Shared by live turns and resumed approvals. An existing write never gains a send
@@ -997,12 +1113,65 @@ pub(crate) struct EffectDispatch<'a> {
     pub settings: &'a LeaseSettings,
 }
 
+fn operation_outcome(result: &StepResult) -> WorkerOperationOutcome {
+    match result {
+        StepResult::Answer(_)
+        | StepResult::ToolOutput(_)
+        | StepResult::ToolSuccess { .. }
+        | StepResult::ToolResponse(Ok(_))
+        | StepResult::Continue
+        | StepResult::Finished => WorkerOperationOutcome::Ok,
+        StepResult::ToolResponse(Err(_)) | StepResult::Failed(_) => WorkerOperationOutcome::Failed,
+        StepResult::Stopped => WorkerOperationOutcome::Stopped,
+        StepResult::Handoff => WorkerOperationOutcome::Handoff,
+        StepResult::LeaseLost => WorkerOperationOutcome::LeaseLost,
+        StepResult::Invalidated(_) => WorkerOperationOutcome::Invalidated,
+    }
+}
+
 impl EffectDispatch<'_> {
     pub async fn send(
         &self,
         run: &ActiveRun,
         proposal: &Proposal,
         intent: IntentResult,
+        step: StepContext,
+    ) -> StepResult {
+        let fail = StepResult::Failed(FailReason::StepFailed);
+        let (op, fresh) = match intent {
+            IntentResult::Applied(i) => (i.operation_id.clone(), Some(i)),
+            IntentResult::Replayed(id) => (id, None),
+            IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
+            IntentResult::ApprovalRequired => return fail,
+        };
+        let started = std::time::Instant::now();
+        let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
+        let op_span =
+            worker_operation_span(&run.claim.run_id, &lease_id, &op, WorkerOperationKind::Tool);
+        async {
+            let result = self.send_operation(run, proposal, &op, fresh, step).await;
+            let outcome = operation_outcome(&result);
+            tracing::Span::current().record("operation.outcome", outcome.as_str());
+            worker_operation_completed(
+                &run.claim.run_id,
+                &lease_id,
+                &op,
+                WorkerOperationKind::Tool,
+                outcome,
+                started.elapsed(),
+            );
+            result
+        }
+        .instrument(op_span)
+        .await
+    }
+
+    async fn send_operation(
+        &self,
+        run: &ActiveRun,
+        proposal: &Proposal,
+        op: &str,
+        fresh: Option<approvals::CommittedIntent>,
         mut step: StepContext,
     ) -> StepResult {
         let Self {
@@ -1013,12 +1182,6 @@ impl EffectDispatch<'_> {
         } = *self;
         use approvals::ReplayEffect;
         let fail = StepResult::Failed(FailReason::StepFailed);
-        let (op, fresh) = match intent {
-            IntentResult::Applied(i) => (i.operation_id.clone(), Some(i)),
-            IntentResult::Replayed(id) => (id, None),
-            IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
-            IntentResult::ApprovalRequired => return fail,
-        };
         let policy = Some(effects);
         let lease = run.claim.lease();
         let Ok(mut c) = pool.acquire().await else {
@@ -1030,7 +1193,7 @@ impl EffectDispatch<'_> {
         )
         .bind(lease.scope_id)
         .bind(lease.run_id)
-        .bind(&op)
+        .bind(op)
         .fetch_one(&mut *c)
         .await;
         let permit = match op_row {
@@ -1042,7 +1205,7 @@ impl EffectDispatch<'_> {
                 if Instant::now() >= step.deadline {
                     return StepResult::Handoff;
                 }
-                approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
+                approvals::start_replayed_read(&mut c, &lease, op, proposal, settings, &policy)
                     .await
             }
             // Only legacy single-phase rows (`dispatched_attempts IS NULL`, created while
@@ -1059,12 +1222,12 @@ impl EffectDispatch<'_> {
                 if Instant::now() >= step.deadline {
                     return StepResult::Handoff;
                 }
-                approvals::start_write_attempt(&mut c, &lease, &op, proposal, settings, &policy)
+                approvals::start_write_attempt(&mut c, &lease, op, proposal, settings, &policy)
                     .await
             }
             Ok(_) => {
                 approvals::recheck_replay_effect_authority(
-                    &mut c, &lease, &op, proposal, settings, &policy,
+                    &mut c, &lease, op, proposal, settings, &policy,
                 )
                 .await
             }
@@ -1072,7 +1235,7 @@ impl EffectDispatch<'_> {
         let bytes = match start_permit(
             &mut c,
             &lease,
-            (&op, proposal),
+            (op, proposal),
             settings,
             &policy,
             &mut step,
@@ -1086,7 +1249,9 @@ impl EffectDispatch<'_> {
         drop(c);
         let result = match timeout_at(
             step.deadline,
-            effects.adapter.send(run, op.clone(), bytes, step.clone()),
+            effects
+                .adapter
+                .send(run, op.to_owned(), bytes, step.clone()),
         )
         .await
         {
@@ -1099,7 +1264,7 @@ impl EffectDispatch<'_> {
                     pool,
                     lease,
                     proposal,
-                    operation: &op,
+                    operation: op,
                     step: &step,
                 };
                 return artifact_fs::publish_bytes_with_handle(
@@ -1123,7 +1288,7 @@ impl EffectDispatch<'_> {
                     &mut c,
                     &lease,
                     &step,
-                    &op,
+                    op,
                     true,
                     handle.as_deref(),
                     &text,
@@ -1139,7 +1304,7 @@ impl EffectDispatch<'_> {
                     pool,
                     lease,
                     proposal,
-                    operation: &op,
+                    operation: op,
                     step: &step,
                 };
                 return artifact_fs::publish_bytes(&cx, artifacts, &text, settings, &policy).await;
@@ -1156,7 +1321,7 @@ impl EffectDispatch<'_> {
                     return StepResult::LeaseLost;
                 };
                 if let Err(e) =
-                    crate::mcp::observe_known(&mut c, &lease, &step, &op, success, &output).await
+                    crate::mcp::observe_known(&mut c, &lease, &step, op, success, &output).await
                 {
                     return turns::lease_step(e);
                 }
@@ -1175,7 +1340,7 @@ impl EffectDispatch<'_> {
             return StepResult::LeaseLost;
         };
         match approvals::recheck_replay_effect_authority(
-            &mut c, &lease, &op, proposal, settings, &policy,
+            &mut c, &lease, op, proposal, settings, &policy,
         )
         .await
         {

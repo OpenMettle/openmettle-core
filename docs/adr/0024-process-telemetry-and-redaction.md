@@ -58,9 +58,14 @@ Throughout, the following rules hold:
    `openmettle_core::telemetry`, a field name is outside the allowlist, or the level exceeds
    `LOG_LEVEL`. `enabled` repeats the same check, because a callsite shared with another
    dispatcher is re-evaluated per use.
-   - **Allowlisted fields:** `event`, `role`, `signal`, `request_id`, `http.route`,
-     `http.request.method`, `http.response.status_code`, `duration_us`, `error.type`,
-     `schema_version` and `dropped_lines`.
+   - **Allowlisted fields (increment 1 baseline):** `event`, `role`, `signal`, `request_id`,
+     `http.route`, `http.request.method`, `http.response.status_code`, `duration_us`,
+     `error.type`, `schema_version` and `dropped_lines`. *Update, 27 November 2026:*
+     `telemetry::FIELDS` now contains 26 allowlisted fields (adding `dropped_spans`,
+     `dropped_metric_exports`, quota/gateway fields, and validated correlation/lifecycle
+     fields `run_id`, `operation_id`, `lease_id`, `run.outcome`, `operation.kind`,
+     `operation.outcome`, enforced bijectively against `contracts/telemetry/v1.json`; raw
+     `claim_token` and `fence_token` secrets remain excluded).
    - **`message` is not allowlisted,** so a formatted free-text event never reaches the sink.
    - **Third-party targets are refused,** including sqlx, hyper, rustls and openidconnect.
      This covers their spans too.

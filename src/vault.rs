@@ -2333,6 +2333,21 @@ impl HttpsRefreshClient {
             loopback: self.loopback,
         }
     }
+
+    #[cfg(test)]
+    fn with_lookup(
+        mut self,
+        lookup: impl Fn(&str, u16) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + Sync + 'static,
+    ) -> Self {
+        self.lookup = Arc::new(lookup);
+        self
+    }
+
+    #[cfg(test)]
+    fn allow_loopback_fixture(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
 }
 
 /// Provider- and origin-bound registry of trusted OAuth token refresh clients.
@@ -2515,10 +2530,16 @@ impl RefreshClient for HttpsRefreshClient {
                 total,
             };
             let send_buf = std::mem::take(&mut body_bytes);
+            let started = std::time::Instant::now();
             let reply = self
                 .route()
                 .send(Method::POST, &headers, send_buf, &limits)
                 .await;
+            crate::telemetry::metrics::global().record_provider_http(
+                crate::telemetry::metrics::ProviderOperation::OauthRefresh,
+                provider_http::provider_outcome(&reply),
+                started.elapsed(),
+            );
             match reply {
                 Ok(response) => match response.status() {
                     StatusCode::OK => match parse_oauth_refresh_reply(response.body()) {
@@ -4121,5 +4142,118 @@ mod tests {
                 "expected Unconfigured for ({provider_kind}, {origin}), got {outcome:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn https_refresh_client_records_oauth_refresh_provider_http_metrics() {
+        use crate::provider_http::fixture::{Ca, HOST, Reply, Server, loopback, response};
+        use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ca = Ca::new();
+        let step = Arc::new(AtomicUsize::new(0));
+        let server_step = Arc::clone(&step);
+        let server = Server::start(ca.leaf(HOST, false), move |_| {
+            if server_step.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    br#"{"access_token":"tok-refreshed","expires_in":3600}"#,
+                ))
+            } else {
+                Reply::Bytes(response(
+                    401,
+                    &[("content-type", "application/json")],
+                    br#"{"error":"invalid_grant"}"#,
+                ))
+            }
+        })
+        .await;
+
+        let client = HttpsRefreshClient::new(
+            "github",
+            &["https://mcp.vendor.example.test"],
+            &format!("https://{HOST}:{}/token", server.port),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            Some("synthetic-client".into()),
+            RefreshTimeouts::default(),
+        )
+        .unwrap()
+        .with_lookup(loopback)
+        .allow_loopback_fixture();
+
+        let refresh_tok = SecretText::new_refresh("CANARY-REFRESH-METRIC").unwrap();
+        let scopes = vec!["issues.read".to_owned()];
+        let req = |origin: &'static str| RefreshRequest {
+            connection_id: "00000000-0000-4000-8000-000000000001",
+            provider_kind: "github",
+            account_id: "acct-1",
+            endpoint_origin: origin,
+            refresh_token: &refresh_tok,
+            allowed_scopes: &scopes,
+            current_granted_scopes: &scopes,
+        };
+
+        let before_ok = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Ok);
+        let ok = client
+            .refresh(
+                req("https://mcp.vendor.example.test"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        assert!(matches!(ok, RefreshOutcome::Refreshed(_)));
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Ok),
+            before_ok + 1
+        );
+
+        let before_err = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::HttpError);
+        let refused = client
+            .refresh(
+                req("https://mcp.vendor.example.test"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        assert!(matches!(refused, RefreshOutcome::Refused));
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::HttpError),
+            before_err + 1
+        );
+
+        // Unconfigured origin returns before any HTTP request and must emit zero metrics.
+        let before_unconf_ok = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Ok);
+        let before_unconf_err = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::HttpError);
+        let before_unconf_refused = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Refused);
+        let unconf = client
+            .refresh(
+                req("https://other.vendor.example.test"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        assert!(matches!(unconf, RefreshOutcome::Unconfigured));
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Ok),
+            before_unconf_ok
+        );
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::HttpError),
+            before_unconf_err
+        );
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Refused),
+            before_unconf_refused
+        );
+        assert_eq!(step.load(Ordering::SeqCst), 2);
     }
 }

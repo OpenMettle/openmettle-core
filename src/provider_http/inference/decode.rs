@@ -91,32 +91,41 @@ pub(super) async fn receive<F: Future<Output = ()>>(
     request: &Request,
     server: bool,
     mut visible: impl FnMut(VisibleDelta) -> F,
+    metric: &crate::provider_http::ProviderMetricSlot,
 ) -> Result<Turn, Error> {
+    use crate::telemetry::metrics::ProviderOutcome;
+
     let q = &gateway.qualification;
     let idle = gateway.timeouts.idle;
     let (head, mut body) = response.into_parts();
     if !head.status.is_success() {
+        metric.finish(ProviderOutcome::HttpError);
         return Err(status(head.status.as_u16(), &head.headers));
     }
     if head.status != hyper::StatusCode::OK {
+        metric.finish(ProviderOutcome::HttpError);
         return Err(Error::Malformed);
     }
-    let length = transport::framed_length(&head, BODY)?;
+    let length = transport::framed_length(&head, BODY).map_err(|err| {
+        metric.finish(crate::provider_http::provider_error_outcome(err));
+        Error::from(err)
+    })?;
     media(&head.headers, request.stream)?;
     let mut total = 0;
     let mut bytes = Vec::new();
     let mut sse = stream::Sse::default();
     let mut responses = responses::Events::default();
     let mut state = Assembly::default();
-    while let Some(frame) = timeout(idle, body.frame())
-        .await
-        .map_err(|_| Error::Timeout)?
-    {
+    while let Some(frame) = timeout(idle, body.frame()).await.map_err(|_| {
+        metric.finish(ProviderOutcome::Timeout);
+        Error::Timeout
+    })? {
         let data = frame
             .map_err(|e| body_error(&e))?
             .into_data()
             .map_err(|_| Error::Malformed)?;
         if data.len() > BODY - total {
+            metric.finish(ProviderOutcome::BodyLimit);
             return Err(Error::Malformed);
         }
         total += data.len();

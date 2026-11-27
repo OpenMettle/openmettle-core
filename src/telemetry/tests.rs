@@ -300,8 +300,55 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     metric_exports_dropped(1);
     let route = Route(None);
     let id = RequestId::generate();
-    request_completed(id, &route, Method::Other, 404, Duration::from_micros(7));
-    request_completed(None, &route, Method::Get, 503, Duration::from_micros(9));
+    let empty_ids = CorrelationIds::default();
+    let run_id = "11111111-2222-4333-8444-555555555555";
+    let op_id = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+    let lease_id = derive_run_lease_id(run_id, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
+    let correlated = CorrelationIds {
+        run_id: Some(run_id.to_owned()),
+        operation_id: Some(op_id.to_owned()),
+        lease_id: Some(lease_id.clone()),
+    };
+    request_completed(
+        id,
+        &route,
+        Method::Other,
+        404,
+        Duration::from_micros(7),
+        &empty_ids,
+    );
+    request_completed(
+        None,
+        &route,
+        Method::Get,
+        503,
+        Duration::from_micros(9),
+        &empty_ids,
+    );
+    request_completed(
+        id,
+        &route,
+        Method::Post,
+        200,
+        Duration::from_micros(11),
+        &correlated,
+    );
+    run_stream_failed(id, run_id);
+    worker_run_claimed(run_id, &lease_id);
+    worker_run_settled(
+        run_id,
+        &lease_id,
+        WorkerRunOutcome::Succeeded,
+        Duration::from_micros(15),
+    );
+    worker_operation_completed(
+        run_id,
+        &lease_id,
+        op_id,
+        WorkerOperationKind::Tool,
+        WorkerOperationOutcome::Ok,
+        Duration::from_micros(5),
+    );
     let lines = capture.json();
     let base = ["timestamp", "level", "event", "role"];
     let with =
@@ -349,6 +396,42 @@ fn every_constructor_passes_the_guard_with_its_fields() {
         ("http.request.completed", "DEBUG", request(&["request_id"])),
         // No ID is recorded rather than an invented one.
         ("http.request.completed", "WARN", request(&[])),
+        (
+            "http.request.completed",
+            "DEBUG",
+            request(&["request_id", "run_id", "operation_id", "lease_id"]),
+        ),
+        (
+            "run.stream.ended",
+            "ERROR",
+            [
+                "timestamp",
+                "level",
+                "event",
+                "request_id",
+                "run_id",
+                "error.type",
+            ]
+            .into(),
+        ),
+        ("worker.run.claimed", "INFO", with(&["run_id", "lease_id"])),
+        (
+            "worker.run.settled",
+            "INFO",
+            with(&["run_id", "lease_id", "run.outcome", "duration_us"]),
+        ),
+        (
+            "worker.operation.completed",
+            "DEBUG",
+            with(&[
+                "run_id",
+                "lease_id",
+                "operation_id",
+                "operation.kind",
+                "operation.outcome",
+                "duration_us",
+            ]),
+        ),
     ];
     assert_eq!(lines.len(), expected.len(), "{}", capture.text());
     for (line, (event, level, keys_expected)) in lines.iter().zip(expected) {
@@ -380,6 +463,52 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     assert_eq!(field(12, "http.request.method"), "_OTHER");
     assert_eq!(field(12, "http.response.status_code"), 404);
     assert_eq!(field(12, "duration_us"), 7);
+    assert_eq!(field(14, "run_id"), run_id);
+    assert_eq!(field(14, "operation_id"), op_id);
+    assert_eq!(field(14, "lease_id"), lease_id.as_str());
+    assert_eq!(field(15, "run_id"), run_id);
+    assert_eq!(field(16, "run_id"), run_id);
+    assert_eq!(field(16, "lease_id"), lease_id.as_str());
+    assert_eq!(field(17, "run.outcome"), "succeeded");
+    assert_eq!(field(18, "operation.kind"), "tool");
+    assert_eq!(field(18, "operation.outcome"), "ok");
+}
+
+#[test]
+fn derive_run_lease_id_is_deterministic_rotates_and_never_exposes_claim_token() {
+    let run_a = "11111111-2222-4333-8444-555555555555";
+    let run_b = "11111111-2222-4333-8444-555555555556";
+    let token_1 = "aaaa1111-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let token_2 = "ffff1111-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    let id_1 = derive_run_lease_id(run_a, token_1);
+    let id_1_repeat = derive_run_lease_id(run_a, token_1);
+    let id_2 = derive_run_lease_id(run_a, token_2);
+    let id_other_run = derive_run_lease_id(run_b, token_1);
+
+    assert_eq!(id_1, id_1_repeat);
+    assert!(is_derived_run_lease_id(&id_1), "{id_1}");
+    assert_ne!(id_1, id_2, "new claim_token must rotate lease_id");
+    assert_ne!(id_1, id_other_run, "different run_id must change lease_id");
+    assert_ne!(id_1, token_1);
+    assert!(!id_1.contains(token_1));
+    assert!(!id_1.contains(&token_1.replace('-', "")));
+
+    // Correlation defensively rejects unvalidated/canary IDs and raw non-UUID strings.
+    let corr = Correlation::default();
+    corr.set_run_id("not-a-uuid-CANARY");
+    corr.set_operation_id("not-a-uuid-CANARY");
+    corr.set_lease_id("rl-UPPERCASE000000000000000000000000");
+    corr.set_lease_id("not-a-lease-CANARY");
+    assert_eq!(corr.snapshot(), CorrelationIds::default());
+
+    corr.set_run_id(run_a);
+    corr.set_operation_id(run_b);
+    corr.set_lease_id(&id_1);
+    let snap = corr.snapshot();
+    assert_eq!(snap.run_id.as_deref(), Some(run_a));
+    assert_eq!(snap.operation_id.as_deref(), Some(run_b));
+    assert_eq!(snap.lease_id.as_deref(), Some(id_1.as_str()));
 }
 
 /// The shutdown deadline covers draining and the final flush together.

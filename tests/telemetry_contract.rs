@@ -4,9 +4,10 @@ use openmettle_core::telemetry::{
     self, Process,
     metrics::{
         self, BackupRunOutcome, CONTRACT_VERSION, CapacityOperation, CapacityOutcome,
-        CapacityStaleSurface, CapacityWaitOutcome, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal,
-        InstrumentKind, Metrics, ProviderOperation, ProviderOutcome, QuotaDriftOutcome,
-        ReadinessOutcome, RouteClass, StatusClass, StorageOperation, StorageOutcome,
+        CapacityStaleSurface, CapacityWaitOutcome, DESCRIPTORS, DroppedSignal, InstrumentKind,
+        Metrics, ProviderOperation, ProviderOutcome, QUEUE_AGE_BUCKETS, QuotaDriftOutcome,
+        ReadinessOutcome, RouteClass, RunQueueAgeOutcome, StatusClass, StorageOperation,
+        StorageOutcome,
     },
 };
 use opentelemetry_proto::tonic::metrics::v1::metric;
@@ -61,6 +62,31 @@ fn telemetry_contract_matches_compiled_log_and_trace_allowlists() {
     assert_eq!(
         contract["policy"]["retention_ceilings"]["metrics_days"].as_u64(),
         Some(14)
+    );
+    let access_control = &contract["policy"]["access_control"];
+    assert_eq!(
+        access_control["audience"].as_str(),
+        Some("infrastructure_operator_only")
+    );
+    assert_eq!(
+        access_control["exposed_via_product_api"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        access_control["granted_by_tenant_or_project_roles"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        access_control["independent_from_product_memory"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        access_control["independent_from_authorization_audit"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        access_control["requires_jurisdiction_retention_confirmation"].as_bool(),
+        Some(true)
     );
 
     assert_eq!(contract["logs"]["target"].as_str(), Some(telemetry::TARGET));
@@ -225,36 +251,19 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         Some(total_prom_series as u64)
     );
 
-    // capacity.grants (V1-18), storage.quota.drift (V1-17) and backup.runs (V1-30) are now
-    // implemented in `metrics`; only V1-10 queue age remains reserved.
+    // Every v1 reserved signal (including V1-10 `openmettle.runs.queue.age`) is now implemented.
     let reserved = contract["reserved_signals"].as_array().unwrap();
-    let mut reserved_by_name = BTreeMap::new();
-    for entry in reserved {
-        let name = entry["name"].as_str().unwrap();
-        let owner = entry["owner_ticket"].as_str().unwrap();
-        assert!(
-            !seen_otel.contains(name),
-            "implemented metric {name} must not remain in reserved_signals"
-        );
-        assert!(
-            reserved_by_name.insert(name, owner).is_none(),
-            "duplicate reserved signal {name}"
-        );
-    }
-    assert_eq!(
-        reserved_by_name.get("openmettle.runs.queue.age"),
-        Some(&"V1-10")
+    assert!(
+        reserved.is_empty(),
+        "expected no remaining reserved_signals in v1.json; got {reserved:?}"
     );
-    assert_eq!(reserved_by_name.len(), 1);
-    assert!(!reserved_by_name.contains_key("openmettle.backup.runs"));
-    assert!(!reserved_by_name.contains_key("openmettle.storage.quota.drift"));
-    assert!(!reserved_by_name.contains_key("openmettle.capacity.grants"));
     for implemented in [
         "openmettle.capacity.grants",
         "openmettle.capacity.observations.stale",
         "openmettle.capacity.wait.duration",
         "openmettle.storage.quota.drift",
         "openmettle.backup.runs",
+        "openmettle.runs.queue.age",
     ] {
         assert!(
             seen_otel.contains(implemented),
@@ -410,6 +419,9 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     for &outcome in BackupRunOutcome::ALL {
         store.record_backup_run(outcome, 1);
     }
+    for &outcome in RunQueueAgeOutcome::ALL {
+        store.record_run_queue_age(outcome, 12.5);
+    }
 
     let request = store
         .encode_otlp(Process::Api, Some(instance_id))
@@ -456,9 +468,15 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
                 sum.data_points.len()
             }
             (InstrumentKind::Histogram, metric::Data::Histogram(hist)) => {
+                let expected_bounds = descriptor
+                    .buckets
+                    .expect("histogram descriptor must declare buckets");
+                if descriptor.name == "openmettle.runs.queue.age" {
+                    assert_eq!(expected_bounds, &QUEUE_AGE_BUCKETS);
+                }
                 for dp in &hist.data_points {
-                    assert_eq!(dp.explicit_bounds.as_slice(), &DURATION_BUCKETS);
-                    assert_eq!(dp.bucket_counts.len(), DURATION_BUCKETS.len() + 1);
+                    assert_eq!(dp.explicit_bounds.as_slice(), expected_bounds);
+                    assert_eq!(dp.bucket_counts.len(), expected_bounds.len() + 1);
                     let bucket_sum: u64 = dp.bucket_counts.iter().sum();
                     assert_eq!(dp.count, bucket_sum);
                 }
@@ -540,7 +558,29 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
             ]
             .into(),
         );
-        allowed_metrics.insert(prom_name, labels);
+        if entry["kind"].as_str() == Some("histogram") {
+            let mut bucket_labels = labels.clone();
+            let mut le_values: BTreeSet<String> = entry["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    let bound = v.as_f64().unwrap();
+                    if bound.fract() == 0.0 {
+                        format!("{}", bound as i64)
+                    } else {
+                        format!("{bound}")
+                    }
+                })
+                .collect();
+            le_values.insert("+Inf".to_owned());
+            bucket_labels.insert("le".to_owned(), le_values);
+            allowed_metrics.insert(format!("{prom_name}_bucket"), bucket_labels);
+            allowed_metrics.insert(format!("{prom_name}_sum"), labels.clone());
+            allowed_metrics.insert(format!("{prom_name}_count"), labels);
+        } else {
+            allowed_metrics.insert(prom_name, labels);
+        }
     }
 
     let yaml = std::fs::read_to_string(root().join("contracts/telemetry/alerts-v1.yaml"))
@@ -549,7 +589,7 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         .lines()
         .filter(|line| line.trim_start().starts_with("- alert:"))
         .count();
-    assert!(alert_count >= 6, "expected at least 6 v1 alert rules");
+    assert_eq!(alert_count, 8, "expected 8 v1 alert rules");
     assert!(yaml.contains("signal_contract: v1"));
 
     let exprs = extract_alert_exprs(&yaml);
@@ -647,17 +687,20 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         }
     }
     assert!(
-        found_metrics.len() >= 6,
-        "expected alerts covering HTTP, DB readiness, telemetry drops, provider transport, quota drift and backup runs; got {found_metrics:?}"
+        found_metrics.len() >= 8,
+        "expected alerts covering HTTP, DB readiness, telemetry drops, provider transport, gateway failures, queue age, quota drift and backup runs; got {found_metrics:?}"
     );
-    assert!(
-        found_metrics.contains("openmettle_storage_quota_drift_total"),
-        "expected alert covering openmettle_storage_quota_drift_total; got {found_metrics:?}"
-    );
-    assert!(
-        found_metrics.contains("openmettle_backup_runs_total"),
-        "expected alert covering openmettle_backup_runs_total; got {found_metrics:?}"
-    );
+    for required in [
+        "openmettle_storage_quota_drift_total",
+        "openmettle_backup_runs_total",
+        "openmettle_gateway_failures_total",
+        "openmettle_runs_queue_age_seconds_bucket",
+    ] {
+        assert!(
+            found_metrics.contains(required),
+            "expected alert covering {required}; got {found_metrics:?}"
+        );
+    }
 }
 
 #[test]

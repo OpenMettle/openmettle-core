@@ -1215,3 +1215,268 @@ async fn traces_and_metrics_export_concurrently_and_stop_cleanly() {
     assert!(super::is_v4(trace_instance));
     assert_eq!(trace_instance, metric_instance);
 }
+
+#[tokio::test]
+async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_unvalidated_input() {
+    use crate::telemetry::{
+        derive_run_lease_id, record_request_lease_id, record_request_operation_id,
+        record_request_run_id,
+    };
+    use axum::http::Extensions;
+
+    const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const OP_ID: &str = "22222222-2222-4222-8222-222222222222";
+    const RAW_CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+
+    let lease_id = derive_run_lease_id(RUN_ID, RAW_CLAIM_TOKEN);
+    let valid_lease = lease_id.clone();
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    let app = observe(
+        Router::new()
+            .route(
+                "/v1/runs/{run_id}",
+                get(move |ext: Extensions| {
+                    let valid_lease = valid_lease.clone();
+                    async move {
+                        record_request_run_id(&ext, RUN_ID);
+                        record_request_operation_id(&ext, OP_ID);
+                        record_request_lease_id(&ext, &valid_lease);
+                        "ok\n"
+                    }
+                }),
+            )
+            .route(
+                "/v1/bad",
+                get(|ext: Extensions| async move {
+                    // Unvalidated canary strings and non-canonical IDs must be silently ignored.
+                    record_request_run_id(&ext, CANARY);
+                    record_request_operation_id(&ext, "not-a-uuid-canary");
+                    record_request_lease_id(&ext, "rl-not-hex-canary");
+                    "ok\n"
+                }),
+            ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    assert_eq!(
+        exchange(
+            address,
+            get_request(&format!("/v1/runs/{RUN_ID}")).as_bytes()
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        exchange(address, get_request("/v1/bad").as_bytes()).await,
+        200
+    );
+    server.abort();
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+
+    let run_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/runs/{run_id}"))
+        .expect("correlated /v1/runs/{run_id} span");
+    assert_eq!(run_span.name, "http.server.request");
+    assert_eq!(run_span.kind, SpanKind::Server as i32);
+    assert!(run_span.parent_span_id.is_empty());
+    assert_eq!(run_span.dropped_attributes_count, 0);
+    let run_attrs = attributes(&run_span.attributes);
+    let run_keys: BTreeSet<&str> = run_attrs.keys().copied().collect();
+    assert_eq!(
+        run_keys,
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "lease_id",
+            "operation_id",
+            "request_id",
+            "run_id",
+        ]
+        .into()
+    );
+    let run_req_id = text(run_attrs["request_id"]).unwrap();
+    assert_eq!(text(run_attrs["run_id"]), Some(RUN_ID));
+    assert_eq!(text(run_attrs["operation_id"]), Some(OP_ID));
+    assert_eq!(text(run_attrs["lease_id"]), Some(lease_id.as_str()));
+
+    let bad_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/bad"))
+        .expect("/v1/bad span");
+    assert_eq!(bad_span.dropped_attributes_count, 0);
+    let bad_attrs = attributes(&bad_span.attributes);
+    let bad_keys: BTreeSet<&str> = bad_attrs.keys().copied().collect();
+    assert_eq!(
+        bad_keys,
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "request_id",
+        ]
+        .into()
+    );
+
+    let completed = capture.events("http.request.completed");
+    assert_eq!(completed.len(), 2, "{}", capture.text());
+    let run_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/runs/{run_id}"))
+        .expect("correlated completion log");
+    assert_eq!(run_log["request_id"].as_str(), Some(run_req_id));
+    assert_eq!(run_log["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(run_log["operation_id"].as_str(), Some(OP_ID));
+    assert_eq!(run_log["lease_id"].as_str(), Some(lease_id.as_str()));
+
+    let bad_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/bad"))
+        .expect("/v1/bad completion log");
+    assert!(bad_log.get("run_id").is_none());
+    assert!(bad_log.get("operation_id").is_none());
+    assert!(bad_log.get("lease_id").is_none());
+
+    collector.assert_absent(&[
+        CANARY.as_bytes(),
+        b"not-a-uuid-canary",
+        b"rl-not-hex-canary",
+        RAW_CLAIM_TOKEN.as_bytes(),
+    ]);
+    capture.assert_absent(&[
+        CANARY.as_bytes(),
+        b"not-a-uuid-canary",
+        b"rl-not-hex-canary",
+        RAW_CLAIM_TOKEN.as_bytes(),
+    ]);
+}
+
+#[tokio::test]
+async fn worker_run_and_child_operation_spans_and_logs_correlate_without_exposing_claim_token() {
+    use crate::telemetry::{
+        WorkerOperationKind, WorkerOperationOutcome, WorkerRunOutcome, derive_run_lease_id,
+        worker_operation_completed, worker_operation_span, worker_run_claimed, worker_run_settled,
+        worker_run_span,
+    };
+    use tracing::Instrument;
+
+    const RUN_ID: &str = "44444444-4444-4444-8444-444444444444";
+    const OP_ID: &str = "55555555-5555-4555-8555-555555555555";
+    const RAW_CLAIM_TOKEN: &str = "66666666-6666-4666-8666-666666666666";
+
+    let lease_id = derive_run_lease_id(RUN_ID, RAW_CLAIM_TOKEN);
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    let run_span = worker_run_span(RUN_ID, &lease_id);
+    async {
+        worker_run_claimed(RUN_ID, &lease_id);
+        let op_span =
+            worker_operation_span(RUN_ID, &lease_id, OP_ID, WorkerOperationKind::Inference);
+        async {
+            worker_operation_completed(
+                RUN_ID,
+                &lease_id,
+                OP_ID,
+                WorkerOperationKind::Inference,
+                WorkerOperationOutcome::Ok,
+                Duration::from_millis(12),
+            );
+            tracing::Span::current()
+                .record("operation.outcome", WorkerOperationOutcome::Ok.as_str());
+        }
+        .instrument(op_span)
+        .await;
+        worker_run_settled(
+            RUN_ID,
+            &lease_id,
+            WorkerRunOutcome::Succeeded,
+            Duration::from_millis(25),
+        );
+        tracing::Span::current().record("run.outcome", WorkerRunOutcome::Succeeded.as_str());
+    }
+    .instrument(run_span)
+    .await;
+
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    let run_s = spans
+        .iter()
+        .find(|s| s.name == "worker.run")
+        .expect("worker.run span");
+    let op_s = spans
+        .iter()
+        .find(|s| s.name == "worker.operation")
+        .expect("worker.operation span");
+
+    assert!(run_s.parent_span_id.is_empty());
+    assert_eq!(run_s.kind, SpanKind::Internal as i32);
+    assert_eq!(run_s.dropped_attributes_count, 0);
+    assert_eq!(op_s.trace_id, run_s.trace_id);
+    assert_eq!(op_s.parent_span_id, run_s.span_id);
+    assert_eq!(op_s.kind, SpanKind::Internal as i32);
+    assert_eq!(op_s.dropped_attributes_count, 0);
+
+    let run_attrs = attributes(&run_s.attributes);
+    assert_eq!(
+        run_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        ["lease_id", "run.outcome", "run_id"].into()
+    );
+    assert_eq!(text(run_attrs["run_id"]), Some(RUN_ID));
+    assert_eq!(text(run_attrs["lease_id"]), Some(lease_id.as_str()));
+    assert_eq!(text(run_attrs["run.outcome"]), Some("succeeded"));
+
+    let op_attrs = attributes(&op_s.attributes);
+    assert_eq!(
+        op_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        [
+            "lease_id",
+            "operation.kind",
+            "operation.outcome",
+            "operation_id",
+            "run_id",
+        ]
+        .into()
+    );
+    assert_eq!(text(op_attrs["run_id"]), Some(RUN_ID));
+    assert_eq!(text(op_attrs["lease_id"]), Some(lease_id.as_str()));
+    assert_eq!(text(op_attrs["operation_id"]), Some(OP_ID));
+    assert_eq!(text(op_attrs["operation.kind"]), Some("inference"));
+    assert_eq!(text(op_attrs["operation.outcome"]), Some("ok"));
+
+    let claimed = capture.events("worker.run.claimed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(claimed[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+
+    let op_done = capture.events("worker.operation.completed");
+    assert_eq!(op_done.len(), 1);
+    assert_eq!(op_done[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(op_done[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+    assert_eq!(op_done[0]["operation_id"].as_str(), Some(OP_ID));
+    assert_eq!(op_done[0]["operation.kind"].as_str(), Some("inference"));
+    assert_eq!(op_done[0]["operation.outcome"].as_str(), Some("ok"));
+
+    let settled = capture.events("worker.run.settled");
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(settled[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+    assert_eq!(settled[0]["run.outcome"].as_str(), Some("succeeded"));
+
+    collector.assert_absent(&[RAW_CLAIM_TOKEN.as_bytes()]);
+    capture.assert_absent(&[RAW_CLAIM_TOKEN.as_bytes()]);
+}

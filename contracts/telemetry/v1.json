@@ -16,8 +16,16 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 480,
-    "max_prometheus_series_per_process": 1208,
+    "access_control": {
+      "audience": "infrastructure_operator_only",
+      "exposed_via_product_api": false,
+      "granted_by_tenant_or_project_roles": false,
+      "independent_from_product_memory": true,
+      "independent_from_authorization_audit": true,
+      "requires_jurisdiction_retention_confirmation": true
+    },
+    "max_data_point_streams": 520,
+    "max_prometheus_series_per_process": 1534,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -61,6 +69,12 @@
       "role",
       "signal",
       "request_id",
+      "run_id",
+      "operation_id",
+      "lease_id",
+      "run.outcome",
+      "operation.kind",
+      "operation.outcome",
       "http.route",
       "http.request.method",
       "http.response.status_code",
@@ -105,9 +119,29 @@
         "fields": ["event", "role", "error.type"]
       },
       {
+        "name": "worker.run.claimed",
+        "levels": ["info"],
+        "fields": ["event", "role", "run_id", "lease_id"]
+      },
+      {
+        "name": "worker.run.settled",
+        "levels": ["info", "warn"],
+        "fields": ["event", "role", "run_id", "lease_id", "run.outcome", "duration_us"]
+      },
+      {
+        "name": "worker.operation.completed",
+        "levels": ["debug", "warn"],
+        "fields": ["event", "role", "run_id", "lease_id", "operation_id", "operation.kind", "operation.outcome", "duration_us"]
+      },
+      {
         "name": "http.request.completed",
         "levels": ["debug", "warn"],
-        "fields": ["event", "request_id", "http.route", "http.request.method", "http.response.status_code", "duration_us"]
+        "fields": ["event", "request_id", "run_id", "operation_id", "lease_id", "http.route", "http.request.method", "http.response.status_code", "duration_us"]
+      },
+      {
+        "name": "run.stream.ended",
+        "levels": ["error"],
+        "fields": ["event", "request_id", "run_id", "error.type"]
       },
       {
         "name": "process.started",
@@ -166,6 +200,12 @@
     "allowed_fields": [
       "otel.kind",
       "request_id",
+      "run_id",
+      "operation_id",
+      "lease_id",
+      "run.outcome",
+      "operation.kind",
+      "operation.outcome",
       "http.route",
       "http.request.method",
       "http.response.status_code"
@@ -175,6 +215,21 @@
         "name": "http.server.request",
         "kind": "server",
         "excluded_routes": ["/healthz", "/readyz"],
+        "max_attributes": 8,
+        "max_events": 0,
+        "max_links": 0
+      },
+      {
+        "name": "worker.run",
+        "kind": "internal",
+        "max_attributes": 8,
+        "max_events": 0,
+        "max_links": 0
+      },
+      {
+        "name": "worker.operation",
+        "kind": "internal",
+        "parent": "worker.run",
         "max_attributes": 8,
         "max_events": 0,
         "max_links": 0
@@ -232,9 +287,9 @@
       "prometheus_name": "openmettle_provider_http_requests_total",
       "kind": "counter",
       "unit": "{request}",
-      "max_series": 18,
+      "max_series": 36,
       "labels": {
-        "operation": ["discovery", "jwks", "token"],
+        "operation": ["discovery", "jwks", "token", "inference", "mcp", "oauth_refresh"],
         "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
       }
     },
@@ -243,10 +298,10 @@
       "prometheus_name": "openmettle_provider_http_duration_seconds",
       "kind": "histogram",
       "unit": "s",
-      "max_series": 18,
+      "max_series": 36,
       "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
       "labels": {
-        "operation": ["discovery", "jwks", "token"],
+        "operation": ["discovery", "jwks", "token", "inference", "mcp", "oauth_refresh"],
         "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
       }
     },
@@ -386,9 +441,19 @@
       "labels": {
         "outcome": ["succeeded", "failed", "incomplete", "overdue"]
       }
+    },
+    {
+      "name": "openmettle.runs.queue.age",
+      "prometheus_name": "openmettle_runs_queue_age_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "semantics": "recorded_after_commit_for_queued_and_resumable_approved_waits",
+      "max_series": 4,
+      "buckets": [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0],
+      "labels": {
+        "outcome": ["claimed", "resumed", "cancelled", "expired"]
+      }
     }
   ],
-  "reserved_signals": [
-    {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"}
-  ]
+  "reserved_signals": []
 }

@@ -787,7 +787,8 @@ pub async fn disable_user(
     user_id: &str,
 ) -> Result<WriteOutcome, StoreError> {
     let change = user_change("user.disable", user_id)?;
-    write(
+    let mut cancelled_queue_ages = Vec::new();
+    let outcome = write(
         c,
         ctx,
         Action::ManageAccounts,
@@ -809,11 +810,13 @@ pub async fn disable_user(
             .execute(&mut *c)
             .await?;
             // Last statement: run rows are locked after every other lock (see `authz::runs`).
-            super::runs::cancel_user_runs(c, user).await?;
+            cancelled_queue_ages = super::runs::cancel_user_runs(c, user).await?;
             Ok(())
         },
     )
-    .await
+    .await?;
+    super::runs::record_cancelled_queue_ages(&cancelled_queue_ages);
+    Ok(outcome)
 }
 
 /// Re-enable a disabled account. Earlier sessions stay invalid; the user signs in again.

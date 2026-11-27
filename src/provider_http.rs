@@ -125,6 +125,87 @@ impl fmt::Debug for ProviderTransport {
     }
 }
 
+#[doc(hidden)]
+pub fn provider_error_outcome(error: Error) -> crate::telemetry::metrics::ProviderOutcome {
+    use crate::telemetry::metrics::ProviderOutcome;
+    match error {
+        Error::Timeout => ProviderOutcome::Timeout,
+        Error::Destination | Error::Address | Error::Configuration => ProviderOutcome::Refused,
+        Error::TooLarge => ProviderOutcome::BodyLimit,
+        Error::Resolve | Error::Connect | Error::Tls | Error::Protocol => {
+            ProviderOutcome::Transport
+        }
+    }
+}
+
+pub(crate) fn provider_outcome(
+    result: &Result<HttpResponse, Error>,
+) -> crate::telemetry::metrics::ProviderOutcome {
+    use crate::telemetry::metrics::ProviderOutcome;
+    match result {
+        Ok(response) if response.status().is_success() => ProviderOutcome::Ok,
+        Ok(_) => ProviderOutcome::HttpError,
+        Err(err) => provider_error_outcome(*err),
+    }
+}
+
+/// Records one outbound provider HTTP exchange at most once after [`Self::arm`], including if the
+/// exchange future is cancelled or dropped mid-flight. Unarmed slots record nothing so local
+/// pre-send validation failures never emit fake HTTP metrics.
+#[doc(hidden)]
+pub struct ProviderMetricSlot {
+    operation: crate::telemetry::metrics::ProviderOperation,
+    state: std::sync::Mutex<ProviderMetricState>,
+}
+
+enum ProviderMetricState {
+    Unarmed,
+    Armed(std::time::Instant),
+    Recorded,
+}
+
+impl ProviderMetricSlot {
+    pub fn new(operation: crate::telemetry::metrics::ProviderOperation) -> Self {
+        Self {
+            operation,
+            state: std::sync::Mutex::new(ProviderMetricState::Unarmed),
+        }
+    }
+
+    pub fn arm(&self) {
+        let mut guard = self.state.lock().unwrap();
+        if matches!(*guard, ProviderMetricState::Unarmed) {
+            *guard = ProviderMetricState::Armed(std::time::Instant::now());
+        }
+    }
+
+    pub fn finish(&self, outcome: crate::telemetry::metrics::ProviderOutcome) {
+        let elapsed = {
+            let mut guard = self.state.lock().unwrap();
+            match *guard {
+                ProviderMetricState::Armed(started) => {
+                    *guard = ProviderMetricState::Recorded;
+                    Some(started.elapsed())
+                }
+                ProviderMetricState::Unarmed | ProviderMetricState::Recorded => None,
+            }
+        };
+        if let Some(elapsed) = elapsed {
+            crate::telemetry::metrics::global().record_provider_http(
+                self.operation,
+                outcome,
+                elapsed,
+            );
+        }
+    }
+}
+
+impl Drop for ProviderMetricSlot {
+    fn drop(&mut self) {
+        self.finish(crate::telemetry::metrics::ProviderOutcome::Transport);
+    }
+}
+
 impl ProviderTransport {
     /// `token_endpoint` and `private_ranges` are deployment configuration, never request input.
     /// Private ranges default to none: a self-hosted provider is reachable only when every DNS
@@ -202,7 +283,6 @@ impl ProviderTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
-        use crate::telemetry::metrics::{self, ProviderOutcome};
         let started = std::time::Instant::now();
         let result = async {
             self.admit(&request)?;
@@ -229,19 +309,11 @@ impl ProviderTransport {
                 .await
         }
         .await;
-        let outcome = match &result {
-            Ok(response) if response.status().is_success() => ProviderOutcome::Ok,
-            Ok(_) => ProviderOutcome::HttpError,
-            Err(Error::Timeout) => ProviderOutcome::Timeout,
-            Err(Error::Destination | Error::Address | Error::Configuration) => {
-                ProviderOutcome::Refused
-            }
-            Err(Error::TooLarge) => ProviderOutcome::BodyLimit,
-            Err(Error::Resolve | Error::Connect | Error::Tls | Error::Protocol) => {
-                ProviderOutcome::Transport
-            }
-        };
-        metrics::global().record_provider_http(self.operation, outcome, started.elapsed());
+        crate::telemetry::metrics::global().record_provider_http(
+            self.operation,
+            provider_outcome(&result),
+            started.elapsed(),
+        );
         result
     }
 }
@@ -402,6 +474,10 @@ pub struct TurnDispatch<'a> {
 impl<'a> TurnDispatch<'a> {
     pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
         Self { dispatch, prepared }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.dispatch.id
     }
 
     /// Transmit the committed turn request through its originating [`inference::Gateway`]

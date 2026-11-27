@@ -44,10 +44,13 @@ impl MetricsSource {
     }
 }
 
-/// Upper bounds in seconds for every duration histogram in telemetry contract v1.
+/// Upper bounds in seconds for short-latency duration histograms in telemetry contract v1.
 pub const DURATION_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+/// Upper bounds in seconds for `openmettle.runs.queue.age` (resolution up to 5 minutes).
+pub const QUEUE_AGE_BUCKETS: [f64; 11] =
+    [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0];
 const BUCKET_SLOTS: usize = DURATION_BUCKETS.len() + 1;
 
 /// Closed HTTP route bucket for metrics. Keeps cardinality fixed even as new routes land and
@@ -152,18 +155,35 @@ impl ReadinessOutcome {
     }
 }
 
-/// Closed outbound provider HTTP operation set (ADR 0010 / 0011).
+/// Closed outbound provider HTTP operation set (OIDC, inference, MCP, OAuth refresh).
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOperation {
     Discovery,
     Jwks,
     Token,
+    Inference,
+    Mcp,
+    OauthRefresh,
 }
 
 impl ProviderOperation {
-    pub const ALL: &'static [Self] = &[Self::Discovery, Self::Jwks, Self::Token];
-    pub const NAMES: &'static [&'static str] = &["discovery", "jwks", "token"];
+    pub const ALL: &'static [Self] = &[
+        Self::Discovery,
+        Self::Jwks,
+        Self::Token,
+        Self::Inference,
+        Self::Mcp,
+        Self::OauthRefresh,
+    ];
+    pub const NAMES: &'static [&'static str] = &[
+        "discovery",
+        "jwks",
+        "token",
+        "inference",
+        "mcp",
+        "oauth_refresh",
+    ];
 
     pub const fn as_str(self) -> &'static str {
         Self::NAMES[self.index()]
@@ -591,6 +611,30 @@ impl BackupRunOutcome {
     }
 }
 
+/// Closed outcome set for durable work-queue wait observations (`openmettle.runs.queue.age`).
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunQueueAgeOutcome {
+    Claimed,
+    Resumed,
+    Cancelled,
+    Expired,
+}
+
+impl RunQueueAgeOutcome {
+    pub const ALL: &'static [Self] =
+        &[Self::Claimed, Self::Resumed, Self::Cancelled, Self::Expired];
+    pub const NAMES: &'static [&'static str] = &["claimed", "resumed", "cancelled", "expired"];
+
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Instrument kind recorded in telemetry contract v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstrumentKind {
@@ -721,7 +765,7 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         prometheus_name: "openmettle_provider_http_requests_total",
         kind: InstrumentKind::Counter,
         unit: "{request}",
-        description: "Outbound identity provider HTTP requests over the ADR 0010 transport.",
+        description: "Outbound provider HTTP requests over hardened transports (OIDC, inference, MCP, OAuth refresh).",
         labels: &[
             LabelDescriptor {
                 name: "operation",
@@ -739,7 +783,7 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         prometheus_name: "openmettle_provider_http_duration_seconds",
         kind: InstrumentKind::Histogram,
         unit: "s",
-        description: "Outbound identity provider HTTP request latency.",
+        description: "Outbound provider HTTP request latency.",
         labels: &[
             LabelDescriptor {
                 name: "operation",
@@ -899,6 +943,18 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.runs.queue.age",
+        prometheus_name: "openmettle_runs_queue_age_seconds",
+        kind: InstrumentKind::Histogram,
+        unit: "s",
+        description: "Post-commit wait time before a queued or approval-resumable run left the durable work queue.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: RunQueueAgeOutcome::NAMES,
+        }],
+        buckets: Some(&QUEUE_AGE_BUCKETS),
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -935,6 +991,7 @@ const CAPACITY_STALE_SLOTS: usize = CapacityStaleSurface::NAMES.len();
 const CAPACITY_WAIT_SLOTS: usize = CapacityWaitOutcome::NAMES.len();
 const QUOTA_DRIFT_SLOTS: usize = QuotaDriftOutcome::NAMES.len();
 const BACKUP_RUN_SLOTS: usize = BackupRunOutcome::NAMES.len();
+const RUN_QUEUE_AGE_SLOTS: usize = RunQueueAgeOutcome::NAMES.len();
 
 struct HistogramSlot {
     buckets: [AtomicU64; BUCKET_SLOTS],
@@ -950,13 +1007,37 @@ impl HistogramSlot {
     }
 
     fn observe(&self, elapsed: Duration) {
+        self.observe_duration(&DURATION_BUCKETS, elapsed);
+    }
+
+    fn observe_duration(&self, bounds: &[f64; 11], elapsed: Duration) {
         let secs = elapsed.as_secs_f64();
-        let bucket = DURATION_BUCKETS
+        let bucket = bounds
             .iter()
             .position(|&bound| secs <= bound)
-            .unwrap_or(DURATION_BUCKETS.len());
+            .unwrap_or(bounds.len());
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    fn observe_seconds(&self, bounds: &[f64; 11], seconds: f64) {
+        let secs = if seconds.is_finite() && seconds > 0.0 {
+            seconds
+        } else {
+            0.0
+        };
+        let bucket = bounds
+            .iter()
+            .position(|&bound| secs <= bound)
+            .unwrap_or(bounds.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        let scaled = (secs * 1_000_000.0).round();
+        let us = if scaled.is_finite() && scaled >= 0.0 {
+            scaled.min(u64::MAX as f64) as u64
+        } else {
+            0
+        };
         self.sum_us.fetch_add(us, Ordering::Relaxed);
     }
 
@@ -996,6 +1077,7 @@ pub struct Metrics {
     quota_drift: [AtomicU64; QUOTA_DRIFT_SLOTS],
     backup_runs: [AtomicU64; BACKUP_RUN_SLOTS],
     backup_runs_seeded: AtomicBool,
+    run_queue_age: [HistogramSlot; RUN_QUEUE_AGE_SLOTS],
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -1040,6 +1122,7 @@ impl Metrics {
             quota_drift: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_runs: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_runs_seeded: AtomicBool::new(false),
+            run_queue_age: std::array::from_fn(|_| HistogramSlot::new()),
         }
     }
 
@@ -1173,6 +1256,25 @@ impl Metrics {
         self.backup_runs[outcome.index()].load(Ordering::Relaxed)
     }
 
+    pub fn record_run_queue_age(&self, outcome: RunQueueAgeOutcome, age_seconds: f64) {
+        self.run_queue_age[outcome.index()].observe_seconds(&QUEUE_AGE_BUCKETS, age_seconds);
+    }
+
+    /// Snapshot cumulative `(count, sum_seconds, bucket_counts)` for one queue-age outcome.
+    pub fn run_queue_age_snapshot(&self, outcome: RunQueueAgeOutcome) -> (u64, f64, Vec<u64>) {
+        self.run_queue_age[outcome.index()].snapshot()
+    }
+
+    /// Snapshot cumulative outbound provider HTTP request count for `(operation, outcome)`.
+    pub fn provider_http_count(
+        &self,
+        operation: ProviderOperation,
+        outcome: ProviderOutcome,
+    ) -> u64 {
+        let idx = operation.index() * ProviderOutcome::NAMES.len() + outcome.index();
+        self.provider_requests[idx].load(Ordering::Relaxed)
+    }
+
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
     /// Returns `None` when nothing has been recorded yet so idle processes send no empty batch.
     pub fn encode_otlp(
@@ -1223,6 +1325,7 @@ impl Metrics {
                         count,
                         sum,
                         buckets,
+                        &DURATION_BUCKETS,
                         &[
                             ("openmettle.route_class", route.as_str()),
                             ("http.response.status_class", status.as_str()),
@@ -1255,6 +1358,7 @@ impl Metrics {
                     count,
                     sum,
                     buckets,
+                    &DURATION_BUCKETS,
                     &[("outcome", outcome.as_str())],
                 ));
             }
@@ -1285,6 +1389,7 @@ impl Metrics {
                         count,
                         sum,
                         buckets,
+                        &DURATION_BUCKETS,
                         &[("operation", op.as_str()), ("outcome", outcome.as_str())],
                     ));
                 }
@@ -1417,6 +1522,7 @@ impl Metrics {
                     count,
                     sum,
                     buckets,
+                    &DURATION_BUCKETS,
                     &[("outcome", outcome.as_str())],
                 ));
             }
@@ -1463,6 +1569,24 @@ impl Metrics {
             }
         }
         push_counter(&mut metrics, &DESCRIPTORS[16], backup_points);
+
+        // 17: openmettle.runs.queue.age
+        let mut queue_age_hpoints = Vec::new();
+        for &outcome in RunQueueAgeOutcome::ALL {
+            let (count, sum, buckets) = self.run_queue_age[outcome.index()].snapshot();
+            if count > 0 {
+                queue_age_hpoints.push(histogram_point(
+                    start,
+                    now,
+                    count,
+                    sum,
+                    buckets,
+                    &QUEUE_AGE_BUCKETS,
+                    &[("outcome", outcome.as_str())],
+                ));
+            }
+        }
+        push_histogram(&mut metrics, &DESCRIPTORS[17], queue_age_hpoints);
 
         if metrics.is_empty() {
             return None;
@@ -1528,6 +1652,7 @@ fn histogram_point(
     count: u64,
     sum: f64,
     bucket_counts: Vec<u64>,
+    explicit_bounds: &[f64],
     labels: &[(&str, &str)],
 ) -> HistogramDataPoint {
     HistogramDataPoint {
@@ -1537,7 +1662,7 @@ fn histogram_point(
         count,
         sum: Some(sum),
         bucket_counts,
-        explicit_bounds: DURATION_BUCKETS.to_vec(),
+        explicit_bounds: explicit_bounds.to_vec(),
         exemplars: Vec::new(),
         flags: 0,
         min: None,

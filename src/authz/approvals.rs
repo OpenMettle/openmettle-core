@@ -1095,13 +1095,14 @@ async fn invalidate_wait(
     scope: &str,
     run: &str,
     expires: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<f64>, StoreError> {
     if expires <= db_time(c).await? {
-        fail(c, scope, run, EXPIRED).await
+        fail(c, scope, run, EXPIRED).await?;
+        Ok(None)
     } else {
-        runs::cancel_one(c, scope, run, CancelReason::Revoked)
-            .await
-            .map(drop)
+        Ok(runs::cancel_one(c, scope, run, CancelReason::Revoked)
+            .await?
+            .and_then(|(_, age)| age))
     }
 }
 
@@ -1295,7 +1296,7 @@ pub async fn decide(
             i.idempotency_key.as_bytes(),
         ],
     )));
-    runs::transaction(c, async |c| {
+    let (receipt, cancelled_age_s) = runs::transaction(c, async |c| {
         let r = locked_actor_run(c, session, i.scope, i.run).await?;
         crate::restore::require_open_gate(c).await?;
         crate::backup::require_open_maintenance(c).await?;
@@ -1319,12 +1320,15 @@ pub async fn decide(
             {
                 return Err(StoreError::Conflict(store::KEY_REUSED));
             }
-            return Ok(Some(Receipt {
-                approval_id: i.approval.into(),
-                decision: i.decision,
-                binding_digest: i.binding_digest.into(),
-                decided_us: old.try_get("decided")?,
-            }));
+            return Ok((
+                Some(Receipt {
+                    approval_id: i.approval.into(),
+                    decision: i.decision,
+                    binding_digest: i.binding_digest.into(),
+                    decided_us: old.try_get("decided")?,
+                }),
+                None,
+            ));
         }
         if r.try_get::<&str, _>("state")? != "waiting"
             || r.try_get::<Option<&str>, _>("approval_wait_id")? != Some(i.approval)
@@ -1335,7 +1339,7 @@ pub async fn decide(
         let expires: i64 = a.try_get("expires")?;
         if db_time(c).await? >= expires {
             fail(c, i.scope, i.run, EXPIRED).await?;
-            return Ok(None);
+            return Ok((None, None));
         }
         let s = subject(&r, i.scope, i.run)?;
         if session.context.approval_id() != s.approval {
@@ -1370,8 +1374,8 @@ pub async fn decide(
             Ok(time) => time,
             Err(StoreError::Denied(_)) => {
                 session_proof(&reader).session_time(c).await?;
-                invalidate_wait(c, i.scope, i.run, expires).await?;
-                return Ok(None);
+                let age = invalidate_wait(c, i.scope, i.run, expires).await?;
+                return Ok((None, age));
             }
             Err(e) => return Err(e),
         };
@@ -1383,18 +1387,27 @@ pub async fn decide(
             event("openmettle.run-approval-decided", b"{}"),
         )
         .await?;
+        let mut cancelled_age = None;
         if i.decision == HumanDecision::Deny {
-            runs::cancel_one(c, i.scope, i.run, CancelReason::Requested).await?;
+            cancelled_age = runs::cancel_one(c, i.scope, i.run, CancelReason::Requested)
+                .await?
+                .and_then(|(_, age)| age);
         }
-        Ok(Some(Receipt {
-            approval_id: i.approval.into(),
-            decision: i.decision,
-            binding_digest: i.binding_digest.into(),
-            decided_us,
-        }))
+        Ok((
+            Some(Receipt {
+                approval_id: i.approval.into(),
+                decision: i.decision,
+                binding_digest: i.binding_digest.into(),
+                decided_us,
+            }),
+            cancelled_age,
+        ))
     })
-    .await?
-    .ok_or(CONFLICT)
+    .await?;
+    if let Some(age_s) = cancelled_age_s {
+        runs::record_cancelled_queue_ages(&[age_s]);
+    }
+    receipt.ok_or(CONFLICT)
 }
 
 /// Only an Applied result carries the exact committed outbound request and a one-use start check.
