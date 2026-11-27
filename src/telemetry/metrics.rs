@@ -1354,12 +1354,18 @@ impl Metrics {
         push_histogram(&mut metrics, &DESCRIPTORS[1], hpoints);
 
         // 2 & 3: openmettle.db.readiness.{checks,duration}
+        // Always emit all 3 closed outcome counters (including 0) on serving roles (`api`,
+        // `worker`, `gateway`, each serving `/readyz`) from startup so Prometheus records a zero
+        // baseline before any first failure burst; otherwise `increase(...[5m])` treats a startup
+        // burst (`absent -> 3 -> 3`) as a series appearance with zero increase. These 3 streams
+        // are already counted in `max_series: 3`. Keep the duration histogram omitted when empty.
         let mut db_points = Vec::new();
         let mut db_hpoints = Vec::new();
+        let db_baseline = matches!(role, Process::Api | Process::Worker | Process::Gateway);
         for &outcome in ReadinessOutcome::ALL {
             let idx = outcome.index();
             let value = self.db_readiness_checks[idx].load(Ordering::Relaxed);
-            if value > 0 {
+            if value > 0 || db_baseline {
                 db_points.push(counter_point(
                     start,
                     now,
@@ -1384,13 +1390,20 @@ impl Metrics {
         push_histogram(&mut metrics, &DESCRIPTORS[3], db_hpoints);
 
         // 4 & 5: openmettle.provider.http.{requests,duration}
+        // Always emit all 42 closed (operation, outcome) request counters (including 0) on `api`
+        // and `worker` from startup so Prometheus records a zero baseline before any first
+        // outbound provider failure burst; otherwise `increase(...[5m])` misses the initial burst
+        // on a freshly started process. These 42 streams are already counted in `max_series: 42`.
+        // Keep the duration histogram omitted when empty so idle processes never export empty
+        // histogram buckets.
         let mut prov_points = Vec::new();
         let mut prov_hpoints = Vec::new();
+        let provider_baseline = matches!(role, Process::Api | Process::Worker);
         for &op in ProviderOperation::ALL {
             for &outcome in ProviderOutcome::ALL {
                 let idx = op.index() * ProviderOutcome::NAMES.len() + outcome.index();
                 let value = self.provider_requests[idx].load(Ordering::Relaxed);
-                if value > 0 {
+                if value > 0 || provider_baseline {
                     prov_points.push(counter_point(
                         start,
                         now,
@@ -1852,6 +1865,95 @@ mod tests {
                     .iter()
                     .any(|m| m.name == "openmettle.gateway.failures"),
                 "unrecorded openmettle.gateway.failures must stay omitted on {role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_readiness_checks_emit_zero_baselines_on_serving_roles_only() {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+        for role in [Process::Api, Process::Worker, Process::Gateway] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            let metrics = &encoded.resource_metrics[0].scope_metrics[0].metrics;
+            let checks = metrics
+                .iter()
+                .find(|m| m.name == "openmettle.db.readiness.checks")
+                .unwrap_or_else(|| {
+                    panic!("expected zero-baseline openmettle.db.readiness.checks on {role:?}")
+                });
+            match checks.data.as_ref().unwrap() {
+                metric::Data::Sum(sum) => {
+                    assert_eq!(sum.data_points.len(), ReadinessOutcome::ALL.len());
+                    assert!(sum.data_points.iter().all(|dp| {
+                        matches!(
+                            dp.value,
+                            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0))
+                        )
+                    }));
+                }
+                other => panic!("expected Sum, got {other:?}"),
+            }
+            assert!(
+                !metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.db.readiness.duration"),
+                "empty openmettle.db.readiness.duration must stay omitted on {role:?}"
+            );
+        }
+        let migrate = store.encode_otlp(Process::Migrate, instance).unwrap();
+        assert!(
+            !migrate.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .any(|m| m.name == "openmettle.db.readiness.checks"),
+            "unrecorded openmettle.db.readiness.checks must stay omitted on Migrate"
+        );
+    }
+
+    #[test]
+    fn provider_http_requests_emit_zero_baselines_on_api_and_worker_only() {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+        for role in [Process::Api, Process::Worker] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            let metrics = &encoded.resource_metrics[0].scope_metrics[0].metrics;
+            let reqs = metrics
+                .iter()
+                .find(|m| m.name == "openmettle.provider.http.requests")
+                .unwrap_or_else(|| {
+                    panic!("expected zero-baseline openmettle.provider.http.requests on {role:?}")
+                });
+            match reqs.data.as_ref().unwrap() {
+                metric::Data::Sum(sum) => {
+                    assert_eq!(
+                        sum.data_points.len(),
+                        ProviderOperation::ALL.len() * ProviderOutcome::ALL.len()
+                    );
+                    assert!(sum.data_points.iter().all(|dp| {
+                        matches!(
+                            dp.value,
+                            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0))
+                        )
+                    }));
+                }
+                other => panic!("expected Sum, got {other:?}"),
+            }
+            assert!(
+                !metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.provider.http.duration"),
+                "empty openmettle.provider.http.duration must stay omitted on {role:?}"
+            );
+        }
+        for role in [Process::Gateway, Process::Migrate] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            assert!(
+                !encoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.provider.http.requests"),
+                "unrecorded openmettle.provider.http.requests must stay omitted on {role:?}"
             );
         }
     }

@@ -1973,3 +1973,261 @@ async fn takeover_and_reconcile_emits_correlated_capacity_grant_spans_and_events
         );
     }
 }
+
+#[derive(Default)]
+struct WorkerOpTraceRecorder {
+    state: std::sync::Mutex<WorkerOpTraceState>,
+}
+
+#[derive(Default)]
+struct WorkerOpTraceState {
+    next_id: u64,
+    spans: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, String>>,
+    closed_spans: Vec<std::collections::BTreeMap<String, String>>,
+    events: Vec<(String, std::collections::BTreeMap<String, String>)>,
+}
+
+impl tracing::Subscriber for WorkerOpTraceRecorder {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "openmettle_core::telemetry"
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut guard = self.state.lock().unwrap();
+        guard.next_id += 1;
+        let id = guard.next_id;
+        if span.metadata().name() == "worker.operation" {
+            let mut fields = std::collections::BTreeMap::new();
+            span.record(&mut FieldCollector(&mut fields));
+            guard.spans.insert(id, fields);
+        }
+        tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(fields) = guard.spans.get_mut(&span.into_u64()) {
+            values.record(&mut FieldCollector(fields));
+        }
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = std::collections::BTreeMap::new();
+        event.record(&mut FieldCollector(&mut fields));
+        if fields.get("event").map(String::as_str) == Some("worker.operation.completed") {
+            self.state
+                .lock()
+                .unwrap()
+                .events
+                .push((event.metadata().level().as_str().to_owned(), fields));
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn try_close(&self, id: tracing::span::Id) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(fields) = guard.spans.remove(&id.into_u64()) {
+            guard.closed_spans.push(fields);
+        }
+        true
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn worker_tool_operation_known_fault_and_replay_emit_failed_outcome_preserving_envelope() {
+    use openmettle_core::{
+        artifact_fs::Store,
+        authz::leases::ExecState,
+        mcp::{self, ScopedAdapter, ToolFault},
+        telemetry::derive_run_lease_id,
+        worker::{ActiveRun, StepContext, StepResult},
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_scope = personal_of(&db, &alice).await;
+    let alice_session = effect_session(&db, &alice, 1).await;
+    let claim = admit_approval_run(
+        &db,
+        &alice_scope,
+        "personal",
+        &alice,
+        &alice_session,
+        "tel-tool-fault-run",
+    )
+    .await;
+
+    let api_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, API))
+        .await
+        .unwrap();
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, WORKER))
+        .await
+        .unwrap();
+    let dir = crate::auth_config_support::Dir::new();
+    let root = std::path::PathBuf::from(dir.path("payload"));
+    fs::create_dir(&root).unwrap();
+    Store::open(&root)
+        .unwrap()
+        .initialize_api(&api_pool)
+        .await
+        .unwrap();
+    let store = Store::open(&root).unwrap();
+    store.probe_writable().unwrap();
+
+    let (_stop_tx, stop_rx) = watch::channel(None);
+    let tasks = StepTasks::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let step = StepContext {
+        deadline,
+        stop: stop_rx,
+        tasks: tasks.handle(),
+    };
+    let run = ActiveRun {
+        state: ExecState::Running,
+        execution_deadline: deadline,
+        claim: claim.clone(),
+    };
+    let expected_lease_id = derive_run_lease_id(&claim.run_id, &claim.claim_token);
+    let adapter = ScopedAdapter::new(worker_pool, store, LEASES);
+
+    let missing_args = json!({
+        "artifact_id": "00000000-0000-4000-8000-00000000f001",
+        "revision_id": "00000000-0000-4000-8000-00000000f002",
+        "offset": 0,
+        "max_bytes": 1024,
+    })
+    .to_string();
+    let expected_envelope = ToolFault::Semantic.envelope();
+
+    let recorder = Arc::new(WorkerOpTraceRecorder::default());
+    let _sub_guard = tracing::subscriber::set_default(recorder.clone());
+
+    // 1. Fresh known `ToolFault::Semantic`: `observe_known(..., false, &envelope)` +
+    //    `recheck_replay_effect_authority` must still return `StepResult::ToolOutput(envelope)`
+    //    to the model while recording `operation.outcome = "failed"` on span and log event.
+    let fresh = adapter
+        .call(
+            &run,
+            step.clone(),
+            "tel-missing-fault",
+            mcp::READ_RANGE,
+            "1",
+            missing_args.as_bytes(),
+        )
+        .await;
+    let StepResult::ToolOutput(fresh_env) = fresh else {
+        panic!("expected StepResult::ToolOutput for fresh known ToolFault");
+    };
+    assert_eq!(fresh_env, expected_envelope);
+
+    let (op_id, db_outcome, attempts): (String, String, i32) = sqlx::query_as(
+        "SELECT id::text, outcome, dispatched_attempts
+           FROM openmettle.operations
+          WHERE run_id = $1::uuid AND logical_key = 'tel-missing-fault'",
+    )
+    .bind(&claim.run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(db_outcome, "failed");
+    assert_eq!(attempts, 1);
+
+    // 2. Replayed failed `Observed` tool operation (same logical key): `start_permit_with_outcome`
+    //    replays the stored fault envelope without re-executing the adapter and must ALSO record
+    //    `operation.outcome = "failed"` on both span and log event.
+    let replayed = adapter
+        .call(
+            &run,
+            step,
+            "tel-missing-fault",
+            mcp::READ_RANGE,
+            "1",
+            missing_args.as_bytes(),
+        )
+        .await;
+    let StepResult::ToolOutput(replayed_env) = replayed else {
+        panic!("expected StepResult::ToolOutput for replayed failed tool op");
+    };
+    assert_eq!(replayed_env, expected_envelope);
+
+    let attempts_after_replay: i32 = sqlx::query_scalar(
+        "SELECT dispatched_attempts FROM openmettle.operations WHERE id = $1::uuid",
+    )
+    .bind(&op_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts_after_replay, 1,
+        "replaying an observed failed tool call must not dispatch a second attempt"
+    );
+
+    let st = recorder.state.lock().unwrap();
+    assert_eq!(st.closed_spans.len(), 2, "{:?}", st.closed_spans);
+    assert_eq!(st.events.len(), 2, "{:?}", st.events);
+    for idx in 0..2 {
+        let span = &st.closed_spans[idx];
+        assert_eq!(
+            span.get("run_id").map(String::as_str),
+            Some(claim.run_id.as_str())
+        );
+        assert_eq!(
+            span.get("lease_id").map(String::as_str),
+            Some(expected_lease_id.as_str())
+        );
+        assert_eq!(
+            span.get("operation_id").map(String::as_str),
+            Some(op_id.as_str())
+        );
+        assert_eq!(span.get("operation.kind").map(String::as_str), Some("tool"));
+        assert_eq!(
+            span.get("operation.outcome").map(String::as_str),
+            Some("failed"),
+            "call #{idx} span must record operation.outcome=failed, got {span:?}"
+        );
+        assert!(
+            !span.values().any(|v| v.contains(&claim.claim_token)),
+            "claim_token leaked into worker.operation span"
+        );
+
+        let (level, ev) = &st.events[idx];
+        assert_eq!(level, "WARN");
+        assert_eq!(
+            ev.get("run_id").map(String::as_str),
+            Some(claim.run_id.as_str())
+        );
+        assert_eq!(
+            ev.get("lease_id").map(String::as_str),
+            Some(expected_lease_id.as_str())
+        );
+        assert_eq!(
+            ev.get("operation_id").map(String::as_str),
+            Some(op_id.as_str())
+        );
+        assert_eq!(ev.get("operation.kind").map(String::as_str), Some("tool"));
+        assert_eq!(
+            ev.get("operation.outcome").map(String::as_str),
+            Some("failed"),
+            "call #{idx} event must record operation.outcome=failed, got {ev:?}"
+        );
+        assert!(
+            !ev.values().any(|v| v.contains(&claim.claim_token)),
+            "claim_token leaked into worker.operation.completed event"
+        );
+    }
+}

@@ -283,23 +283,55 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     let api_baseline_names: Vec<&str> = baseline_metrics.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
         api_baseline_names,
-        ["openmettle.telemetry.dropped", "openmettle.runs.queue.age"]
+        [
+            "openmettle.db.readiness.checks",
+            "openmettle.provider.http.requests",
+            "openmettle.telemetry.dropped",
+            "openmettle.runs.queue.age",
+        ]
     );
-    match baseline_metrics[0].data.as_ref().unwrap() {
-        metric::Data::Sum(sum) => {
-            assert_eq!(sum.data_points.len(), DroppedSignal::ALL.len());
-            assert!(sum.data_points.iter().all(|dp| {
-                matches!(
-                    dp.value,
-                    Some(
-                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+    let assert_zero_sum = |metrics: &[opentelemetry_proto::tonic::metrics::v1::Metric],
+                           name: &str,
+                           expected_len: usize| {
+        let metric = metrics
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("missing baseline metric {name}"));
+        match metric.data.as_ref().unwrap() {
+            metric::Data::Sum(sum) => {
+                assert_eq!(sum.data_points.len(), expected_len, "for {name}");
+                assert!(sum.data_points.iter().all(|dp| {
+                    matches!(
+                        dp.value,
+                        Some(
+                            opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+                        )
                     )
-                )
-            }));
+                }));
+            }
+            other => panic!("expected Sum for {name}, got {other:?}"),
         }
-        other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
-    }
-    match baseline_metrics[1].data.as_ref().unwrap() {
+    };
+    assert_zero_sum(
+        baseline_metrics,
+        "openmettle.db.readiness.checks",
+        ReadinessOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        baseline_metrics,
+        "openmettle.provider.http.requests",
+        ProviderOperation::ALL.len() * ProviderOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        baseline_metrics,
+        "openmettle.telemetry.dropped",
+        DroppedSignal::ALL.len(),
+    );
+    let api_queue_age = baseline_metrics
+        .iter()
+        .find(|m| m.name == "openmettle.runs.queue.age")
+        .expect("missing baseline metric openmettle.runs.queue.age");
+    match api_queue_age.data.as_ref().unwrap() {
         metric::Data::Histogram(hist) => {
             assert_eq!(hist.data_points.len(), RunQueueAgeOutcome::ALL.len());
             for dp in &hist.data_points {
@@ -312,7 +344,8 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Histogram for openmettle.runs.queue.age, got {other:?}"),
     }
 
-    // Gateway baseline emits dropped-telemetry and gateway-failure counters (never run queue age).
+    // Gateway baseline emits DB readiness checks, dropped-telemetry and gateway-failure counters
+    // (never provider HTTP requests or run queue age).
     let gateway_baseline = store
         .encode_otlp(Process::Gateway, Some(instance_id))
         .expect("fresh gateway registry emits zero-initialized baseline series");
@@ -321,32 +354,37 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     assert_eq!(
         gateway_names,
         [
+            "openmettle.db.readiness.checks",
             "openmettle.telemetry.dropped",
-            "openmettle.gateway.failures"
+            "openmettle.gateway.failures",
         ]
     );
-    match gateway_metrics[1].data.as_ref().unwrap() {
-        metric::Data::Sum(sum) => {
-            assert_eq!(
-                sum.data_points.len(),
-                metrics::GatewayStep::ALL.len() * metrics::GatewayCause::ALL.len()
-            );
-            assert!(sum.data_points.iter().all(|dp| {
-                matches!(
-                    dp.value,
-                    Some(
-                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
-                    )
-                )
-            }));
-        }
-        other => panic!("expected Sum for openmettle.gateway.failures, got {other:?}"),
-    }
+    assert_zero_sum(
+        gateway_metrics,
+        "openmettle.db.readiness.checks",
+        ReadinessOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        gateway_metrics,
+        "openmettle.gateway.failures",
+        metrics::GatewayStep::ALL.len() * metrics::GatewayCause::ALL.len(),
+    );
 
-    // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs,
-    // all 8 quota drift outcomes, and all 4 queue-age histograms, omitting `openmettle.backup.runs`
-    // until the worker seeds durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on
-    // restart).
+    // Migrate one-shot CLI emits only the 3 telemetry-drop baselines (no `/readyz` or provider HTTP).
+    let migrate_baseline = store
+        .encode_otlp(Process::Migrate, Some(instance_id))
+        .expect("fresh migrate registry emits zero-initialized drop baselines");
+    let migrate_names: Vec<&str> = migrate_baseline.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(migrate_names, ["openmettle.telemetry.dropped"]);
+
+    // Worker baseline before durable DB backup-run seeding emits zero-initialized DB readiness,
+    // provider HTTP request counters, telemetry drops, overdue handoffs, all 8 quota drift
+    // outcomes, and all 4 queue-age histograms, omitting `openmettle.backup.runs` until the
+    // worker seeds durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on restart).
     let worker_unseeded = store
         .encode_otlp(Process::Worker, Some(instance_id))
         .expect("fresh worker registry emits zero-initialized baseline series");
@@ -358,6 +396,8 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     assert_eq!(
         unseeded_names,
         [
+            "openmettle.db.readiness.checks",
+            "openmettle.provider.http.requests",
             "openmettle.telemetry.dropped",
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
@@ -375,6 +415,8 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     assert_eq!(
         worker_names,
         [
+            "openmettle.db.readiness.checks",
+            "openmettle.provider.http.requests",
             "openmettle.telemetry.dropped",
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
@@ -382,34 +424,26 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.runs.queue.age",
         ]
     );
-    match worker_metrics[2].data.as_ref().unwrap() {
-        metric::Data::Sum(sum) => {
-            assert_eq!(sum.data_points.len(), QuotaDriftOutcome::ALL.len());
-            assert!(sum.data_points.iter().all(|dp| {
-                matches!(
-                    dp.value,
-                    Some(
-                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
-                    )
-                )
-            }));
-        }
-        other => panic!("expected Sum for openmettle.storage.quota.drift, got {other:?}"),
-    }
-    match worker_metrics[3].data.as_ref().unwrap() {
-        metric::Data::Sum(sum) => {
-            assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len());
-            assert!(sum.data_points.iter().all(|dp| {
-                matches!(
-                    dp.value,
-                    Some(
-                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
-                    )
-                )
-            }));
-        }
-        other => panic!("expected Sum for openmettle.backup.runs, got {other:?}"),
-    }
+    assert_zero_sum(
+        worker_metrics,
+        "openmettle.db.readiness.checks",
+        ReadinessOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        worker_metrics,
+        "openmettle.provider.http.requests",
+        ProviderOperation::ALL.len() * ProviderOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        worker_metrics,
+        "openmettle.storage.quota.drift",
+        QuotaDriftOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        worker_metrics,
+        "openmettle.backup.runs",
+        BackupRunOutcome::ALL.len(),
+    );
 
     // An overdue handoff can be observed again on a later sweep.
     for step in metrics::GatewayStep::ALL {

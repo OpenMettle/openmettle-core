@@ -1249,6 +1249,43 @@ pub(crate) struct EffectDispatch<'a> {
     pub settings: &'a LeaseSettings,
 }
 
+pub(crate) struct DispatchStep {
+    pub(crate) step: StepResult,
+    pub(crate) outcome: WorkerOperationOutcome,
+}
+
+impl DispatchStep {
+    pub(crate) fn from_step(step: StepResult) -> Self {
+        let outcome = operation_outcome(&step);
+        Self { step, outcome }
+    }
+
+    pub(crate) fn observed_output(output: String, succeeded: bool) -> Self {
+        Self {
+            step: StepResult::ToolOutput(output),
+            outcome: observed_output_outcome(succeeded),
+        }
+    }
+}
+
+fn observed_output_outcome(succeeded: bool) -> WorkerOperationOutcome {
+    if succeeded {
+        WorkerOperationOutcome::Ok
+    } else {
+        WorkerOperationOutcome::Failed
+    }
+}
+
+fn observed_replay_step(step: &StepContext, succeeded: bool, output: String) -> DispatchStep {
+    if let Some(why) = *step.stop.borrow() {
+        DispatchStep::from_step(stopped_step(why))
+    } else if Instant::now() >= step.deadline {
+        DispatchStep::from_step(StepResult::Handoff)
+    } else {
+        DispatchStep::observed_output(output, succeeded)
+    }
+}
+
 fn operation_outcome(result: &StepResult) -> WorkerOperationOutcome {
     match result {
         StepResult::Answer(_)
@@ -1294,9 +1331,9 @@ impl EffectDispatch<'_> {
                 WorkerOperationKind::Tool,
                 Some(stop_rx),
             );
-            let result = self.send_operation(run, proposal, &op, fresh, step).await;
-            guard.finish(operation_outcome(&result));
-            result
+            let dispatched = self.send_operation(run, proposal, &op, fresh, step).await;
+            guard.finish(dispatched.outcome);
+            dispatched.step
         }
         .instrument(op_span)
         .await
@@ -1309,7 +1346,7 @@ impl EffectDispatch<'_> {
         op: &str,
         fresh: Option<approvals::CommittedIntent>,
         mut step: StepContext,
-    ) -> StepResult {
+    ) -> DispatchStep {
         let Self {
             pool,
             artifacts,
@@ -1321,7 +1358,7 @@ impl EffectDispatch<'_> {
         let policy = Some(effects);
         let lease = run.claim.lease();
         let Ok(mut c) = pool.acquire().await else {
-            return StepResult::LeaseLost;
+            return DispatchStep::from_step(StepResult::LeaseLost);
         };
         let op_row: Result<(String, Option<i32>), _> = sqlx::query_as(
             "SELECT capability, dispatched_attempts FROM openmettle.operations
@@ -1333,13 +1370,13 @@ impl EffectDispatch<'_> {
         .fetch_one(&mut *c)
         .await;
         let permit = match op_row {
-            Err(_) => return StepResult::LeaseLost,
+            Err(_) => return DispatchStep::from_step(StepResult::LeaseLost),
             Ok((cap, _)) if cap == "repeatable_read" => {
                 if let Some(why) = *step.stop.borrow() {
-                    return stopped_step(why);
+                    return DispatchStep::from_step(stopped_step(why));
                 }
                 if Instant::now() >= step.deadline {
-                    return StepResult::Handoff;
+                    return DispatchStep::from_step(StepResult::Handoff);
                 }
                 approvals::start_replayed_read(&mut c, &lease, op, proposal, settings, &policy)
                     .await
@@ -1353,10 +1390,10 @@ impl EffectDispatch<'_> {
             // MUST go through Transaction 2 (`start_write_attempt`).
             Ok((_, Some(attempts))) if attempts == 0 || fresh.is_some() => {
                 if let Some(why) = *step.stop.borrow() {
-                    return stopped_step(why);
+                    return DispatchStep::from_step(stopped_step(why));
                 }
                 if Instant::now() >= step.deadline {
-                    return StepResult::Handoff;
+                    return DispatchStep::from_step(StepResult::Handoff);
                 }
                 approvals::start_write_attempt(&mut c, &lease, op, proposal, settings, &policy)
                     .await
@@ -1368,7 +1405,7 @@ impl EffectDispatch<'_> {
                 .await
             }
         };
-        let bytes = match start_permit(
+        let bytes = match start_permit_with_outcome(
             &mut c,
             &lease,
             (op, proposal),
@@ -1380,7 +1417,7 @@ impl EffectDispatch<'_> {
         .await
         {
             Ok(bytes) => bytes,
-            Err(step) => return step,
+            Err(dispatched) => return dispatched,
         };
         drop(c);
         let result = match timeout_at(
@@ -1392,7 +1429,7 @@ impl EffectDispatch<'_> {
         .await
         {
             Ok(r) => r,
-            Err(_) => return StepResult::Handoff,
+            Err(_) => return DispatchStep::from_step(StepResult::Handoff),
         };
         let output = match result {
             StepResult::ToolSuccess { text, handle } if proposal.tool != crate::mcp::READ_RANGE => {
@@ -1415,10 +1452,10 @@ impl EffectDispatch<'_> {
             }
             StepResult::ToolSuccess { text, handle } => {
                 if *step.stop.borrow() == Some(Stop::LeaseLost) {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 }
                 let Ok(mut c) = pool.acquire().await else {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 };
                 if let Err(e) = crate::mcp::observe_known_with_handle(
                     &mut c,
@@ -1431,7 +1468,7 @@ impl EffectDispatch<'_> {
                 )
                 .await
                 {
-                    return turns::lease_step(e);
+                    return DispatchStep::from_step(turns::lease_step(e));
                 }
                 text
             }
@@ -1443,7 +1480,10 @@ impl EffectDispatch<'_> {
                     operation: op,
                     step: &step,
                 };
-                return artifact_fs::publish_bytes(&cx, artifacts, &text, settings, &policy).await;
+                return artifact_fs::publish_bytes_with_handle(
+                    &cx, artifacts, &text, None, settings, &policy,
+                )
+                .await;
             }
             StepResult::ToolResponse(known) => {
                 // Range pages have already been sized after JSON escaping. Known faults
@@ -1451,29 +1491,29 @@ impl EffectDispatch<'_> {
                 let success = known.is_ok();
                 let output = known.unwrap_or_else(crate::mcp::ToolFault::envelope);
                 if *step.stop.borrow() == Some(Stop::LeaseLost) {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 }
                 let Ok(mut c) = pool.acquire().await else {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 };
                 if let Err(e) =
                     crate::mcp::observe_known(&mut c, &lease, &step, op, success, &output).await
                 {
-                    return turns::lease_step(e);
+                    return DispatchStep::from_step(turns::lease_step(e));
                 }
                 output
             }
             StepResult::ToolOutput(output) => output,
-            other => return other,
+            other => return DispatchStep::from_step(other),
         };
         if let Some(why) = *step.stop.borrow() {
-            return stopped_step(why);
+            return DispatchStep::from_step(stopped_step(why));
         }
         if Instant::now() >= step.deadline {
-            return StepResult::Handoff;
+            return DispatchStep::from_step(StepResult::Handoff);
         }
         let Ok(mut c) = pool.acquire().await else {
-            return StepResult::LeaseLost;
+            return DispatchStep::from_step(StepResult::LeaseLost);
         };
         match approvals::recheck_replay_effect_authority(
             &mut c, &lease, op, proposal, settings, &policy,
@@ -1481,16 +1521,17 @@ impl EffectDispatch<'_> {
         .await
         {
             Ok(ReplayEffect::Observed {
+                succeeded,
                 output: Some(stored),
                 ..
-            }) => StepResult::ToolOutput(stored),
+            }) => DispatchStep::observed_output(stored, succeeded),
             // Preserve the output of legacy adapters with their own observation format.
             Ok(ReplayEffect::Observed {
                 succeeded: true, ..
-            }) if output.len() <= 65536 => StepResult::ToolOutput(output),
-            Ok(ReplayEffect::Invalidated(s)) => StepResult::Invalidated(s),
-            Err(e) => turns::lease_step(e),
-            _ => fail,
+            }) if output.len() <= 65536 => DispatchStep::observed_output(output, true),
+            Ok(ReplayEffect::Invalidated(s)) => DispatchStep::from_step(StepResult::Invalidated(s)),
+            Err(e) => DispatchStep::from_step(turns::lease_step(e)),
+            _ => DispatchStep::from_step(fail),
         }
     }
 }
@@ -1504,16 +1545,34 @@ pub(crate) async fn start_permit(
     settings: &LeaseSettings,
     policy: &impl EffectPolicy,
     step: &mut StepContext,
-    mut permit: Result<approvals::ReplayEffect, LeaseError>,
+    permit: Result<approvals::ReplayEffect, LeaseError>,
 ) -> Result<Vec<u8>, StepResult> {
+    start_permit_with_outcome(c, lease, effect, settings, policy, step, permit)
+        .await
+        .map_err(|dispatched| dispatched.step)
+}
+
+async fn start_permit_with_outcome(
+    c: &mut sqlx::PgConnection,
+    lease: &leases::Lease<'_>,
+    effect: (&str, &Proposal),
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+    step: &mut StepContext,
+    mut permit: Result<approvals::ReplayEffect, LeaseError>,
+) -> Result<Vec<u8>, DispatchStep> {
     use approvals::{ReplayEffect, StartPermit};
     let (operation, proposal) = effect;
     let mut refreshed = false;
     loop {
         match permit {
             Ok(ReplayEffect::Ready(intent)) => match intent.start(step) {
-                StartPermit::Stopped(stop) => return Err(stopped_step(stop)),
-                StartPermit::LeaseMarginExhausted => return Err(StepResult::Handoff),
+                StartPermit::Stopped(stop) => {
+                    return Err(DispatchStep::from_step(stopped_step(stop)));
+                }
+                StartPermit::LeaseMarginExhausted => {
+                    return Err(DispatchStep::from_step(StepResult::Handoff));
+                }
                 StartPermit::AuthorityExpired { .. } if !refreshed => {
                     refreshed = true;
                     permit = approvals::expire_unstarted_intent(
@@ -1521,29 +1580,36 @@ pub(crate) async fn start_permit(
                     )
                     .await;
                 }
-                StartPermit::AuthorityExpired { .. } => return Err(StepResult::Handoff),
+                StartPermit::AuthorityExpired { .. } => {
+                    return Err(DispatchStep::from_step(StepResult::Handoff));
+                }
                 StartPermit::Ready { request, deadline } => {
                     step.deadline = deadline;
                     return Ok(request);
                 }
             },
             Ok(ReplayEffect::Observed {
+                succeeded,
                 output: Some(output),
                 ..
             }) => {
-                return Err(if let Some(why) = *step.stop.borrow() {
-                    stopped_step(why)
-                } else if Instant::now() >= step.deadline {
-                    StepResult::Handoff
-                } else {
-                    StepResult::ToolOutput(output)
-                });
+                return Err(observed_replay_step(step, succeeded, output));
             }
-            Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
-            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => return Err(StepResult::Handoff),
-            Ok(ReplayEffect::Exhausted) => return Err(StepResult::Stopped),
-            Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
-            Err(e) => return Err(turns::lease_step(e)),
+            Ok(ReplayEffect::Invalidated(s)) => {
+                return Err(DispatchStep::from_step(StepResult::Invalidated(s)));
+            }
+            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => {
+                return Err(DispatchStep::from_step(StepResult::Handoff));
+            }
+            Ok(ReplayEffect::Exhausted) => {
+                return Err(DispatchStep::from_step(StepResult::Stopped));
+            }
+            Ok(_) => {
+                return Err(DispatchStep::from_step(StepResult::Failed(
+                    FailReason::StepFailed,
+                )));
+            }
+            Err(e) => return Err(DispatchStep::from_step(turns::lease_step(e))),
         }
     }
 }
@@ -2080,6 +2146,134 @@ mod tests {
         assert_eq!(settled[0]["lease_id"].as_str(), Some(lease_id.as_str()));
         assert_eq!(settled[0]["run.outcome"].as_str(), Some("aborted"));
         assert!(settled[0]["duration_us"].as_u64().is_some());
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn observed_tool_output_classifies_known_fault_as_failed_and_preserves_envelope() {
+        use crate::mcp::ToolFault;
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111121";
+        const OP_FRESH: &str = "22222222-2222-4222-8222-222222222221";
+        const OP_REPLAY: &str = "22222222-2222-4222-8222-222222222222";
+        const OP_OK: &str = "22222222-2222-4222-8222-222222222223";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333321";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+
+        let (_stop_tx, stop_rx) = watch::channel(None);
+        let step = StepContext {
+            deadline: Instant::now() + Duration::from_secs(30),
+            stop: stop_rx.clone(),
+            tasks: StepTasks::default().handle(),
+        };
+
+        let semantic_env = ToolFault::Semantic.envelope();
+        let refusal_env = ToolFault::TerminalRefusal.envelope();
+        let ok_env = r#"{"status":"ok","text":"synthetic-page"}"#.to_owned();
+
+        // Fresh known fault observed via `recheck_replay_effect_authority` (`succeeded: false`).
+        let fresh_fault = DispatchStep::observed_output(semantic_env.clone(), false);
+        assert_eq!(fresh_fault.outcome, WorkerOperationOutcome::Failed);
+        assert!(matches!(&fresh_fault.step, StepResult::ToolOutput(s) if s == &semantic_env));
+
+        // Replayed failed observed output via `start_permit_with_outcome` (`succeeded: false`).
+        let replayed_fault = observed_replay_step(&step, false, refusal_env.clone());
+        assert_eq!(replayed_fault.outcome, WorkerOperationOutcome::Failed);
+        assert!(matches!(&replayed_fault.step, StepResult::ToolOutput(s) if s == &refusal_env));
+
+        // Replayed succeeded observed output (`succeeded: true`).
+        let replayed_ok = observed_replay_step(&step, true, ok_env.clone());
+        assert_eq!(replayed_ok.outcome, WorkerOperationOutcome::Ok);
+        assert!(matches!(&replayed_ok.step, StepResult::ToolOutput(s) if s == &ok_env));
+
+        // Stopped/expired step still wins over observed output on replay.
+        let (stopped_tx, stopped_rx) = watch::channel(Some(Stop::LeaseLost));
+        let stopped_ctx = StepContext {
+            deadline: Instant::now() + Duration::from_secs(30),
+            stop: stopped_rx,
+            tasks: StepTasks::default().handle(),
+        };
+        let stopped_replay = observed_replay_step(&stopped_ctx, false, refusal_env.clone());
+        assert_eq!(stopped_replay.outcome, WorkerOperationOutcome::LeaseLost);
+        assert!(matches!(stopped_replay.step, StepResult::LeaseLost));
+        drop(stopped_tx);
+
+        // Emit OTLP spans + structured completion logs via `WorkerOperationGuard` just as
+        // `EffectDispatch::send` does for fresh fault, replayed fault, and succeeded output.
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        for (op_id, dispatched) in [
+            (OP_FRESH, fresh_fault),
+            (OP_REPLAY, replayed_fault),
+            (OP_OK, replayed_ok),
+        ] {
+            let span = worker_operation_span(RUN_ID, &lease_id, op_id, WorkerOperationKind::Tool);
+            let guard_span = span.clone();
+            let rx = stop_rx.clone();
+            async {
+                let guard = WorkerOperationGuard::new(
+                    guard_span,
+                    RUN_ID,
+                    &lease_id,
+                    op_id,
+                    WorkerOperationKind::Tool,
+                    Some(rx),
+                );
+                guard.finish(dispatched.outcome);
+            }
+            .instrument(span)
+            .await;
+        }
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.operation")
+            .collect();
+        assert_eq!(spans.len(), 3);
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 3, "{}", capture.text());
+
+        for (i, (op_id, expected_outcome, expected_level)) in [
+            (OP_FRESH, "failed", "WARN"),
+            (OP_REPLAY, "failed", "WARN"),
+            (OP_OK, "ok", "DEBUG"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+            assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+            assert_eq!(text(attrs["operation_id"]), Some(op_id));
+            assert_eq!(text(attrs["operation.kind"]), Some("tool"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["level"].as_str(), Some(expected_level));
+            assert_eq!(ev["run_id"].as_str(), Some(RUN_ID));
+            assert_eq!(ev["lease_id"].as_str(), Some(lease_id.as_str()));
+            assert_eq!(ev["operation_id"].as_str(), Some(op_id));
+            assert_eq!(ev["operation.kind"].as_str(), Some("tool"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
 
         capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
         collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
