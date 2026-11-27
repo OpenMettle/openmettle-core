@@ -396,6 +396,21 @@ impl Route<'_> {
         body: Vec<u8>,
         limits: &Limits,
     ) -> Result<HttpResponse, Error> {
+        self.send_with_status(method, headers, body, limits)
+            .await
+            .map_err(|(_, err)| err)
+    }
+
+    /// Like [`Self::send`], but preserves any parsed HTTP response [`http::StatusCode`] when
+    /// reading the response body fails (for example `Error::TooLarge`, `Error::Protocol`, or
+    /// `Error::Timeout` mid-body). Pre-response errors carry `None`.
+    pub(crate) async fn send_with_status(
+        &self,
+        method: http::Method,
+        headers: &http::HeaderMap,
+        body: Vec<u8>,
+        limits: &Limits,
+    ) -> Result<HttpResponse, (Option<http::StatusCode>, Error)> {
         if !(method == http::Method::POST || method == http::Method::GET && body.is_empty())
             || body.len() > limits.request_body
             || headers.keys_len() != headers.len()
@@ -403,35 +418,41 @@ impl Route<'_> {
                 .keys()
                 .any(|k| k != header::ACCEPT && k != header::CONTENT_TYPE)
         {
-            return Err(Error::Destination);
+            return Err((None, Error::Destination));
         }
-        self.send_admitted(method, headers, body, limits).await
+        self.send_admitted_with_status(method, headers, body, limits)
+            .await
     }
 
-    /// Gateway admin constructs its pinned method, path and sensitive headers internally.
-    pub(super) async fn send_admitted(
+    async fn send_admitted_with_status(
         &self,
         method: http::Method,
         headers: &http::HeaderMap,
         body: Vec<u8>,
         limits: &Limits,
-    ) -> Result<HttpResponse, Error> {
+    ) -> Result<HttpResponse, (Option<http::StatusCode>, Error)> {
         let start = Instant::now();
         let total = start + limits.total;
         let setup = (start + limits.setup).min(total);
         if body.len() > limits.request_body {
-            return Err(Error::TooLarge);
+            return Err((None, Error::TooLarge));
         }
-        let outbound = self.request(method, headers, body)?;
-        let connection = self.connect(setup).await?;
-        tokio::time::timeout_at(
+        let outbound = self.request(method, headers, body).map_err(|e| (None, e))?;
+        let connection = self.connect(setup).await.map_err(|e| (None, e))?;
+        let mut observed_status: Option<http::StatusCode> = None;
+        let result = tokio::time::timeout_at(
             total,
             self.exchange(connection, outbound, total, limits, |response| {
+                observed_status = Some(response.status());
                 read(response, limits.response_body)
             }),
         )
-        .await
-        .map_err(|_| Error::Timeout)?
+        .await;
+        match result {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(err)) => Err((observed_status, err)),
+            Err(_) => Err((observed_status, Error::Timeout)),
+        }
     }
 
     pub(super) async fn connect(&self, setup: Instant) -> Result<Box<dyn Connection>, Error> {

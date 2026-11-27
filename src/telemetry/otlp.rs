@@ -525,7 +525,8 @@ async fn export_metrics(
     // Deliver the pre-captured zero baseline immediately at startup (before the first sleep).
     // Retryable failures (429/502/503/504 or transport/timeout errors) retain `pending_baseline`
     // ahead of the first live snapshot; permanent rejections (such as 400 Bad Request) discard it
-    // immediately so live snapshots are never blocked behind a permanently rejected baseline.
+    // immediately and fall through to export the current live snapshot right away rather than
+    // waiting a full export interval.
     if let Some(body) = pending_baseline.take() {
         match post(&transport, &endpoint, body.clone()).await {
             PostOutcome::Delivered => {}
@@ -541,6 +542,14 @@ async fn export_metrics(
                     .as_ref()
                     .record_dropped(DroppedSignal::MetricExports, 1);
                 metric_exports_dropped(1);
+                send_metrics(
+                    &transport,
+                    &endpoint,
+                    metrics.as_ref(),
+                    role,
+                    instance_id.as_deref(),
+                )
+                .await;
             }
         }
     }
@@ -632,7 +641,10 @@ async fn send_spans(
 }
 
 /// One POST over the shared transport core: no retry, redirect, proxy or extra header. Only
-/// a 2xx answer counts as delivered; a partial-success body is not decoded.
+/// a complete 2xx response counts as delivered; a partial-success body is not decoded. When
+/// response headers already carried a non-2xx status before a body-read failure (such as an
+/// oversized `400`/`413` error payload), classify that status directly so permanent rejections
+/// are not misclassified as retryable.
 async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -> PostOutcome {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -657,10 +669,11 @@ async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -
         total: transport.tuning.deadline,
     };
     match route
-        .send(http::Method::POST, &headers, body, &limits)
+        .send_with_status(http::Method::POST, &headers, body, &limits)
         .await
     {
         Ok(response) => classify_status(response.status()),
+        Err((Some(status), _)) if !status.is_success() => classify_status(status),
         Err(_) => PostOutcome::RetryableFailure,
     }
 }

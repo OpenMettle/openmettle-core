@@ -22,6 +22,7 @@ import contextlib
 import http.client
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -1043,6 +1044,10 @@ def validate_delayed_baseline_samples(
             f"expected both [0, 1] samples for delayed startup baseline, got {values!r}"
         )
     parsed = [(float(ts), float(val)) for ts, val in values]
+    if any(not (math.isfinite(ts) and math.isfinite(val)) for ts, val in parsed):
+        raise QualificationFailure(
+            f"non-finite sample timestamp or value in delayed baseline series: {parsed!r}"
+        )
     if parsed[0][1] != 0.0 or parsed[-1][1] != 1.0:
         raise QualificationFailure(
             f"expected ordered [0.0, 1.0] samples after delayed baseline, got {parsed!r}"
@@ -1056,12 +1061,19 @@ def validate_delayed_baseline_samples(
             "increase(openmettle_runs_queue_slow_exits_total[10m]) returned no result"
         )
     increase_val = float(increase_rows[0]["value"][1])
-    if increase_val < 1.0:
+    if not math.isfinite(increase_val) or increase_val < 1.0:
         raise QualificationFailure(
-            f"expected increase(...) >= 1.0 for delayed startup baseline, got {increase_val}"
+            f"expected finite increase(...) >= 1.0 for delayed startup baseline, got {increase_val}"
         )
-    delayed = int(relay_stats.get("delayed", 0))
-    status_4xx = int(relay_stats.get("status_4xx", 0))
+    if not isinstance(relay_stats, dict):
+        raise QualificationFailure(f"invalid otlp-delay-relay stats payload: {relay_stats!r}")
+    for key in ("delayed", "status_4xx"):
+        if key not in relay_stats or not isinstance(relay_stats[key], int) or isinstance(relay_stats[key], bool):
+            raise QualificationFailure(
+                f"otlp-delay-relay stats missing integer field {key!r}: {relay_stats!r}"
+            )
+    delayed = relay_stats["delayed"]
+    status_4xx = relay_stats["status_4xx"]
     if delayed < 1:
         raise QualificationFailure(
             f"expected otlp-delay-relay to delay the baseline POST at least once, got {relay_stats!r}"

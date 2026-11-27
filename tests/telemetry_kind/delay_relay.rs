@@ -351,6 +351,12 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
                 "eof in chunk size",
             ));
         }
+        if !size_line.ends_with("\r\n") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing chunk size crlf",
+            ));
+        }
         let hex = trim_crlf(&size_line)
             .split(';')
             .next()
@@ -359,13 +365,22 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
         let size = usize::from_str_radix(hex, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
         if size == 0 {
-            // Drain trailer lines until empty line.
+            // Drain trailer lines until empty CRLF line.
             loop {
                 let mut trailer = String::new();
                 if read_line_bounded(reader, &mut trailer, 4096)? == 0 {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "eof in chunk trailers",
+                    ));
                 }
-                if trim_crlf(&trailer).is_empty() {
+                if !trailer.ends_with("\r\n") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing chunk trailer crlf",
+                    ));
+                }
+                if trailer == "\r\n" {
                     break;
                 }
             }
@@ -382,6 +397,12 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
         reader.read_exact(&mut out[start..])?;
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing chunk crlf",
+            ));
+        }
     }
     Ok(out)
 }

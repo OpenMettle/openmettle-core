@@ -1351,7 +1351,9 @@ async fn metrics_export_discards_permanently_rejected_baseline_and_delivers_live
     );
 
     // Case 2: Collector returns 400 immediately on the initial t=0 startup baseline POST, then
-    // 200 for live snapshots; baseline must be sent only once and live snapshot delivered on stop.
+    // 200 for live snapshots; baseline must be sent only once, the first live snapshot must be
+    // exported immediately without waiting for `interval` (60s) or `stop()`, and shutdown flushes
+    // without retrying the rejected baseline.
     let seen2 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
     let seen2_srv = seen2.clone();
     let server2 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
@@ -1372,14 +1374,37 @@ async fn metrics_export_discards_permanently_rejected_baseline_and_delivers_live
     .await;
 
     let store2 = Arc::new(metrics::Metrics::new());
+    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(4));
     let tuning2 = Tuning {
         interval: Duration::from_secs(60),
         ..FAST
     };
     let dest2 = metrics_destination(server2.port, &ca, tuning2);
     let (_, exporter2) = otlp::start_with_metrics(dest2, Process::Api, store2.clone());
-    until(|| !seen2.lock().unwrap().is_empty()).await;
-    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(4));
+
+    // Both the rejected 400 baseline AND the immediate fallback 200 live snapshot must arrive
+    // before `interval` (60s) elapses and before `stop()` is called.
+    until(|| seen2.lock().unwrap().len() >= 2).await;
+    {
+        let early = seen2.lock().unwrap().clone();
+        assert_eq!(early.len(), 2);
+        assert_eq!((early[0].0, early[0].1), (400, true));
+        assert_eq!((early[1].0, early[1].1), (200, false));
+        let live2 = ExportMetricsServiceRequest::decode(early[1].2.as_slice()).unwrap();
+        let (err_val, _, _) = find_counter_point(
+            &live2,
+            "openmettle.db.readiness.checks",
+            &[("outcome", "error")],
+        );
+        let (drop_val2, _, _) = find_counter_point(
+            &live2,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        assert_eq!(err_val, 1);
+        assert_eq!(drop_val2, 1);
+    }
+
     exporter2
         .stop(tokio::time::Instant::now() + Duration::from_secs(2))
         .await;
@@ -1387,24 +1412,253 @@ async fn metrics_export_discards_permanently_rejected_baseline_and_delivers_live
     let history2 = seen2.lock().unwrap().clone();
     assert_eq!(
         history2.len(),
-        2,
-        "expected single 400 baseline + 200 shutdown live flush"
+        3,
+        "expected single 400 baseline + immediate 200 live fallback + 200 shutdown flush"
     );
     assert_eq!((history2[0].0, history2[0].1), (400, true));
     assert_eq!((history2[1].0, history2[1].1), (200, false));
-    let live2 = ExportMetricsServiceRequest::decode(history2[1].2.as_slice()).unwrap();
-    let (err_val, _, _) = find_counter_point(
-        &live2,
-        "openmettle.db.readiness.checks",
-        &[("outcome", "error")],
+    assert_eq!((history2[2].0, history2[2].1), (200, false));
+}
+
+#[tokio::test]
+async fn metrics_export_classifies_oversized_response_bodies_by_parsed_status() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    const OVERSIZED_LEN: usize = otlp::MAX_RESPONSE_BYTES + 4; // 65,540 bytes > 64 KiB cap
+    let oversized_body = Arc::new(vec![b'x'; OVERSIZED_LEN]);
+    let ca = Ca::new();
+
+    // 1. After an initial 503, collector returns 400 with a 65,540-byte error body for the stale
+    //    baseline and 200 for live snapshots: baseline must still be classified PermanentRejection
+    //    (never retried after 400) and live snapshot must be delivered.
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_srv = recovered.clone();
+    let seen1 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen1_srv = seen1.clone();
+    let big1 = oversized_body.clone();
+    let server1 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if !recovered_srv.load(AtomicOrdering::Acquire) {
+            (503, b"")
+        } else if is_baseline {
+            (400, big1.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen1_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store1 = Arc::new(metrics::Metrics::new());
+    let dest1 = metrics_destination(server1.port, &ca, FAST);
+    let (_, exporter1) = otlp::start_with_metrics(dest1, Process::Worker, store1.clone());
+    until(|| {
+        let log = seen1.lock().unwrap();
+        !log.is_empty() && log[0].0 == 503 && log[0].1
+    })
+    .await;
+    store1.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 90.0);
+    recovered.store(true, AtomicOrdering::Release);
+    until(|| {
+        seen1
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(code, is_base, _)| *code == 200 && !*is_base)
+    })
+    .await;
+    exporter1
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let hist1 = seen1.lock().unwrap().clone();
+    let base_codes1: Vec<u16> = hist1
+        .iter()
+        .filter(|(_, is_base, _)| *is_base)
+        .map(|(code, _, _)| *code)
+        .collect();
+    assert_eq!(base_codes1, vec![503, 400]);
+    let live1_body = hist1
+        .iter()
+        .find(|(code, is_base, _)| *code == 200 && !*is_base)
+        .map(|(_, _, body)| body)
+        .expect("expected 200 live snapshot after oversized 400");
+    let live1 = ExportMetricsServiceRequest::decode(live1_body.as_slice()).unwrap();
+    assert_eq!(
+        find_counter_point(
+            &live1,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")]
+        )
+        .0,
+        1
     );
-    let (drop_val2, _, _) = find_counter_point(
-        &live2,
-        "openmettle.telemetry.dropped",
-        &[("signal", "metric_exports")],
+    assert_eq!(
+        find_counter_point(
+            &live1,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")]
+        )
+        .0,
+        2
     );
-    assert_eq!(err_val, 1);
-    assert_eq!(drop_val2, 1);
+
+    // 2. Immediate t=0 400 with a 65,540-byte body must discard baseline and immediately export
+    //    the live snapshot (before 60s interval or stop).
+    let seen2 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen2_srv = seen2.clone();
+    let big2 = oversized_body.clone();
+    let server2 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if is_baseline {
+            (400, big2.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen2_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store2 = Arc::new(metrics::Metrics::new());
+    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(3));
+    let tuning_long = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest2 = metrics_destination(server2.port, &ca, tuning_long);
+    let (_, exporter2) = otlp::start_with_metrics(dest2, Process::Api, store2.clone());
+    until(|| seen2.lock().unwrap().len() >= 2).await;
+    exporter2
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let hist2 = seen2.lock().unwrap().clone();
+    assert_eq!(hist2.len(), 3);
+    assert_eq!((hist2[0].0, hist2[0].1), (400, true));
+    assert_eq!((hist2[1].0, hist2[1].1), (200, false));
+    assert_eq!((hist2[2].0, hist2[2].1), (200, false));
+    assert_eq!(
+        store2.dropped_count(metrics::DroppedSignal::MetricExports),
+        1
+    );
+
+    // 3. 503 with a 65,540-byte body must remain RetryableFailure (retaining pending_baseline
+    //    until the collector recovers to 200).
+    let healthy3 = Arc::new(AtomicBool::new(false));
+    let healthy3_srv = healthy3.clone();
+    let seen3 = Arc::new(Mutex::new(Vec::<(u16, bool)>::new()));
+    let seen3_srv = seen3.clone();
+    let big3 = oversized_body.clone();
+    let server3 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if !healthy3_srv.load(AtomicOrdering::Acquire) {
+            (503, big3.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen3_srv.lock().unwrap().push((status, is_baseline));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store3 = Arc::new(metrics::Metrics::new());
+    let dest3 = metrics_destination(server3.port, &ca, FAST);
+    let (_, exporter3) = otlp::start_with_metrics(dest3, Process::Api, store3.clone());
+    until(|| store3.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+    healthy3.store(true, AtomicOrdering::Release);
+    until(|| seen3.lock().unwrap().iter().any(|&(c, b)| c == 200 && !b)).await;
+    exporter3
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let hist3 = seen3.lock().unwrap().clone();
+    let ok3: Vec<(u16, bool)> = hist3.into_iter().filter(|&(c, _)| c == 200).collect();
+    assert!(ok3.len() >= 2);
+    assert_eq!(
+        ok3[0],
+        (200, true),
+        "503 + oversized body must retain baseline"
+    );
+    assert_eq!(ok3[1], (200, false));
+
+    // 4. 200 with a 65,540-byte body must NEVER be treated as Delivered (must count a drop and
+    //    retain pending_baseline until a valid <=64 KiB 200 response arrives).
+    let healthy4 = Arc::new(AtomicBool::new(false));
+    let healthy4_srv = healthy4.clone();
+    let seen4 = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
+    let seen4_srv = seen4.clone();
+    let big4 = oversized_body.clone();
+    let server4 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let is_small = healthy4_srv.load(AtomicOrdering::Acquire);
+        let payload: &[u8] = if is_small { b"" } else { big4.as_slice() };
+        seen4_srv.lock().unwrap().push((is_small, is_baseline));
+        Reply::Bytes(response(200, &[], payload))
+    })
+    .await;
+
+    let store4 = Arc::new(metrics::Metrics::new());
+    let dest4 = metrics_destination(server4.port, &ca, FAST);
+    let (_, exporter4) = otlp::start_with_metrics(dest4, Process::Api, store4.clone());
+    until(|| store4.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+    healthy4.store(true, AtomicOrdering::Release);
+    until(|| {
+        seen4
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(small, base)| small && !base)
+    })
+    .await;
+    exporter4
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(store4.dropped_count(metrics::DroppedSignal::MetricExports) >= 1);
+    let ok4: Vec<(bool, bool)> = seen4
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|&(small, _)| small)
+        .collect();
+    assert!(ok4.len() >= 2);
+    assert_eq!(
+        ok4[0],
+        (true, true),
+        "oversized 200 must not mark baseline delivered"
+    );
+    assert_eq!(ok4[1], (true, false));
 }
 
 #[tokio::test]

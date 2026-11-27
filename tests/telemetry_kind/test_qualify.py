@@ -548,13 +548,31 @@ class SeriesValidationAndParserTests(unittest.TestCase):
                 [{"values": [[1700000000.0, "0"], [1700000000.0, "1"]]}], good_inc, good_stats
             )
 
-        # Empty or <1 increase must fail.
+        # Empty, non-finite (NaN/Inf), or <1 increase must fail.
         with self.assertRaisesRegex(qualify.QualificationFailure, "returned no result"):
             qualify.validate_delayed_baseline_samples(good_range, [], good_stats)
-        with self.assertRaisesRegex(qualify.QualificationFailure, "increase"):
-            qualify.validate_delayed_baseline_samples(
-                good_range, [{"value": [1700000005.0, "0"]}], good_stats
-            )
+        for bad_inc in ("0", "NaN", "Inf", "+Inf", "-Inf"):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "increase"):
+                qualify.validate_delayed_baseline_samples(
+                    good_range, [{"value": [1700000005.0, bad_inc]}], good_stats
+                )
+        for bad_sample in ("NaN", "Inf"):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "non-finite"):
+                qualify.validate_delayed_baseline_samples(
+                    [{"values": [[1700000000.0, "0"], [1700000000.001, bad_sample]]}],
+                    good_inc,
+                    good_stats,
+                )
+
+        # Missing or non-integer (including boolean) relay_stats keys must fail.
+        for bad_stats in (
+            {"forwarded": 4, "delayed": 1, "armed_ms": 0},
+            {"forwarded": 4, "armed_ms": 0, "status_4xx": 0},
+            {**good_stats, "delayed": True},
+            {**good_stats, "status_4xx": False},
+        ):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "missing integer field"):
+                qualify.validate_delayed_baseline_samples(good_range, good_inc, bad_stats)
 
         # Unfired delay or any 4xx rejection from Prometheus must fail.
         with self.assertRaisesRegex(qualify.QualificationFailure, "delay"):
@@ -699,6 +717,44 @@ class SeriesValidationAndParserTests(unittest.TestCase):
                 self.assertEqual(received[0], ("/api/v1/otlp/v1/metrics", other_body))
                 self.assertEqual(received[1], ("/api/v1/otlp/v1/metrics", base_body))
                 self.assertEqual(received[2], ("/api/v1/otlp/v1/metrics", live_body))
+
+                # Malformed chunked bodies (missing chunk CRLF, truncated trailer EOF, or LF-only
+                # chunk size line) must return 400 Bad Request and never forward upstream.
+                before_bad = len(received)
+                for raw_bad in (
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\r\nhelloXX0\r\n\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\r\nhello\r\n0\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\nhello\r\n0\r\n\r\n"
+                    ),
+                ):
+                    with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as raw_sock:
+                        raw_sock.sendall(raw_bad)
+                        raw_sock.shutdown(socket.SHUT_WR)
+                        reply = b""
+                        while True:
+                            chunk = raw_sock.recv(4096)
+                            if not chunk:
+                                break
+                            reply += chunk
+                    self.assertTrue(
+                        reply.startswith(b"HTTP/1.1 400 Bad Request\r\n"),
+                        f"expected 400 Bad Request for malformed chunked body {raw_bad!r}, got {reply!r}",
+                    )
+                self.assertEqual(len(received), before_bad)
         finally:
             if proc is not None:
                 proc.terminate()
