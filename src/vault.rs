@@ -4288,7 +4288,9 @@ mod tests {
 
         let refresh_tok = SecretText::new_refresh("CANARY-DROP-REFRESH").unwrap();
         let scopes = vec!["issues.read".to_owned()];
-        let before = metrics::global()
+        let before_cancelled = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Cancelled);
+        let before_transport = metrics::global()
             .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Transport);
 
         let mut fut = Box::pin(client.refresh(
@@ -4314,8 +4316,13 @@ mod tests {
 
         assert_eq!(
             metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Cancelled),
+            before_cancelled + 1
+        );
+        assert_eq!(
+            metrics::global()
                 .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Transport),
-            before + 1
+            before_transport
         );
     }
 }

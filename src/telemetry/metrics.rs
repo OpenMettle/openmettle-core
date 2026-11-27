@@ -204,6 +204,7 @@ pub enum ProviderOutcome {
     Transport,
     Refused,
     BodyLimit,
+    Cancelled,
 }
 
 impl ProviderOutcome {
@@ -214,6 +215,7 @@ impl ProviderOutcome {
         Self::Transport,
         Self::Refused,
         Self::BodyLimit,
+        Self::Cancelled,
     ];
     pub const NAMES: &'static [&'static str] = &[
         "ok",
@@ -222,6 +224,7 @@ impl ProviderOutcome {
         "transport",
         "refused",
         "body_limit",
+        "cancelled",
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -1202,6 +1205,16 @@ impl Metrics {
         self.capacity_grants[idx].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Snapshot cumulative capacity grant decision count for `(operation, outcome)`.
+    pub fn capacity_grant_count(
+        &self,
+        operation: CapacityOperation,
+        outcome: CapacityOutcome,
+    ) -> u64 {
+        let idx = operation.index() * CapacityOutcome::NAMES.len() + outcome.index();
+        self.capacity_grants[idx].load(Ordering::Relaxed)
+    }
+
     pub fn record_capacity_stale_observation(&self, surface: CapacityStaleSurface) {
         self.capacity_stale_observations[surface.index()].fetch_add(1, Ordering::Relaxed);
     }
@@ -1455,12 +1468,18 @@ impl Metrics {
             );
         }
 
+        // 10: openmettle.gateway.failures
+        // Always emit all 49 closed (step, cause) series (including 0) on `openmettle-gateway`
+        // from startup so Prometheus records a zero baseline before any first failure burst;
+        // otherwise `increase(openmettle_gateway_failures_total[5m])` treats a first burst
+        // (`absent -> 3 -> 3`) as a series appearance with zero increase. These 49 streams are
+        // already counted in `max_series: 49`.
         let mut failures = Vec::new();
         for step in GatewayStep::ALL {
             for cause in GatewayCause::ALL {
                 let n =
                     self.gateway_failures[step as usize][cause as usize].load(Ordering::Relaxed);
-                if n > 0 {
+                if n > 0 || role == Process::Gateway {
                     failures.push(counter_point(
                         start,
                         now,
@@ -1798,5 +1817,42 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "openmettle.runs.queue.age")
         );
+    }
+
+    #[test]
+    fn gateway_failures_emit_zero_baselines_on_gateway_only() {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+        let gateway = store.encode_otlp(Process::Gateway, instance).unwrap();
+        let metric = gateway.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .find(|m| m.name == "openmettle.gateway.failures")
+            .expect("expected zero-baseline openmettle.gateway.failures on Gateway");
+        match metric.data.as_ref().unwrap() {
+            metric::Data::Sum(sum) => {
+                assert_eq!(
+                    sum.data_points.len(),
+                    GatewayStep::ALL.len() * GatewayCause::ALL.len()
+                );
+                assert!(sum.data_points.iter().all(|dp| {
+                    matches!(
+                        dp.value,
+                        Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0))
+                    )
+                }));
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
+        for role in [Process::Api, Process::Worker] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            assert!(
+                !encoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.gateway.failures"),
+                "unrecorded openmettle.gateway.failures must stay omitted on {role:?}"
+            );
+        }
     }
 }

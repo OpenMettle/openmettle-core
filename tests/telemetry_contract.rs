@@ -312,16 +312,36 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Histogram for openmettle.runs.queue.age, got {other:?}"),
     }
 
-    // Gateway baseline emits only dropped-telemetry counters (never run queue age).
+    // Gateway baseline emits dropped-telemetry and gateway-failure counters (never run queue age).
     let gateway_baseline = store
         .encode_otlp(Process::Gateway, Some(instance_id))
-        .expect("fresh gateway registry emits zero-initialized drop baseline");
-    let gateway_names: Vec<&str> = gateway_baseline.resource_metrics[0].scope_metrics[0]
-        .metrics
-        .iter()
-        .map(|m| m.name.as_str())
-        .collect();
-    assert_eq!(gateway_names, ["openmettle.telemetry.dropped"]);
+        .expect("fresh gateway registry emits zero-initialized baseline series");
+    let gateway_metrics = &gateway_baseline.resource_metrics[0].scope_metrics[0].metrics;
+    let gateway_names: Vec<&str> = gateway_metrics.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        gateway_names,
+        [
+            "openmettle.telemetry.dropped",
+            "openmettle.gateway.failures"
+        ]
+    );
+    match gateway_metrics[1].data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(
+                sum.data_points.len(),
+                metrics::GatewayStep::ALL.len() * metrics::GatewayCause::ALL.len()
+            );
+            assert!(sum.data_points.iter().all(|dp| {
+                matches!(
+                    dp.value,
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+                    )
+                )
+            }));
+        }
+        other => panic!("expected Sum for openmettle.gateway.failures, got {other:?}"),
+    }
 
     // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs,
     // all 8 quota drift outcomes, and all 4 queue-age histograms, omitting `openmettle.backup.runs`

@@ -131,11 +131,11 @@ const CANCEL_ONE_LEGACY: &str = concat!(
 macro_rules! lock_bulk {
     ($column:literal) => {
         concat!(
-            "SELECT id::text FROM openmettle.runs WHERE ",
+            "SELECT r.id::text FROM openmettle.runs r WHERE r.",
             $column,
-            " = $1::uuid AND ",
+            " = $1::uuid AND r.",
             cancellable!(),
-            " ORDER BY id FOR NO KEY UPDATE"
+            " ORDER BY r.id FOR NO KEY UPDATE"
         )
     };
 }
@@ -2102,7 +2102,12 @@ mod tests {
             assert!(sql.contains("AS MATERIALIZED"), "{sql}");
         }
         for sql in [LOCK_SCOPE_RUNS, LOCK_USER_RUNS] {
-            assert!(sql.contains("ORDER BY id FOR NO KEY UPDATE"), "{sql}");
+            assert!(
+                sql.starts_with("SELECT r.id::text FROM openmettle.runs r WHERE r."),
+                "{sql}"
+            );
+            assert!(sql.contains("ORDER BY r.id FOR NO KEY UPDATE"), "{sql}");
+            assert!(!sql.contains("ORDER BY id "), "{sql}");
             assert!(sql.contains("OR cancel_reason IS NULL"), "{sql}");
         }
     }

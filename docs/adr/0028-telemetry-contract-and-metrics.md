@@ -77,9 +77,10 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
-  *Update, 27 November 2026:* the contract now defines **18** metrics, **520** data-point
-  streams and **1,534** Prometheus series per process (extending `ProviderOperation` to
-  `inference`, `mcp`, and `oauth_refresh` and promoting V1-10 `openmettle.runs.queue.age`
+  *Update, 27 November 2026:* the contract now defines **18** metrics, **532** data-point
+  streams and **1,624** Prometheus series per process (extending `ProviderOperation` to
+  `inference`, `mcp`, and `oauth_refresh`, adding `ProviderOutcome::Cancelled` for
+  caller-cancelled/dropped in-flight calls, and promoting V1-10 `openmettle.runs.queue.age`
   with `QUEUE_AGE_BUCKETS`, alongside V1-06 gateway failure/backfill signals, V1-17 overdue
   handoffs and `openmettle.storage.quota.drift`, V1-18 capacity grant, stale observation and
   wait duration signals, and V1-30 `openmettle.backup.runs`).
@@ -106,13 +107,16 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   or user identities.
 - When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
   cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
-  (`DroppedSignal::ALL`) series from process startup, all four zero-initialized
-  `openmettle.runs.queue.age` (`RunQueueAgeOutcome::ALL`) histogram points on
-  `openmettle-api` and `openmettle-worker` (omitted on `openmettle-gateway` when unrecorded),
-  and, on `openmettle-worker`, the zero-initialized `openmettle.quota.overdue.handoffs`
-  series, all eight `openmettle.storage.quota.drift` `QuotaDriftOutcome::ALL` series, and
-  all four `openmettle.backup.runs` `BackupRunOutcome::ALL` series, so Prometheus records a
-  zero baseline before any first collector outage, slow queue exit, hourly drift, or backup
+  (`DroppedSignal::ALL`) series from process startup, all 49 zero-initialized
+  `openmettle.gateway.failures` (`GatewayStep::ALL × GatewayCause::ALL`) series on
+  `openmettle-gateway` (omitted on `openmettle-api` and `openmettle-worker` when unrecorded),
+  all four zero-initialized `openmettle.runs.queue.age` (`RunQueueAgeOutcome::ALL`)
+  histogram points on `openmettle-api` and `openmettle-worker` (omitted on
+  `openmettle-gateway` when unrecorded), and, on `openmettle-worker`, the zero-initialized
+  `openmettle.quota.overdue.handoffs` series, all eight `openmettle.storage.quota.drift`
+  `QuotaDriftOutcome::ALL` series, and all four `openmettle.backup.runs`
+  `BackupRunOutcome::ALL` series, so Prometheus records a zero baseline before any first
+  collector outage, gateway failure burst, slow queue exit, hourly drift, or backup
   failure/overdue event, encodes
   `ExportMetricsServiceRequest` via `opentelemetry-proto` (`metrics` feature enabled with zero
   new crates in `Cargo.lock`), and POSTs with `Content-Type: application/x-protobuf` over the

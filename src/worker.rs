@@ -669,6 +669,76 @@ impl RunContext {
     }
 }
 
+/// RAII guard for one `worker.operation` span and its matching `worker.operation.completed`
+/// structured log event. Disarmed on normal completion via [`Self::finish`]; if the enclosing
+/// future is dropped mid-flight (for example when worker drain hits its deadline), `Drop`
+/// records `lease_lost` or `stopped` directly on the open span handle and emits the event once.
+pub(crate) struct WorkerOperationGuard {
+    span: tracing::Span,
+    run_id: String,
+    lease_id: String,
+    operation_id: String,
+    kind: WorkerOperationKind,
+    started: std::time::Instant,
+    stop: Option<watch::Receiver<Option<Stop>>>,
+    finished: bool,
+}
+
+impl WorkerOperationGuard {
+    pub(crate) fn new(
+        span: tracing::Span,
+        run_id: &str,
+        lease_id: &str,
+        operation_id: &str,
+        kind: WorkerOperationKind,
+        stop: Option<watch::Receiver<Option<Stop>>>,
+    ) -> Self {
+        Self {
+            span,
+            run_id: run_id.to_owned(),
+            lease_id: lease_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            kind,
+            started: std::time::Instant::now(),
+            stop,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: WorkerOperationOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: WorkerOperationOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("operation.outcome", outcome.as_str());
+        worker_operation_completed(
+            &self.run_id,
+            &self.lease_id,
+            &self.operation_id,
+            self.kind,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for WorkerOperationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let outcome = match self.stop.as_ref().and_then(|rx| *rx.borrow()) {
+                Some(Stop::LeaseLost) => WorkerOperationOutcome::LeaseLost,
+                _ => WorkerOperationOutcome::Stopped,
+            };
+            let span = self.span.clone();
+            span.in_scope(|| self.record(outcome));
+        }
+    }
+}
+
 async fn reconcile_operation<E: Executor>(
     pool: &PgPool,
     run: &ActiveRun,
@@ -678,14 +748,22 @@ async fn reconcile_operation<E: Executor>(
     lease_id: &str,
 ) -> Result<Option<WorkEnd>, LeaseError> {
     let lease = run.claim.lease();
-    let op_started = std::time::Instant::now();
     let op_span = worker_operation_span(
         lease.run_id,
         lease_id,
         &op.id,
         WorkerOperationKind::Reconcile,
     );
+    let guard_span = op_span.clone();
     async {
+        let guard = WorkerOperationGuard::new(
+            guard_span,
+            lease.run_id,
+            lease_id,
+            &op.id,
+            WorkerOperationKind::Reconcile,
+            Some(context.stop.clone()),
+        );
         let res: Result<(WorkerOperationOutcome, Option<WorkEnd>), LeaseError> = async {
             if let Some(o) = executor.reconcile(run, op, context.step()).await {
                 let mut c = connection(pool).await?;
@@ -732,15 +810,7 @@ async fn reconcile_operation<E: Executor>(
         .await;
         match res {
             Ok((outcome, end)) => {
-                tracing::Span::current().record("operation.outcome", outcome.as_str());
-                worker_operation_completed(
-                    lease.run_id,
-                    lease_id,
-                    &op.id,
-                    WorkerOperationKind::Reconcile,
-                    outcome,
-                    op_started.elapsed(),
-                );
+                guard.finish(outcome);
                 Ok(end)
             }
             Err(err) => {
@@ -751,15 +821,7 @@ async fn reconcile_operation<E: Executor>(
                     }
                     LeaseError::Store(_) => WorkerOperationOutcome::Failed,
                 };
-                tracing::Span::current().record("operation.outcome", outcome.as_str());
-                worker_operation_completed(
-                    lease.run_id,
-                    lease_id,
-                    &op.id,
-                    WorkerOperationKind::Reconcile,
-                    outcome,
-                    op_started.elapsed(),
-                );
+                guard.finish(outcome);
                 Err(err)
             }
         }
@@ -1171,22 +1233,22 @@ impl EffectDispatch<'_> {
             IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
             IntentResult::ApprovalRequired => return fail,
         };
-        let started = std::time::Instant::now();
         let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
         let op_span =
             worker_operation_span(&run.claim.run_id, &lease_id, &op, WorkerOperationKind::Tool);
+        let guard_span = op_span.clone();
+        let stop_rx = step.stop.clone();
         async {
-            let result = self.send_operation(run, proposal, &op, fresh, step).await;
-            let outcome = operation_outcome(&result);
-            tracing::Span::current().record("operation.outcome", outcome.as_str());
-            worker_operation_completed(
+            let guard = WorkerOperationGuard::new(
+                guard_span,
                 &run.claim.run_id,
                 &lease_id,
                 &op,
                 WorkerOperationKind::Tool,
-                outcome,
-                started.elapsed(),
+                Some(stop_rx),
             );
+            let result = self.send_operation(run, proposal, &op, fresh, step).await;
+            guard.finish(operation_outcome(&result));
             result
         }
         .instrument(op_span)
@@ -1696,5 +1758,160 @@ mod tests {
         assert_eq!(events[0]["operation.kind"].as_str(), Some("reconcile"));
         assert_eq!(events[0]["operation.outcome"].as_str(), Some("failed"));
         capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_operation_records_outcome_and_event_when_dropped_while_pending() {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct PendingExecutor(Arc<Notify>);
+        impl Executor for PendingExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let db_url = format!("postgres://unused@127.0.0.1:{closed_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy_with(db_url.parse().unwrap());
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111112";
+        const OP_ID: &str = "22222222-2222-4222-8222-222222222223";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333334";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-444444444445".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-555555555556".to_owned(),
+                round_limit: 5,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Reconciling,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let op = UnresolvedOperation {
+            id: OP_ID.to_owned(),
+            logical_key: "synthetic-pending-key".to_owned(),
+            target: "tool".to_owned(),
+            capability: "cap".to_owned(),
+            outcome: "outcome_unknown".to_owned(),
+            revision: 0,
+            downstream_handle: None,
+            dispatched_attempts: Some(1),
+        };
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        // Case 1: dropped while pending with no lease loss -> `stopped`.
+        {
+            let children = StepTasks::default();
+            let (_stop_tx, stop_rx) = watch::channel(None);
+            let (_dl_tx, dl_rx) =
+                watch::channel((Instant::now() + Duration::from_secs(30), Stop::Deadline));
+            let context = RunContext {
+                deadline: dl_rx,
+                stop: stop_rx,
+                tasks: children.handle(),
+            };
+            let entered = Arc::new(Notify::new());
+            let exec = PendingExecutor(entered.clone());
+            let mut fut = std::pin::pin!(reconcile_operation(
+                &pool, &run, &op, &exec, &context, &lease_id
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending executor must not resolve"),
+                _ = entered.notified() => {}
+            }
+        }
+
+        // Case 2: `Stop::LeaseLost` observed before drop -> `lease_lost`.
+        {
+            let children = StepTasks::default();
+            let (stop_tx, stop_rx) = watch::channel(None);
+            let (_dl_tx, dl_rx) =
+                watch::channel((Instant::now() + Duration::from_secs(30), Stop::Deadline));
+            let context = RunContext {
+                deadline: dl_rx,
+                stop: stop_rx,
+                tasks: children.handle(),
+            };
+            let entered = Arc::new(Notify::new());
+            let exec = PendingExecutor(entered.clone());
+            let mut fut = std::pin::pin!(reconcile_operation(
+                &pool, &run, &op, &exec, &context, &lease_id
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending executor must not resolve"),
+                _ = entered.notified() => {}
+            }
+            stop_tx.send(Some(Stop::LeaseLost)).unwrap();
+        }
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.operation")
+            .collect();
+        assert_eq!(spans.len(), 2);
+
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 2, "{}", capture.text());
+
+        for (i, expected_outcome) in ["stopped", "lease_lost"].into_iter().enumerate() {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+            assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+            assert_eq!(text(attrs["operation_id"]), Some(OP_ID));
+            assert_eq!(text(attrs["operation.kind"]), Some("reconcile"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["run_id"].as_str(), Some(RUN_ID));
+            assert_eq!(ev["lease_id"].as_str(), Some(lease_id.as_str()));
+            assert_eq!(ev["operation_id"].as_str(), Some(OP_ID));
+            assert_eq!(ev["operation.kind"].as_str(), Some("reconcile"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
     }
 }

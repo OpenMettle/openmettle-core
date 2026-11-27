@@ -1080,6 +1080,9 @@ impl Relay {
         };
         if let Err(gap) = usage {
             telemetry::gateway_usage_unrecorded(&id, gap);
+            if let Some(cause) = relay_failure_cause(gap) {
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
+            }
         }
         record(&pool, id, routing, usage, write_limit).await;
     }
@@ -1145,6 +1148,19 @@ impl Relay {
 
     fn draining(&self) -> bool {
         self.extract.as_ref().is_some_and(Extract::worth_draining)
+    }
+}
+
+/// Classifies a post-200 relay [`UsageGap`] into its gateway failure cause.
+///
+/// Caller disconnects are not upstream/gateway failures, and non-200 statuses (`UpstreamStatus`)
+/// are already counted in [`Proxy::forward`] before a relay is spawned.
+fn relay_failure_cause(gap: UsageGap) -> Option<GatewayCause> {
+    match gap {
+        UsageGap::UpstreamTimeout => Some(GatewayCause::Timeout),
+        UsageGap::Incomplete => Some(GatewayCause::Transport),
+        UsageGap::Unparsable | UsageGap::NoUsage => Some(GatewayCause::Protocol),
+        _ => None,
     }
 }
 
@@ -2056,6 +2072,53 @@ mod tests {
         assert!(
             metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Timeout)
                 > before_usage_timeout
+        );
+    }
+
+    /// Post-200 relay failures (upstream body stall past idle timeout or premature body truncation)
+    /// must increment `openmettle_gateway_failures_total` once per relay under `GatewayStep::Policy`
+    /// even when usage-report storage is independent.
+    #[tokio::test]
+    async fn post_200_relay_failures_increment_gateway_failures_metric() {
+        use crate::telemetry::metrics;
+
+        // 1. Upstream sends HTTP 200 SSE headers, one chunk, and stalls past the idle timeout ->
+        //    `(GatewayStep::Policy, GatewayCause::Timeout)` increments by 1.
+        let (_hold_tx, hold_rx) = oneshot::channel::<()>();
+        let (stall_addr, stall_upstream) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx).await;
+        let (stall_relay, mut stall_rx) = relay(&stall_addr, Duration::from_millis(60)).await;
+        stall_relay.pool.close().await;
+        let before_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout);
+        let drain_caller = tokio::spawn(async move { while stall_rx.recv().await.is_some() {} });
+        stall_relay.run().await;
+        let _ = drain_caller.await;
+        stall_upstream.abort();
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout),
+            before_timeout + 1
+        );
+
+        // 2. Upstream sends HTTP 200 with Content-Length: 100 and cuts the TCP stream after 10 bytes ->
+        //    `(GatewayStep::Policy, GatewayCause::Transport)` increments by 1.
+        let (cut_tx, cut_rx) = oneshot::channel::<()>();
+        let cut_head =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n";
+        let (cut_addr, cut_upstream) =
+            upstream(cut_head, vec![b"{\"choices\"".to_vec()], Vec::new(), cut_rx).await;
+        let (cut_relay, mut cut_rx_frames) = relay(&cut_addr, Duration::from_secs(2)).await;
+        cut_relay.pool.close().await;
+        // Release the upstream task so it closes the socket after sending only 10 of 100 bytes.
+        let _ = cut_tx.send(());
+        let before_transport =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Transport);
+        let drain_cut = tokio::spawn(async move { while cut_rx_frames.recv().await.is_some() {} });
+        cut_relay.run().await;
+        let _ = drain_cut.await;
+        let _ = cut_upstream.await;
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Transport),
+            before_transport + 1
         );
     }
 }

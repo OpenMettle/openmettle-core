@@ -477,7 +477,7 @@ impl McpTransport {
                 metric.finish(if why == Stop::Deadline {
                     crate::telemetry::metrics::ProviderOutcome::Timeout
                 } else {
-                    crate::telemetry::metrics::ProviderOutcome::Transport
+                    crate::telemetry::metrics::ProviderOutcome::Cancelled
                 });
                 Err(TransportFault {
                     kind: FaultKind::Stopped(why),

@@ -24,8 +24,8 @@
       "independent_from_authorization_audit": true,
       "requires_jurisdiction_retention_confirmation": true
     },
-    "max_data_point_streams": 520,
-    "max_prometheus_series_per_process": 1534,
+    "max_data_point_streams": 532,
+    "max_prometheus_series_per_process": 1624,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -299,10 +299,10 @@
       "prometheus_name": "openmettle_provider_http_requests_total",
       "kind": "counter",
       "unit": "{request}",
-      "max_series": 36,
+      "max_series": 42,
       "labels": {
         "operation": ["discovery", "jwks", "token", "inference", "mcp", "oauth_refresh"],
-        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
+        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit", "cancelled"]
       }
     },
     {
@@ -310,11 +310,11 @@
       "prometheus_name": "openmettle_provider_http_duration_seconds",
       "kind": "histogram",
       "unit": "s",
-      "max_series": 36,
+      "max_series": 42,
       "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
       "labels": {
         "operation": ["discovery", "jwks", "token", "inference", "mcp", "oauth_refresh"],
-        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
+        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit", "cancelled"]
       }
     },
     {

@@ -587,6 +587,7 @@ impl Gateway {
                 e = run.signal() => {
                     metric.finish(match e {
                         Error::Stopped(Stop::Deadline) => ProviderOutcome::Timeout,
+                        Error::Stopped(_) => ProviderOutcome::Cancelled,
                         _ => ProviderOutcome::Transport,
                     });
                     return Err(e);
@@ -598,7 +599,7 @@ impl Gateway {
                 metric.finish(if cause == Stop::Deadline {
                     ProviderOutcome::Timeout
                 } else {
-                    ProviderOutcome::Transport
+                    ProviderOutcome::Cancelled
                 });
                 return Err(Error::Stopped(cause));
             }
@@ -610,6 +611,7 @@ impl Gateway {
                 let err = run.signal().await;
                 metric.finish(match err {
                     Error::Stopped(Stop::Deadline) => ProviderOutcome::Timeout,
+                    Error::Stopped(_) => ProviderOutcome::Cancelled,
                     _ => ProviderOutcome::Transport,
                 });
                 return Err(err);
@@ -619,7 +621,10 @@ impl Gateway {
         };
         match &result {
             Ok(_) => metric.finish(ProviderOutcome::Ok),
-            Err(Error::Timeout) => metric.finish(ProviderOutcome::Timeout),
+            Err(Error::Timeout | Error::Stopped(Stop::Deadline)) => {
+                metric.finish(ProviderOutcome::Timeout)
+            }
+            Err(Error::Stopped(_)) => metric.finish(ProviderOutcome::Cancelled),
             Err(_) => metric.finish(ProviderOutcome::Transport),
         }
         result

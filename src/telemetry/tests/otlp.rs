@@ -77,7 +77,7 @@ fn metrics_destination(port: u16, ca: &Ca, tuning: Tuning) -> otlp::Destination 
         .allow_loopback_fixture()
 }
 
-fn start_traces(
+pub(crate) fn start_traces(
     destination: otlp::Destination,
     role: Process,
 ) -> (opentelemetry_sdk::trace::SdkTracer, otlp::Exporter) {
@@ -165,7 +165,7 @@ pub(crate) async fn finish(exporter: Exporter) {
         .await;
 }
 
-fn text(value: &Option<AnyValue>) -> Option<&str> {
+pub(crate) fn text(value: &Option<AnyValue>) -> Option<&str> {
     match value.as_ref()?.value.as_ref()? {
         Value::StringValue(s) => Some(s),
         _ => None,
@@ -179,7 +179,7 @@ fn int(value: &Option<AnyValue>) -> Option<i64> {
     }
 }
 
-fn attributes(list: &[KeyValue]) -> BTreeMap<&str, &Option<AnyValue>> {
+pub(crate) fn attributes(list: &[KeyValue]) -> BTreeMap<&str, &Option<AnyValue>> {
     list.iter().map(|kv| (kv.key.as_str(), &kv.value)).collect()
 }
 

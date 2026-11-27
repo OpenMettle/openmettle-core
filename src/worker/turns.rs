@@ -1307,14 +1307,23 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 };
                 let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
                 let op_id = turn_dispatch.id().to_owned();
-                let op_started = std::time::Instant::now();
                 let op_span = worker_operation_span(
                     &run.claim.run_id,
                     &lease_id,
                     &op_id,
                     WorkerOperationKind::Inference,
                 );
+                let guard_span = op_span.clone();
+                let stop_rx = cx.stop.clone();
                 async {
+                    let guard = super::WorkerOperationGuard::new(
+                        guard_span,
+                        &run.claim.run_id,
+                        &lease_id,
+                        &op_id,
+                        WorkerOperationKind::Inference,
+                        Some(stop_rx),
+                    );
                     let sent = turn_dispatch
                         .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
                         .await
@@ -1323,15 +1332,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         Ok(_) => WorkerOperationOutcome::Ok,
                         Err(step) => operation_outcome(step),
                     };
-                    tracing::Span::current().record("operation.outcome", outcome.as_str());
-                    worker_operation_completed(
-                        &run.claim.run_id,
-                        &lease_id,
-                        &op_id,
-                        WorkerOperationKind::Inference,
-                        outcome,
-                        op_started.elapsed(),
-                    );
+                    guard.finish(outcome);
                     sent
                 }
                 .instrument(op_span)
@@ -1377,14 +1378,23 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 let op_id = crate::telemetry::RequestId::generate()
                     .map(|id| id.to_string())
                     .unwrap_or_default();
-                let op_started = std::time::Instant::now();
                 let op_span = worker_operation_span(
                     &run.claim.run_id,
                     &lease_id,
                     &op_id,
                     WorkerOperationKind::Inference,
                 );
+                let guard_span = op_span.clone();
+                let stop_rx = cx.stop.clone();
                 async {
+                    let guard = super::WorkerOperationGuard::new(
+                        guard_span,
+                        &run.claim.run_id,
+                        &lease_id,
+                        &op_id,
+                        WorkerOperationKind::Inference,
+                        Some(stop_rx),
+                    );
                     let sent = route
                         .gateway
                         .server(
@@ -1401,15 +1411,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         Ok(_) => WorkerOperationOutcome::Ok,
                         Err(step) => operation_outcome(step),
                     };
-                    tracing::Span::current().record("operation.outcome", outcome.as_str());
-                    worker_operation_completed(
-                        &run.claim.run_id,
-                        &lease_id,
-                        &op_id,
-                        WorkerOperationKind::Inference,
-                        outcome,
-                        op_started.elapsed(),
-                    );
+                    guard.finish(outcome);
                     sent
                 }
                 .instrument(op_span)

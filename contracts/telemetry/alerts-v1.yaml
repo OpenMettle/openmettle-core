@@ -49,7 +49,7 @@ groups:
 
       - alert: OpenMettleProviderTransportFailures
         expr: |
-          sum by (operation, outcome) (increase(openmettle_provider_http_requests_total{outcome!="ok"}[5m])) >= 3
+          sum by (operation, outcome) (increase(openmettle_provider_http_requests_total{outcome!~"ok|cancelled"}[5m])) >= 3
         for: 5m
         labels:
           severity: warning

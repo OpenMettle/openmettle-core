@@ -1074,3 +1074,165 @@ async fn api_runs_endpoints_correlate_request_and_run_id_and_redact_invalid_path
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn coordinator_resume_records_post_commit_error_and_never_resumed_when_commit_fails() {
+    use openmettle_core::{
+        capacity::{
+            self, Controller,
+            adapter::{BackendDeviceConfig, FencedBackend, GroupCoordinator},
+        },
+        telemetry::metrics::{CapacityOperation, CapacityOutcome, Metrics},
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const GROUP: &str = "00000000-0000-4000-8000-00000000d001";
+    const GPU0: &str = "00000000-0000-4000-8000-00000000d0d0";
+    const GIB: i64 = 1 << 30;
+    const TOTAL: i64 = 24 * GIB;
+    const FLOOR: i64 = 16 * GIB;
+    const HEADROOM: i64 = GIB;
+
+    let db = TestDb::migrated_exclusive().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+         VALUES ($1::uuid, 60000)",
+    )
+    .bind(GROUP)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+         VALUES ($1::uuid, $2::uuid, $3)",
+    )
+    .bind(GPU0)
+    .bind(GROUP)
+    .bind(FLOOR)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, WORKER))
+        .await
+        .unwrap();
+    let mut worker_conn = worker(&db).await;
+    let controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let epoch = controller.epoch();
+    let backend = FencedBackend::new(
+        GROUP,
+        vec![BackendDeviceConfig {
+            device_id: GPU0.into(),
+            total_bytes: TOTAL,
+            safety_headroom_bytes: HEADROOM,
+            active_chat_floor_bytes: FLOOR,
+            backed_chat_floor_bytes: FLOOR,
+            reclaimable_bytes: 0,
+            unattributed_used_bytes: 0,
+        }],
+    )
+    .unwrap();
+    let registry = Arc::new(Metrics::new());
+    let coord = GroupCoordinator::with_metrics(pool, controller, backend, registry.clone());
+
+    coord.takeover_and_reconcile().await.unwrap();
+    let obs = coord.adapter().observe().unwrap();
+    let now_us: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+            .fetch_one(&mut worker_conn)
+            .await
+            .unwrap();
+    assert!(
+        capacity::publish(
+            &mut worker_conn,
+            coord.controller(),
+            &capacity::Observation {
+                revision: 1,
+                observed_at_us: now_us,
+                commit_watermark: 0,
+                devices: &obs,
+            },
+        )
+        .await
+        .unwrap()
+    );
+
+    // Install a deferred constraint trigger that fails `COMMIT` AFTER `openmettle.capacity_resume`
+    // has updated `ready_epoch` and returned `true` to Rust.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION openmettle.fail_resume_commit_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             RAISE EXCEPTION 'simulated deferred commit failure on capacity_resume'
+                 USING ERRCODE = '40001';
+         END;
+         $$",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE CONSTRAINT TRIGGER fail_resume_commit_test
+             AFTER UPDATE ON openmettle.capacity_groups
+             DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW
+             WHEN (NEW.ready_epoch IS NOT NULL AND OLD.ready_epoch IS DISTINCT FROM NEW.ready_epoch)
+             EXECUTE FUNCTION openmettle.fail_resume_commit_for_test()",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let err = coord.resume().await;
+    assert_eq!(err, Err(capacity::Error::Database));
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+        0,
+        "rolled-back resume commit must never record Resumed"
+    );
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
+        1,
+        "rolled-back resume commit must record Error"
+    );
+    let ready_after_rollback: Option<i64> = sqlx::query_scalar(
+        "SELECT ready_epoch FROM openmettle.capacity_groups WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(ready_after_rollback, None);
+
+    // Remove the trigger and verify a committed resume records `Resumed == 1`.
+    sqlx::query("DROP TRIGGER fail_resume_commit_test ON openmettle.capacity_groups")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(coord.resume().await, Ok(true));
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+        1
+    );
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
+        1
+    );
+    let ready_after_commit: Option<i64> = sqlx::query_scalar(
+        "SELECT ready_epoch FROM openmettle.capacity_groups WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(ready_after_commit, Some(epoch));
+}

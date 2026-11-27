@@ -1396,6 +1396,65 @@ async fn confirm_dispatch_tx(
     Ok(())
 }
 
+struct CapacityGrantGuard<'a> {
+    span: tracing::Span,
+    run_id: Option<&'a str>,
+    grant_id: Option<&'a str>,
+    operation: CapacityOperation,
+    started: Instant,
+    metrics: &'a Metrics,
+    finished: bool,
+}
+
+impl<'a> CapacityGrantGuard<'a> {
+    fn new(
+        span: tracing::Span,
+        run_id: Option<&'a str>,
+        grant_id: Option<&'a str>,
+        operation: CapacityOperation,
+        metrics: &'a Metrics,
+    ) -> Self {
+        Self {
+            span,
+            run_id,
+            grant_id,
+            operation,
+            started: Instant::now(),
+            metrics,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, outcome: CapacityOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: CapacityOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.metrics.record_capacity_grant(self.operation, outcome);
+        self.span.record("operation.outcome", outcome.as_str());
+        telemetry::capacity_grant_completed(
+            self.run_id,
+            self.grant_id,
+            self.operation,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for CapacityGrantGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let span = self.span.clone();
+            span.in_scope(|| self.record(CapacityOutcome::Error));
+        }
+    }
+}
+
 async fn reconcile_tx(
     pool: &PgPool,
     controller: &Controller,
@@ -1403,19 +1462,24 @@ async fn reconcile_tx(
     evidence: Evidence<'_>,
     registry: &Metrics,
 ) -> Result<GrantState, StoreError> {
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
-        .await
-        .map_err(map_tx_error)?;
-    let state = super::reconcile_with_metrics(
-        tx.connection().map_err(map_tx_error)?,
-        controller,
-        grant_id,
-        evidence,
-        registry,
-    )
-    .await?;
-    tx.commit().await.map_err(map_tx_error)?;
-    Ok(state)
+    let result = async {
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+            .await
+            .map_err(map_tx_error)?;
+        let state = super::reconcile_inner(
+            tx.connection().map_err(map_tx_error)?,
+            controller,
+            grant_id,
+            evidence,
+        )
+        .await?;
+        tx.commit().await.map_err(map_tx_error)?;
+        Ok(state)
+    }
+    .await;
+    let outcome = super::reconcile_outcome(&result, evidence);
+    registry.record_capacity_grant(CapacityOperation::Reconcile, outcome);
+    result
 }
 
 async fn load_grant_state_and_group_devices(
@@ -1646,49 +1710,54 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
 
         let has_unknown = !verified.unknown_ids.is_empty();
 
-        let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
-            .await
-            .map_err(map_tx_error)?;
-        let conn = tx.connection().map_err(map_tx_error)?;
-        let mut final_state = None;
-        if !verified.released_ids.is_empty() {
-            final_state = Some(
-                super::reconcile_with_metrics(
-                    conn,
-                    &self.controller,
-                    grant_id,
-                    Evidence::Released(&verified.released_ids),
-                    self.metrics(),
-                )
-                .await?,
-            );
+        let mut outcomes = Vec::with_capacity(3);
+        let commit_result: Result<GrantState, StoreError> = async {
+            let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
+                .await
+                .map_err(map_tx_error)?;
+            let conn = tx.connection().map_err(map_tx_error)?;
+            let mut final_state = None;
+            if !verified.released_ids.is_empty() {
+                let evidence = Evidence::Released(&verified.released_ids);
+                let res = super::reconcile_inner(conn, &self.controller, grant_id, evidence).await;
+                let outcome = super::reconcile_outcome(&res, evidence);
+                final_state = Some(res?);
+                outcomes.push(outcome);
+            }
+            if !verified.not_allocated_ids.is_empty() {
+                let evidence = Evidence::NotAllocated(&verified.not_allocated_ids);
+                let res = super::reconcile_inner(conn, &self.controller, grant_id, evidence).await;
+                let outcome = super::reconcile_outcome(&res, evidence);
+                final_state = Some(res?);
+                outcomes.push(outcome);
+            }
+            if has_unknown && final_state != Some(GrantState::UnknownAllocation) {
+                let evidence = Evidence::UnknownAllocation;
+                let res = super::reconcile_inner(conn, &self.controller, grant_id, evidence).await;
+                let outcome = super::reconcile_outcome(&res, evidence);
+                final_state = Some(res?);
+                outcomes.push(outcome);
+            }
+            tx.commit().await.map_err(map_tx_error)?;
+            Ok(final_state.unwrap_or(GrantState::UnknownAllocation))
         }
-        if !verified.not_allocated_ids.is_empty() {
-            final_state = Some(
-                super::reconcile_with_metrics(
-                    conn,
-                    &self.controller,
-                    grant_id,
-                    Evidence::NotAllocated(&verified.not_allocated_ids),
-                    self.metrics(),
-                )
-                .await?,
-            );
+        .await;
+        match commit_result {
+            Ok(state) => {
+                for outcome in outcomes {
+                    self.metrics()
+                        .record_capacity_grant(CapacityOperation::Reconcile, outcome);
+                }
+                Ok(state)
+            }
+            Err(err) => {
+                self.metrics().record_capacity_grant(
+                    CapacityOperation::Reconcile,
+                    super::store_error_outcome(&err),
+                );
+                Err(CoordinatorError::Store(err))
+            }
         }
-        if has_unknown && final_state != Some(GrantState::UnknownAllocation) {
-            final_state = Some(
-                super::reconcile_with_metrics(
-                    conn,
-                    &self.controller,
-                    grant_id,
-                    Evidence::UnknownAllocation,
-                    self.metrics(),
-                )
-                .await?,
-            );
-        }
-        tx.commit().await.map_err(map_tx_error)?;
-        Ok(final_state.unwrap_or(GrantState::UnknownAllocation))
     }
 
     /// Durably close the group in PostgreSQL (`backend_unknown = true`, `ready_epoch = NULL`),
@@ -2322,23 +2391,42 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
     /// Reopen bursts in PostgreSQL only after [`Self::takeover_and_reconcile`] completed with zero
     /// unresolved backend unknowns.
     pub async fn resume(&self) -> Result<bool, StoreError> {
-        let _guard = self.op_lock.lock().await;
-        if !self.reconciled_clean.load(Ordering::Acquire) {
-            self.metrics()
-                .record_capacity_grant(CapacityOperation::Resume, CapacityOutcome::Unavailable);
-            return Ok(false);
+        let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Resume);
+        let guard_span = span.clone();
+        async {
+            let guard = CapacityGrantGuard::new(
+                guard_span,
+                None,
+                None,
+                CapacityOperation::Resume,
+                self.metrics(),
+            );
+            let _lock = self.op_lock.lock().await;
+            if !self.reconciled_clean.load(Ordering::Acquire) {
+                guard.finish(CapacityOutcome::Unavailable);
+                return Ok(false);
+            }
+            let result: Result<bool, StoreError> = async {
+                let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
+                    .await
+                    .map_err(map_tx_error)?;
+                let resumed =
+                    super::resume_query(tx.connection().map_err(map_tx_error)?, &self.controller)
+                        .await?;
+                tx.commit().await.map_err(map_tx_error)?;
+                Ok(resumed)
+            }
+            .await;
+            let outcome = match &result {
+                Ok(true) => CapacityOutcome::Resumed,
+                Ok(false) => CapacityOutcome::Unavailable,
+                Err(err) => super::store_error_outcome(err),
+            };
+            guard.finish(outcome);
+            result
         }
-        let mut tx = WriteTransaction::begin_bounded_pool(&self.pool, false)
-            .await
-            .map_err(map_tx_error)?;
-        let resumed = super::resume_with_metrics(
-            tx.connection().map_err(map_tx_error)?,
-            &self.controller,
-            self.metrics(),
-        )
-        .await?;
-        tx.commit().await.map_err(map_tx_error)?;
-        Ok(resumed)
+        .instrument(span)
+        .await
     }
 }
 
@@ -2815,5 +2903,117 @@ mod tests {
                 bytes: 3 * GIB,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_resume_emits_span_and_event_on_early_unavailable_and_db_failure() {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+
+        const SECRET_CANARY: &[u8; 32] = b"CANARY-cap-ctrl-secret-012345678";
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let db_url = format!("postgres://unused@127.0.0.1:{closed_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy_with(db_url.parse().unwrap());
+        pool.close().await;
+
+        let controller = Controller {
+            group_id: GROUP.into(),
+            epoch: 1,
+            secret: *SECRET_CANARY,
+        };
+        let registry = Arc::new(Metrics::new());
+        let coord =
+            GroupCoordinator::with_metrics(pool, controller, backend_two_gpu(), registry.clone());
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        // 1. Early `!reconciled_clean` returns `Ok(false)` and records `unavailable` on span,
+        //    event, and metric.
+        assert_eq!(coord.resume().await, Ok(false));
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Unavailable),
+            1
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+            0
+        );
+
+        // 2. Closed pool after reconciliation returns `Err(Database)` and records `error`, never
+        //    `resumed`.
+        coord.reconciled_clean.store(true, Ordering::Release);
+        assert_eq!(coord.resume().await, Err(StoreError::Database));
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
+            1
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+            0
+        );
+
+        // 3. Dropping a pending `resume()` future while suspended on `op_lock` triggers
+        //    `CapacityGrantGuard::drop`, recording `error` on span, event, and metric.
+        {
+            let _held = coord.op_lock.lock().await;
+            let mut fut = std::pin::pin!(coord.resume());
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("resume must wait while op_lock is held"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
+            2
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+            0
+        );
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "capacity.grant")
+            .collect();
+        assert_eq!(spans.len(), 3);
+
+        let events = capture.events("capacity.grant.completed");
+        assert_eq!(events.len(), 3, "{}", capture.text());
+
+        for (i, expected_outcome) in ["unavailable", "error", "error"].into_iter().enumerate() {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["operation.kind"]), Some("resume"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["operation.kind"].as_str(), Some("resume"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[SECRET_CANARY]);
+        collector.assert_absent(&[SECRET_CANARY]);
     }
 }

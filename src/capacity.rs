@@ -285,7 +285,20 @@ pub async fn set_backend_unknown(
     Ok(())
 }
 
-pub(super) async fn resume_with_metrics(
+pub(super) async fn resume_query(
+    c: &mut PgConnection,
+    controller: &Controller,
+) -> Result<bool, Error> {
+    sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
+        .bind(&controller.group_id)
+        .bind(controller.secret.as_slice())
+        .bind(controller.epoch)
+        .fetch_one(c)
+        .await
+        .map_err(Error::from)
+}
+
+async fn resume_with_metrics(
     c: &mut PgConnection,
     controller: &Controller,
     m: &metrics::Metrics,
@@ -293,14 +306,7 @@ pub(super) async fn resume_with_metrics(
     let started = Instant::now();
     let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Resume);
     async {
-        let result: Result<bool, Error> =
-            sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
-                .bind(&controller.group_id)
-                .bind(controller.secret.as_slice())
-                .bind(controller.epoch)
-                .fetch_one(c)
-                .await
-                .map_err(Error::from);
+        let result = resume_query(c, controller).await;
         let outcome = match &result {
             Ok(true) => CapacityOutcome::Resumed,
             Ok(false) => CapacityOutcome::Unavailable,
@@ -506,7 +512,23 @@ pub enum Evidence<'a> {
     NotAllocated(&'a [String]),
 }
 
-pub(super) async fn reconcile_with_metrics(
+pub(super) fn reconcile_outcome(
+    result: &Result<GrantState, Error>,
+    evidence: Evidence<'_>,
+) -> CapacityOutcome {
+    match result {
+        Ok(GrantState::Granted) => CapacityOutcome::Granted,
+        Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
+        Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
+        Ok(GrantState::Released) => match evidence {
+            Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
+            _ => CapacityOutcome::Released,
+        },
+        Err(err) => error_outcome(err),
+    }
+}
+
+async fn reconcile_with_metrics(
     c: &mut PgConnection,
     controller: &Controller,
     grant_id: &str,
@@ -517,16 +539,7 @@ pub(super) async fn reconcile_with_metrics(
     let span = telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
     async {
         let result = reconcile_inner(c, controller, grant_id, evidence).await;
-        let outcome = match &result {
-            Ok(GrantState::Granted) => CapacityOutcome::Granted,
-            Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
-            Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
-            Ok(GrantState::Released) => match evidence {
-                Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
-                _ => CapacityOutcome::Released,
-            },
-            Err(err) => error_outcome(err),
-        };
+        let outcome = reconcile_outcome(&result, evidence);
         m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
         tracing::Span::current().record("operation.outcome", outcome.as_str());
         telemetry::capacity_grant_completed(
@@ -555,7 +568,7 @@ pub async fn reconcile(
     reconcile_with_metrics(c, controller, grant_id, evidence, metrics::global()).await
 }
 
-async fn reconcile_inner(
+pub(super) async fn reconcile_inner(
     c: &mut PgConnection,
     controller: &Controller,
     grant_id: &str,

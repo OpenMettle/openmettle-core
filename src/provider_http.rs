@@ -202,7 +202,7 @@ impl ProviderMetricSlot {
 
 impl Drop for ProviderMetricSlot {
     fn drop(&mut self) {
-        self.finish(crate::telemetry::metrics::ProviderOutcome::Transport);
+        self.finish(crate::telemetry::metrics::ProviderOutcome::Cancelled);
     }
 }
 
