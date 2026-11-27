@@ -1710,7 +1710,7 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
         Some("capture") => {
             let parsed = parse_backup_capture_args(args)?;
             let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
-            let (url, db) = validated_backup_pool(4).await?;
+            let (url, db) = validated_backup_pool(2).await?;
             let prune_policy = if parsed.no_prune {
                 None
             } else {
@@ -1731,8 +1731,8 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                     Err(_) => None,
                 },
             };
-            let res = backup::capture(
-                db.pool(),
+            let res = backup::capture_validated(
+                &db,
                 &keyring,
                 &CaptureOptions {
                     database_url: url,

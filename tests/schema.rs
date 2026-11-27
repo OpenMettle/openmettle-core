@@ -509,7 +509,9 @@ const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
 const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000","lifecycle_baseline_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
 const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"restore_run_id":null,"required_origin_us":null,"snapshot_lifecycle_origin_us":null,"snapshot_lifecycle_baseline_digest":null,"required_lifecycle_origin_us":null,"required_lifecycle_baseline_digest":null,"replayed_lifecycle_baseline_digest":null,"snapshot_connection_origin_us":null,"required_connection_origin_us":null,"connection_gap_reconciled":false,"gate_generation":1,"snapshot_journal_seq":null,"required_journal_seq":null,"required_chain_digest":null,"checkpoints":[],"coverage_complete":true,"volume_claim_token":null,"volume_lease_until":null,"locked_at":null,"opened_at":null}"#;
-const BACKUP_MAINTENANCE_GATE_SEED: &str = r#"{"id":true,"maintenance_active":false,"backup_run_id":null,"entered_at":null,"entered_by_operator_id":null,"reason":null,"quiesced_at":null,"rpo_target_seconds":86400,"rpo_tracking_armed_at":null,"last_overdue_observed_at":null,"overdue_count":0}"#;
+const BACKUP_MAINTENANCE_GATE_SEED: &str = r#"{"id":true,"maintenance_active":false,"backup_run_id":null,"entered_at":null,"entered_by_operator_id":null,"reason":null,"quiesced_at":null,"rpo_target_seconds":86400,"rpo_tracking_armed_at":null}"#;
+const BACKUP_RPO_TELEMETRY_STATE_SEED: &str =
+    r#"{"id":true,"last_overdue_observed_at":null,"overdue_count":0}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -1299,6 +1301,12 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "backup_maintenance_gate",
         seed_row: Some(BACKUP_MAINTENANCE_GATE_SEED),
     },
+    AdditiveTable {
+        since: 45,
+        dropped_in: None,
+        table: "backup_rpo_telemetry_state",
+        seed_row: Some(BACKUP_RPO_TELEMETRY_STATE_SEED),
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1486,7 +1494,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "3d6e5c6d44cb3ee77cbcf26dc77e4ca5d460bfc658a17d5c48307b067fcdd6d6",
         "82f67b5f5f67e12ccf95aab4b82777412c2262c860e45bb76194db2459fb164e",
         "9bdbe2c9c78885ec7b507df84aee23160194f3bb842aef0ebf3ac2612c8cf19a",
-        "4fc531fa0dffe635a236daad306c324cf057cf84f6ef99ba6611ef041c93a447",
+        "87e7a7ba37ca3893e0f1013a0c766eec227f808f93de9f24c00cf5bcbdc454dc",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1633,7 +1641,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 50);
+    assert_eq!(after_14.len(), 51);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1703,6 +1711,10 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             (
                 "backup_maintenance_gate",
                 Some(BACKUP_MAINTENANCE_GATE_SEED)
+            ),
+            (
+                "backup_rpo_telemetry_state",
+                Some(BACKUP_RPO_TELEMETRY_STATE_SEED)
             ),
         ]
     );

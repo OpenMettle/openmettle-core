@@ -755,13 +755,67 @@ fn json_looks_like_secret_material(val: &serde_json::Value) -> bool {
     }
 }
 
-/// Collect every `(dev, ino)` belonging to the active backup keyring and any configured vault
-/// keyring (`OPENMETTLE_{API,WORKER,ADMIN}_VAULT_KEYS_CONFIG`, `VAULT_KEYS_CONFIG`). Fails closed
-/// whenever a configured vault keyring or any referenced key file is unreadable or malformed.
+fn collect_keyring_config_inodes(
+    cfg_path: &Path,
+    unreadable_cfg: &'static str,
+    malformed_cfg: &'static str,
+    malformed_entry: &'static str,
+    unreadable_key: &'static str,
+    protected: &mut BTreeSet<(u64, u64)>,
+) -> Result<(), ArchiveError> {
+    let ino = file_dev_ino(cfg_path).ok_or(ArchiveError::Invalid(unreadable_cfg))?;
+    protected.insert(ino);
+    let file = fs::File::open(cfg_path).map_err(|_| ArchiveError::Invalid(unreadable_cfg))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ArchiveError::Invalid(unreadable_cfg))?;
+    if bytes.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ArchiveError::Invalid(malformed_cfg));
+    }
+    let val: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ArchiveError::Invalid(malformed_cfg))?;
+    let keys = val
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(ArchiveError::Invalid(malformed_cfg))?;
+    for item in keys {
+        let key_path = item
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ArchiveError::Invalid(malformed_entry))?;
+        let key_ino =
+            file_dev_ino(Path::new(key_path)).ok_or(ArchiveError::Invalid(unreadable_key))?;
+        protected.insert(key_ino);
+    }
+    Ok(())
+}
+
+/// Collect every `(dev, ino)` belonging to the active backup keyring (both originally loaded
+/// inodes and current on-disk inodes so atomic post-load `rename` rotations are also blocked) and
+/// any configured vault keyring (`OPENMETTLE_{API,WORKER,ADMIN}_VAULT_KEYS_CONFIG`,
+/// `VAULT_KEYS_CONFIG`). Fails closed whenever a configured backup or vault keyring or any
+/// referenced key file is unreadable or malformed.
 pub(crate) fn collect_protected_key_inodes(
     keyring_paths: &KeyRingPaths,
 ) -> Result<BTreeSet<(u64, u64)>, ArchiveError> {
     let mut protected = keyring_paths.protected_inodes.clone();
+    if let Some(cfg_path) = &keyring_paths.config_path {
+        collect_keyring_config_inodes(
+            cfg_path,
+            "configured backup keyring is unreadable; refusing to bundle external files",
+            "configured backup keyring is malformed; refusing to bundle external files",
+            "configured backup keyring entry is malformed; refusing to bundle external files",
+            "configured backup key file is unreadable; refusing to bundle external files",
+            &mut protected,
+        )?;
+    }
+    for key_file in &keyring_paths.key_files {
+        let key_ino = file_dev_ino(key_file).ok_or(ArchiveError::Invalid(
+            "configured backup key file is unreadable; refusing to bundle external files",
+        ))?;
+        protected.insert(key_ino);
+    }
     for var in [
         "OPENMETTLE_API_VAULT_KEYS_CONFIG",
         "OPENMETTLE_WORKER_VAULT_KEYS_CONFIG",
@@ -774,38 +828,14 @@ pub(crate) fn collect_protected_key_inodes(
         if raw.is_empty() {
             continue;
         }
-        let p = Path::new(&raw);
-        let ino = file_dev_ino(p).ok_or(ArchiveError::Invalid(
+        collect_keyring_config_inodes(
+            Path::new(&raw),
             "configured vault keyring is unreadable; refusing to bundle external files",
-        ))?;
-        protected.insert(ino);
-        let bytes = fs::read(p).map_err(|_| {
-            ArchiveError::Invalid(
-                "configured vault keyring is unreadable; refusing to bundle external files",
-            )
-        })?;
-        let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-            ArchiveError::Invalid(
-                "configured vault keyring is malformed; refusing to bundle external files",
-            )
-        })?;
-        let keys = val
-            .get("keys")
-            .and_then(serde_json::Value::as_array)
-            .ok_or(ArchiveError::Invalid(
-                "configured vault keyring is malformed; refusing to bundle external files",
-            ))?;
-        for item in keys {
-            let file = item.get("file").and_then(serde_json::Value::as_str).ok_or(
-                ArchiveError::Invalid(
-                    "configured vault keyring entry is malformed; refusing to bundle external files",
-                ),
-            )?;
-            let key_ino = file_dev_ino(Path::new(file)).ok_or(ArchiveError::Invalid(
-                "configured vault key file is unreadable; refusing to bundle external files",
-            ))?;
-            protected.insert(key_ino);
-        }
+            "configured vault keyring is malformed; refusing to bundle external files",
+            "configured vault keyring entry is malformed; refusing to bundle external files",
+            "configured vault key file is unreadable; refusing to bundle external files",
+            &mut protected,
+        )?;
     }
     Ok(protected)
 }
@@ -1427,6 +1457,71 @@ mod tests {
         assert!(kept_newest.is_dir());
         assert!(!expired_1.exists());
         assert!(!expired_2.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_protected_key_inodes_blocks_hardlink_and_atomically_rotated_key_file() {
+        use super::super::crypto::BackupKeyRing;
+
+        let dir = std::env::temp_dir().join(format!(
+            "om-backup-key-rotate-inodes-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        create_dir_0700(&dir).unwrap();
+
+        let key_path = dir.join("bk1.key");
+        let cfg_path = dir.join("backup-keys.json");
+        write_file_0600(&key_path, &[0x41u8; 32]).unwrap();
+        write_file_0600(
+            &cfg_path,
+            serde_json::json!({
+                "version": 1,
+                "active_key_id": "bk1",
+                "keys": [{ "id": "bk1", "file": key_path.to_str().unwrap() }]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let ring = BackupKeyRing::load_from_config(&cfg_path).unwrap();
+
+        // Retain a hard link to the original inode, then atomically replace `key_path` with a
+        // brand-new inode via `rename`.
+        let old_hardlink = dir.join("old-bk1-hardlink.txt");
+        fs::hard_link(&key_path, &old_hardlink).unwrap();
+        let replacement_tmp = dir.join("bk1.key.new");
+        write_file_0600(&replacement_tmp, &[0x42u8; 32]).unwrap();
+        fs::rename(&replacement_tmp, &key_path).unwrap();
+
+        let old_ino = file_dev_ino(&old_hardlink).unwrap();
+        let new_ino = file_dev_ino(&key_path).unwrap();
+        assert_ne!(old_ino, new_ino, "atomic rename must allocate a new inode");
+
+        let protected = collect_protected_key_inodes(ring.paths()).unwrap();
+        assert!(
+            protected.contains(&old_ino),
+            "pre-rotation hardlink inode must stay protected"
+        );
+        assert!(
+            protected.contains(&new_ino),
+            "post-rotation key inode must be re-stat'd and protected"
+        );
+        assert!(
+            load_non_secret_config_files(&[("old.txt".into(), old_hardlink)], ring.paths())
+                .is_err()
+        );
+        assert!(
+            load_non_secret_config_files(&[("new.txt".into(), key_path.clone())], ring.paths())
+                .is_err()
+        );
+
+        // Also fail closed if the configured backup keyring config becomes malformed.
+        fs::write(&cfg_path, b"{not-json").unwrap();
+        assert!(collect_protected_key_inodes(ring.paths()).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

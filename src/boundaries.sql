@@ -80,9 +80,9 @@
 -- `storage_declare_payload_lost(...)` and `restore_verify_lost_journal_tail(...)`, and replaces
 -- restore verification/replay/open functions with unchanged signatures, security and privileges
 -- (ADR 0040 / ADR 0041, issue #154).
--- Version 45 adds `backup_runs` and singleton `backup_maintenance_gate` (owner-only, zero table
--- or column privileges for any runtime role or PUBLIC, and zero new grants for
--- `openmettle_issuance` or `openmettle_gateway`), widens `authorization_audit` CHECK constraints
+-- Version 45 adds `backup_runs`, singleton `backup_maintenance_gate`, and singleton
+-- `backup_rpo_telemetry_state` (owner-only, zero table or column privileges for any runtime role
+-- or PUBLIC, and zero new grants for `openmettle_issuance` or `openmettle_gateway`), widens `authorization_audit` CHECK constraints
 -- for operator backup actions, adds runtime SECURITY DEFINER helpers
 -- `backup_maintenance_is_active()` (`openmettle_api`, `openmettle_worker`),
 -- `backup_maintenance_lock_open()` (`openmettle_api`, `openmettle_worker`),

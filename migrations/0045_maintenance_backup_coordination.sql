@@ -9,15 +9,20 @@
 --     via the SECURITY DEFINER trigger on local_sessions/native_handoffs) invoke
 --     openmettle.backup_maintenance_lock_open(), taking FOR SHARE on
 --     openmettle.backup_maintenance_gate (and raising OMM01 when maintenance_active).
---   - Owner maintenance/capture transitions and worker telemetry observation lock ONLY
---     openmettle.backup_maintenance_gate (FIRST, FOR UPDATE) -> openmettle.backup_runs
---     (SECOND) -> openmettle.authorization_audit (INSERT only), committing immediately and
---     never locking any runtime table (runs, storage_reservations, projects, users, sessions,
---     external_connections, restore_reconciliation_gate, etc.).
+--   - Owner maintenance/capture transitions lock ONLY openmettle.backup_maintenance_gate
+--     (FIRST, FOR UPDATE) -> openmettle.backup_runs (SECOND, ORDER BY id) ->
+--     openmettle.authorization_audit (INSERT only), committing immediately and never locking any
+--     runtime table (runs, storage_reservations, projects, users, sessions, external_connections,
+--     restore_reconciliation_gate, etc.) or openmettle.backup_rpo_telemetry_state.
+--   - Worker telemetry observation (openmettle.backup_observe_telemetry) locks ONLY
+--     openmettle.backup_rpo_telemetry_state (FIRST, FOR UPDATE SKIP LOCKED) ->
+--     openmettle.backup_runs (SECOND, ORDER BY id FOR UPDATE SKIP LOCKED), and reads
+--     openmettle.backup_maintenance_gate via a lock-free MVCC SELECT so runtime FOR SHARE locks
+--     can never starve RPO overdue observation or form a lock cycle.
 --
 -- Role boundaries (verified by src/boundaries.sql):
---   - Zero table or column privileges on backup_maintenance_gate or backup_runs for any
---     runtime role or PUBLIC.
+--   - Zero table or column privileges on backup_maintenance_gate, backup_rpo_telemetry_state,
+--     or backup_runs for any runtime role or PUBLIC.
 --   - Zero new privileges of any kind for openmettle_issuance or openmettle_gateway.
 --   - openmettle.backup_maintenance_is_active() SECURITY DEFINER: EXECUTE for
 --     openmettle_api, openmettle_worker.
@@ -264,7 +269,7 @@ CREATE TRIGGER backup_runs_enforce_transitions
     FOR EACH ROW
     EXECUTE FUNCTION openmettle.enforce_backup_runs_transitions();
 
--- Singleton maintenance-window gate, stable installation_id, and durable RPO tracking state.
+-- Singleton maintenance-window gate, stable installation_id, and durable RPO policy state.
 CREATE TABLE openmettle.backup_maintenance_gate (
     id boolean PRIMARY KEY DEFAULT true CHECK (id),
     installation_id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -277,8 +282,6 @@ CREATE TABLE openmettle.backup_maintenance_gate (
     rpo_target_seconds integer NOT NULL DEFAULT 86400
         CHECK (rpo_target_seconds BETWEEN 3600 AND 604800),
     rpo_tracking_armed_at timestamptz,
-    last_overdue_observed_at timestamptz,
-    overdue_count bigint NOT NULL DEFAULT 0 CHECK (overdue_count >= 0),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT backup_maintenance_gate_state_check CHECK (
         (
@@ -302,6 +305,18 @@ CREATE TABLE openmettle.backup_maintenance_gate (
 REVOKE ALL ON TABLE openmettle.backup_maintenance_gate FROM PUBLIC;
 
 INSERT INTO openmettle.backup_maintenance_gate (id) VALUES (true);
+
+-- Dedicated singleton RPO overdue telemetry state decoupled from backup_maintenance_gate
+-- FOR SHARE runtime locks so sustained write traffic cannot starve overdue observation.
+CREATE TABLE openmettle.backup_rpo_telemetry_state (
+    id boolean PRIMARY KEY DEFAULT true CHECK (id),
+    last_overdue_observed_at timestamptz,
+    overdue_count bigint NOT NULL DEFAULT 0 CHECK (overdue_count >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+REVOKE ALL ON TABLE openmettle.backup_rpo_telemetry_state FROM PUBLIC;
+
+INSERT INTO openmettle.backup_rpo_telemetry_state (id) VALUES (true);
 
 -- Widen authorization_audit constraints additively for operator backup coordination actions.
 ALTER TABLE openmettle.authorization_audit
@@ -342,71 +357,69 @@ ALTER TABLE openmettle.authorization_audit
         'backup_maintenance', 'backup_run')),
     ADD CONSTRAINT authorization_audit_backup_check CHECK (
         (
-            (
-                action IN (
-                    'backup.maintenance_entered',
-                    'backup.maintenance_released',
-                    'backup.rpo_armed'
-                )
-                AND target_kind = 'backup_maintenance'
-                AND actor_kind = 'operator'
-                AND actor_user_id IS NULL
-                AND operator_id IS NOT NULL
+            action IN (
+                'backup.maintenance_entered',
+                'backup.maintenance_released',
+                'backup.rpo_armed'
             )
-            OR (
-                action IN (
-                    'backup.capture_started',
-                    'backup.capture_succeeded',
-                    'backup.capture_failed'
-                )
-                AND target_kind = 'backup_run'
-                AND actor_kind = 'operator'
-                AND actor_user_id IS NULL
-                AND operator_id IS NOT NULL
-            )
-            OR (
-                action NOT IN (
-                    'backup.maintenance_entered',
-                    'backup.maintenance_released',
-                    'backup.rpo_armed',
-                    'backup.capture_started',
-                    'backup.capture_succeeded',
-                    'backup.capture_failed'
-                )
-                AND target_kind NOT IN ('backup_maintenance', 'backup_run')
-            )
+            AND target_kind = 'backup_maintenance'
+            AND actor_kind = 'operator'
+            AND actor_user_id IS NULL
+            AND operator_id IS NOT NULL
         )
-        AND (
-            request_key NOT LIKE 'sys.backup:%'
-            OR (
-                actor_kind = 'operator'
-                AND actor_user_id IS NULL
-                AND operator_id IS NOT NULL
-                AND (
-                    (
-                        action = 'backup.capture_succeeded'
-                        AND target_kind = 'backup_run'
-                        AND request_key = 'sys.backup:capture_succeeded:' || target_id
-                    )
-                    OR (
-                        action = 'backup.capture_failed'
-                        AND target_kind = 'backup_run'
-                        AND request_key = 'sys.backup:capture_failed:' || target_id
-                    )
-                    OR (
-                        action = 'backup.maintenance_entered'
-                        AND target_kind = 'backup_maintenance'
-                        AND request_key LIKE 'sys.backup:capture_enter:%'
-                    )
-                    OR (
-                        action = 'backup.maintenance_released'
-                        AND target_kind = 'backup_maintenance'
-                        AND request_key LIKE 'sys.backup:capture_release:%'
-                    )
+        OR (
+            action IN (
+                'backup.capture_started',
+                'backup.capture_succeeded',
+                'backup.capture_failed'
+            )
+            AND target_kind = 'backup_run'
+            AND actor_kind = 'operator'
+            AND actor_user_id IS NULL
+            AND operator_id IS NOT NULL
+        )
+        OR (
+            action NOT IN (
+                'backup.maintenance_entered',
+                'backup.maintenance_released',
+                'backup.rpo_armed',
+                'backup.capture_started',
+                'backup.capture_succeeded',
+                'backup.capture_failed'
+            )
+            AND target_kind NOT IN ('backup_maintenance', 'backup_run')
+        )
+    ),
+    ADD CONSTRAINT authorization_audit_sys_backup_namespace_check CHECK (
+        request_key NOT LIKE 'sys.backup:%'
+        OR (
+            actor_kind = 'operator'
+            AND actor_user_id IS NULL
+            AND operator_id IS NOT NULL
+            AND (
+                (
+                    action = 'backup.capture_succeeded'
+                    AND target_kind = 'backup_run'
+                    AND request_key = 'sys.backup:capture_succeeded:' || target_id
+                )
+                OR (
+                    action = 'backup.capture_failed'
+                    AND target_kind = 'backup_run'
+                    AND request_key = 'sys.backup:capture_failed:' || target_id
+                )
+                OR (
+                    action = 'backup.maintenance_entered'
+                    AND target_kind = 'backup_maintenance'
+                    AND request_key LIKE 'sys.backup:capture_enter:%'
+                )
+                OR (
+                    action = 'backup.maintenance_released'
+                    AND target_kind = 'backup_maintenance'
+                    AND request_key LIKE 'sys.backup:capture_release:%'
                 )
             )
         )
-    );
+    ) NOT VALID;
 
 -- Runtime helper: non-locking read of maintenance state (fail-closed if singleton missing).
 CREATE FUNCTION openmettle.backup_maintenance_is_active()
@@ -466,7 +479,9 @@ CREATE TRIGGER enforce_native_handoffs_maintenance_gate
     EXECUTE FUNCTION openmettle.enforce_issuance_maintenance_gate();
 
 -- Worker telemetry observer for openmettle.backup.runs (ADR 0028 / ADR 0046).
--- Canonical lock order: backup_maintenance_gate (FOR UPDATE SKIP LOCKED) -> backup_runs.
+-- Canonical lock order: backup_rpo_telemetry_state (FOR UPDATE SKIP LOCKED) -> backup_runs
+-- (ORDER BY id FOR UPDATE SKIP LOCKED). Reads backup_maintenance_gate via a lock-free MVCC
+-- SELECT so runtime FOR SHARE admission locks never block or starve overdue observation.
 -- Returns durable cumulative outcome totals so worker restarts before an OTLP flush never lose
 -- failure, incomplete, or overdue counts (monotonically synchronized via fetch_max).
 CREATE FUNCTION openmettle.backup_observe_telemetry()
@@ -477,7 +492,9 @@ RETURNS TABLE(
     overdue_count bigint)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    g openmettle.backup_maintenance_gate%ROWTYPE;
+    s openmettle.backup_rpo_telemetry_state%ROWTYPE;
+    v_rpo_target_seconds integer;
+    v_armed_at timestamptz;
     v_now timestamptz;
     v_anchor timestamptz;
     v_succeeded bigint := 0;
@@ -486,8 +503,8 @@ DECLARE
     v_overdue bigint := 0;
 BEGIN
     SELECT *
-      INTO g
-      FROM openmettle.backup_maintenance_gate
+      INTO s
+      FROM openmettle.backup_rpo_telemetry_state
      WHERE id
        FOR UPDATE SKIP LOCKED;
     IF NOT FOUND THEN
@@ -496,10 +513,10 @@ BEGIN
                count(*) FILTER (WHERE r.state = 'incomplete')
           INTO v_succeeded, v_failed, v_incomplete
           FROM openmettle.backup_runs r;
-        SELECT coalesce(gm.overdue_count, 0::bigint)
+        SELECT coalesce(t.overdue_count, 0::bigint)
           INTO v_overdue
-          FROM openmettle.backup_maintenance_gate gm
-         WHERE gm.id;
+          FROM openmettle.backup_rpo_telemetry_state t
+         WHERE t.id;
         RETURN QUERY SELECT
             coalesce(v_succeeded, 0::bigint),
             coalesce(v_failed, 0::bigint),
@@ -512,41 +529,47 @@ BEGIN
 
     -- 1. Mark any draining/capturing backup runs whose lease expired as incomplete.
     --    Maintenance intentionally remains active for explicit operator recovery.
-    WITH expired AS (
-        SELECT r.id
-          FROM openmettle.backup_runs r
-         WHERE r.state IN ('draining', 'capturing')
-           AND r.lease_until <= v_now
-         ORDER BY r.id
-           FOR UPDATE SKIP LOCKED
-    )
     UPDATE openmettle.backup_runs r
        SET state = 'incomplete',
            completed_at = v_now,
            lease_until = NULL,
            failure_code = 'lease_expired'
-      FROM expired e
-     WHERE r.id = e.id;
+     WHERE r.id IN (
+               SELECT b.id
+                 FROM openmettle.backup_runs b
+                WHERE b.state IN ('draining', 'capturing')
+                  AND b.lease_until <= v_now
+                ORDER BY b.id
+                  FOR UPDATE SKIP LOCKED
+           )
+       AND r.state IN ('draining', 'capturing')
+       AND r.lease_until <= v_now;
 
-    -- 2. Evaluate RPO overdue state once tracking has been armed and persist durable count.
+    -- 2. Evaluate RPO overdue state using a lock-free MVCC read of backup_maintenance_gate
+    --    once tracking has been armed and persist durable count on backup_rpo_telemetry_state.
     --    Anchor RPO age to the captured recovery point (`quiesced_at`), not publication
     --    confirmation time (`completed_at`), so late confirmation of an old staged backup
     --    never falsely resets the RPO clock.
-    v_overdue := g.overdue_count;
-    IF g.rpo_tracking_armed_at IS NOT NULL THEN
-        SELECT coalesce(max(r.quiesced_at), g.rpo_tracking_armed_at)
+    SELECT g.rpo_target_seconds, g.rpo_tracking_armed_at
+      INTO v_rpo_target_seconds, v_armed_at
+      FROM openmettle.backup_maintenance_gate g
+     WHERE g.id;
+
+    v_overdue := s.overdue_count;
+    IF v_armed_at IS NOT NULL THEN
+        SELECT coalesce(max(r.quiesced_at), v_armed_at)
           INTO v_anchor
           FROM openmettle.backup_runs r
          WHERE r.state = 'succeeded';
         v_now := pg_catalog.clock_timestamp();
-        IF v_now - v_anchor > pg_catalog.make_interval(secs => g.rpo_target_seconds)
+        IF v_now - v_anchor > pg_catalog.make_interval(secs => v_rpo_target_seconds)
            AND (
-               g.last_overdue_observed_at IS NULL
-               OR g.last_overdue_observed_at < v_anchor
-               OR v_now - g.last_overdue_observed_at >= interval '1 hour'
+               s.last_overdue_observed_at IS NULL
+               OR s.last_overdue_observed_at < v_anchor
+               OR v_now - s.last_overdue_observed_at >= interval '1 hour'
            ) THEN
-            v_overdue := g.overdue_count + 1;
-            UPDATE openmettle.backup_maintenance_gate
+            v_overdue := s.overdue_count + 1;
+            UPDATE openmettle.backup_rpo_telemetry_state
                SET last_overdue_observed_at = v_now,
                    overdue_count = v_overdue,
                    updated_at = v_now
@@ -554,7 +577,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 3. Return durable cumulative counts across backup_runs and backup_maintenance_gate.
+    -- 3. Return durable cumulative counts across backup_runs and backup_rpo_telemetry_state.
     SELECT count(*) FILTER (WHERE r.state = 'succeeded'),
            count(*) FILTER (WHERE r.state = 'failed'),
            count(*) FILTER (WHERE r.state = 'incomplete')
@@ -1075,7 +1098,24 @@ BEGIN
          WHERE id = r.id;
     END LOOP;
 
-    v_run_id := pg_catalog.gen_random_uuid();
+    LOOP
+        v_run_id := pg_catalog.gen_random_uuid();
+        EXIT WHEN NOT EXISTS (
+            SELECT 1
+              FROM openmettle.backup_runs br
+             WHERE br.id = v_run_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+              FROM openmettle.authorization_audit a
+             WHERE a.request_key IN (
+                 'sys.backup:capture_enter:' || v_run_id::text,
+                 'sys.backup:capture_succeeded:' || v_run_id::text,
+                 'sys.backup:capture_failed:' || v_run_id::text,
+                 'sys.backup:capture_release:' || v_run_id::text
+             )
+        );
+    END LOOP;
     v_lease_until := v_now + pg_catalog.make_interval(secs => p_lease_seconds);
     v_opened := NOT g.maintenance_active;
 

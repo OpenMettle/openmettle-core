@@ -56,7 +56,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::{TcpStream, UnixListener},
     task::JoinSet,
 };
 
@@ -954,7 +954,7 @@ fn build_strict_tls_client(
             })),
         _ => unreachable!(),
     };
-    let tls_config = match (cfg.sslcert.as_deref(), cfg.sslkey.as_deref()) {
+    let mut tls_config = match (cfg.sslcert.as_deref(), cfg.sslkey.as_deref()) {
         (Some(cert_path), Some(key_path)) => {
             let cert_bytes = read_regular_bounded_nofollow(Path::new(cert_path), MAX_TLS_PEM_BYTES)
                 .map_err(|_| BackupError::PgDump("failed to read sslcert PEM file"))?;
@@ -974,6 +974,9 @@ fn build_strict_tls_client(
             ));
         }
     };
+    // Disable TLS 1.2 session-ID and TLS 1.3 PSK ticket resumption so every reconnect performs
+    // a full handshake and strictly re-verifies the peer certificate against `sslrootcert`.
+    tls_config.resumption = rustls::client::Resumption::disabled();
 
     let server_name = match cfg.sslmode.as_str() {
         "verify-full" => ServerName::try_from(cfg.host.clone()).map_err(|_| {
@@ -1157,13 +1160,17 @@ where
     .await;
 }
 
-/// In-process loopback TCP->TLS tunnel enforcing strict `sslrootcert`-only `rustls` verification
-/// on EVERY PostgreSQL connection and pool reconnect before reading a single byte (e.g.,
-/// `StartupMessage` or credentials) from SQLx.
+/// Process-private Unix-socket -> TLS tunnel stored in an exclusive owner-only `0700` directory
+/// (`0600` socket + `SO_PEERCRED`/`LOCAL_PEERCRED` UID verification on every `accept`), enforcing
+/// strict `sslrootcert`-only `rustls` verification (with TLS session resumption disabled) on EVERY
+/// PostgreSQL connection and pool reconnect before reading a single byte (e.g., `StartupMessage`
+/// or credentials) from SQLx.
 struct StrictTlsTunnel {
-    local_port: u16,
+    socket_dir: PathBuf,
     accept_task: tokio::task::JoinHandle<()>,
 }
+
+const STRICT_TLS_TUNNEL_PORT: u16 = 5432;
 
 impl StrictTlsTunnel {
     async fn start(
@@ -1172,21 +1179,58 @@ impl StrictTlsTunnel {
         tls_config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
     ) -> Result<Self, BackupError> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|_| BackupError::PgDump("failed to bind local strict-TLS tunnel"))?;
-        let local_port = listener
-            .local_addr()
-            .map_err(|_| BackupError::PgDump("failed to inspect local strict-TLS tunnel address"))?
-            .port();
+        let temp_dir = std::env::temp_dir();
+        let base_dir = if temp_dir.as_os_str().len() <= 55 {
+            temp_dir
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let mut rnd = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut rnd)
+            .map_err(|_| BackupError::Crypto(CryptoError::Random))?;
+        let socket_dir = base_dir.join(format!("om-pgtls-{}", hex(&rnd)));
+        create_dir_0700(&socket_dir)?;
+
+        let expected_uid = match fs::metadata(&socket_dir) {
+            Ok(meta) => meta.uid(),
+            Err(_) => {
+                let _ = fs::remove_dir_all(&socket_dir);
+                return Err(BackupError::PgDump(
+                    "failed to inspect local strict-TLS tunnel directory",
+                ));
+            }
+        };
+        let sock_path = socket_dir.join(format!(".s.PGSQL.{STRICT_TLS_TUNNEL_PORT}"));
+        let listener = match UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&socket_dir);
+                return Err(BackupError::PgDump(
+                    "failed to bind local strict-TLS Unix socket tunnel",
+                ));
+            }
+        };
+        if fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600)).is_err() {
+            drop(listener);
+            let _ = fs::remove_dir_all(&socket_dir);
+            return Err(BackupError::PgDump(
+                "failed to restrict local strict-TLS Unix socket permissions",
+            ));
+        }
+
         let accept_task = tokio::spawn(async move {
             let mut active: JoinSet<()> = JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((local_tcp, _)) = accepted else {
+                        let Ok((local_unix, _)) = accepted else {
                             break;
                         };
+                        if !local_unix.peer_cred().is_ok_and(|c| c.uid() == expected_uid) {
+                            drop(local_unix);
+                            continue;
+                        }
                         let host = remote_host.clone();
                         let cfg = Arc::clone(&tls_config);
                         let name = server_name.clone();
@@ -1197,10 +1241,10 @@ impl StrictTlsTunnel {
                             let Ok(remote_tls) =
                                 connect_strict_pg_tls(&host, remote_port, cfg, name).await
                             else {
-                                drop(local_tcp);
+                                drop(local_unix);
                                 return;
                             };
-                            forward_duplex(local_tcp, remote_tls).await;
+                            forward_duplex(local_unix, remote_tls).await;
                         });
                     }
                     Some(_) = active.join_next(), if !active.is_empty() => {}
@@ -1208,7 +1252,7 @@ impl StrictTlsTunnel {
             }
         });
         Ok(Self {
-            local_port,
+            socket_dir,
             accept_task,
         })
     }
@@ -1217,20 +1261,27 @@ impl StrictTlsTunnel {
 impl Drop for StrictTlsTunnel {
     fn drop(&mut self) {
         self.accept_task.abort();
+        let _ = fs::remove_dir_all(&self.socket_dir);
     }
 }
 
 /// A validated PostgreSQL pool whose `sslmode=verify-ca` and `sslmode=verify-full` connections
 /// (including every pool reconnect) are routed through [`StrictTlsTunnel`] enforcing strict
-/// `sslrootcert`-only verification (zero host native or WebPKI fallback roots).
+/// `sslrootcert`-only verification (zero host native or WebPKI fallback roots, TLS session
+/// resumption disabled) over an owner-only Unix domain socket.
 pub struct ValidatedPgPool {
     pool: PgPool,
+    cfg: ValidatedPgConfig,
     _tunnel: Option<StrictTlsTunnel>,
 }
 
 impl ValidatedPgPool {
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn config(&self) -> &ValidatedPgConfig {
+        &self.cfg
     }
 
     pub async fn close(self) {
@@ -1263,6 +1314,7 @@ pub async fn connect_validated_pool(
             .await?;
         return Ok(ValidatedPgPool {
             pool,
+            cfg: cfg.clone(),
             _tunnel: None,
         });
     }
@@ -1281,25 +1333,26 @@ pub async fn connect_validated_pool(
 
     let tunnel =
         StrictTlsTunnel::start(cfg.host.clone(), cfg.port, tls_config, server_name).await?;
-    let mut loopback_opts = PgConnectOptions::new_without_pgpass()
-        .host("127.0.0.1")
-        .port(tunnel.local_port)
+    let mut local_opts = PgConnectOptions::new_without_pgpass()
+        .socket(&tunnel.socket_dir)
+        .port(STRICT_TLS_TUNNEL_PORT)
         .username(&cfg.username)
         .database(&cfg.database)
         .ssl_mode(PgSslMode::Disable);
     if let Some(password) = &cfg.password {
-        loopback_opts = loopback_opts.password(password);
+        local_opts = local_opts.password(password);
     }
     if let Some(app) = &cfg.application_name {
-        loopback_opts = loopback_opts.application_name(app);
+        local_opts = local_opts.application_name(app);
     }
 
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
-        .connect_with(loopback_opts)
+        .connect_with(local_opts)
         .await?;
     Ok(ValidatedPgPool {
         pool,
+        cfg: cfg.clone(),
         _tunnel: Some(tunnel),
     })
 }
@@ -1892,17 +1945,18 @@ pub struct BackupStatus {
 
 pub async fn status(pool: &PgPool) -> Result<BackupStatus, BackupError> {
     let row = sqlx::query(
-        "SELECT installation_id::text,
-                maintenance_active,
-                backup_run_id::text,
-                to_char(entered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
-                to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
-                reason,
-                rpo_target_seconds,
-                to_char(rpo_tracking_armed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
-                to_char(last_overdue_observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
-           FROM openmettle.backup_maintenance_gate
-          WHERE id",
+        "SELECT g.installation_id::text,
+                g.maintenance_active,
+                g.backup_run_id::text,
+                to_char(g.entered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                to_char(g.quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                g.reason,
+                g.rpo_target_seconds,
+                to_char(g.rpo_tracking_armed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                to_char(t.last_overdue_observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+           FROM openmettle.backup_maintenance_gate g
+           JOIN openmettle.backup_rpo_telemetry_state t ON t.id = g.id
+          WHERE g.id",
     )
     .fetch_one(pool)
     .await?;
@@ -2653,13 +2707,7 @@ fn valid_backup_dir_name(name: &str, run_id: &str) -> bool {
         && name.ends_with(&format!("-{run_id}"))
 }
 
-/// Run the full coordinated maintenance-window backup capture using the default real `pg_dump`
-/// CLI runner (`CliPgDumpRunner`, honoring `opts.pg_dump_bin`).
-pub async fn capture(
-    pool: &PgPool,
-    keyring: &BackupKeyRing,
-    opts: &CaptureOptions,
-) -> Result<CaptureReport, BackupError> {
+fn default_pg_dump_runner(opts: &CaptureOptions) -> Result<Arc<dyn PgDumpRunner>, BackupError> {
     let runner = match &opts.pg_dump_bin {
         Some(bin) => {
             if bin.as_os_str().is_empty() {
@@ -2669,7 +2717,40 @@ pub async fn capture(
         }
         None => CliPgDumpRunner::default(),
     };
-    capture_with_runner(pool, keyring, opts, Arc::new(runner)).await
+    Ok(Arc::new(runner))
+}
+
+/// Run the full coordinated maintenance-window backup capture using the default real `pg_dump`
+/// CLI runner (`CliPgDumpRunner`, honoring `opts.pg_dump_bin`).
+pub async fn capture(
+    pool: &PgPool,
+    keyring: &BackupKeyRing,
+    opts: &CaptureOptions,
+) -> Result<CaptureReport, BackupError> {
+    capture_with_runner(pool, keyring, opts, default_pg_dump_runner(opts)?).await
+}
+
+/// Run the full coordinated maintenance-window backup capture reusing a pre-validated
+/// [`ValidatedPgPool`] directly (zero second pool opened, fitting cleanly inside a 3-connection
+/// `openmettle_owner` limit alongside `pg_dump`) and using the default real `pg_dump` CLI runner.
+pub async fn capture_validated(
+    pool: &ValidatedPgPool,
+    keyring: &BackupKeyRing,
+    opts: &CaptureOptions,
+) -> Result<CaptureReport, BackupError> {
+    capture_validated_with_runner(pool, keyring, opts, default_pg_dump_runner(opts)?).await
+}
+
+/// Run the full coordinated maintenance-window backup capture reusing a pre-validated
+/// [`ValidatedPgPool`] with a pluggable [`PgDumpRunner`]. Fails closed if the pool's validated
+/// PostgreSQL configuration disagrees with `opts.database_url`.
+pub async fn capture_validated_with_runner(
+    pool: &ValidatedPgPool,
+    keyring: &BackupKeyRing,
+    opts: &CaptureOptions,
+    pg_dump: Arc<dyn PgDumpRunner>,
+) -> Result<CaptureReport, BackupError> {
+    capture_inner(pool.pool(), Some(&pool.cfg), keyring, opts, pg_dump).await
 }
 
 enum CaptureFailure {
@@ -2995,6 +3076,16 @@ pub async fn capture_with_runner(
     opts: &CaptureOptions,
     pg_dump: Arc<dyn PgDumpRunner>,
 ) -> Result<CaptureReport, BackupError> {
+    capture_inner(pool, None, keyring, opts, pg_dump).await
+}
+
+async fn capture_inner(
+    pool: &PgPool,
+    already_validated: Option<&ValidatedPgConfig>,
+    keyring: &BackupKeyRing,
+    opts: &CaptureOptions,
+    pg_dump: Arc<dyn PgDumpRunner>,
+) -> Result<CaptureReport, BackupError> {
     // 1. Validate arguments, database URL allow-list + SQLx/TLS parity, and destination isolation
     //    BEFORE touching the database maintenance window or external source files.
     runs::uuid(&opts.operator_id)
@@ -3021,13 +3112,24 @@ pub async fn capture_with_runner(
         opts.allow_local_test_paths,
     )?;
 
-    // Enforce strict `sslrootcert`-only verification on EVERY PostgreSQL connection and pool
-    // reconnect for `verify-ca` / `verify-full`, even when a library caller supplies an unverified
-    // `&PgPool`.
-    let strict_pool = if matches!(validated_pg.sslmode.as_str(), "verify-ca" | "verify-full") {
-        Some(connect_validated_pool(&validated_pg, 4).await?)
-    } else {
-        None
+    // Reuse an already-validated `ValidatedPgPool` directly when its configuration matches
+    // `opts.database_url` (zero second pool opened, staying within 2 SQLx + 1 pg_dump sessions).
+    // For legacy callers passing a raw `&PgPool` with `verify-ca` / `verify-full`, open an
+    // internal `ValidatedPgPool` (`max_connections = 2`) to enforce strict `sslrootcert`-only
+    // verification across every connection and reconnect.
+    let strict_pool = match already_validated {
+        Some(pool_cfg) => {
+            if pool_cfg != &validated_pg {
+                return Err(BackupError::PgDump(
+                    "validated PostgreSQL pool configuration disagrees with capture database URL",
+                ));
+            }
+            None
+        }
+        None if matches!(validated_pg.sslmode.as_str(), "verify-ca" | "verify-full") => {
+            Some(connect_validated_pool(&validated_pg, 2).await?)
+        }
+        None => None,
     };
     let active_pool = strict_pool.as_ref().map_or(pool, ValidatedPgPool::pool);
 
@@ -4534,6 +4636,7 @@ pub fn prune(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::{TcpListener, UnixStream};
 
     #[test]
     fn parse_validated_pg_uri_handles_allowed_fields_and_rejects_hostaddr_or_missing_parts() {
@@ -5659,6 +5762,52 @@ mod tests {
                     forbidden.display()
                 );
             }
+
+            // Atomically rotate the backup key file via `rename` (creating a brand-new inode)
+            // while retaining a hard link to the pre-rotation inode. Re-collecting protected inodes
+            // must refuse BOTH the pre-rotation hard link and the newly rotated key file.
+            let old_key_hardlink = dir.join("old-backup-key-hardlink.bin");
+            fs::hard_link(&backup_key, &old_key_hardlink).unwrap();
+            let rotated_tmp = dir.join("backup-k1.key.rotated.tmp");
+            write_file_0600(&rotated_tmp, &[0x33u8; 32]).unwrap();
+            fs::rename(&rotated_tmp, &backup_key).unwrap();
+
+            let protected_after_rotate = collect_protected_key_inodes(keyring.paths()).unwrap();
+            for forbidden in [&old_key_hardlink, &backup_key] {
+                assert!(
+                    matches!(
+                        OpenedExternalFile::open(
+                            forbidden,
+                            &protected_after_rotate,
+                            &NEO4J_DUMP_ERRORS
+                        ),
+                        Err(BackupError::Invalid(msg)) if msg.contains("key custody")
+                    ),
+                    "expected --neo4j-dump to refuse rotated/hardlinked key {}",
+                    forbidden.display()
+                );
+                assert!(
+                    matches!(
+                        OpenedExternalFile::open(
+                            forbidden,
+                            &protected_after_rotate,
+                            &CHROMA_ARCHIVE_ERRORS
+                        ),
+                        Err(BackupError::Invalid(msg)) if msg.contains("key custody")
+                    ),
+                    "expected --chroma-archive to refuse rotated/hardlinked key {}",
+                    forbidden.display()
+                );
+                assert!(
+                    load_non_secret_config_files(
+                        &[("leak.txt".to_owned(), forbidden.clone())],
+                        keyring.paths()
+                    )
+                    .is_err(),
+                    "expected --config-file to refuse rotated/hardlinked key {}",
+                    forbidden.display()
+                );
+            }
             return;
         }
 
@@ -5733,7 +5882,45 @@ mod tests {
     async fn strict_tls_tunnel_blocks_forwarding_bytes_after_cert_rotation() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::os::unix::fs::FileTypeExt;
         use std::sync::{RwLock, atomic::AtomicUsize};
+
+        async fn write_all_stream<S: AsyncWrite + Unpin>(
+            stream: &mut S,
+            mut buf: &[u8],
+        ) -> io::Result<()> {
+            while !buf.is_empty() {
+                let n =
+                    std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_write(cx, buf)).await?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
+                }
+                buf = &buf[n..];
+            }
+            std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_flush(cx)).await
+        }
+
+        async fn read_exact_stream<S: AsyncRead + Unpin>(
+            stream: &mut S,
+            mut buf: &mut [u8],
+        ) -> io::Result<()> {
+            while !buf.is_empty() {
+                let n = std::future::poll_fn(|cx| {
+                    let mut rb = ReadBuf::new(buf);
+                    match Pin::new(&mut *stream).poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                })
+                .await?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+                }
+                buf = &mut buf[n..];
+            }
+            Ok(())
+        }
 
         fn pem_cert(der: &[u8]) -> Vec<u8> {
             let body = STANDARD.encode(der);
@@ -5766,27 +5953,32 @@ mod tests {
             (rcgen::Issuer::new(params, key), der)
         }
 
-        fn make_srv(
-            issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
-            ca_der: &CertificateDer<'static>,
-        ) -> Arc<rustls::ServerConfig> {
+        let shared_sessions: Arc<dyn rustls::server::StoresServerSessions> =
+            rustls::server::ServerSessionMemoryCache::new(256);
+        let shared_ticketer: Arc<dyn rustls::server::ProducesTickets> =
+            rustls::crypto::ring::Ticketer::new().unwrap();
+
+        let make_srv = |issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+                        ca_der: &CertificateDer<'static>| {
             let key = rcgen::KeyPair::generate().unwrap();
             let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
             let cert = params.signed_by(&key, issuer).unwrap();
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            Arc::new(
-                rustls::ServerConfig::builder_with_provider(provider)
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_no_client_auth()
-                    .with_single_cert(
-                        vec![cert.der().clone(), ca_der.clone()],
-                        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-                    )
-                    .unwrap(),
-            )
-        }
+            let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone(), ca_der.clone()],
+                    PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                )
+                .unwrap();
+            cfg.session_storage = Arc::clone(&shared_sessions);
+            cfg.ticketer = Arc::clone(&shared_ticketer);
+            cfg.send_tls13_tickets = 2;
+            Arc::new(cfg)
+        };
 
         let mut rnd = [0u8; 4];
         SystemRandom::new().fill(&mut rnd).unwrap();
@@ -5845,6 +6037,9 @@ mod tests {
                         })
                         .await;
                         let _ = std::future::poll_fn(|cx| Pin::new(&mut tls).poll_flush(cx)).await;
+                        // Keep TLS stream open briefly so post-handshake TLS 1.3 NewSessionTicket
+                        // frames flush cleanly before client drops.
+                        tokio::time::sleep(Duration::from_millis(80)).await;
                     }
                 });
             }
@@ -5861,30 +6056,39 @@ mod tests {
                 .await
                 .unwrap();
 
+        // Verify strict owner-only Unix domain socket isolation (`0700` dir, `0600` socket).
+        let socket_dir = tunnel.socket_dir.clone();
+        let sock_path = socket_dir.join(format!(".s.PGSQL.{STRICT_TLS_TUNNEL_PORT}"));
+        let dir_meta = fs::metadata(&socket_dir).unwrap();
+        assert!(dir_meta.is_dir());
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+        let sock_meta = fs::metadata(&sock_path).unwrap();
+        assert!(sock_meta.file_type().is_socket());
+        assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600);
+
         // First connection against trusted `ca_good` forwards traffic cleanly.
-        let c1 = TcpStream::connect(("127.0.0.1", tunnel.local_port))
-            .await
-            .unwrap();
-        write_all_tcp(&c1, b"STARTUP-1").await.unwrap();
+        let mut c1 = UnixStream::connect(&sock_path).await.unwrap();
+        write_all_stream(&mut c1, b"STARTUP-1").await.unwrap();
         let mut resp = [0u8; 7];
-        read_exact_tcp(&c1, &mut resp).await.unwrap();
+        read_exact_stream(&mut c1, &mut resp).await.unwrap();
         assert_eq!(&resp, b"ECHO-OK");
+        // Allow server TLS 1.3 NewSessionTicket messages to arrive before disconnecting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         drop(c1);
 
-        // Rotate server to untrusted `ca_bad` and reset received-byte counter.
+        // Rotate server to untrusted `ca_bad` while retaining identical session cache & ticketer.
         *active_cfg.write().unwrap() = make_srv(&ca_bad, &ca_bad_der);
         forwarded_bytes.store(0, Ordering::SeqCst);
 
-        // Second connection through the SAME tunnel must close before forwarding any bytes.
-        let c2 = TcpStream::connect(("127.0.0.1", tunnel.local_port))
-            .await
-            .unwrap();
-        let _ = write_all_tcp(&c2, b"SECRET-STARTUP-MUST-NOT-LEAK").await;
+        // Second connection through the SAME tunnel must not resume via PSK/session-ID and must
+        // close before forwarding any bytes.
+        let mut c2 = UnixStream::connect(&sock_path).await.unwrap();
+        let _ = write_all_stream(&mut c2, b"SECRET-STARTUP-MUST-NOT-LEAK").await;
         let mut probe = [0u8; 1];
-        let read_res = read_exact_tcp(&c2, &mut probe).await;
+        let read_res = read_exact_stream(&mut c2, &mut probe).await;
         assert!(
             read_res.is_err(),
-            "tunnel must close connection when rotated cert is outside sslrootcert"
+            "tunnel must close connection when rotated cert is outside sslrootcert even with shared ticket keys"
         );
         assert_eq!(
             forwarded_bytes.load(Ordering::SeqCst),
@@ -5893,6 +6097,10 @@ mod tests {
         );
 
         drop(tunnel);
+        assert!(
+            !socket_dir.exists(),
+            "StrictTlsTunnel must unlink its 0700 socket directory on Drop"
+        );
         server_task.abort();
         let _ = fs::remove_dir_all(&dir);
     }

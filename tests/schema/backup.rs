@@ -625,6 +625,7 @@ async fn maintenance_window_closes_mutations_keeps_reads_probes_and_in_flight_se
         let mut cn = connect(&db.0, role).await;
         for sql in [
             "SELECT * FROM openmettle.backup_maintenance_gate",
+            "SELECT * FROM openmettle.backup_rpo_telemetry_state",
             "SELECT * FROM openmettle.backup_runs",
             "SELECT openmettle.backup_enter_maintenance('11111111-1111-4111-8111-111111111111'::uuid, 'rk', 'bad')",
             "SELECT openmettle.backup_release_maintenance('11111111-1111-4111-8111-111111111111'::uuid, 'rk', 'bad', false)",
@@ -1868,7 +1869,7 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
 
     // Advances to 2 once 1 hour passes.
     sqlx::query(
-        "UPDATE openmettle.backup_maintenance_gate
+        "UPDATE openmettle.backup_rpo_telemetry_state
             SET last_overdue_observed_at = clock_timestamp() - interval '61 minutes'
           WHERE id",
     )
@@ -3338,21 +3339,23 @@ async fn audit_request_key_collision_blocked_during_inflight_capture() {
              request_key, reason, details)
          VALUES
             ('operator', NULL, $1::uuid, 'restore.accept_coverage_gap', 'restore_gate',
-             'singleton', $2, 'attempt to spoof sys.backup namespace', '{}'::jsonb)",
+             'instance', $2, 'attempt to spoof sys.backup namespace', '{}'::jsonb)",
     )
     .bind(OPERATOR_1)
     .bind(&reserved_key)
     .execute(&owner_pool)
     .await
     .unwrap_err();
+    let db_err = direct_non_backup_err.as_database_error().unwrap();
     assert_eq!(
-        direct_non_backup_err
-            .as_database_error()
-            .unwrap()
-            .code()
-            .as_deref(),
+        db_err.code().as_deref(),
         Some("23514"),
-        "table CHECK must forbid sys.backup: prefix on non-backup audit actions: {direct_non_backup_err}"
+        "table CHECK must forbid sys.backup: prefix on non-backup audit actions: {db_err:?}"
+    );
+    assert_eq!(
+        db_err.constraint(),
+        Some("authorization_audit_sys_backup_namespace_check"),
+        "expected authorization_audit_sys_backup_namespace_check violation, got {db_err:?}"
     );
 
     // Complete run 1 through quiesce -> stage -> confirm -> auto-release; confirmation MUST
@@ -3857,19 +3860,18 @@ async fn chroma_modes_not_provisioned_archive_and_qualified_rebuild_and_retry_wi
     assert!(!rep_arch.backup_dir.exists());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "isolated PostgreSQL 18 required"]
-async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump() {
+mod tls_proxy_helpers {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::pin::Pin;
+    use std::sync::{Arc, RwLock, atomic::AtomicUsize};
     use std::task::Poll;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::net::{TcpListener, TcpStream};
 
     const PG_SSL_REQ: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 
-    fn pem_cert(der: &[u8]) -> Vec<u8> {
+    pub fn pem_cert(der: &[u8]) -> Vec<u8> {
         let body = STANDARD.encode(der);
         let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
         for line in body.as_bytes().chunks(64) {
@@ -3880,7 +3882,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         out.into_bytes()
     }
 
-    fn make_ca(
+    pub fn make_ca(
         cn: &str,
     ) -> (
         rcgen::Issuer<'static, rcgen::KeyPair>,
@@ -3900,10 +3902,12 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         (rcgen::Issuer::new(params, key), der)
     }
 
-    fn make_server_config(
+    pub fn make_server_config(
         issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
         ca_der: &CertificateDer<'static>,
         san: &str,
+        shared_sessions: Option<Arc<dyn rustls::server::StoresServerSessions>>,
+        shared_ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>,
     ) -> Arc<rustls::ServerConfig> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec![san.to_owned()]).unwrap();
@@ -3912,14 +3916,20 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         let chain = vec![cert.der().clone(), ca_der.clone()];
         let priv_key: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        Arc::new(
-            rustls::ServerConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(chain, priv_key)
-                .unwrap(),
-        )
+        let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(chain, priv_key)
+            .unwrap();
+        if let Some(sessions) = shared_sessions {
+            cfg.session_storage = sessions;
+        }
+        if let Some(ticketer) = shared_ticketer {
+            cfg.ticketer = ticketer;
+            cfg.send_tls13_tickets = 2;
+        }
+        Arc::new(cfg)
     }
 
     async fn read_exact_tcp(stream: &TcpStream, mut buf: &mut [u8]) -> std::io::Result<()> {
@@ -3958,49 +3968,41 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         Ok(())
     }
 
-    async fn forward_duplex<A, B>(mut a: A, mut b: B)
-    where
+    async fn forward_duplex<
         A: AsyncRead + AsyncWrite + Unpin,
         B: AsyncRead + AsyncWrite + Unpin,
-    {
+    >(
+        mut a: A,
+        mut b: B,
+    ) {
         let mut a_to_b = vec![0u8; 16 * 1024];
-        let mut a_pos = 0usize;
-        let mut a_len = 0usize;
-        let mut a_eof = false;
-        let mut b_needs_flush = false;
-        let mut b_shutdown = false;
-
+        let (mut a_pos, mut a_len, mut a_eof, mut b_flush, mut b_shut) =
+            (0usize, 0usize, false, false, false);
         let mut b_to_a = vec![0u8; 16 * 1024];
-        let mut b_pos = 0usize;
-        let mut b_len = 0usize;
-        let mut b_eof = false;
-        let mut a_needs_flush = false;
-        let mut a_shutdown = false;
-
+        let (mut b_pos, mut b_len, mut b_eof, mut a_flush, mut a_shut) =
+            (0usize, 0usize, false, false, false);
         let _ = std::future::poll_fn(|cx| {
             loop {
-                let mut progressed = false;
-
+                let mut prog = false;
                 if a_pos < a_len {
                     match Pin::new(&mut b).poll_write(cx, &a_to_b[a_pos..a_len]) {
-                        Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                        Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Ready(Ok(n)) => {
                             a_pos += n;
-                            b_needs_flush = true;
+                            b_flush = true;
                             if a_pos == a_len {
                                 a_pos = 0;
                                 a_len = 0;
                             }
-                            progressed = true;
+                            prog = true;
                         }
-                        Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
-                } else if b_needs_flush {
+                } else if b_flush {
                     match Pin::new(&mut b).poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
-                            b_needs_flush = false;
-                            progressed = true;
+                            b_flush = false;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
@@ -4016,42 +4018,40 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
                                 a_len = n;
                                 a_pos = 0;
                             }
-                            progressed = true;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
-                } else if !b_shutdown {
+                } else if !b_shut {
                     match Pin::new(&mut b).poll_shutdown(cx) {
                         Poll::Ready(Ok(())) => {
-                            b_shutdown = true;
-                            progressed = true;
+                            b_shut = true;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
                 }
-
                 if b_pos < b_len {
                     match Pin::new(&mut a).poll_write(cx, &b_to_a[b_pos..b_len]) {
-                        Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                        Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Ready(Ok(n)) => {
                             b_pos += n;
-                            a_needs_flush = true;
+                            a_flush = true;
                             if b_pos == b_len {
                                 b_pos = 0;
                                 b_len = 0;
                             }
-                            progressed = true;
+                            prog = true;
                         }
-                        Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
-                } else if a_needs_flush {
+                } else if a_flush {
                     match Pin::new(&mut a).poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
-                            a_needs_flush = false;
-                            progressed = true;
+                            a_flush = false;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
@@ -4067,26 +4067,25 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
                                 b_len = n;
                                 b_pos = 0;
                             }
-                            progressed = true;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
-                } else if !a_shutdown {
+                } else if !a_shut {
                     match Pin::new(&mut a).poll_shutdown(cx) {
                         Poll::Ready(Ok(())) => {
-                            a_shutdown = true;
-                            progressed = true;
+                            a_shut = true;
+                            prog = true;
                         }
                         Poll::Ready(Err(_)) => return Poll::Ready(()),
                         Poll::Pending => {}
                     }
                 }
-
-                if a_shutdown && b_shutdown {
+                if a_shut && b_shut {
                     return Poll::Ready(());
                 }
-                if !progressed {
+                if !prog {
                     return Poll::Pending;
                 }
             }
@@ -4094,11 +4093,11 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         .await;
     }
 
-    async fn spawn_pg_tls_proxy(
+    pub async fn spawn_pg_tls_proxy(
         upstream_host: String,
         upstream_port: u16,
-        server_cfg: Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>,
-        post_accept_connections: Arc<std::sync::atomic::AtomicUsize>,
+        server_cfg: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+        post_accept_connections: Arc<AtomicUsize>,
     ) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -4130,6 +4129,28 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         });
         (port, handle)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump() {
+    use tls_proxy_helpers::{make_ca, make_server_config, pem_cert, spawn_pg_tls_proxy};
+
+    let shared_sessions: Arc<dyn rustls::server::StoresServerSessions> =
+        rustls::server::ServerSessionMemoryCache::new(256);
+    let shared_ticketer: Arc<dyn rustls::server::ProducesTickets> =
+        rustls::crypto::ring::Ticketer::new().unwrap();
+    let make_resumable_srv = |issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+                              ca_der: &rustls::pki_types::CertificateDer<'static>,
+                              san: &str| {
+        make_server_config(
+            issuer,
+            ca_der,
+            san,
+            Some(Arc::clone(&shared_sessions)),
+            Some(Arc::clone(&shared_ticketer)),
+        )
+    };
 
     let db = TestDb::migrated().await;
     let base_url = db.url(OWNER);
@@ -4153,7 +4174,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     fs::set_permissions(&ca_server_path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&ca_other_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let proxy_ip_cfg = Arc::new(std::sync::RwLock::new(make_server_config(
+    let proxy_ip_cfg = Arc::new(std::sync::RwLock::new(make_resumable_srv(
         &ca_server,
         &ca_server_der,
         "127.0.0.1",
@@ -4166,7 +4187,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         Arc::clone(&proxy_ip_accepted),
     )
     .await;
-    let proxy_dns_cfg = Arc::new(std::sync::RwLock::new(make_server_config(
+    let proxy_dns_cfg = Arc::new(std::sync::RwLock::new(make_resumable_srv(
         &ca_server,
         &ca_server_der,
         "other.example.test",
@@ -4325,7 +4346,8 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     tls_pool_ca.close().await;
 
     // 4. `verify-full` against matching `127.0.0.1` IP SAN + `ca_server` succeeds over real TLS
-    //    via `ValidatedPgPool`.
+    //    via ONE reused `ValidatedPgPool(2)` (`capture_validated_with_runner`), and refuses a
+    //    mismatched `database_url`.
     let verify_full_url = build_proxy_url(
         proxy_ip_port,
         &format!(
@@ -4334,11 +4356,44 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         ),
     );
     let verify_full_cfg = backup::parse_validated_pg_uri(&verify_full_url).unwrap();
-    let tls_pool_full = backup::connect_validated_pool(&verify_full_cfg, 4)
+    let tls_pool_full = backup::connect_validated_pool(&verify_full_cfg, 2)
         .await
         .unwrap();
-    let rep_full = backup::capture_with_runner(
-        tls_pool_full.pool(),
+    let mismatch_pool_err = backup::capture_validated_with_runner(
+        &tls_pool_full,
+        &keyring,
+        &CaptureOptions {
+            database_url: build_proxy_url(
+                proxy_dns_port,
+                &format!("sslmode=verify-ca&sslrootcert={}", ca_server_path.display()),
+            ),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-validated-mismatch-1".to_owned(),
+            reason: "mismatched validated pool url".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        make_runner(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(mismatch_pool_err, BackupError::PgDump(_)),
+        "{mismatch_pool_err:?}"
+    );
+    let rep_full = backup::capture_validated_with_runner(
+        &tls_pool_full,
         &keyring,
         &CaptureOptions {
             database_url: verify_full_url,
@@ -4473,11 +4528,14 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     backup::verify_backup(&rep_req.backup_dir, &keyring).unwrap();
     tls_pool_req.close().await;
 
-    // 6. Mid-pool certificate rotation / reconnect fail-closed proof:
-    //    Open `ValidatedPgPool` (`max_connections=1`) against `ca_server`, verify `SELECT 1`,
-    //    atomically rotate the proxy server certificate to `ca_other`, terminate the first
-    //    pooled backend so SQLx must reconnect through `StrictTlsTunnel`, and prove the reconnect
-    //    fails closed during TLS verification with zero accepted post-rotation handshakes!
+    // 6. Mid-pool certificate rotation / reconnect fail-closed proof with preserved server TLS
+    //    session cache & TLS 1.3 ticket keys:
+    //    Open `ValidatedPgPool` (`max_connections=1`) against `ca_server`, verify `SELECT
+    //    pg_backend_pid()`, pause 50ms so TLS 1.3 NewSessionTicket frames arrive, atomically
+    //    rotate the proxy server certificate to `ca_other` while keeping the SAME session cache
+    //    and ticketer, terminate the first pooled backend so SQLx must reconnect through
+    //    `StrictTlsTunnel`, and prove the reconnect performs full cert verification (never PSK
+    //    resumption) and fails closed with zero accepted post-rotation handshakes!
     let rotate_pool = backup::connect_validated_pool(&verify_full_cfg, 1)
         .await
         .unwrap();
@@ -4485,7 +4543,8 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         .fetch_one(rotate_pool.pool())
         .await
         .unwrap();
-    *proxy_ip_cfg.write().unwrap() = make_server_config(&ca_other, &ca_other_der, "127.0.0.1");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    *proxy_ip_cfg.write().unwrap() = make_resumable_srv(&ca_other, &ca_other_der, "127.0.0.1");
     proxy_ip_accepted.store(0, std::sync::atomic::Ordering::SeqCst);
     let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
         .bind(first_pid)
@@ -4643,42 +4702,31 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
         }
         if let Some(sock_dir) = reachable_dir {
             let base_cfg = backup::parse_validated_pg_uri(&db.url(OWNER)).unwrap();
-            let encoded_sock = sock_dir.replace('/', "%2F");
-            let sock_url = match base_cfg.password.as_deref() {
-                Some(pw) => format!(
-                    "postgres://{}:{}@{encoded_sock}:{port}/{}?sslmode=disable",
-                    base_cfg.username, pw, base_cfg.database
-                ),
-                None => format!(
-                    "postgres://{}@{encoded_sock}:{port}/{}?sslmode=disable",
-                    base_cfg.username, base_cfg.database
-                ),
-            };
-            // Negative control: when `local` requires SCRAM/password auth on libpq's default
-            // socket dir, a single-line `{sock_dir}:...` PGPASSFILE without `localhost:` fails.
-            if local_requires_password && let Some(pw) = base_cfg.password.as_deref() {
-                let bad_pgpass = PathBuf::from(
-                    dir.write(
-                        "socket-only.pgpass",
-                        format!(
-                            "{sock_dir}:{port}:{}:{}:{pw}\n",
-                            base_cfg.database, base_cfg.username
-                        )
-                        .as_bytes(),
+            let make_sock_url = |socket_dir: &str| -> String {
+                let encoded = socket_dir.replace('/', "%2F");
+                match base_cfg.password.as_deref() {
+                    Some(pw) => format!(
+                        "postgres://{}:{}@{encoded}:{port}/{}?sslmode=disable",
+                        base_cfg.username, pw, base_cfg.database
                     ),
-                );
-                fs::set_permissions(&bad_pgpass, fs::Permissions::from_mode(0o600)).unwrap();
+                    None => format!(
+                        "postgres://{}@{encoded}:{port}/{}?sslmode=disable",
+                        base_cfg.username, base_cfg.database
+                    ),
+                }
+            };
+            let run_raw_pg_dump = |host_arg: &str, pgpass_path: &Path| -> std::process::Output {
                 let mut raw = Command::new("pg_dump");
                 raw.env_clear()
                     .env("PATH", std::env::var("PATH").unwrap_or_default())
-                    .env("PGPASSFILE", &bad_pgpass)
+                    .env("PGPASSFILE", pgpass_path)
                     .env("PGSSLMODE", "disable")
                     .env("PGGSSENCMODE", "disable")
                     .args([
                         "--format=custom",
                         "--schema=openmettle",
                         "--no-owner",
-                        &format!("--host={sock_dir}"),
+                        &format!("--host={host_arg}"),
                         &format!("--port={port}"),
                         &format!("--username={}", base_cfg.username),
                         &format!("--dbname={}", base_cfg.database),
@@ -4689,16 +4737,64 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
                 if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
                     raw.env("LD_LIBRARY_PATH", ld);
                 }
-                let raw_out = raw.output().unwrap();
-                assert!(
-                    !raw_out.status.success(),
-                    "negative control failed: socket-only PGPASSFILE without localhost entry unexpectedly authenticated on {sock_dir}"
+                raw.output().unwrap()
+            };
+
+            // Probe `localhost:`-only PGPASSFILE first: on libpq's compiled-in default socket
+            // directory (e.g. `/var/run/postgresql` on Debian/Ubuntu), libpq rewrites the host
+            // lookup to `localhost`, so `localhost:`-only succeeds and `socket-only.pgpass` fails.
+            // On custom non-default socket directories, libpq matches `{sock_dir}:` literally.
+            let mut localhost_only_pgpass: Option<PathBuf> = None;
+            if local_requires_password && let Some(pw) = base_cfg.password.as_deref() {
+                let lh_pgpass = PathBuf::from(
+                    dir.write(
+                        "localhost-only.pgpass",
+                        format!(
+                            "localhost:{port}:{}:{}:{pw}\n",
+                            base_cfg.database, base_cfg.username
+                        )
+                        .as_bytes(),
+                    ),
                 );
+                fs::set_permissions(&lh_pgpass, fs::Permissions::from_mode(0o600)).unwrap();
+                let localhost_only_ok = run_raw_pg_dump(sock_dir, &lh_pgpass).status.success();
+                if std::env::var_os("OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST").is_some() {
+                    assert!(
+                        localhost_only_ok,
+                        "expected localhost-only PGPASSFILE to authenticate on libpq default socket dir {sock_dir}"
+                    );
+                }
+                if localhost_only_ok {
+                    let bad_pgpass = PathBuf::from(
+                        dir.write(
+                            "socket-only.pgpass",
+                            format!(
+                                "{sock_dir}:{port}:{}:{}:{pw}\n",
+                                base_cfg.database, base_cfg.username
+                            )
+                            .as_bytes(),
+                        ),
+                    );
+                    fs::set_permissions(&bad_pgpass, fs::Permissions::from_mode(0o600)).unwrap();
+                    let raw_out = run_raw_pg_dump(sock_dir, &bad_pgpass);
+                    assert!(
+                        !raw_out.status.success(),
+                        "negative control failed: socket-only PGPASSFILE without localhost entry unexpectedly authenticated on libpq default socket dir {sock_dir}"
+                    );
+                }
+                localhost_only_pgpass = Some(lh_pgpass);
             }
+
+            // Dual-entry `CliPgDumpRunner` MUST succeed on `sock_dir`.
             let runner = CliPgDumpRunner::default();
             let mut dump_bytes = Vec::new();
             let written = runner
-                .dump(&sock_url, None, &DumpCancel::new(), &mut dump_bytes)
+                .dump(
+                    &make_sock_url(sock_dir),
+                    None,
+                    &DumpCancel::new(),
+                    &mut dump_bytes,
+                )
                 .unwrap();
             assert!(
                 written > 100,
@@ -4708,6 +4804,324 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
                 dump_bytes.starts_with(b"PGDMP"),
                 "expected PostgreSQL custom-format PGDMP header"
             );
+
+            // Also test a custom non-default socket path (short symlink to `sock_dir`) where
+            // libpq does NOT rewrite to `localhost` and instead requires the literal socket path
+            // line in `PGPASSFILE`.
+            struct UnlinkGuard(PathBuf);
+            impl Drop for UnlinkGuard {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(&self.0);
+                }
+            }
+            let custom_sock = PathBuf::from(format!(
+                "/tmp/om-csock-{}-{}",
+                std::process::id(),
+                new_uuid(&db).await.split('-').next().unwrap_or("0")
+            ));
+            let _ = fs::remove_file(&custom_sock);
+            std::os::unix::fs::symlink(sock_dir, &custom_sock).unwrap();
+            let _custom_guard = UnlinkGuard(custom_sock.clone());
+            let custom_sock_str = custom_sock.to_str().unwrap();
+
+            if let Some(lh_pgpass) = &localhost_only_pgpass {
+                let custom_lh_out = run_raw_pg_dump(custom_sock_str, lh_pgpass);
+                assert!(
+                    !custom_lh_out.status.success(),
+                    "negative control failed: localhost-only PGPASSFILE unexpectedly authenticated on custom non-default socket path {custom_sock_str}"
+                );
+            }
+            let mut custom_dump = Vec::new();
+            let custom_written = runner
+                .dump(
+                    &make_sock_url(custom_sock_str),
+                    None,
+                    &DumpCancel::new(),
+                    &mut custom_dump,
+                )
+                .unwrap();
+            assert!(
+                custom_written > 100 && custom_dump.starts_with(b"PGDMP"),
+                "CliPgDumpRunner must succeed on custom non-default Unix socket path {custom_sock_str}"
+            );
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn populated_upgrade_from_44_preserves_historical_sys_backup_audit_rows_and_blocks_new_ones()
+{
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..44])
+        .await
+        .unwrap();
+
+    // Insert historical pre-45 operator audit rows whose `request_key` starts with `sys.backup:`.
+    let owner_pre = pool(&db, OWNER).await;
+    sqlx::query(
+        "INSERT INTO openmettle.authorization_audit
+            (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
+             request_key, reason, details)
+         VALUES
+            ('operator', NULL, $1::uuid, 'restore.accept_coverage_gap', 'restore_gate',
+             'instance', 'sys.backup:historical-gap-1', 'pre-45 historical gap', '{}'::jsonb),
+            ('operator', NULL, $1::uuid, 'storage.declare_payload_lost', 'artifact_revision',
+             '33333333-3333-4333-8333-333333333333', 'sys.backup:historical-lost-1',
+             'pre-45 historical lost payload', '{}'::jsonb)",
+    )
+    .bind(OPERATOR_1)
+    .execute(&owner_pre)
+    .await
+    .unwrap();
+    owner_pre.close().await;
+
+    // Upgrade 44 -> 45 (including `src/boundaries.sql`) must succeed without rolling back.
+    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+
+    let owner_pool = pool(&db, OWNER).await;
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM openmettle.authorization_audit
+          WHERE request_key IN ('sys.backup:historical-gap-1', 'sys.backup:historical-lost-1')",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        preserved, 2,
+        "pre-45 historical sys.backup:* audit rows must be preserved across 44 -> 45 upgrade"
+    );
+
+    // Post-45: new non-internal inserts using `sys.backup:%` MUST be rejected by the NOT VALID
+    // CHECK constraint `authorization_audit_sys_backup_namespace_check` (SQLSTATE 23514).
+    let err = sqlx::query(
+        "INSERT INTO openmettle.authorization_audit
+            (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
+             request_key, reason, details)
+         VALUES
+            ('operator', NULL, $1::uuid, 'restore.accept_coverage_gap', 'restore_gate',
+             'instance', 'sys.backup:post45-forged', 'must fail post-45', '{}'::jsonb)",
+    )
+    .bind(OPERATOR_1)
+    .execute(&owner_pool)
+    .await
+    .unwrap_err();
+    let db_err = err.as_database_error().unwrap();
+    assert_eq!(
+        db_err.code().as_deref(),
+        Some("23514"),
+        "post-45 non-internal sys.backup:* insert must fail CHECK constraint: {db_err:?}"
+    );
+    assert_eq!(
+        db_err.constraint(),
+        Some("authorization_audit_sys_backup_namespace_check"),
+        "expected authorization_audit_sys_backup_namespace_check violation, got {db_err:?}"
+    );
+
+    // Normal post-45 backup capture start & release still succeed cleanly.
+    let mut tx = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let run_id: String = sqlx::query_scalar(
+        "SELECT backup_run_id::text
+           FROM openmettle.backup_start_capture($1::uuid, 'post45-ok-1', 'upgrade ok', 'offhost-upg', 300)",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(!run_id.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn validated_pool_capture_fits_owner_connection_limit_three_over_verify_full() {
+    use tls_proxy_helpers::{make_ca, make_server_config, pem_cert, spawn_pg_tls_proxy};
+
+    let db = TestDb::migrated_exclusive().await;
+    let base_url = db.url(OWNER);
+    let base_cfg = backup::parse_validated_pg_uri(&base_url).unwrap();
+    if base_cfg.host.starts_with('/') {
+        return;
+    }
+    let _restore = Restore(&["ALTER ROLE openmettle_owner CONNECTION LIMIT -1"]);
+    db.wait_no_migration_session().await;
+    sqlx::query("ALTER ROLE openmettle_owner CONNECTION LIMIT 3")
+        .execute(&mut db.admin().await)
+        .await
+        .unwrap();
+
+    let (ca_issuer, ca_der) = make_ca("OpenMettle Lim3 CA");
+    let srv_cfg = Arc::new(std::sync::RwLock::new(make_server_config(
+        &ca_issuer,
+        &ca_der,
+        "127.0.0.1",
+        None,
+        None,
+    )));
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (proxy_port, proxy_handle) =
+        spawn_pg_tls_proxy(base_cfg.host.clone(), base_cfg.port, srv_cfg, accepted).await;
+
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-lim3"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-lim3", &[("bk-lim3", [0xcd; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let ca_path = PathBuf::from(dir.write("ca-lim3.pem", &pem_cert(ca_der.as_ref())));
+    fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let verify_full_url = match base_cfg.password.as_deref() {
+        Some(pw) => format!(
+            "postgres://{}:{}@127.0.0.1:{proxy_port}/{}?sslmode=verify-full&sslrootcert={}",
+            base_cfg.username,
+            pw,
+            base_cfg.database,
+            ca_path.display()
+        ),
+        None => format!(
+            "postgres://{}@127.0.0.1:{proxy_port}/{}?sslmode=verify-full&sslrootcert={}",
+            base_cfg.username,
+            base_cfg.database,
+            ca_path.display()
+        ),
+    };
+    let cfg = backup::parse_validated_pg_uri(&verify_full_url).unwrap();
+    let validated_pool = backup::connect_validated_pool(&cfg, 2).await.unwrap();
+    let runner: Arc<dyn PgDumpRunner> = if pg_tool_major_version("pg_dump").is_some_and(|v| v >= 18)
+    {
+        Arc::new(CliPgDumpRunner::default())
+    } else {
+        Arc::new(SyntheticPgDumpRunner)
+    };
+
+    let report = backup::capture_validated_with_runner(
+        &validated_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: verify_full_url,
+            destination_root: dest,
+            destination_domain: "offhost-lim3".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "lim3-verify-full-1".to_owned(),
+            reason: "connection limit 3 verify-full capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        runner,
+    )
+    .await
+    .unwrap();
+    backup::verify_backup(&report.backup_dir, &keyring).unwrap();
+    assert!(report.released_maintenance);
+
+    validated_pool.close().await;
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn worker_observe_telemetry_advances_overdue_and_expires_leases_under_held_for_share_gate_lock()
+ {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let api_pool = pool(&db, API).await;
+    let worker_pool = pool(&db, WORKER).await;
+    let metrics = Metrics::new();
+
+    // 1. Arm RPO and backdate it past 3600s so the next telemetry observation is overdue, while
+    //    keeping `maintenance_active = false` so `openmettle_api` can acquire `FOR SHARE` on
+    //    `backup_maintenance_gate`.
+    backup::arm_rpo(
+        &owner_pool,
+        OPERATOR_1,
+        "arm-for-share-1",
+        "arm rpo under active traffic",
+        3600,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.backup_maintenance_gate
+            SET rpo_tracking_armed_at = clock_timestamp() - interval '2 hours'
+          WHERE id",
+    )
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // 2. Seed an expired `draining` row directly in `backup_runs` (representing a crashed capture
+    //    whose lease lapsed).
+    let stale_run_id = new_uuid(&db).await;
+    sqlx::query(
+        "INSERT INTO openmettle.backup_runs
+            (id, request_key, operator_id, state, started_at, lease_until, destination_domain,
+             opened_maintenance)
+         VALUES
+            ($1::uuid, 'stale-under-share-1', $2::uuid, 'draining',
+             clock_timestamp() - interval '10 minutes',
+             clock_timestamp() - interval '1 minute',
+             'offhost-share', false)",
+    )
+    .bind(&stale_run_id)
+    .bind(OPERATOR_1)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // 3. Hold an open `openmettle_api` transaction with `FOR SHARE` on `backup_maintenance_gate`.
+    let mut api_tx = api_pool.begin().await.unwrap();
+    sqlx::query("SELECT openmettle.backup_maintenance_lock_open()")
+        .execute(&mut *api_tx)
+        .await
+        .unwrap();
+
+    // 4. `backup_observe_telemetry()` must neither block nor skip under the held `FOR SHARE` lock:
+    //    it must expire the stale lease AND increment `overdue_count`.
+    let obs = tokio::time::timeout(
+        Duration::from_secs(5),
+        backup::observe_telemetry_into(&worker_pool, &metrics),
+    )
+    .await
+    .expect("backup_observe_telemetry must not block on runtime FOR SHARE lock")
+    .unwrap();
+    assert_eq!(obs.overdue, 1, "overdue_count must advance under FOR SHARE");
+    assert_eq!(
+        obs.incomplete, 1,
+        "stale draining lease must expire to incomplete under FOR SHARE"
+    );
+
+    let (state, failure_code): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, failure_code FROM openmettle.backup_runs WHERE id = $1::uuid",
+    )
+    .bind(&stale_run_id)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "incomplete");
+    assert_eq!(failure_code.as_deref(), Some("lease_expired"));
+
+    let st = backup::status(&owner_pool).await.unwrap();
+    assert!(
+        st.last_overdue_observed_at.is_some(),
+        "backup::status must surface last_overdue_observed_at from backup_rpo_telemetry_state"
+    );
+
+    api_tx.rollback().await.unwrap();
 }
