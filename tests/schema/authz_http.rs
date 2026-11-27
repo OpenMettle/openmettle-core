@@ -72,7 +72,7 @@ impl Api {
 
     /// Starts the binary over `dir`, whose `artifacts` directory an earlier process may have
     /// left files in.
-    fn start_in(db: &TestDb, dir: auth_config_support::Dir) -> Self {
+    pub(super) fn start_in(db: &TestDb, dir: auth_config_support::Dir) -> Self {
         let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
         Self::configured(db, dir, document, 4)
     }
@@ -147,7 +147,7 @@ impl Api {
     }
 
     /// Kills the process as a crash would, keeping its directory.
-    fn kill(self) -> auth_config_support::Dir {
+    pub(super) fn kill(self) -> auth_config_support::Dir {
         drop(self.process);
         self.dir
     }
@@ -244,7 +244,7 @@ impl Api {
 
     /// One multipart upload under `key`; the boundary is the one `body` opens with. A created
     /// revision decodes with the contract consumer.
-    fn upload(&self, who: As<'_>, path: &str, key: &str, body: &str) -> (u16, Value) {
+    pub(super) fn upload(&self, who: As<'_>, path: &str, key: &str, body: &str) -> (u16, Value) {
         let (status, _, body) = self.send(who, "POST", path, &upload_headers(key, body), body);
         let response = decoded(status, &body);
         if status == 201 {
@@ -271,7 +271,7 @@ impl Api {
 
     /// A `GET` or `HEAD` of revision content with an optional `Range`: the status, the
     /// lowercase head and the body. A `GET` problem decodes with the contract consumer.
-    fn download(
+    pub(super) fn download(
         &self,
         who: As<'_>,
         method: &str,
@@ -931,10 +931,10 @@ async fn roles_groups_and_private_items_are_enforced_on_every_request() {
 
 // --- artifact uploads and downloads (ADR 0031 PR2) --------------------------------------------
 
-const GIB: i64 = 1 << 30;
+pub(super) const GIB: i64 = 1 << 30;
 
 /// Storage limits: a large instance budget and the given owner limits (`None` unconfigured).
-async fn limits(db: &TestDb, personal: Option<i64>, project: Option<i64>) {
+pub(super) async fn limits(db: &TestDb, personal: Option<i64>, project: Option<i64>) {
     sqlx::query(
         "UPDATE openmettle.storage_instance
             SET instance_budget_bytes = $1, personal_limit_bytes = $2, project_limit_bytes = $3",
@@ -979,7 +979,7 @@ async fn eventually(mut done: impl AsyncFnMut() -> bool) {
 }
 
 /// The file part, with an optional file name and the given media type.
-fn file_part(filename: Option<&str>, media: &str, bytes: &str) -> String {
+pub(super) fn file_part(filename: Option<&str>, media: &str, bytes: &str) -> String {
     let filename = filename
         .map(|f| format!("; filename=\"{f}\""))
         .unwrap_or_default();
@@ -988,14 +988,14 @@ fn file_part(filename: Option<&str>, media: &str, bytes: &str) -> String {
     )
 }
 
-fn metadata_part(json: &str) -> String {
+pub(super) fn metadata_part(json: &str) -> String {
     format!(
         "Content-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{json}"
     )
 }
 
 /// A form of `parts` under `boundary`, with or without its closing delimiter.
-fn form(boundary: &str, parts: &[String], close: bool) -> String {
+pub(super) fn form(boundary: &str, parts: &[String], close: bool) -> String {
     let mut out: String = parts
         .iter()
         .map(|part| format!("--{boundary}\r\n{part}\r\n"))

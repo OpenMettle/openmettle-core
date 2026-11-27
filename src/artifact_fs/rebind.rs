@@ -13,10 +13,11 @@ use super::{
 use rustix::{fs as at, io::Errno};
 use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, TryLockError},
     os::unix::fs::MetadataExt,
     path::Path,
+    time::Instant,
 };
 
 pub struct Options<'a> {
@@ -75,81 +76,130 @@ pub enum Barrier {
     Unknown(String),
 }
 
-const CHANGED: &str = "volume changed during rebind";
+pub(super) const CHANGED: &str = "volume changed during rebind";
 const INACCESSIBLE: &str = "payload is not accessible";
+const FENCE_EXPIRED: &str = "transaction fence expired";
+
+fn check_fence(deadline: Instant) -> Result<(), Failure> {
+    if Instant::now() >= deadline {
+        return Err(Failure(FENCE_EXPIRED));
+    }
+    Ok(())
+}
 
 const INVENTORY: &str =
-    "SELECT s.id::text,s.state,s.reclaim_state,s.payload_ino::text,s.adoption_unverified,
-    s.publish_pending,r.state AS revision_state,r.purge_stage,r.size_bytes,r.content_digest
+    "SELECT s.id::text,s.scope_id::text,s.state,s.reclaim_state,s.payload_ino::text,
+    s.adoption_unverified,s.publish_pending,r.id::text AS revision_id,r.state AS revision_state,
+    r.purge_stage,r.size_bytes,r.content_digest,
+    EXISTS (
+        SELECT 1 FROM openmettle.deletion_journal j
+         WHERE j.scope_id=s.scope_id AND j.entity_id=r.id
+           AND j.event_kind='artifact_revision.purged'
+    ) AS journal_purged
     FROM openmettle.storage_reservations s LEFT JOIN openmettle.artifact_revisions r
     ON r.scope_id=s.scope_id AND r.reservation_id=s.id ORDER BY s.id";
 
 /// Everything the scan relied on. The locked apply requires it unchanged.
-type Identity = (
-    String,
-    String,
-    String,
-    Option<String>,
-    bool,
-    bool,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<Vec<u8>>,
-);
+#[derive(PartialEq, Eq)]
+struct Identity {
+    id: String,
+    scope_id: String,
+    state: String,
+    reclaim_state: String,
+    payload_ino: Option<String>,
+    adoption_unverified: bool,
+    publish_pending: bool,
+    revision_id: Option<String>,
+    revision_state: Option<String>,
+    purge_stage: Option<String>,
+    size_bytes: Option<i64>,
+    content_digest: Option<Vec<u8>>,
+    journal_purged: bool,
+}
 fn identity(row: &PgRow) -> Identity {
-    (
-        row.get("id"),
-        row.get("state"),
-        row.get("reclaim_state"),
-        row.get("payload_ino"),
-        row.get("adoption_unverified"),
-        row.get("publish_pending"),
-        row.get("revision_state"),
-        row.get("purge_stage"),
-        row.get("size_bytes"),
-        row.get("content_digest"),
-    )
+    Identity {
+        id: row.get("id"),
+        scope_id: row.get("scope_id"),
+        state: row.get("state"),
+        reclaim_state: row.get("reclaim_state"),
+        payload_ino: row.get("payload_ino"),
+        adoption_unverified: row.get("adoption_unverified"),
+        publish_pending: row.get("publish_pending"),
+        revision_id: row.get("revision_id"),
+        revision_state: row.get("revision_state"),
+        purge_stage: row.get("purge_stage"),
+        size_bytes: row.get("size_bytes"),
+        content_digest: row.get("content_digest"),
+        journal_purged: row.get("journal_purged"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Entry {
-    ino: u64,
-    len: u64,
-    links: u64,
+pub(super) struct Entry {
+    pub ino: u64,
+    pub len: u64,
+    pub links: u64,
 }
 
 /// The four names one reservation can own.
 #[derive(Clone, Copy, Debug, Default)]
-struct Names {
-    staging: Option<Entry>,
-    reclaim: Option<Entry>,
-    revision: Option<Entry>,
-    purge: Option<Entry>,
+pub(super) struct Names {
+    pub staging: Option<Entry>,
+    pub reclaim: Option<Entry>,
+    pub revision: Option<Entry>,
+    pub purge: Option<Entry>,
 }
 
-struct Ledger<'a> {
-    state: &'a str,
-    reclaim: &'a str,
-    revision: Option<&'a str>,
-    purge: Option<&'a str>,
+pub(super) struct Ledger<'a> {
+    pub state: &'a str,
+    pub reclaim: &'a str,
+    pub revision: Option<&'a str>,
+    pub purge: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Plan {
+pub(super) enum Plan {
     /// The lifecycle state owns no file and none is present.
     Skip,
     /// Accept the published payload once its size and SHA-256 match the ledger.
     Content(u64),
     /// Accept an empty file. `truncate` first discards an unsettled upload's bytes.
     Empty { ino: u64, truncate: bool },
+    /// A lost revision still has leftover reservation files on disk with no foreign hard links.
+    Cleanup,
+}
+
+/// Returns `true` if any present inode among a reservation's four names has links outside
+/// those four names (including cross-reservation inode aliases or external hard links).
+pub(super) fn has_foreign_hard_link(entries: &[Option<Entry>; 4]) -> bool {
+    for entry in entries.iter().flatten() {
+        let own = entries
+            .iter()
+            .flatten()
+            .filter(|other| other.ino == entry.ino)
+            .count() as u64;
+        if entry.links != own {
+            return true;
+        }
+    }
+    false
 }
 
 /// Decide what a bound, unquarantined reservation needs, from its lifecycle state and every
 /// name found on disk. The layouts accepted here are the ones the drift check accepts, with
 /// one difference: no inode number is compared with the ledger, because a copy can keep one
 /// by chance. An error leaves the reservation untouched.
-fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
+pub(super) fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
+    let all = [n.staging, n.reclaim, n.revision, n.purge];
+    if l.state == "settled" && l.revision == Some("lost") {
+        if all.iter().all(Option::is_none) {
+            return Ok(Plan::Skip);
+        }
+        if has_foreign_hard_link(&all) {
+            return Err("foreign hard link");
+        }
+        return Ok(Plan::Cleanup);
+    }
     let reclaim_allowed = matches!(
         (l.state, l.reclaim),
         ("reserved", "claiming" | "truncated") | ("released", "anchor_pending_unlink")
@@ -230,6 +280,16 @@ fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
 /// bytes under its staging name, which the reconciler quarantines when the reservation
 /// expires (`reclaim::release`). Every other name is one the drift check rejects.
 fn classify_unbound(l: &Ledger<'_>, n: &Names) -> Result<bool, &'static str> {
+    if l.state == "settled" && l.revision == Some("lost") {
+        let all = [n.staging, n.reclaim, n.revision, n.purge];
+        if all.iter().all(Option::is_none) {
+            return Ok(false);
+        }
+        if has_foreign_hard_link(&all) {
+            return Err("foreign hard link");
+        }
+        return Ok(false);
+    }
     if n.reclaim.is_some() {
         return Err("unexpected reclaim anchor");
     }
@@ -254,7 +314,146 @@ enum Evidence {
 }
 
 /// One reservation's four names, as `(in revisions, name)`.
-type OwnedNames = [(bool, String); 4];
+pub(super) type OwnedNames = [(bool, String); 4];
+
+pub(super) fn reservation_names(id: &str) -> OwnedNames {
+    [
+        (false, id.to_owned()),
+        (false, format!(".reclaim.{id}")),
+        (true, id.to_owned()),
+        (true, format!(".purge.{id}")),
+    ]
+}
+
+/// Stat all four names of a reservation. `Ok(None)` means at least one name is not a regular
+/// file on this volume.
+pub(super) fn stat_reservation(
+    v: &Volume,
+    names: &OwnedNames,
+) -> Result<Option<[Option<Entry>; 4]>, Failure> {
+    let mut entries = [None; 4];
+    for (slot, (revisions, name)) in names.iter().enumerate() {
+        match v.stat(directory(v, *revisions), name) {
+            Ok(Some(stat)) => entries[slot] = Some(entry(&stat)),
+            Ok(None) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(entries))
+}
+
+/// Open and exclusively `flock` every unique regular inode present among a reservation's four
+/// names, verifying each name still maps to its stat'd inode and optionally checking that no
+/// foreign hard links exist outside those four names.
+pub(super) fn lock_reservation_files(
+    v: &Volume,
+    names: &OwnedNames,
+    entries: &[Option<Entry>; 4],
+    check_links: bool,
+) -> Result<Vec<(u64, File)>, Failure> {
+    let mut own_links: HashMap<u64, u64> = HashMap::new();
+    let mut unique_slots: Vec<(u64, usize)> = Vec::new();
+    for (slot, maybe) in entries.iter().enumerate() {
+        let Some(e) = maybe else { continue };
+        let count = own_links.entry(e.ino).or_insert(0);
+        if *count == 0 {
+            unique_slots.push((e.ino, slot));
+        }
+        *count += 1;
+    }
+    let mut locked = Vec::with_capacity(unique_slots.len());
+    for (ino, slot) in unique_slots {
+        let (revisions, name) = &names[slot];
+        let file = match v.regular(directory(v, *revisions), name, true) {
+            Ok(file) => file,
+            Err(e) if file_specific(&e) => return Err(Failure(INACCESSIBLE)),
+            Err(e) => return Err(e.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(Failure("reservation in use")),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let meta = file.metadata()?;
+        if meta.ino() != ino || meta.dev() != v.dev {
+            return Err(Failure(CHANGED));
+        }
+        locked.push((ino, file));
+    }
+    for ((revisions, name), expected) in names.iter().zip(entries.iter()) {
+        if v.inode(directory(v, *revisions), name)? != expected.map(|e| e.ino) {
+            return Err(Failure(CHANGED));
+        }
+    }
+    if check_links {
+        for (ino, file) in &locked {
+            let nlink = file.metadata()?.nlink();
+            let own = own_links[ino];
+            if nlink > own {
+                return Err(Failure("foreign hard link"));
+            }
+            if nlink < own {
+                return Err(Failure(CHANGED));
+            }
+        }
+    }
+    Ok(locked)
+}
+
+/// Unlink every present name among a reservation's four names and `fsync` each touched
+/// directory. Call only while holding the exclusive locks from [`lock_reservation_files`].
+pub(super) fn unlink_reservation_files(
+    v: &Volume,
+    names: &OwnedNames,
+    entries: &[Option<Entry>; 4],
+    deadline: Option<Instant>,
+) -> Result<usize, Failure> {
+    let mut unlinked = 0;
+    let mut touched_staging = false;
+    let mut touched_revisions = false;
+    for ((revisions, name), entry) in names.iter().zip(entries.iter()) {
+        let Some(e) = entry else { continue };
+        let dir = directory(v, *revisions);
+        if let Some(deadline) = deadline {
+            v.unlink_before(dir, name, e.ino, deadline)?;
+        } else {
+            v.unlink(dir, name, e.ino)?;
+        }
+        if *revisions {
+            touched_revisions = true;
+        } else {
+            touched_staging = true;
+        }
+        unlinked += 1;
+    }
+    if touched_staging {
+        at::fsync(&v.staging)?;
+    }
+    if touched_revisions {
+        at::fsync(&v.revisions)?;
+    }
+    Ok(unlinked)
+}
+
+/// A lost revision that still has leftover files on disk or a stale recorded `payload_ino`.
+struct LostCleanup {
+    id: String,
+    bound: Option<u64>,
+    names: OwnedNames,
+    entries: [Option<Entry>; 4],
+}
+
+/// A settled `purging` revision that already has a terminal `artifact_revision.purged` commitment
+/// in `deletion_journal`, whose payload on disk is missing, corrupt, or has a broken layout, and
+/// whose remaining files (if any) have no foreign hard links.
+struct JournalPurgeCompletion {
+    id: String,
+    scope_id: String,
+    revision_id: String,
+    size_bytes: i64,
+    names: OwnedNames,
+    entries: [Option<Entry>; 4],
+}
 
 /// A reservation whose file the scan accepted. No descriptor is kept between the scan and
 /// the apply: each step reopens the file and requires it unchanged.
@@ -272,7 +471,7 @@ struct Binding {
     evidence: Evidence,
 }
 
-fn directory(v: &Volume, revisions: bool) -> &File {
+pub(super) fn directory(v: &Volume, revisions: bool) -> &File {
     if revisions { &v.revisions } else { &v.staging }
 }
 
@@ -322,7 +521,12 @@ impl Binding {
     /// that changes the volume after this check is not detected.
     /// `modified` is set immediately before the first byte is discarded. `false`: the file
     /// could not be opened and nothing was discarded.
-    fn truncate(&self, v: &Volume, modified: &mut bool) -> Result<bool, Failure> {
+    fn truncate(
+        &self,
+        v: &Volume,
+        modified: &mut bool,
+        deadline: Instant,
+    ) -> Result<bool, Failure> {
         let Some(file) = self.open(v)? else {
             return Ok(false);
         };
@@ -330,6 +534,7 @@ impl Binding {
         if file.metadata()?.nlink() != own {
             return Err(Failure(CHANGED));
         }
+        check_fence(deadline)?;
         // From here a failing run keeps the barrier.
         *modified = true;
         file.set_len(0)?;
@@ -342,10 +547,53 @@ impl Binding {
 struct Scan {
     digests: RevisionDigests,
     bindings: Vec<Binding>,
+    lost_cleanups: Vec<LostCleanup>,
+    journal_purges: Vec<JournalPurgeCompletion>,
     report: Report,
 }
 
 impl Scan {
+    fn plan_journal_purge(
+        &mut self,
+        v: &Volume,
+        row: &PgRow,
+        names: OwnedNames,
+        entries: [Option<Entry>; 4],
+    ) -> Result<(), Failure> {
+        let id: &str = row.try_get("id")?;
+        if has_foreign_hard_link(&entries) {
+            self.report
+                .failures
+                .push((id.to_owned(), "foreign hard link"));
+            return Ok(());
+        }
+        if let Err(err) = lock_reservation_files(v, &names, &entries, true) {
+            match err.0 {
+                INACCESSIBLE | "foreign hard link" => {
+                    self.report.failures.push((id.to_owned(), err.0));
+                    return Ok(());
+                }
+                _ => return Err(err),
+            }
+        }
+        let scope_id: String = row.try_get("scope_id")?;
+        let revision_id: String = row
+            .try_get::<Option<String>, _>("revision_id")?
+            .ok_or(Failure("missing revision"))?;
+        let size_bytes: i64 = row
+            .try_get::<Option<i64>, _>("size_bytes")?
+            .ok_or(Failure("invalid revision size"))?;
+        self.journal_purges.push(JournalPurgeCompletion {
+            id: id.to_owned(),
+            scope_id,
+            revision_id,
+            size_bytes,
+            names,
+            entries,
+        });
+        Ok(())
+    }
+
     fn inspect(
         &mut self,
         v: &Volume,
@@ -374,6 +622,7 @@ impl Scan {
             revision: row.try_get("revision_state")?,
             purge: row.try_get("purge_stage")?,
         };
+        let journal_purged: bool = row.try_get("journal_purged")?;
         let [staging, reclaim, revision, purge] = entries;
         let names = Names {
             staging,
@@ -381,9 +630,45 @@ impl Scan {
             revision,
             purge,
         };
+        if ledger.state == "settled" && ledger.revision == Some("lost") {
+            let bound = bound
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| Failure("invalid inode"))?;
+            if entries.iter().all(Option::is_none) && bound.is_none() {
+                return Ok(());
+            }
+            if has_foreign_hard_link(&entries) {
+                fail("foreign hard link");
+                return Ok(());
+            }
+            // Verify every present file can be opened and exclusively locked without foreign links.
+            if let Err(err) = lock_reservation_files(v, &observed.names, &entries, true) {
+                match err.0 {
+                    INACCESSIBLE | "foreign hard link" => {
+                        fail(err.0);
+                        return Ok(());
+                    }
+                    _ => return Err(err),
+                }
+            }
+            self.lost_cleanups.push(LostCleanup {
+                id: id.to_owned(),
+                bound,
+                names: observed.names,
+                entries,
+            });
+            return Ok(());
+        }
+        let can_complete_journal_purge =
+            ledger.state == "settled" && ledger.revision == Some("purging") && journal_purged;
         // Binding a reservation that never had an inode is adoption's decision. Its layout
-        // is still validated, and its file is never touched.
+        // is still validated, and its file is never touched, unless it already has a terminal
+        // `artifact_revision.purged` commitment in `deletion_journal`.
         let Some(bound) = bound else {
+            if can_complete_journal_purge {
+                return self.plan_journal_purge(v, row, observed.names, entries);
+            }
             match classify_unbound(&ledger, &names) {
                 Err(reason) => fail(reason),
                 Ok(true) => self.report.unbound_staged.push(id.to_owned()),
@@ -395,10 +680,13 @@ impl Scan {
         let seen = entries.map(|e| e.map(|e| e.ino));
         let (ino, at, evidence) = match plan {
             Err(reason) => {
+                if can_complete_journal_purge {
+                    return self.plan_journal_purge(v, row, observed.names, entries);
+                }
                 fail(reason);
                 return Ok(());
             }
-            Ok(Plan::Skip) => return Ok(()),
+            Ok(Plan::Skip | Plan::Cleanup) => return Ok(()),
             // The published name is index 2 of the reservation's names.
             Ok(Plan::Content(ino)) => (
                 ino,
@@ -435,6 +723,10 @@ impl Scan {
             match self.digests.verify(id, &mut file, *size, digest) {
                 Ok(()) => {}
                 Err(Failure(reason @ ("size_or_digest_mismatch" | READ_FAILED))) => {
+                    if can_complete_journal_purge {
+                        drop(file);
+                        return self.plan_journal_purge(v, row, binding.names, entries);
+                    }
                     fail(reason);
                     return Ok(());
                 }
@@ -470,12 +762,7 @@ fn observe(v: &Volume, rows: &[PgRow]) -> Result<(Vec<Observed>, HashSet<String>
     let mut observed = Vec::with_capacity(rows.len());
     for row in rows {
         let id: &str = row.try_get("id")?;
-        let names = [
-            (false, id.to_owned()),
-            (false, format!(".reclaim.{id}")),
-            (true, id.to_owned()),
-            (true, format!(".purge.{id}")),
-        ];
+        let names = reservation_names(id);
         let mut entries = Some([None; 4]);
         for (slot, (revisions, name)) in names.iter().enumerate() {
             match v.stat(directory(v, *revisions), name) {
@@ -566,12 +853,34 @@ async fn scan_and_apply(
     }
 
     let mut tx = c.begin().await?;
+    sqlx::query(super::FS_TX_IDLE_TIMEOUT)
+        .execute(&mut *tx)
+        .await?;
+    let tx_deadline = Instant::now() + super::TX_FENCE_BUDGET;
     sqlx::query("SELECT id FROM openmettle.storage_reservations ORDER BY id FOR UPDATE")
         .execute(&mut *tx)
         .await?;
     sqlx::query("SELECT id FROM openmettle.artifact_revisions ORDER BY id FOR UPDATE")
         .execute(&mut *tx)
         .await?;
+    let gate = if !scan.lost_cleanups.is_empty() {
+        Some(
+            sqlx::query(
+                "SELECT open,
+                        (NOT open AND volume_claim_token IS NOT NULL AND volume_lease_until > clock_timestamp()) AS volume_active,
+                        required_journal_seq,
+                        required_chain_digest,
+                        restore_run_id::text AS restore_run_id
+                   FROM openmettle.restore_reconciliation_gate
+                  WHERE id
+                    FOR SHARE",
+            )
+            .fetch_one(&mut *tx)
+            .await?,
+        )
+    } else {
+        None
+    };
     // A later run that replaced this barrier fences this one out here.
     let own: Option<bool> = sqlx::query_scalar(
         "SELECT adoption_run_id=$1::uuid FROM openmettle.storage_volume_control WHERE id FOR UPDATE",
@@ -587,12 +896,74 @@ async fn scan_and_apply(
     if !locked.iter().map(identity).eq(rows.iter().map(identity)) {
         return Err(Failure("ledger changed during rebind"));
     }
+    if let Some(gate) = gate
+        && !gate.try_get::<bool, _>("open")?
+    {
+        if gate.try_get::<bool, _>("volume_active")? {
+            return Err(Failure("restore volume phase is active"));
+        }
+        // Preserve canonical lock order before locking deletion_journal_head FOR SHARE when this
+        // transaction will also update storage_accounts and storage_instance for journal purges.
+        if !scan.journal_purges.is_empty() {
+            let scope_ids: BTreeSet<&str> = scan
+                .journal_purges
+                .iter()
+                .map(|jp| jp.scope_id.as_str())
+                .collect();
+            for scope_id in scope_ids {
+                sqlx::query(
+                    "SELECT FROM openmettle.storage_accounts WHERE scope_id = $1::uuid FOR UPDATE",
+                )
+                .bind(scope_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query("SELECT FROM openmettle.storage_instance WHERE id FOR UPDATE")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let (head_seq, head_digest): (i64, Vec<u8>) = sqlx::query_as(
+            "SELECT journal_seq, chain_digest FROM openmettle.deletion_journal_head WHERE id FOR SHARE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let req_seq = gate
+            .try_get::<Option<i64>, _>("required_journal_seq")?
+            .ok_or(Failure(
+                "closed restore gate is missing required journal state",
+            ))?;
+        let req_digest = gate
+            .try_get::<Option<Vec<u8>>, _>("required_chain_digest")?
+            .ok_or(Failure(
+                "closed restore gate is missing required journal state",
+            ))?;
+        let restore_run_id =
+            gate.try_get::<Option<String>, _>("restore_run_id")?
+                .ok_or(Failure(
+                    "closed restore gate is missing required journal state",
+                ))?;
+        if head_seq < req_seq || (head_seq == req_seq && head_digest != req_digest) {
+            return Err(Failure(
+                "closed restore gate deletion journal has not caught up",
+            ));
+        }
+        if head_seq > req_seq {
+            sqlx::query("SELECT openmettle.restore_verify_lost_journal_tail($1, $2, $3::uuid)")
+                .bind(req_seq)
+                .bind(&req_digest)
+                .bind(&restore_run_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| Failure("closed restore gate journal tail verification failed"))?;
+        }
+    }
     // Before the first write: every file is still the one inspected, and every file whose
     // inode is about to be recorded is durable.
     scan.digests.recheck = true;
     let mut report = scan.report;
     let mut accepted = Vec::with_capacity(scan.bindings.len());
     for b in &scan.bindings {
+        check_fence(tx_deadline)?;
         // A file that cannot be reopened fails its reservation, as in the scan.
         let Some(mut file) = b.open(v)? else {
             report.failures.push((b.id.clone(), INACCESSIBLE));
@@ -607,6 +978,7 @@ async fn scan_and_apply(
             }
             Evidence::Empty { .. } => {}
         }
+        check_fence(tx_deadline)?;
         // Whatever its inode number: an equal number does not show that the data is durable.
         file.sync_all()?;
         accepted.push(b);
@@ -614,7 +986,7 @@ async fn scan_and_apply(
     let mut bound = Vec::with_capacity(accepted.len());
     for b in accepted {
         if matches!(b.evidence, Evidence::Empty { truncate: true }) {
-            if !b.truncate(v, modified)? {
+            if !b.truncate(v, modified, tx_deadline)? {
                 report.failures.push((b.id.clone(), INACCESSIBLE));
                 continue;
             }
@@ -622,9 +994,121 @@ async fn scan_and_apply(
         }
         bound.push(b);
     }
+    let mut cleared_lost = Vec::with_capacity(scan.lost_cleanups.len());
+    for lost in &scan.lost_cleanups {
+        check_fence(tx_deadline)?;
+        let locked = match lock_reservation_files(v, &lost.names, &lost.entries, true) {
+            Ok(locked) => locked,
+            Err(Failure(reason @ (INACCESSIBLE | "foreign hard link"))) => {
+                report.failures.push((lost.id.clone(), reason));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if lost.entries.iter().any(Option::is_some) {
+            check_fence(tx_deadline)?;
+            *modified = true;
+            unlink_reservation_files(v, &lost.names, &lost.entries, Some(tx_deadline))?;
+        }
+        drop(locked);
+        cleared_lost.push(lost);
+    }
+    let mut completed_purges = Vec::with_capacity(scan.journal_purges.len());
+    for jp in &scan.journal_purges {
+        check_fence(tx_deadline)?;
+        let locked = match lock_reservation_files(v, &jp.names, &jp.entries, true) {
+            Ok(locked) => locked,
+            Err(Failure(reason @ (INACCESSIBLE | "foreign hard link"))) => {
+                report.failures.push((jp.id.clone(), reason));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if jp.entries.iter().any(Option::is_some) {
+            check_fence(tx_deadline)?;
+            *modified = true;
+            unlink_reservation_files(v, &jp.names, &jp.entries, Some(tx_deadline))?;
+        }
+        drop(locked);
+        completed_purges.push(jp);
+    }
+    check_fence(tx_deadline)?;
     // The directory entries behind every recorded inode are durable before the commit.
     for dir in [&v.root, &v.staging, &v.revisions] {
         at::fsync(dir)?;
+    }
+    for lost in cleared_lost {
+        if let Some(prev) = lost.bound {
+            let updated = sqlx::query(
+                "UPDATE openmettle.storage_reservations SET payload_ino=NULL,publish_pending=false
+                 WHERE id=$1::uuid AND payload_ino=$2::text::numeric AND NOT adoption_unverified",
+            )
+            .bind(&lost.id)
+            .bind(prev.to_string())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(Failure("ledger changed during rebind"));
+            }
+        }
+    }
+    let mut scope_retained_decrements: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut instance_retained_decrement: i64 = 0;
+    for jp in completed_purges {
+        let updated_res = sqlx::query(
+            "UPDATE openmettle.storage_reservations
+                SET payload_ino = NULL, publish_pending = false
+              WHERE scope_id = $1::uuid AND id = $2::uuid
+                AND state = 'settled' AND NOT adoption_unverified",
+        )
+        .bind(&jp.scope_id)
+        .bind(&jp.id)
+        .execute(&mut *tx)
+        .await?;
+        if updated_res.rows_affected() != 1 {
+            return Err(Failure("ledger changed during rebind"));
+        }
+        let updated_rev = sqlx::query(
+            "UPDATE openmettle.artifact_revisions
+                SET state = 'purged',
+                    purged_at = greatest(clock_timestamp(), purging_at),
+                    purge_stage = 'none'
+              WHERE scope_id = $1::uuid AND id = $2::uuid AND state = 'purging'",
+        )
+        .bind(&jp.scope_id)
+        .bind(&jp.revision_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated_rev.rows_affected() != 1 {
+            return Err(Failure("ledger changed during rebind"));
+        }
+        *scope_retained_decrements
+            .entry(jp.scope_id.as_str())
+            .or_insert(0) += jp.size_bytes;
+        instance_retained_decrement += jp.size_bytes;
+    }
+    // Canonical lock order: storage_reservations -> artifact_revisions ->
+    // restore_reconciliation_gate -> storage_volume_control -> storage_accounts (ascending
+    // scope_id) -> storage_instance -> deletion_journal_head.
+    for (scope_id, bytes) in scope_retained_decrements {
+        let updated = sqlx::query(
+            "UPDATE openmettle.storage_accounts
+                SET retained_bytes = retained_bytes - $2
+              WHERE scope_id = $1::uuid",
+        )
+        .bind(scope_id)
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(Failure("ledger changed during rebind"));
+        }
+    }
+    if instance_retained_decrement > 0 {
+        sqlx::query("UPDATE openmettle.storage_instance SET retained_bytes = retained_bytes - $1")
+            .bind(instance_retained_decrement)
+            .execute(&mut *tx)
+            .await?;
     }
     for b in bound {
         if b.ino == b.bound {
@@ -655,9 +1139,11 @@ async fn scan_and_apply(
             .map_err(|_| Failure("drift verification failed"))?;
         report.drift = Some(drift);
     }
+    check_fence(tx_deadline)?;
     if report.complete() {
         adoption::restore_barrier(&mut tx, run, None).await?;
     }
+    check_fence(tx_deadline)?;
     tx.commit().await.map_err(|_| Failure(COMMIT_UNKNOWN))?;
     report.run = run.to_owned();
     Ok(report)
@@ -932,6 +1418,23 @@ mod tests {
             classify_unbound(&settled, &published),
             Err("reservation has no recorded inode")
         );
+        let lost = ledger("settled", "none", Some("lost"), Some("none"));
+        assert_eq!(classify(&lost, &NONE), Ok(Plan::Skip));
+        assert_eq!(classify(&lost, &published), Ok(Plan::Cleanup));
+        assert_eq!(classify_unbound(&lost, &NONE), Ok(false));
+        assert_eq!(classify_unbound(&lost, &published), Ok(false));
+        let linked = Names {
+            staging: entry(40, 9, 2),
+            revision: entry(40, 9, 2),
+            ..NONE
+        };
+        assert_eq!(classify(&lost, &linked), Ok(Plan::Cleanup));
+        let foreign = Names {
+            revision: entry(40, 9, 2),
+            ..NONE
+        };
+        assert_eq!(classify(&lost, &foreign), Err("foreign hard link"));
+        assert_eq!(classify_unbound(&lost, &foreign), Err("foreign hard link"));
     }
 
     /// A published, unsettled upload as the scan saw it: two names, one file.
@@ -967,7 +1470,8 @@ mod tests {
         let dir = Dir::new();
         let (v, binding) = two_name_upload(&dir);
         let mut modified = false;
-        assert!(binding.truncate(&v, &mut modified).unwrap());
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert!(binding.truncate(&v, &mut modified, valid).unwrap());
         assert!(modified);
         let staged = Path::new(&dir.path("volume"))
             .join("staging")
@@ -985,7 +1489,11 @@ mod tests {
         let foreign = root.join("foreign");
         std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
         let mut modified = false;
-        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, valid).unwrap_err().0,
+            CHANGED
+        );
         assert!(!modified);
         assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
     }
@@ -1016,9 +1524,30 @@ mod tests {
         let foreign = root.join("foreign");
         std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
         let mut modified = false;
-        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        let valid = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, valid).unwrap_err().0,
+            CHANGED
+        );
         // A refused check modified nothing, so it must not keep a barrier that was clear.
         assert!(!modified);
         assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
+    }
+
+    #[test]
+    fn truncation_refuses_expired_fence_deadline_without_modifying_file() {
+        let dir = Dir::new();
+        let (v, binding) = two_name_upload(&dir);
+        let staged = Path::new(&dir.path("volume"))
+            .join("staging")
+            .join(&binding.id);
+        let mut modified = false;
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            binding.truncate(&v, &mut modified, expired).unwrap_err().0,
+            FENCE_EXPIRED
+        );
+        assert!(!modified);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"unsettled");
     }
 }

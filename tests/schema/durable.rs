@@ -913,6 +913,8 @@ async fn concurrent_observations_have_one_revision_winner() {
 mod artifact_fs;
 #[path = "cancellation.rs"]
 mod cancellation;
+#[path = "declare_lost.rs"]
+mod declare_lost;
 #[path = "restore.rs"]
 mod restore;
 #[path = "retention.rs"]

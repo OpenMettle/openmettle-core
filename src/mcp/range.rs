@@ -115,6 +115,7 @@ mod tests {
             created_us: 0,
             retained_us: None,
             purge_after_us: None,
+            lost_us: None,
         }
     }
     #[test]

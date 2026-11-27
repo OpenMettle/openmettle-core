@@ -241,6 +241,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "credential vault and external connections",
         sql: include_str!("../migrations/0043_credential_vault_and_connections.sql"),
     },
+    Source {
+        version: 44,
+        description: "declare lost artifact payload",
+        sql: include_str!("../migrations/0044_declare_lost_artifact_payload.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

@@ -4587,9 +4587,73 @@ the run is an operator precondition.
 required post-restore check. `quota_verify_accounting_drift()` alone compares no file and
 reports a copied, unbound volume as healthy.
 
-**Consequences and known gaps.** A settled payload that cannot be recovered keeps the volume
-closed until the owner resolves that row by hand; a supported step to declare a payload lost
-does not exist yet. A quarantined reservation stays quarantined, and `quota verify ROOT` stays
+**Consequences and known gaps.** A quarantined reservation stays quarantined, and `quota verify ROOT` stays
 unhealthy for it as it was before the backup. A worker that got past the start-up check
 before rebind can quarantine unsettled uploads, which rebind leaves quarantined. Only `cp -a`,
 GNU `tar` and restic 0.14 copies were exercised; Velero, NFS and CSI snapshots were not.
+
+### Amendment (26 November 2026): Owner-only lost-payload declaration (`storage declare-lost`, migration 44, issue `#154`)
+
+**Triggering problem.** When a settled artifact payload (`active`, `retained`, or non-empty
+`purging`) is missing or irreversibly corrupted in every copy of a recovery point, `storage rebind`
+intentionally refuses to release its barrier because `rebind` is strictly non-destructive on
+settled revisions. Without a supported operator step, the volume stayed closed until the owner
+hand-edited PostgreSQL, risking accounting drift, bypassed audit trails, or resurrection on a
+subsequent restore to an older backup.
+
+**Decision.** Add a separate owner-only maintenance command and schema increment (migration 44,
+keeping `storage rebind` strictly non-destructive on settled revisions):
+
+- **Separate command, DB-only replay catch-up and barrier preconditions.** `openmettle-admin storage declare-lost ROOT
+  --revision UUID --operator-id UUID --request-key KEY --reason REASON` runs exclusively as
+  `openmettle_owner` in `READ COMMITTED`, requires matching volume sentinels, refuses live open
+  volumes (`adoption_run_id IS NULL AND restore_reconciliation_gate.open`), refuses active restore
+  volume-phase leases (`OMR02`), and refuses closed restore gates whose `deletion_journal_head` has
+  not caught up to `required_journal_seq` (`OMR04`) so legitimately purged revisions are replayed
+  first. `openmettle-admin restore replay --db-only FILE` runs the database replay phase
+  (`restore_replay_baseline` and `deletion_journal_replay`, taking `storage_volume_control FOR SHARE`
+  so it succeeds even while a failed `storage rebind` holds `adoption_run_id`) without opening the
+  gate.
+- **Refuse verifiable payloads, terminal purge commitments and foreign hard links.** Under
+  continuously-held exclusive `flock` descriptors and `TX_FENCE_BUDGET`, `storage declare-lost`
+  verifies candidate reservation files by SHA-256 independently of `rebind::classify` layout/anchor
+  errors so intact bytes are never unlinked, refuses already-truncated `purging` layouts accepted by
+  `storage rebind`, refuses revisions that already carry an `artifact_revision.purged` commitment in
+  `deletion_journal` (instead `storage rebind` and `purge_journaled` complete already-journaled
+  purges whose payloads are missing or unrecoverable), and refuses any foreign hard link or active
+  lock. For genuinely unrecoverable payloads, it commits durable `'lost'` DB state first while still
+  holding the exclusive locks, then unlinks leftover reservation files with deadline-fenced
+  `unlink_before` and `fsync`s touched directories.
+- **State, role boundary, accounting, audit and deletion journal.** Migration 44 adds nullable
+  `artifact_revisions.lost_at`, widens `artifact_revisions_state_check` and
+  `artifact_revisions_lifecycle_check` with terminal state `'lost'`, and adds owner-only trigger
+  `artifact_revisions_lost_owner_only` (`42501` for non-owners). Owner-only SQL function
+  `openmettle.storage_declare_payload_lost(...)` follows the canonical lock order
+  (`pg_advisory_xact_lock` -> `storage_reservations` -> `artifact_revisions` ->
+  `restore_reconciliation_gate` -> `storage_volume_control` -> `storage_accounts` ->
+  `storage_instance` -> `deletion_journal_head`), enforces idempotency on `request_key` (`23505`
+  on mismatch), deletes `artifact_retention_holds`, clears `storage_reservations.payload_ino`,
+  decrements `active_bytes` or `retained_bytes` once, records `'storage.declare_payload_lost'` in
+  `authorization_audit`, and appends `'artifact_revision.lost'` to `deletion_journal` (mutually
+  exclusive per entity with `'artifact_revision.purged'` via unique partial index
+  `deletion_journal_terminal_revision_idx`; `openmettle.deletion_journal/2` digest).
+- **Restore gate and re-restore consistency.** `restore_verify_checkpoints`,
+  `restore_verify_export`, `restore_claim_volume_phase`, and `restore_gate_open` accept a
+  post-replay journal tail strictly composed of valid-chain `'artifact_revision.lost'` entries
+  audited under the active `restore_run_id`, letting operators finish `restore replay` with the
+  original export file; `restore_gate_open` fails closed (`OMR05`) if any `'artifact_revision.lost'`
+  journal row is not in state `'lost'`. Replaying an export containing `'artifact_revision.lost'`
+  onto an older backup transitions the revision to `'lost'`, releases its bytes, and lets
+  `restore::finish` (`cleanup_lost_on_restore`) and `storage rebind` clean obsolete non-foreign-
+  hardlink files cleanly.
+- **`/v1` contract and runtime safety.** `ArtifactRevision` adds optional nullable `lost_at` and
+  open-vocabulary state `"lost"`; `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}/content`
+  returns `410 Gone` (`code: "payload_lost"`) to authorized callers while preserving `404 not_found`
+  concealment for unauthorized callers. Revision delete/restore return `409 conflict` on `'lost'`,
+  artifact delete skips `'lost'` revisions, message history continues to load without failing, and
+  attaching or running inference on a `'lost'` attachment fails cleanly without touching disk.
+
+**Affected contracts and boundaries.** Migration 44, `src/boundaries.sql`, `src/artifact_fs/`,
+`src/restore.rs`, `src/storage.rs`, `src/v1/artifacts.rs`, `src/bin/admin.rs`,
+`contracts/openapi/openmettle-v1.json`, `contracts/fixtures/`, and
+[ADR 0041](0041-retention-purge-and-deletion-journal.md).

@@ -43,8 +43,8 @@
 | [0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md) | Application-owned gateway provisioning and usage reconciliation | 21 November 2026 |
 | [0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) | SGLang and external-provider conformance adapter (superseded in part by ADR 0044) | 21 November 2026 |
 | [0039](docs/adr/0039-scoped-mcp-adapter-and-bounded-tool-results.md) | Scoped MCP adapter, reviewed tool contracts and bounded spill artifacts | 21 November 2026 |
-| [0040](docs/adr/0040-transactional-quotas-and-reservation-reconciliation.md) | Transactional quotas and reservation reconciliation | 21 November 2026 |
-| [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026; PR2a split and audit/journal privilege amendments 23 November 2026; PR2b restore gate, origin/watermark verification and unsettled scrub 26 November 2026 |
+| [0040](docs/adr/0040-transactional-quotas-and-reservation-reconciliation.md) | Transactional quotas and reservation reconciliation | 21 November 2026; file-copy rebind amendment 24 November 2026; lost-payload declaration amendment 26 November 2026 |
+| [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026; PR2a split and audit/journal privilege amendments 23 November 2026; PR2b/PR3 restore gate, lifecycle commitments and lost-payload journal amendment 26 November 2026 |
 | [0042](docs/adr/0042-shared-capacity-api-and-resource-grants.md) | Shared capacity API and serialized resource grants | 22 November 2026 |
 | [0043](docs/adr/0043-packaged-worker-inference-configuration.md) | Packaged worker inference configuration | 23 November 2026 |
 | [0044](docs/adr/0044-own-inference-proxy-and-binding-free-dispatch.md) | OpenMettle's own inference proxy and binding-free dispatch (supersedes ADRs 0037 and 0038 in part) | 23 November 2026 |

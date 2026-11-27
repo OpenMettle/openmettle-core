@@ -79,6 +79,19 @@ pub(super) const READ_FAILED: &str = "cannot read revision digest";
 /// A commit got no answer or an error. Whether it took effect is known only to the database.
 pub(super) const COMMIT_UNKNOWN: &str = "commit outcome unknown";
 
+pub(super) fn sha256_reader(mut reader: impl Read) -> Result<[u8; 32], Failure> {
+    let mut hash = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(hash.finalize().into()),
+            Ok(n) => hash.update(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(Failure(READ_FAILED)),
+        }
+    }
+}
+
 impl RevisionDigests {
     pub(super) fn verify(
         &mut self,
@@ -97,19 +110,11 @@ impl RevisionDigests {
             }
             *matched
         } else {
-            let mut hash = Sha256::new();
-            let mut buf = [0; 65536];
-            loop {
-                let n = file.read(&mut buf).map_err(|_| Failure(READ_FAILED))?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buf[..n]);
-            }
+            let digest = sha256_reader(&mut *file)?;
             if FileStamp::from(&file.metadata()?) != stamp {
                 return Err(Failure(RESCAN));
             }
-            let matched = stamp.length == size && hash.finalize().as_slice() == expected;
+            let matched = stamp.length == size && digest.as_slice() == expected;
             self.results.insert(id.into(), (stamp, matched));
             matched
         };
@@ -204,6 +209,24 @@ impl Evidence {
         if state == "released" && reclaim == "none"
             || rev == Some("purged") && purge == Some("none")
         {
+            return Ok(());
+        }
+        if rev == Some("lost") {
+            let reclaim_name = format!(".reclaim.{id}");
+            let purge_name = format!(".purge.{id}");
+            let any_present = [
+                (&v.staging, id),
+                (&v.staging, reclaim_name.as_str()),
+                (&v.revisions, id),
+                (&v.revisions, purge_name.as_str()),
+            ]
+            .into_iter()
+            .try_fold(false, |found, (dir, name)| {
+                Ok::<_, Failure>(found || v.inode(dir, name)?.is_some())
+            })?;
+            if bound.is_some() || any_present {
+                return Err(Failure("unexpected payload"));
+            }
             return Ok(());
         }
         let reclaim_name = format!(".reclaim.{id}");
@@ -686,5 +709,45 @@ mod tests {
             cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
             RESCAN
         );
+    }
+
+    #[test]
+    fn sha256_reader_retries_interrupted_and_fails_closed_on_other_io_errors() {
+        struct ScriptedReader {
+            steps: std::collections::VecDeque<io::Result<Vec<u8>>>,
+        }
+        impl Read for ScriptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.steps.pop_front() {
+                    None => Ok(0),
+                    Some(Ok(chunk)) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        Ok(n)
+                    }
+                    Some(Err(err)) => Err(err),
+                }
+            }
+        }
+
+        let interrupted_then_ok = ScriptedReader {
+            steps: std::collections::VecDeque::from([
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"pay".to_vec()),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"load".to_vec()),
+            ]),
+        };
+        let digest = sha256_reader(interrupted_then_ok).unwrap();
+        assert_eq!(digest.as_slice(), Sha256::digest(b"payload").as_slice());
+
+        let hard_io_error = ScriptedReader {
+            steps: std::collections::VecDeque::from([
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(b"pay".to_vec()),
+                Err(io::Error::other("injected eio")),
+            ]),
+        };
+        assert_eq!(sha256_reader(hard_io_error).unwrap_err().0, READ_FAILED);
     }
 }

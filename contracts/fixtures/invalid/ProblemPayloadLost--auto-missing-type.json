@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemPayloadLost--auto-missing-type",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "payload_lost",
+    "detail": "The revision's payload was declared lost after a restore and is permanently unavailable.",
+    "request_id": "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e",
+    "status": 410,
+    "title": "Gone"
+  },
+  "mutation": {
+    "name": "auto-missing-type",
+    "op": "remove",
+    "path": "/type"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemPayloadLost"
+}

@@ -60,6 +60,11 @@ const NOT_SERVABLE: Problem = problem(
     "conflict",
     "The revision's content is not available in its current state.",
 );
+const PAYLOAD_LOST: Problem = problem(
+    StatusCode::GONE,
+    "payload_lost",
+    "The revision's payload was declared lost after a restore and is permanently unavailable.",
+);
 const QUOTA: Problem = problem(
     StatusCode::TOO_MANY_REQUESTS,
     "quota",
@@ -211,6 +216,7 @@ fn revision_json(r: &Revision) -> Result<Value, Problem> {
         "created_at": timestamp(r.created_us)?,
         "retained_at": r.retained_us.map(timestamp).transpose()?,
         "purge_after": r.purge_after_us.map(timestamp).transpose()?,
+        "lost_at": r.lost_us.map(timestamp).transpose()?,
     }))
 }
 
@@ -431,6 +437,9 @@ impl Api {
                         .await?
                         .ok_or(StoreError::Denied(DenialReason::NotFound))?;
                     let expected_generation = restore::require_open_gate_generation(conn).await?;
+                    if revision.state == "lost" {
+                        return Err(PAYLOAD_LOST);
+                    }
                     if revision.state != "active" {
                         return Err(NOT_SERVABLE);
                     }

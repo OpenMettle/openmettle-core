@@ -95,6 +95,18 @@ fn check(v: &Volume, row: &sqlx::postgres::PgRow) -> Result<bool, Error> {
                     Err(Error::Io)
                 };
             }
+            if rev == Some("lost") {
+                return if bound.is_none()
+                    && s.is_none()
+                    && r.is_none()
+                    && reclaim_anchor.is_none()
+                    && purge_anchor.is_none()
+                {
+                    Ok(false)
+                } else {
+                    Err(Error::Io)
+                };
+            }
             if bound.is_none()
                 || s.is_some_and(|i| Some(i) != bound)
                 || r.is_some_and(|i| Some(i) != bound)

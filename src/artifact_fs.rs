@@ -6,6 +6,7 @@ mod drift;
 pub use drift::verify_volume_for_test;
 pub use drift::{Drift, verify_accounting_drift};
 pub(crate) use drift::{verify_ledgers_on, verify_volume_on};
+pub mod lost;
 pub mod rebind;
 mod reclaim;
 mod spill;
@@ -1197,7 +1198,8 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
 }
 
 pub use reclaim::{
-    purge_due, purge_journaled, reconcile_expired, reconcile_run_spills, scrub_unsettled_on_restore,
+    cleanup_lost_on_restore, purge_due, purge_journaled, reconcile_expired, reconcile_run_spills,
+    scrub_unsettled_on_restore,
 };
 #[cfg(test)]
 mod tests;

@@ -74,6 +74,12 @@
 -- `openmettle_worker`), two trigger guards (no role may call), and two worker-only SECURITY
 -- DEFINER helpers (`external_connection_scope_lifecycle`, `external_connection_audit_worker`)
 -- (ADR 0045, V1-28).
+-- Version 44 adds `artifact_revisions.lost_at` (readable by `openmettle_api` and `openmettle_worker`
+-- via migration 4 table-level SELECT; zero write privileges for any runtime role), owner-only
+-- trigger guard `enforce_artifact_revision_lost_owner_only()` (no role may call), owner-only
+-- `storage_declare_payload_lost(...)` and `restore_verify_lost_journal_tail(...)`, and replaces
+-- restore verification/replay/open functions with unchanged signatures, security and privileges
+-- (ADR 0040 / ADR 0041, issue #154).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -395,6 +401,10 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.restore_verify_export(bigint,bigint,bytea,bigint,bytea,uuid[],bigint)',false,ARRAY[]::text[]),
         ('openmettle.restore_claim_volume_phase(bigint,bigint,bytea,bigint,bytea,bigint)',false,ARRAY[]::text[]),
         ('openmettle.restore_gate_open(uuid,uuid,bigint,bigint,bytea,uuid,bigint,bytea,bigint)',false,ARRAY[]::text[])) AS f WHERE $1 >= 43
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.enforce_artifact_revision_lost_owner_only()',false,ARRAY[]::text[]),
+        ('openmettle.restore_verify_lost_journal_tail(bigint,bytea,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.storage_declare_payload_lost(uuid,uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 44
 ),
 gateway_functions (signature,definer,roles) AS (
     SELECT * FROM (VALUES

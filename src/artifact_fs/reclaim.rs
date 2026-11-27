@@ -448,15 +448,27 @@ async fn purge_one(
     check_fence(fence_deadline)?;
     v.verify(pin)?;
     v.matches(&f, &v.revisions, src, ino)?;
+    let reclaim_name = format!(".reclaim.{reservation}");
     let a_now = v.inode(&v.revisions, &name)?;
     let r_now = v.inode(&v.revisions, reservation)?;
     let s_now = v.inode(&v.staging, reservation)?;
+    let rec_now = v.inode(&v.staging, &reclaim_name)?;
     if a_now.is_some_and(|other| other != ino) || r_now.is_some_and(|other| other != ino) {
+        return Err(Error::Io);
+    }
+    // During restore reconciliation (`phase.is_some()`), a distinct inode at `staging/<id>` or
+    // `staging/.reclaim.<id>` would survive after `confirm_purge` and permanently fail drift
+    // verification; fail closed BEFORE mutating disk or confirming `purged` so `storage rebind`
+    // can clean all four names safely under locks.
+    if phase.is_some()
+        && (s_now.is_some_and(|other| other != ino) || rec_now.is_some_and(|other| other != ino))
+    {
         return Err(Error::Io);
     }
     let own = u64::from(a_now == Some(ino))
         + u64::from(r_now == Some(ino))
-        + u64::from(s_now == Some(ino));
+        + u64::from(s_now == Some(ino))
+        + u64::from(rec_now == Some(ino));
     if f.metadata()?.nlink() != own {
         return Err(Error::Io);
     }
@@ -477,6 +489,9 @@ async fn purge_one(
     }
     if s_now == Some(ino) {
         v.unlink_before(&v.staging, reservation, ino, fence_deadline)?;
+    }
+    if rec_now == Some(ino) {
+        v.unlink_before(&v.staging, &reclaim_name, ino, fence_deadline)?;
     }
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;
@@ -752,10 +767,125 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
     count
 }
 
+/// Completes a previously-journaled `artifact_revision.purged` revision whose files are already
+/// completely absent on disk (for example a snapshot restore whose payload file was missing),
+/// clearing `payload_ino`, setting `state = 'purged'` with `purge_stage = 'none'`, and releasing
+/// `retained_bytes` once under `restore_assert_volume_phase` and `storage_volume_control FOR SHARE`.
+#[allow(clippy::too_many_arguments)]
+async fn complete_absent_journaled_purge(
+    pool: &PgPool,
+    store: &Store,
+    pin: &str,
+    scope: &str,
+    id: &str,
+    reservation: &str,
+    expected_ino: Option<u64>,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<bool, Error> {
+    renew_volume_phase(pool, restore_run_id, claim_token).await?;
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    set_fs_tx_idle_timeout(&mut tx).await?;
+    let res_row: Option<(Option<String>, bool)> = sqlx::query_as(
+        "SELECT payload_ino::text, adoption_unverified
+           FROM openmettle.storage_reservations
+          WHERE scope_id = $1::uuid AND id = $2::uuid AND state = 'settled'
+            FOR UPDATE",
+    )
+    .bind(scope)
+    .bind(reservation)
+    .fetch_optional(tx.connection()?)
+    .await?;
+    let Some((cur_ino, quarantined)) = res_row else {
+        return Ok(false);
+    };
+    if quarantined || parse_ino(cur_ino)? != expected_ino {
+        return Ok(false);
+    }
+    let rev_row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT r.state, r.size_bytes
+           FROM openmettle.artifact_revisions r
+          WHERE r.scope_id = $1::uuid AND r.id = $2::uuid
+            AND EXISTS (
+                SELECT 1
+                  FROM openmettle.deletion_journal j
+                 WHERE j.scope_id = r.scope_id
+                   AND j.entity_id = r.id
+                   AND j.event_kind = 'artifact_revision.purged'
+            )
+            FOR UPDATE OF r",
+    )
+    .bind(scope)
+    .bind(id)
+    .fetch_optional(tx.connection()?)
+    .await?;
+    let Some((state, size_bytes)) = rev_row else {
+        return Ok(false);
+    };
+    if state != "purging" {
+        return Ok(false);
+    }
+    assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
+    let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+    lock_pin(&mut tx, pin).await?;
+    check_fence(fence_deadline)?;
+    let v = &store.volume;
+    v.verify(pin)?;
+    let names = super::rebind::reservation_names(reservation);
+    let entries = super::rebind::stat_reservation(v, &names)
+        .map_err(|_| Error::Io)?
+        .ok_or(Error::Io)?;
+    if entries.iter().any(Option::is_some) {
+        return Err(Error::Io);
+    }
+    check_fence(fence_deadline)?;
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations
+            SET payload_ino = NULL, publish_pending = false
+          WHERE scope_id = $1::uuid AND id = $2::uuid",
+    )
+    .bind(scope)
+    .bind(reservation)
+    .execute(tx.connection()?)
+    .await?;
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET state = 'purged',
+                purged_at = greatest(clock_timestamp(), purging_at),
+                purge_stage = 'none'
+          WHERE scope_id = $1::uuid AND id = $2::uuid AND state = 'purging'",
+    )
+    .bind(scope)
+    .bind(id)
+    .execute(tx.connection()?)
+    .await?;
+    let updated_acct = sqlx::query(
+        "UPDATE openmettle.storage_accounts
+            SET retained_bytes = retained_bytes - $2
+          WHERE scope_id = $1::uuid",
+    )
+    .bind(scope)
+    .bind(size_bytes)
+    .execute(tx.connection()?)
+    .await?
+    .rows_affected();
+    if updated_acct != 1 {
+        return Err(Error::Io);
+    }
+    sqlx::query("UPDATE openmettle.storage_instance SET retained_bytes = retained_bytes - $1")
+        .bind(size_bytes)
+        .execute(tx.connection()?)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Restore replay (ADR 0041): finishes, through the same stages, every revision named by a
 /// journal record that is not yet purged while holding the active restore volume-phase lease.
-/// Replay moved each to `purging`, so no reference or deadline is rechecked; one without a
-/// verified payload binding stays and keeps the gate shut.
+/// Replay moved each to `purging`, so no reference or deadline is rechecked. If all four
+/// reservation names are already absent on disk, completes the already-journaled purge cleanly
+/// without leaving the gate deadlocked; a non-absent file that disagrees with `payload_ino` or has
+/// a foreign hard link fails closed and keeps the gate shut.
 pub async fn purge_journaled(
     pool: &PgPool,
     store: &Store,
@@ -771,14 +901,13 @@ pub async fn purge_journaled(
     let mut after_seq: i64 = 0;
     loop {
         renew_volume_phase(pool, restore_run_id, claim_token).await?;
-        let page = sqlx::query_as::<_, (i64, String, String, String, String)>(
+        let page = sqlx::query_as::<_, (i64, String, String, String, Option<String>)>(
             "SELECT j.journal_seq, r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
                FROM openmettle.deletion_journal j
                JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
                JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
               WHERE j.event_kind = 'artifact_revision.purged'
                 AND r.state = 'purging'
-                AND sr.payload_ino IS NOT NULL
                 AND j.journal_seq > $1
               ORDER BY j.journal_seq
               LIMIT 100",
@@ -793,17 +922,32 @@ pub async fn purge_journaled(
             after_seq = *seq;
         }
         count += sweep_items(page, |(_, id, scope, res, ino)| async move {
-            purge_one(
-                pool,
-                store,
-                pin,
-                &scope,
-                &id,
-                &res,
-                ino.parse().map_err(|_| Error::Io)?,
-                phase,
-            )
-            .await
+            let names = super::rebind::reservation_names(&res);
+            let entries = super::rebind::stat_reservation(&store.volume, &names)
+                .map_err(|_| Error::Io)?
+                .ok_or(Error::Io)?;
+            let bound = parse_ino(ino)?;
+            if entries.iter().all(Option::is_none) {
+                return complete_absent_journaled_purge(
+                    pool,
+                    store,
+                    pin,
+                    &scope,
+                    &id,
+                    &res,
+                    bound,
+                    restore_run_id,
+                    claim_token,
+                )
+                .await;
+            }
+            let Some(ino) = bound else {
+                return Err(Error::Io);
+            };
+            if entries.iter().flatten().any(|e| e.ino != ino) {
+                return Err(Error::Io);
+            }
+            purge_one(pool, store, pin, &scope, &id, &res, ino, phase).await
         })
         .await?;
     }
@@ -1103,4 +1247,128 @@ pub async fn scrub_unsettled_on_restore(
     at::fsync(&v.revisions)?;
     at::fsync(&v.staging)?;
     Ok(scrubbed)
+}
+
+/// Remove any leftover reservation files on disk for revisions already marked `'lost'` (for
+/// example after replaying an `artifact_revision.lost` journal entry onto an older backup whose
+/// artifact volume still holds the old bytes). Fenced by `restore_assert_volume_phase` and
+/// `storage_volume_control FOR SHARE`; refuses foreign hard links and active locks.
+pub async fn cleanup_lost_on_restore(
+    pool: &PgPool,
+    store: &Store,
+    restore_run_id: &str,
+    claim_token: &str,
+) -> Result<u64, Error> {
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Err(Error::Io);
+    };
+    let v = &store.volume;
+    v.verify(&pin)?;
+
+    let mut cleaned = 0u64;
+    let mut cursor: Option<String> = None;
+    loop {
+        renew_volume_phase(pool, restore_run_id, claim_token).await?;
+        let batch: Vec<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT s.id::text, s.scope_id::text, r.id::text, s.payload_ino IS NOT NULL
+               FROM openmettle.storage_reservations s
+               JOIN openmettle.artifact_revisions r
+                 ON r.scope_id = s.scope_id AND r.reservation_id = s.id
+              WHERE s.state = 'settled'
+                AND r.state = 'lost'
+                AND ($1::uuid IS NULL OR s.id > $1::uuid)
+              ORDER BY s.id ASC
+              LIMIT 100",
+        )
+        .bind(&cursor)
+        .fetch_all(pool)
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        for (res_id, scope_id, rev_id, has_ino) in batch {
+            cursor = Some(res_id.clone());
+            renew_volume_phase(pool, restore_run_id, claim_token).await?;
+            let names = super::rebind::reservation_names(&res_id);
+            let entries = super::rebind::stat_reservation(v, &names)
+                .map_err(|_| Error::Io)?
+                .ok_or(Error::Io)?;
+            let has_files = entries.iter().any(Option::is_some);
+            if !has_files && !has_ino {
+                continue;
+            }
+            let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+            set_fs_tx_idle_timeout(&mut tx).await?;
+            let locked_row: Option<(bool,)> = sqlx::query_as(
+                "SELECT s.payload_ino IS NOT NULL
+                   FROM openmettle.storage_reservations s
+                  WHERE s.scope_id = $1::uuid AND s.id = $2::uuid AND s.state = 'settled'
+                    FOR UPDATE",
+            )
+            .bind(&scope_id)
+            .bind(&res_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            let Some((still_has_ino,)) = locked_row else {
+                return Err(Error::Io);
+            };
+            let rev_lost: Option<bool> = sqlx::query_scalar(
+                "SELECT state = 'lost'
+                   FROM openmettle.artifact_revisions
+                  WHERE scope_id = $1::uuid AND id = $2::uuid
+                    FOR UPDATE",
+            )
+            .bind(&scope_id)
+            .bind(&rev_id)
+            .fetch_optional(tx.connection()?)
+            .await?;
+            if rev_lost != Some(true) {
+                return Err(Error::Io);
+            }
+            assert_volume_phase(&mut tx, restore_run_id, claim_token).await?;
+            let fence_deadline = Instant::now() + FS_FENCE_WINDOW;
+            lock_pin(&mut tx, &pin).await?;
+            check_fence(fence_deadline)?;
+            v.verify(&pin)?;
+
+            let entries = super::rebind::stat_reservation(v, &names)
+                .map_err(|_| Error::Io)?
+                .ok_or(Error::Io)?;
+            let locked_files = super::rebind::lock_reservation_files(v, &names, &entries, true)
+                .map_err(|err| {
+                    if err.0 == "reservation in use" {
+                        Error::InProgress
+                    } else {
+                        Error::Io
+                    }
+                })?;
+            let unlinked = if entries.iter().any(Option::is_some) {
+                super::rebind::unlink_reservation_files(v, &names, &entries, Some(fence_deadline))
+                    .map_err(|_| Error::Io)?
+            } else {
+                0
+            };
+            drop(locked_files);
+            if still_has_ino {
+                sqlx::query(
+                    "UPDATE openmettle.storage_reservations
+                        SET payload_ino = NULL, adoption_unverified = false
+                      WHERE scope_id = $1::uuid AND id = $2::uuid",
+                )
+                .bind(&scope_id)
+                .bind(&res_id)
+                .execute(tx.connection()?)
+                .await?;
+            }
+            tx.commit().await?;
+            if unlinked > 0 || still_has_ino {
+                cleaned += 1;
+            }
+        }
+    }
+    renew_volume_phase(pool, restore_run_id, claim_token).await?;
+    v.verify(&pin)?;
+    at::fsync(&v.revisions)?;
+    at::fsync(&v.staging)?;
+    Ok(cleaned)
 }

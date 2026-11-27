@@ -859,18 +859,28 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     assert!(revision.media_type.starts_with("text/plain") && revision.sha256.len() == 64);
     let unnamed = consumer::decode_revision(&fixture("ArtifactRevisionActive--unnamed")).unwrap();
     assert!(unnamed.display_name.is_none());
-    // Backward compatibility: pre-PR3 servers omit optional `retained_at` and `purge_after`.
+    // Backward compatibility: pre-PR3 / pre-#154 servers omit optional `retained_at`,
+    // `purge_after`, and `lost_at`.
     let mut legacy_revision = fixture("ArtifactRevisionActive");
     let obj = legacy_revision.as_object_mut().unwrap();
     obj.remove("retained_at");
     obj.remove("purge_after");
+    obj.remove("lost_at");
     let revision_validator = validator_for("#/components/schemas/ArtifactRevision");
     assert!(revision_validator.is_valid(&legacy_revision));
     let decoded_legacy = consumer::decode_revision(&legacy_revision).unwrap();
     assert_eq!(
-        (decoded_legacy.retained_at, decoded_legacy.purge_after),
-        (None, None)
+        (
+            decoded_legacy.retained_at,
+            decoded_legacy.purge_after,
+            decoded_legacy.lost_at,
+        ),
+        (None, None, None)
     );
+    let lost = consumer::decode_revision(&fixture("ArtifactRevisionLost")).unwrap();
+    assert_eq!(lost.state, RevisionState::Lost);
+    assert!(!lost.state.downloadable());
+    assert_eq!(lost.lost_at.as_deref(), Some("2026-11-22T10:15:00.000000Z"));
     // A newer state is surfaced and never offered for download.
     let newer = fixture("ArtifactRevisionActive--unrecognized-state");
     let newer = consumer::decode_revision(&newer).unwrap();
@@ -1116,6 +1126,7 @@ fn consumer_classifies_problems_without_trusting_unknown_codes() {
         ("ProblemNotFound", Category::NotFound),
         ("ProblemConflict", Category::Conflict),
         ("ProblemIdempotencyConflict", Category::IdempotencyConflict),
+        ("ProblemPayloadLost", Category::PayloadLost),
         ("ProblemRangeNotSatisfiable", Category::RangeNotSatisfiable),
         ("ProblemQuota", Category::Quota),
         ("ProblemRateLimited", Category::RateLimited),

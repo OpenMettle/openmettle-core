@@ -331,3 +331,16 @@ PR3 (migration 42, 26 November 2026) delivers the authenticated `/v1` retention 
   (including `GET /v1/admin/retention/status` and `POST /v1/admin/retention/deadlines/preview`)
   available. Security revocations and conversation/project deletion tombstones remain tracked in
   their owning increments.
+
+Amendment (26 November 2026, migration 44, issue `#154`): extends `openmettle.deletion_journal`
+with the `artifact_revision.lost` commitment (`openmettle.deletion_journal/2` digest, `purged_at`
+carrying `lost_at`, nullable `retained_at`/`original_purge_after` preserving prior retention
+timestamps, and `deletion_journal_terminal_revision_idx` enforcing mutual exclusion per entity
+between `artifact_revision.purged` and `artifact_revision.lost`) so owner-run
+`openmettle-admin storage declare-lost` declarations survive subsequent restores to older backups,
+and allows `openmettle-admin restore replay --db-only FILE` to catch up the database journal under
+a held `adoption_run_id` barrier. See the companion amendment in
+[ADR 0040](0040-transactional-quotas-and-reservation-reconciliation.md) for the command barrier,
+accounting release, `lost` revision state, post-replay lost-tail verification in
+`restore_verify_checkpoints`/`restore_verify_export`/`restore_claim_volume_phase`/`restore_gate_open`,
+and `/v1` `410 payload_lost` contract.

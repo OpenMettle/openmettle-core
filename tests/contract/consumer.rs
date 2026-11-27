@@ -217,6 +217,7 @@ pub enum Category {
     NotFound,
     Conflict,
     IdempotencyConflict,
+    PayloadLost,
     RangeNotSatisfiable,
     Quota,
     RateLimited,
@@ -291,6 +292,7 @@ pub fn decode_problem(value: &Value) -> Result<Problem, String> {
         "not_found" => Some((Category::NotFound, 404)),
         "conflict" => Some((Category::Conflict, 409)),
         "idempotency_conflict" => Some((Category::IdempotencyConflict, 409)),
+        "payload_lost" => Some((Category::PayloadLost, 410)),
         "range_not_satisfiable" => Some((Category::RangeNotSatisfiable, 416)),
         "quota" => Some((Category::Quota, 429)),
         "rate_limited" => Some((Category::RateLimited, 429)),
@@ -727,6 +729,7 @@ pub enum RevisionState {
     Retained,
     Purging,
     Purged,
+    Lost,
     Unrecognized(String),
 }
 
@@ -737,6 +740,7 @@ impl RevisionState {
             "retained" => Self::Retained,
             "purging" => Self::Purging,
             "purged" => Self::Purged,
+            "lost" => Self::Lost,
             _ => Self::Unrecognized(state),
         }
     }
@@ -759,6 +763,7 @@ pub struct ArtifactRevision {
     pub state: RevisionState,
     pub retained_at: Option<String>,
     pub purge_after: Option<String>,
+    pub lost_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -784,6 +789,8 @@ struct WireArtifactRevision {
     retained_at: Option<String>,
     #[serde(default)]
     purge_after: Option<String>,
+    #[serde(default)]
+    lost_at: Option<String>,
 }
 
 /// The revision number and size are exact; the digest is 64 lowercase hexadecimal digits.
@@ -806,6 +813,7 @@ pub fn decode_revision(value: &Value) -> Result<ArtifactRevision, String> {
         state: RevisionState::from_wire(wire.state),
         retained_at: wire.retained_at,
         purge_after: wire.purge_after,
+        lost_at: wire.lost_at,
     })
 }
 
