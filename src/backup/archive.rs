@@ -755,16 +755,49 @@ fn json_looks_like_secret_material(val: &serde_json::Value) -> bool {
     }
 }
 
-fn collect_keyring_config_inodes(
+/// Protected backup and vault key custody identities (both `(dev, ino)` pairs and raw/canonical
+/// paths) used to refuse bundling key material into `--config-file`, `--neo4j-dump`, or
+/// `--chroma-archive`, including across atomic `rename` key rotations.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProtectedKeyCustody {
+    pub(crate) inodes: BTreeSet<(u64, u64)>,
+    pub(crate) paths: BTreeSet<PathBuf>,
+}
+
+impl ProtectedKeyCustody {
+    fn insert_path(&mut self, path: &Path) {
+        self.paths.insert(path.to_path_buf());
+        if let Ok(canon) = fs::canonicalize(path) {
+            self.paths.insert(canon);
+        }
+    }
+
+    pub(crate) fn matches(&self, path: &Path, dev_ino: (u64, u64)) -> bool {
+        if self.inodes.contains(&dev_ino) || self.paths.contains(path) {
+            return true;
+        }
+        fs::canonicalize(path)
+            .ok()
+            .is_some_and(|canon| self.paths.contains(&canon))
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.inodes.extend(other.inodes);
+        self.paths.extend(other.paths);
+    }
+}
+
+fn collect_keyring_config_custody(
     cfg_path: &Path,
     unreadable_cfg: &'static str,
     malformed_cfg: &'static str,
     malformed_entry: &'static str,
     unreadable_key: &'static str,
-    protected: &mut BTreeSet<(u64, u64)>,
+    protected: &mut ProtectedKeyCustody,
 ) -> Result<(), ArchiveError> {
+    protected.insert_path(cfg_path);
     let ino = file_dev_ino(cfg_path).ok_or(ArchiveError::Invalid(unreadable_cfg))?;
-    protected.insert(ino);
+    protected.inodes.insert(ino);
     let file = fs::File::open(cfg_path).map_err(|_| ArchiveError::Invalid(unreadable_cfg))?;
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
@@ -784,24 +817,28 @@ fn collect_keyring_config_inodes(
             .get("file")
             .and_then(serde_json::Value::as_str)
             .ok_or(ArchiveError::Invalid(malformed_entry))?;
-        let key_ino =
-            file_dev_ino(Path::new(key_path)).ok_or(ArchiveError::Invalid(unreadable_key))?;
-        protected.insert(key_ino);
+        let kp = Path::new(key_path);
+        protected.insert_path(kp);
+        let key_ino = file_dev_ino(kp).ok_or(ArchiveError::Invalid(unreadable_key))?;
+        protected.inodes.insert(key_ino);
     }
     Ok(())
 }
 
-/// Collect every `(dev, ino)` belonging to the active backup keyring (both originally loaded
-/// inodes and current on-disk inodes so atomic post-load `rename` rotations are also blocked) and
-/// any configured vault keyring (`OPENMETTLE_{API,WORKER,ADMIN}_VAULT_KEYS_CONFIG`,
+/// Collect every `(dev, ino)` and path belonging to the active backup keyring (both originally
+/// loaded inodes and current on-disk paths/inodes so atomic post-load `rename` rotations are also
+/// blocked) and any configured vault keyring (`OPENMETTLE_{API,WORKER,ADMIN}_VAULT_KEYS_CONFIG`,
 /// `VAULT_KEYS_CONFIG`). Fails closed whenever a configured backup or vault keyring or any
 /// referenced key file is unreadable or malformed.
-pub(crate) fn collect_protected_key_inodes(
+pub(crate) fn collect_protected_key_custody(
     keyring_paths: &KeyRingPaths,
-) -> Result<BTreeSet<(u64, u64)>, ArchiveError> {
-    let mut protected = keyring_paths.protected_inodes.clone();
+) -> Result<ProtectedKeyCustody, ArchiveError> {
+    let mut protected = ProtectedKeyCustody {
+        inodes: keyring_paths.protected_inodes.clone(),
+        paths: BTreeSet::new(),
+    };
     if let Some(cfg_path) = &keyring_paths.config_path {
-        collect_keyring_config_inodes(
+        collect_keyring_config_custody(
             cfg_path,
             "configured backup keyring is unreadable; refusing to bundle external files",
             "configured backup keyring is malformed; refusing to bundle external files",
@@ -811,10 +848,11 @@ pub(crate) fn collect_protected_key_inodes(
         )?;
     }
     for key_file in &keyring_paths.key_files {
+        protected.insert_path(key_file);
         let key_ino = file_dev_ino(key_file).ok_or(ArchiveError::Invalid(
             "configured backup key file is unreadable; refusing to bundle external files",
         ))?;
-        protected.insert(key_ino);
+        protected.inodes.insert(key_ino);
     }
     for var in [
         "OPENMETTLE_API_VAULT_KEYS_CONFIG",
@@ -828,7 +866,7 @@ pub(crate) fn collect_protected_key_inodes(
         if raw.is_empty() {
             continue;
         }
-        collect_keyring_config_inodes(
+        collect_keyring_config_custody(
             Path::new(&raw),
             "configured vault keyring is unreadable; refusing to bundle external files",
             "configured vault keyring is malformed; refusing to bundle external files",
@@ -840,18 +878,26 @@ pub(crate) fn collect_protected_key_inodes(
     Ok(protected)
 }
 
+#[cfg(test)]
+pub(crate) fn collect_protected_key_inodes(
+    keyring_paths: &KeyRingPaths,
+) -> Result<BTreeSet<(u64, u64)>, ArchiveError> {
+    Ok(collect_protected_key_custody(keyring_paths)?.inodes)
+}
+
 /// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
-/// reads, refusing backup/vault key files, reserved generated names, private keys, and JSON
-/// objects holding vault/backup key material. Fails closed whenever a configured vault keyring
-/// environment variable cannot be read or parsed.
+/// reads, refusing backup/vault key files (checked both before and after opening all candidate
+/// descriptors so atomic `rename` rotations cannot race past custody checks), reserved generated
+/// names, private keys, and JSON objects holding vault/backup key material. Fails closed whenever
+/// a configured backup or vault keyring cannot be read or parsed.
 pub fn load_non_secret_config_files(
     specs: &[(String, PathBuf)],
     keyring_paths: &KeyRingPaths,
 ) -> Result<Vec<BundledConfigFile>, ArchiveError> {
-    let protected_inodes = collect_protected_key_inodes(keyring_paths)?;
+    let mut protected = collect_protected_key_custody(keyring_paths)?;
 
     let mut seen_names = BTreeSet::new();
-    let mut out = Vec::with_capacity(specs.len());
+    let mut opened = Vec::with_capacity(specs.len());
     for (name, path) in specs {
         if !valid_config_name(name) || !seen_names.insert(name.to_ascii_lowercase()) {
             return Err(ArchiveError::Invalid(
@@ -871,11 +917,30 @@ pub fn load_non_secret_config_files(
             ));
         }
         let dev_ino = (meta.dev(), meta.ino());
-        if protected_inodes.contains(&dev_ino) {
+        if protected.matches(path, dev_ino) {
             return Err(ArchiveError::Invalid(
                 "--config-file refuses vault or backup key files",
             ));
         }
+        opened.push((name, path, file, meta, dev_ino));
+    }
+
+    // Re-scan active key custody AFTER all candidate descriptors are open so a key rotated via
+    // `rename` between the pre-open scan and `open_regular_nofollow` cannot slip past custody
+    // checks before any bytes are read.
+    if !opened.is_empty() {
+        protected.extend(collect_protected_key_custody(keyring_paths)?);
+        for (_, path, _, _, dev_ino) in &opened {
+            if protected.matches(path, *dev_ino) {
+                return Err(ArchiveError::Invalid(
+                    "--config-file refuses vault or backup key files",
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(opened.len());
+    for (name, _, file, meta, _) in opened {
         let perm = meta.permissions().mode() & 0o777;
         let mut bytes = Vec::with_capacity((meta.len() as usize).min(MAX_CONFIG_FILE_BYTES) + 1);
         file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
@@ -1522,6 +1587,64 @@ mod tests {
         // Also fail closed if the configured backup keyring config becomes malformed.
         fs::write(&cfg_path, b"{not-json").unwrap();
         assert!(collect_protected_key_inodes(ring.paths()).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_key_custody_matches_direct_path_and_post_open_rotation() {
+        use super::super::crypto::BackupKeyRing;
+
+        let dir = std::env::temp_dir().join(format!(
+            "om-backup-key-custody-postopen-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        create_dir_0700(&dir).unwrap();
+
+        let key_path = dir.join("bk1.key");
+        let cfg_path = dir.join("backup-keys.json");
+        write_file_0600(&key_path, &[0x41u8; 32]).unwrap();
+        write_file_0600(
+            &cfg_path,
+            serde_json::json!({
+                "version": 1,
+                "active_key_id": "bk1",
+                "keys": [{ "id": "bk1", "file": key_path.to_str().unwrap() }]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let ring = BackupKeyRing::load_from_config(&cfg_path).unwrap();
+        let mut custody = collect_protected_key_custody(ring.paths()).unwrap();
+
+        // Direct path match catches configured key & keyring paths regardless of inode.
+        assert!(custody.matches(&key_path, (0, 0)));
+        assert!(custody.matches(&cfg_path, (0, 0)));
+
+        // Simulate an atomic `rename` rotation occurring AFTER the pre-open custody scan, with a
+        // hard link to the brand-new rotated key inode opened before the post-open re-scan.
+        let replacement_tmp = dir.join("bk1.key.rotated");
+        write_file_0600(&replacement_tmp, &[0x42u8; 32]).unwrap();
+        fs::rename(&replacement_tmp, &key_path).unwrap();
+        let rotated_hardlink = dir.join("rotated-key-hardlink.bin");
+        fs::hard_link(&key_path, &rotated_hardlink).unwrap();
+
+        let new_ino = file_dev_ino(&rotated_hardlink).unwrap();
+        assert!(
+            !custody.matches(&rotated_hardlink, new_ino),
+            "pre-rotation custody alone cannot yet know the post-rotation inode of a hard link"
+        );
+
+        // Post-open custody refresh catches the opened hard link before any bytes are consumed.
+        custody.extend(collect_protected_key_custody(ring.paths()).unwrap());
+        assert!(custody.matches(&rotated_hardlink, new_ino));
+        assert!(
+            load_non_secret_config_files(&[("leak.txt".into(), rotated_hardlink)], ring.paths())
+                .is_err()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

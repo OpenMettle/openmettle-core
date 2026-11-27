@@ -73,7 +73,7 @@ Migration `0045_maintenance_backup_coordination.sql` (pure 7-bit ASCII, `SQL_ASC
 - **Owner CLI (`openmettle-admin backup`):**
   - `status`: reports `installation_id`, gate state, RPO target/armed timestamp, last succeeded run, and latest run status.
   - `enter-maintenance` / `release-maintenance [--abort-active-run]` / `arm-rpo [--rpo-seconds N]`: idempotent, operator-audited maintenance and RPO controls.
-  - `capture`: runs the full coordinated workflow (optional `--release-on-success`, default verified GFS pruning scoped to `(installation_id, destination_domain)` unless `--no-prune`).
+  - `capture`: runs the full coordinated workflow (optional `--release-on-success` immediately upon confirmation, followed by default verified GFS pruning scoped to `(installation_id, destination_domain)` unless `--no-prune` so pruning I/O faults on older directories cannot keep maintenance open).
   - `verify` / `unpack` / `prune [--backup-keys-config PATH] [--dry-run]`: offline AEAD + SHA-256 + `bundle_digest` verification, `0700` unpack ready for `pg_restore` -> `openmettle-migrate` -> `restore lock` -> `storage rebind` -> `restore replay`, and verified `7 daily, 4 weekly, 3 monthly` GFS retention grouped per `(installation_id, destination_domain)` (authenticating `manifest.json.enc` and checking component `.enc` ciphertext digests before any set can enter retention buckets or supersede older sets, leaving unverified sets untouched and reported in `skipped_unverified`).
 
 ### 5. Telemetry promotion (`openmettle.backup.runs`) and RPO monitoring

@@ -21,7 +21,7 @@ use openmettle_core::{
         DEFAULT_LEASE_SECONDS, DumpCancel, GATEWAY_CONSISTENCY_MODE, GraphitiManifest,
         GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT, PgDumpRunner,
         REBUILDABLE_INDEXES,
-        archive::{BackupMeta, GfsPolicy},
+        archive::{ArchiveError, BackupMeta, GfsPolicy},
         crypto::{BackupKeyRing, StreamEncryptor},
     },
     runs::{self, RunInput, WriteTransaction},
@@ -4674,16 +4674,6 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
         .fetch_one(&mut admin_cn)
         .await
         .unwrap();
-        let local_requires_password: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM pg_catalog.pg_hba_file_rules
-                  WHERE type = 'local'
-                    AND auth_method IN ('scram-sha-256', 'md5', 'password')
-             )",
-        )
-        .fetch_one(&mut admin_cn)
-        .await
-        .unwrap_or(false);
         drop(admin_cn);
         let port: u16 = pg_port.parse().unwrap();
         let reachable_dir = sock_dirs
@@ -4694,10 +4684,6 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
             assert!(
                 reachable_dir.is_some(),
                 "expected reachable PostgreSQL Unix socket in {sock_dirs} for port {port}"
-            );
-            assert!(
-                local_requires_password,
-                "expected local Unix socket SCRAM/password auth when OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST is set"
             );
         }
         if let Some(sock_dir) = reachable_dir {
@@ -4740,12 +4726,28 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
                 raw.output().unwrap()
             };
 
-            // Probe `localhost:`-only PGPASSFILE first: on libpq's compiled-in default socket
-            // directory (e.g. `/var/run/postgresql` on Debian/Ubuntu), libpq rewrites the host
-            // lookup to `localhost`, so `localhost:`-only succeeds and `socket-only.pgpass` fails.
-            // On custom non-default socket directories, libpq matches `{sock_dir}:` literally.
+            // Probe directly with an empty `PGPASSFILE` to determine whether the effective
+            // PostgreSQL Unix-socket auth rule for `(database, openmettle_owner)` actually
+            // requires a password (rather than relying on `pg_hba_file_rules` broadly, which can
+            // match an earlier `trust`/`peer` rule ahead of a later `scram-sha-256` rule).
+            let empty_pgpass = PathBuf::from(dir.write("empty.pgpass", b""));
+            fs::set_permissions(&empty_pgpass, fs::Permissions::from_mode(0o600)).unwrap();
+            let empty_ok = run_raw_pg_dump(sock_dir, &empty_pgpass).status.success();
+            let conn_requires_password = base_cfg.password.is_some() && !empty_ok;
+            if std::env::var_os("OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST").is_some() {
+                assert!(
+                    conn_requires_password,
+                    "expected local Unix socket auth on {sock_dir} to reject empty PGPASSFILE and require a password when OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST is set"
+                );
+            }
+
+            // Probe `localhost:`-only PGPASSFILE when the Unix socket requires a password: on
+            // libpq's compiled-in default socket directory (e.g. `/var/run/postgresql` on
+            // Debian/Ubuntu), libpq rewrites the host lookup to `localhost`, so `localhost:`-only
+            // succeeds and `socket-only.pgpass` fails. On custom non-default socket directories,
+            // libpq matches `{sock_dir}:` literally.
             let mut localhost_only_pgpass: Option<PathBuf> = None;
-            if local_requires_password && let Some(pw) = base_cfg.password.as_deref() {
+            if conn_requires_password && let Some(pw) = base_cfg.password.as_deref() {
                 let lh_pgpass = PathBuf::from(
                     dir.write(
                         "localhost-only.pgpass",
@@ -5124,4 +5126,283 @@ async fn worker_observe_telemetry_advances_overdue_and_expires_leases_under_held
     );
 
     api_tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn sslkey_open_permissions_fail_capture_preflight_before_entering_maintenance() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use tls_proxy_helpers::{make_ca, pem_cert};
+
+    let pem_block = |label: &str, der: &[u8]| -> Vec<u8> {
+        let body = STANDARD.encode(der);
+        let mut out = format!("-----BEGIN {label}-----\n");
+        for line in body.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str(&format!("-----END {label}-----\n"));
+        out.into_bytes()
+    };
+
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-sslkey-preflight"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-sslkey", &[("bk-sslkey", [0x55; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let (ca_issuer, ca_der) = make_ca("OpenMettle KeyPerm CA");
+    let cli_key = rcgen::KeyPair::generate().unwrap();
+    let mut cli_params =
+        rcgen::CertificateParams::new(vec!["openmettle_owner".to_owned()]).unwrap();
+    cli_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cli_cert = cli_params.signed_by(&cli_key, &ca_issuer).unwrap();
+
+    let ca_path = PathBuf::from(dir.write("ca.pem", &pem_cert(ca_der.as_ref())));
+    let cert_path = PathBuf::from(dir.write("client.pem", &pem_cert(cli_cert.der().as_ref())));
+    let key_path = PathBuf::from(dir.write(
+        "client.key",
+        &pem_block("PRIVATE KEY", &cli_key.serialize_der()),
+    ));
+    fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // Overly permissive `0644` client key must fail preflight before opening maintenance.
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let base_cfg = backup::parse_validated_pg_uri(&db.url(OWNER)).unwrap();
+    let host = if base_cfg.host.starts_with('/') {
+        "127.0.0.1"
+    } else {
+        base_cfg.host.as_str()
+    };
+
+    for (idx, url) in [
+        format!(
+            "postgres://{}@{host}:{}/{}?sslmode=require&sslcert={}&sslkey={}",
+            base_cfg.username,
+            base_cfg.port,
+            base_cfg.database,
+            cert_path.display(),
+            key_path.display(),
+        ),
+        format!(
+            "postgres://{}@{host}:{}/{}?sslmode=verify-full&sslrootcert={}&sslcert={}&sslkey={}",
+            base_cfg.username,
+            base_cfg.port,
+            base_cfg.database,
+            ca_path.display(),
+            cert_path.display(),
+            key_path.display(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = backup::capture_with_runner(
+            &owner_pool,
+            &keyring,
+            &CaptureOptions {
+                database_url: url,
+                destination_root: dest.clone(),
+                destination_domain: "offhost-sslkey-perm".to_owned(),
+                artifact_root: None,
+                operator_id: OPERATOR_1.to_owned(),
+                request_key: format!("sslkey-open-perm-{idx}"),
+                reason: "verify sslkey permissions fail before maintenance".to_owned(),
+                drain_timeout: Duration::from_secs(5),
+                lease_seconds: DEFAULT_LEASE_SECONDS,
+                require_separate_device: false,
+                graphiti_mode: GraphitiMode::NotProvisioned,
+                chroma_mode: ChromaMode::NotProvisioned,
+                config_files: Vec::new(),
+                prune_policy: None,
+                release_on_success: true,
+                pg_dump_bin: None,
+                allow_local_test_paths: true,
+            },
+            Arc::new(SyntheticPgDumpRunner),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, BackupError::PgDump(msg) if msg.contains("permissions")),
+            "expected sslkey permission preflight error, got {err:?}"
+        );
+        let st = backup::status(&owner_pool).await.unwrap();
+        assert!(
+            !st.maintenance_active,
+            "sslkey permission preflight failure must not open maintenance"
+        );
+        assert!(
+            st.latest_run_id.is_none(),
+            "sslkey permission preflight failure must not create a backup_runs row"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn gfs_prune_failure_after_confirmation_still_releases_maintenance_and_records_succeeded() {
+    struct RestoreModeGuard {
+        path: PathBuf,
+        mode: u32,
+    }
+    impl Drop for RestoreModeGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-prune-fail"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-prune", &[("bk-prune", [0x66; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    // 1. Capture backup #1 cleanly without pruning.
+    let rep1 = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-prune-fail".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "prune-fail-seed-1".to_owned(),
+            reason: "seed first backup before prune fault".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert!(rep1.released_maintenance);
+    assert!(rep1.backup_dir.is_dir());
+
+    // Probe whether this OS user/container enforces POSIX DAC `0500` on directories (fails under
+    // root with `CAP_DAC_OVERRIDE`, succeeds on non-root runners and rootless containers without
+    // `CAP_DAC_OVERRIDE`).
+    let probe_dir = PathBuf::from(dir.path("dac-probe"));
+    fs::create_dir(&probe_dir).unwrap();
+    let probe_child = probe_dir.join("child");
+    fs::write(&probe_child, b"probe").unwrap();
+    fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let dac_enforced = fs::remove_file(&probe_child).is_err();
+    fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = fs::remove_dir_all(&probe_dir);
+    if std::env::var_os("OPENMETTLE_REQUIRE_DAC_PRUNE_FAILURE_TEST").is_some() {
+        assert!(
+            dac_enforced,
+            "expected POSIX DAC 0500 enforcement when OPENMETTLE_REQUIRE_DAC_PRUNE_FAILURE_TEST is set"
+        );
+    }
+    if !dac_enforced {
+        return;
+    }
+
+    // 2. Make backup #1's directory read+exec only (`0500`) so GFS verification succeeds and
+    //    selects backup #1 for expiry, but `remove_dir_all` fails with PermissionDenied.
+    let restore_guard = RestoreModeGuard {
+        path: rep1.backup_dir.clone(),
+        mode: 0o700,
+    };
+    fs::set_permissions(&rep1.backup_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    // 3. Run capture #2 with `keep_daily=1` and `release_on_success=true`. The capture MUST fail
+    //    with a pruning I/O error, YET backup #2 MUST already be confirmed `succeeded` and the
+    //    capture-owned maintenance window MUST already be released (`maintenance_active = false`).
+    let opts2 = CaptureOptions {
+        database_url: db.url(OWNER),
+        destination_root: dest.clone(),
+        destination_domain: "offhost-prune-fail".to_owned(),
+        artifact_root: None,
+        operator_id: OPERATOR_1.to_owned(),
+        request_key: "prune-fail-capture-2".to_owned(),
+        reason: "capture releasing maintenance before prune".to_owned(),
+        drain_timeout: Duration::from_secs(5),
+        lease_seconds: DEFAULT_LEASE_SECONDS,
+        require_separate_device: false,
+        graphiti_mode: GraphitiMode::NotProvisioned,
+        chroma_mode: ChromaMode::NotProvisioned,
+        config_files: Vec::new(),
+        prune_policy: Some(GfsPolicy {
+            keep_daily: 1,
+            keep_weekly: 1,
+            keep_monthly: 1,
+        }),
+        release_on_success: true,
+        pg_dump_bin: None,
+        allow_local_test_paths: true,
+    };
+    let err = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &opts2,
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, BackupError::Archive(ArchiveError::Io(_))),
+        "expected GFS prune removal I/O error, got {err:?}"
+    );
+
+    let st = backup::status(&owner_pool).await.unwrap();
+    assert!(
+        !st.maintenance_active,
+        "maintenance window MUST be released before GFS pruning even when prune fails"
+    );
+    assert_eq!(
+        st.latest_run_state.as_deref(),
+        Some("succeeded"),
+        "confirmed capture #2 must remain succeeded when post-release GFS pruning fails"
+    );
+    let run2_id = st
+        .last_succeeded_run_id
+        .clone()
+        .expect("capture #2 must be recorded as last_succeeded_run_id");
+    assert_ne!(
+        run2_id, rep1.backup_run_id,
+        "last_succeeded_run_id must advance to newly confirmed capture #2"
+    );
+
+    // 4. Restore write permission on backup #1 and retry capture #2 with the same `request_key`:
+    //    idempotent retry finalization succeeds, prunes backup #1, and leaves maintenance closed.
+    drop(restore_guard);
+    let retry_rep = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &opts2,
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry_rep.backup_run_id, run2_id);
+    backup::verify_backup(&retry_rep.backup_dir, &keyring).unwrap();
+    assert!(
+        !rep1.backup_dir.exists(),
+        "idempotent retry after restoring permissions must prune expired backup #1"
+    );
+    let pruned = retry_rep.pruned.expect("prune report expected on retry");
+    assert_eq!(pruned.pruned.len(), 1);
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
 }
