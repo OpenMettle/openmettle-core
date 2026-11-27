@@ -885,17 +885,40 @@ pub(crate) fn collect_protected_key_inodes(
     Ok(collect_protected_key_custody(keyring_paths)?.inodes)
 }
 
-/// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
-/// reads, refusing backup/vault key files (checked both before and after opening all candidate
-/// descriptors so atomic `rename` rotations cannot race past custody checks), reserved generated
-/// names, private keys, and JSON objects holding vault/backup key material. Fails closed whenever
-/// a configured backup or vault keyring cannot be read or parsed.
-pub fn load_non_secret_config_files(
-    specs: &[(String, PathBuf)],
-    keyring_paths: &KeyRingPaths,
-) -> Result<Vec<BundledConfigFile>, ArchiveError> {
-    let mut protected = collect_protected_key_custody(keyring_paths)?;
+/// Validated, open `O_NOFOLLOW` descriptor for a `--config-file NAME=PATH` candidate whose bytes
+/// have not yet been read. Separating open from read lets callers perform one shared post-open
+/// key-custody scan across every open external archive and config descriptor before consuming any
+/// file contents.
+pub(crate) struct OpenedConfigFile {
+    name: String,
+    path: PathBuf,
+    file: fs::File,
+    len: u64,
+    perm: u32,
+    dev_ino: (u64, u64),
+}
 
+impl OpenedConfigFile {
+    pub(crate) fn verify_not_protected(
+        &self,
+        custody: &ProtectedKeyCustody,
+    ) -> Result<(), ArchiveError> {
+        if custody.matches(&self.path, self.dev_ino) {
+            return Err(ArchiveError::Invalid(
+                "--config-file refuses vault or backup key files",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Phase 1 of `--config-file` loading: validate names/paths, open every candidate with
+/// `O_NOFOLLOW`, verify regular-file size bounds, and check against the pre-open key custody set
+/// without reading any file bytes.
+pub(crate) fn open_non_secret_config_files(
+    specs: &[(String, PathBuf)],
+    protected: &ProtectedKeyCustody,
+) -> Result<Vec<OpenedConfigFile>, ArchiveError> {
     let mut seen_names = BTreeSet::new();
     let mut opened = Vec::with_capacity(specs.len());
     for (name, path) in specs {
@@ -916,34 +939,31 @@ pub fn load_non_secret_config_files(
                 "--config-file must be a regular file <= 1 MiB",
             ));
         }
-        let dev_ino = (meta.dev(), meta.ino());
-        if protected.matches(path, dev_ino) {
-            return Err(ArchiveError::Invalid(
-                "--config-file refuses vault or backup key files",
-            ));
-        }
-        opened.push((name, path, file, meta, dev_ino));
+        let entry = OpenedConfigFile {
+            name: name.clone(),
+            path: path.clone(),
+            file,
+            len: meta.len(),
+            perm: meta.permissions().mode() & 0o777,
+            dev_ino: (meta.dev(), meta.ino()),
+        };
+        entry.verify_not_protected(protected)?;
+        opened.push(entry);
     }
+    Ok(opened)
+}
 
-    // Re-scan active key custody AFTER all candidate descriptors are open so a key rotated via
-    // `rename` between the pre-open scan and `open_regular_nofollow` cannot slip past custody
-    // checks before any bytes are read.
-    if !opened.is_empty() {
-        protected.extend(collect_protected_key_custody(keyring_paths)?);
-        for (_, path, _, _, dev_ino) in &opened {
-            if protected.matches(path, *dev_ino) {
-                return Err(ArchiveError::Invalid(
-                    "--config-file refuses vault or backup key files",
-                ));
-            }
-        }
-    }
-
+/// Phase 2 of `--config-file` loading: read and validate UTF-8 and non-secret content rules from
+/// descriptors that have already passed the post-open key-custody scan.
+pub(crate) fn read_opened_config_files(
+    opened: Vec<OpenedConfigFile>,
+) -> Result<Vec<BundledConfigFile>, ArchiveError> {
     let mut out = Vec::with_capacity(opened.len());
-    for (name, _, file, meta, _) in opened {
-        let perm = meta.permissions().mode() & 0o777;
-        let mut bytes = Vec::with_capacity((meta.len() as usize).min(MAX_CONFIG_FILE_BYTES) + 1);
-        file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+    for entry in opened {
+        let mut bytes = Vec::with_capacity((entry.len as usize).min(MAX_CONFIG_FILE_BYTES) + 1);
+        entry
+            .file
+            .take(MAX_CONFIG_FILE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_CONFIG_FILE_BYTES {
             return Err(ArchiveError::Invalid("--config-file exceeds 1 MiB"));
@@ -957,14 +977,14 @@ pub fn load_non_secret_config_files(
                 "--config-file appears to contain secret or key material",
             ));
         }
-        if matches!(perm, 0o400 | 0o600) && text.len() == 32 && !text.contains('\n') {
+        if matches!(entry.perm, 0o400 | 0o600) && text.len() == 32 && !text.contains('\n') {
             return Err(ArchiveError::Invalid(
                 "--config-file refuses 32-byte owner-only key-like files",
             ));
         }
         let sha256 = crate::authz::projects::hex(&Sha256::digest(text.as_bytes()));
         out.push(BundledConfigFile {
-            name: name.clone(),
+            name: entry.name,
             sha256,
             size_bytes: text.len() as u64,
             content_utf8: text,
@@ -972,6 +992,26 @@ pub fn load_non_secret_config_files(
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
+/// reads, refusing backup/vault key files (checked both before and after opening all candidate
+/// descriptors so atomic `rename` rotations cannot race past custody checks), reserved generated
+/// names, private keys, and JSON objects holding vault/backup key material. Fails closed whenever
+/// a configured backup or vault keyring cannot be read or parsed.
+pub fn load_non_secret_config_files(
+    specs: &[(String, PathBuf)],
+    keyring_paths: &KeyRingPaths,
+) -> Result<Vec<BundledConfigFile>, ArchiveError> {
+    let mut protected = collect_protected_key_custody(keyring_paths)?;
+    let opened = open_non_secret_config_files(specs, &protected)?;
+    if !opened.is_empty() {
+        protected.extend(collect_protected_key_custody(keyring_paths)?);
+        for entry in &opened {
+            entry.verify_not_protected(&protected)?;
+        }
+    }
+    read_opened_config_files(opened)
 }
 
 // --- Unencrypted non-secret routing header (`backup-meta.json`) & GFS retention ---------------

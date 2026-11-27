@@ -4666,7 +4666,14 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
     // 2. When PostgreSQL's Unix socket directory is locally reachable alongside real `pg_dump` 18,
     //    verify `CliPgDumpRunner` authenticates cleanly using the dual-entry `PGPASSFILE`
     //    (socket directory + `localhost`) over the Unix socket.
-    if pg_tool_major_version("pg_dump").is_some_and(|v| v >= 18) {
+    let pg_dump_major = pg_tool_major_version("pg_dump");
+    if std::env::var_os("OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST").is_some() {
+        assert!(
+            pg_dump_major.is_some_and(|v| v >= 18),
+            "expected pg_dump >= 18 on PATH when OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST is set, got {pg_dump_major:?}"
+        );
+    }
+    if pg_dump_major.is_some_and(|v| v >= 18) {
         let mut admin_cn = db.admin().await;
         let (sock_dirs, pg_port): (String, String) = sqlx::query_as(
             "SELECT current_setting('unix_socket_directories'), current_setting('port')",
@@ -4709,6 +4716,7 @@ async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
                     .env("PGSSLMODE", "disable")
                     .env("PGGSSENCMODE", "disable")
                     .args([
+                        "--no-password",
                         "--format=custom",
                         "--schema=openmettle",
                         "--no-owner",

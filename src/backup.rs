@@ -11,16 +11,18 @@ use crate::{
     runs,
     telemetry::metrics::Metrics,
 };
+#[cfg(test)]
+use archive::load_non_secret_config_files;
 use archive::{
     ArchiveError, ArtifactArchiveSummary, BackupMeta, BundledConfigFile, GfsPolicy,
     MAX_BACKUP_META_BYTES, ProtectedKeyCustody, PruneReport, SettledArtifactRecord,
     collect_protected_key_custody, create_dir_0700, fsync_dir, fsync_regular_file_nofollow,
-    load_non_secret_config_files, open_new_file_0600, open_regular_nofollow,
-    prune_destination_with_verifier, read_regular_bounded_nofollow, unpack_artifact_archive,
-    validate_destination_root, write_artifact_archive, write_file_0600,
+    open_new_file_0600, open_non_secret_config_files, open_regular_nofollow,
+    prune_destination_with_verifier, read_opened_config_files, read_regular_bounded_nofollow,
+    unpack_artifact_archive, validate_destination_root, write_artifact_archive, write_file_0600,
 };
 use chrono::{DateTime, Utc};
-use crypto::{BackupKeyRing, CryptoError, EncryptedStats, StreamEncryptor};
+use crypto::{BackupKeyRing, CryptoError, EncryptedStats, KeyRingPaths, StreamEncryptor};
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
@@ -919,48 +921,16 @@ async fn read_exact_tcp(stream: &TcpStream, mut buf: &mut [u8]) -> io::Result<()
     Ok(())
 }
 
-/// Determine the process effective UID without `unsafe` code: POSIX guarantees that a newly
-/// created exclusive file's `st_uid` is unconditionally `geteuid()`.
-fn current_effective_uid() -> Result<u32, BackupError> {
-    let mut rnd = [0u8; 8];
-    SystemRandom::new()
-        .fill(&mut rnd)
-        .map_err(|_| BackupError::Crypto(CryptoError::Random))?;
-    let probe_path = std::env::temp_dir().join(format!(
-        ".om-euid-probe-{}-{}",
-        std::process::id(),
-        hex(&rnd)
-    ));
-    let file = open_new_file_0600(&probe_path)
-        .map_err(|_| BackupError::PgDump("failed to inspect current process effective UID"))?;
-    let uid_res = file
-        .metadata()
-        .map(|m| m.uid())
-        .map_err(|_| BackupError::PgDump("failed to inspect current process effective UID"));
-    drop(file);
-    let _ = fs::remove_file(&probe_path);
-    uid_res
-}
-
-/// Enforce PostgreSQL 18 `libpq` (`fe-secure-openssl.c`) exact Unix ownership and permission rules
-/// on `sslkey`:
-/// - Must be owned by `euid` or `root` (`uid == 0`).
-/// - If owned by `euid` (including when running as `root`), group/other permissions (`0077`) are
-///   forbidden (`0600` or stricter).
-/// - If owned by `root` while `euid != 0`, group-read (`0640`/`0440`) is permitted while group
-///   write/exec and any other bits (`0037`) are forbidden.
-fn validate_libpq_sslkey_metadata_for_uid(
-    uid: u32,
-    mode: u32,
-    euid: u32,
-) -> Result<(), BackupError> {
+/// Enforce upstream PostgreSQL 18.1 `libpq` (`src/interfaces/libpq/fe-secure-openssl.c`) exact
+/// Unix permission rules on `sslkey`:
+/// - When owned by `root` (`uid == 0`), group-read (`0640`/`0440`) and stricter (`0600`/`0400`)
+///   are allowed while group write/exec and any other bits (`0037`) are forbidden.
+/// - When owned by any non-root user (`uid != 0`), group and other bits (`0077`) are forbidden
+///   (`0600`/`0400` or stricter).
+fn validate_libpq_sslkey_metadata(uid: u32, mode: u32) -> Result<(), BackupError> {
     let perm = mode & 0o777;
-    if uid != euid && uid != 0 {
-        return Err(BackupError::PgDump(
-            "sslkey file must be owned by the current user or root",
-        ));
-    }
-    if (uid == euid && (perm & 0o077) != 0) || (uid == 0 && (perm & 0o037) != 0) {
+    let forbidden = if uid == 0 { 0o037 } else { 0o077 };
+    if (perm & forbidden) != 0 {
         return Err(BackupError::PgDump(
             "sslkey file permissions are too open for libpq",
         ));
@@ -968,8 +938,8 @@ fn validate_libpq_sslkey_metadata_for_uid(
     Ok(())
 }
 
-/// Open, validate (`O_NOFOLLOW`, bounded regular file, `libpq` `sslkey` ownership & permissions on
-/// the opened descriptor), and parse `sslcert` + `sslkey` when configured.
+/// Open, validate (`O_NOFOLLOW`, bounded regular file, `libpq` `sslkey` permissions on the opened
+/// descriptor), and parse `sslcert` + `sslkey` when configured.
 fn load_validated_client_cert_and_key(
     cfg: &ValidatedPgConfig,
 ) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>, BackupError> {
@@ -987,8 +957,7 @@ fn load_validated_client_cert_and_key(
             if !meta.is_file() || meta.len() > MAX_TLS_PEM_BYTES as u64 {
                 return Err(BackupError::PgDump("failed to read sslkey PEM file"));
             }
-            let euid = current_effective_uid()?;
-            validate_libpq_sslkey_metadata_for_uid(meta.uid(), meta.permissions().mode(), euid)?;
+            validate_libpq_sslkey_metadata(meta.uid(), meta.permissions().mode())?;
 
             let mut key_bytes =
                 Vec::with_capacity((meta.len() as usize).min(MAX_TLS_PEM_BYTES) + 1);
@@ -3167,6 +3136,88 @@ async fn try_finalize_staged_or_succeeded_retry(
     }))
 }
 
+struct PreparedCaptureExternalInputs {
+    bundled_configs: Vec<BundledConfigFile>,
+    opened_neo4j: Option<OpenedExternalFile>,
+    opened_chroma: Option<OpenedExternalFile>,
+}
+
+/// Open all optional external archives (`--neo4j-dump`, `--chroma-archive`) and `--config-file`
+/// inputs with `O_NOFOLLOW` between one pre-open and one shared post-open backup/vault key-custody
+/// scan, verifying every opened descriptor against the combined custody set BEFORE reading any
+/// bytes from any candidate.
+fn prepare_capture_external_inputs(
+    opts: &CaptureOptions,
+    keyring_paths: &KeyRingPaths,
+) -> Result<PreparedCaptureExternalInputs, BackupError> {
+    prepare_capture_external_inputs_with_hooks(
+        &opts.config_files,
+        &opts.graphiti_mode,
+        &opts.chroma_mode,
+        keyring_paths,
+        || {},
+        || {},
+    )
+}
+
+fn prepare_capture_external_inputs_with_hooks<F1, F2>(
+    config_files: &[(String, PathBuf)],
+    graphiti_mode: &GraphitiMode,
+    chroma_mode: &ChromaMode,
+    keyring_paths: &KeyRingPaths,
+    after_archives_open: F1,
+    after_all_open: F2,
+) -> Result<PreparedCaptureExternalInputs, BackupError>
+where
+    F1: FnOnce(),
+    F2: FnOnce(),
+{
+    let mut protected_custody = collect_protected_key_custody(keyring_paths)?;
+
+    let opened_neo4j = match graphiti_mode {
+        GraphitiMode::NotProvisioned => None,
+        GraphitiMode::OfflineDump(neo4j_path) => {
+            let opened = OpenedExternalFile::open_descriptor(neo4j_path, &NEO4J_DUMP_ERRORS)?;
+            opened.verify_not_protected(neo4j_path, &protected_custody)?;
+            Some((neo4j_path.as_path(), opened))
+        }
+    };
+    let opened_chroma = match chroma_mode {
+        ChromaMode::Archive(chroma_path) => {
+            let opened = OpenedExternalFile::open_descriptor(chroma_path, &CHROMA_ARCHIVE_ERRORS)?;
+            opened.verify_not_protected(chroma_path, &protected_custody)?;
+            Some((chroma_path.as_path(), opened))
+        }
+        ChromaMode::NotProvisioned | ChromaMode::QualifiedRebuild { .. } => None,
+    };
+
+    after_archives_open();
+
+    let opened_configs = open_non_secret_config_files(config_files, &protected_custody)?;
+
+    after_all_open();
+
+    if opened_neo4j.is_some() || opened_chroma.is_some() || !opened_configs.is_empty() {
+        protected_custody.extend(collect_protected_key_custody(keyring_paths)?);
+        if let Some((path, ref opened)) = opened_neo4j {
+            opened.verify_not_protected(path, &protected_custody)?;
+        }
+        if let Some((path, ref opened)) = opened_chroma {
+            opened.verify_not_protected(path, &protected_custody)?;
+        }
+        for entry in &opened_configs {
+            entry.verify_not_protected(&protected_custody)?;
+        }
+    }
+
+    let bundled_configs = read_opened_config_files(opened_configs)?;
+    Ok(PreparedCaptureExternalInputs {
+        bundled_configs,
+        opened_neo4j: opened_neo4j.map(|(_, f)| f),
+        opened_chroma: opened_chroma.map(|(_, f)| f),
+    })
+}
+
 /// Run the full coordinated maintenance-window backup capture with a pluggable [`PgDumpRunner`].
 /// On any failure confirmed before PostgreSQL stages publication (`backup_stage_publication`),
 /// partial staging files are removed, `backup_runs` transitions to `failed`, and
@@ -3246,39 +3297,13 @@ async fn capture_inner(
         }
 
         // 3. Validate non-secret config files and optional external archives BEFORE entering
-        //    maintenance, opening all candidate descriptors between a pre-open and post-open
-        //    backup/vault key-custody scan so atomic `rename` rotations cannot slip past custody
-        //    checks before any bytes are consumed.
-        let mut protected_custody = collect_protected_key_custody(keyring.paths())?;
-        let opened_neo4j = match &opts.graphiti_mode {
-            GraphitiMode::NotProvisioned => None,
-            GraphitiMode::OfflineDump(neo4j_path) => {
-                let opened = OpenedExternalFile::open_descriptor(neo4j_path, &NEO4J_DUMP_ERRORS)?;
-                opened.verify_not_protected(neo4j_path, &protected_custody)?;
-                Some((neo4j_path.as_path(), opened))
-            }
-        };
-        let opened_chroma = match &opts.chroma_mode {
-            ChromaMode::Archive(chroma_path) => {
-                let opened =
-                    OpenedExternalFile::open_descriptor(chroma_path, &CHROMA_ARCHIVE_ERRORS)?;
-                opened.verify_not_protected(chroma_path, &protected_custody)?;
-                Some((chroma_path.as_path(), opened))
-            }
-            ChromaMode::NotProvisioned | ChromaMode::QualifiedRebuild { .. } => None,
-        };
-        if opened_neo4j.is_some() || opened_chroma.is_some() {
-            protected_custody.extend(collect_protected_key_custody(keyring.paths())?);
-            if let Some((path, ref opened)) = opened_neo4j {
-                opened.verify_not_protected(path, &protected_custody)?;
-            }
-            if let Some((path, ref opened)) = opened_chroma {
-                opened.verify_not_protected(path, &protected_custody)?;
-            }
-        }
-        let opened_neo4j = opened_neo4j.map(|(_, f)| f);
-        let opened_chroma = opened_chroma.map(|(_, f)| f);
-        let bundled_configs = load_non_secret_config_files(&opts.config_files, keyring.paths())?;
+        //    maintenance, opening ALL candidate descriptors between one pre-open and one shared
+        //    post-open backup/vault key-custody scan before reading any bytes from any candidate.
+        let PreparedCaptureExternalInputs {
+            bundled_configs,
+            opened_neo4j,
+            opened_chroma,
+        } = prepare_capture_external_inputs(opts, keyring.paths())?;
 
         // 4. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
         //    `draining` backup_runs row.
@@ -5890,8 +5915,7 @@ mod tests {
             write_file_0600(&rotated_tmp, &[0x33u8; 32]).unwrap();
             fs::rename(&rotated_tmp, &backup_key).unwrap();
 
-            let mut protected_after_rotate =
-                collect_protected_key_custody(keyring.paths()).unwrap();
+            let protected_after_rotate = collect_protected_key_custody(keyring.paths()).unwrap();
             for forbidden in [&old_key_hardlink, &backup_key] {
                 assert!(
                     matches!(
@@ -5928,31 +5952,106 @@ mod tests {
                 );
             }
 
-            // Simulate a concurrent atomic `rename` key rotation occurring AFTER the pre-open
-            // custody scan and BEFORE opening an external hard link to the newly rotated key.
-            // Opening the descriptor and re-verifying against the post-open custody scan must
-            // refuse the raced descriptor before any bytes are read.
-            let rotated_tmp_2 = dir.join("backup-k1.key.rotated2.tmp");
-            write_file_0600(&rotated_tmp_2, &[0x44u8; 32]).unwrap();
-            fs::rename(&rotated_tmp_2, &backup_key).unwrap();
-            let raced_hardlink = dir.join("raced-rotated-key-hardlink.bin");
-            fs::hard_link(&backup_key, &raced_hardlink).unwrap();
+            // Exercise capture's real `prepare_capture_external_inputs_with_hooks` helper directly:
+            // 1. A valid non-secret config + valid binary archives succeed when no rotation occurs.
+            let valid_cfg = dir.join("valid-config.json");
+            write_file_0600(&valid_cfg, br#"{"service":"openmettle","replicas":1}"#).unwrap();
+            let PreparedCaptureExternalInputs {
+                bundled_configs: bundled,
+                opened_neo4j: ok_neo4j,
+                opened_chroma: ok_chroma,
+            } = prepare_capture_external_inputs_with_hooks(
+                &[("service.json".to_owned(), valid_cfg.clone())],
+                &GraphitiMode::OfflineDump(binary_archive.clone()),
+                &ChromaMode::Archive(binary_archive.clone()),
+                keyring.paths(),
+                || {},
+                || {},
+            )
+            .unwrap();
+            assert_eq!(bundled.len(), 1);
+            assert!(ok_neo4j.is_some() && ok_chroma.is_some());
 
-            let opened_raced =
-                OpenedExternalFile::open_descriptor(&raced_hardlink, &NEO4J_DUMP_ERRORS).unwrap();
+            // 2. Staged backup key hard-linked by `--neo4j-dump` rotates into active backup
+            //    custody AFTER archive open and BEFORE `--config-file` open: the shared final
+            //    custody scan across all open descriptors must reject `--neo4j-dump` before any
+            //    bytes are consumed.
+            let staged_backup_key = dir.join("backup-k1.key.staged-neo4j");
+            write_file_0600(&staged_backup_key, &[0x44u8; 32]).unwrap();
+            let raced_neo4j_hardlink = dir.join("raced-neo4j-hardlink.bin");
+            fs::hard_link(&staged_backup_key, &raced_neo4j_hardlink).unwrap();
+            let err_neo4j_race = prepare_capture_external_inputs_with_hooks(
+                &[("service.json".to_owned(), valid_cfg.clone())],
+                &GraphitiMode::OfflineDump(raced_neo4j_hardlink),
+                &ChromaMode::NotProvisioned,
+                keyring.paths(),
+                || {
+                    fs::rename(&staged_backup_key, &backup_key).unwrap();
+                },
+                || {},
+            )
+            .err()
+            .expect("expected shared post-open custody scan to reject rotated --neo4j-dump key");
             assert!(
-                opened_raced
-                    .verify_not_protected(&raced_hardlink, &protected_after_rotate)
-                    .is_ok(),
-                "pre-rotation custody alone cannot yet contain the brand-new rotated inode"
+                matches!(err_neo4j_race, BackupError::Invalid(msg) if msg.contains("key custody")),
+                "expected key custody error for raced --neo4j-dump, got {err_neo4j_race:?}"
             );
-            protected_after_rotate.extend(collect_protected_key_custody(keyring.paths()).unwrap());
+
+            // 3. Staged vault key hard-linked by `--chroma-archive` rotates into active vault
+            //    custody AFTER all archive and config descriptors open and BEFORE the shared final
+            //    scan: the shared final scan must reject `--chroma-archive`.
+            let staged_vault_key = dir.join("vault-k1.key.staged-chroma");
+            write_file_0600(&staged_vault_key, &[0x55u8; 32]).unwrap();
+            let raced_chroma_hardlink = dir.join("raced-chroma-hardlink.bin");
+            fs::hard_link(&staged_vault_key, &raced_chroma_hardlink).unwrap();
+            let err_chroma_race = prepare_capture_external_inputs_with_hooks(
+                &[("service.json".to_owned(), valid_cfg.clone())],
+                &GraphitiMode::NotProvisioned,
+                &ChromaMode::Archive(raced_chroma_hardlink),
+                keyring.paths(),
+                || {},
+                || {
+                    fs::rename(&staged_vault_key, &vault_key).unwrap();
+                },
+            )
+            .err()
+            .expect(
+                "expected shared post-open custody scan to reject rotated --chroma-archive key",
+            );
+            assert!(
+                matches!(err_chroma_race, BackupError::Invalid(msg) if msg.contains("key custody")),
+                "expected key custody error for raced --chroma-archive, got {err_chroma_race:?}"
+            );
+
+            // 4. Staged backup key hard-linked by `--config-file` (containing benign UTF-8 so only
+            //    the key-custody check can reject it) rotates into active backup custody AFTER
+            //    opening and BEFORE the shared final scan: rejected before reading bytes.
+            let staged_cfg_key = dir.join("backup-k1.key.staged-cfg");
+            write_file_0600(
+                &staged_cfg_key,
+                b"benign-utf8-key-rotation-sentinel-payload\n",
+            )
+            .unwrap();
+            let raced_cfg_hardlink = dir.join("raced-config-hardlink.txt");
+            fs::hard_link(&staged_cfg_key, &raced_cfg_hardlink).unwrap();
+            let err_cfg_race = prepare_capture_external_inputs_with_hooks(
+                &[("raced.txt".to_owned(), raced_cfg_hardlink)],
+                &GraphitiMode::NotProvisioned,
+                &ChromaMode::NotProvisioned,
+                keyring.paths(),
+                || {},
+                || {
+                    fs::rename(&staged_cfg_key, &backup_key).unwrap();
+                },
+            )
+            .err()
+            .expect("expected shared post-open custody scan to reject rotated --config-file key");
             assert!(
                 matches!(
-                    opened_raced.verify_not_protected(&raced_hardlink, &protected_after_rotate),
-                    Err(BackupError::Invalid(msg)) if msg.contains("key custody")
+                    err_cfg_race,
+                    BackupError::Archive(ArchiveError::Invalid(msg)) if msg.contains("key files")
                 ),
-                "post-open custody scan must reject a hard link opened to an atomically rotated key"
+                "expected key-file refusal for raced --config-file, got {err_cfg_race:?}"
             );
             return;
         }
@@ -6253,76 +6352,47 @@ mod tests {
 
     #[test]
     fn validate_libpq_sslkey_metadata_matches_libpq_ownership_and_mode_rules() {
-        // User-owned (`uid == euid == 1000`): 0600 / 0400 ok; any group or other bit forbidden.
-        for mode in [0o100600, 0o100400] {
-            assert!(
-                validate_libpq_sslkey_metadata_for_uid(1000, mode, 1000).is_ok(),
-                "expected user-owned {:o} to be accepted",
-                mode & 0o777
-            );
-        }
-        for mode in [0o100640, 0o100440, 0o100644, 0o100604, 0o100620, 0o100610] {
-            assert!(
-                matches!(
-                    validate_libpq_sslkey_metadata_for_uid(1000, mode, 1000),
-                    Err(BackupError::PgDump(msg)) if msg.contains("permissions")
-                ),
-                "expected user-owned {:o} to be rejected",
-                mode & 0o777
-            );
+        // Non-root-owned (`uid != 0`): 0600 / 0400 ok; any group or other bit (`0077`) forbidden,
+        // matching upstream PostgreSQL 18.1 `fe-secure-openssl.c:1267-1270`.
+        for uid in [1000u32, 2000u32] {
+            for mode in [0o100600, 0o100400] {
+                assert!(
+                    validate_libpq_sslkey_metadata(uid, mode).is_ok(),
+                    "expected non-root uid {uid} mode {:o} to be accepted",
+                    mode & 0o777
+                );
+            }
+            for mode in [0o100640, 0o100440, 0o100644, 0o100604, 0o100620, 0o100610] {
+                assert!(
+                    matches!(
+                        validate_libpq_sslkey_metadata(uid, mode),
+                        Err(BackupError::PgDump(msg)) if msg.contains("permissions")
+                    ),
+                    "expected non-root uid {uid} mode {:o} to be rejected",
+                    mode & 0o777
+                );
+            }
         }
 
-        // Root-owned while running non-root (`uid == 0`, `euid == 1000`): group-read (0640/0440)
-        // and stricter (0600/0400) accepted; group write/exec and any other bits (0037) rejected.
+        // Root-owned (`uid == 0`): group-read (`0640`/`0440`) and stricter (`0600`/`0400`)
+        // accepted; group write/exec and any other bits (`0037`) rejected.
         for mode in [0o100640, 0o100440, 0o100600, 0o100400] {
             assert!(
-                validate_libpq_sslkey_metadata_for_uid(0, mode, 1000).is_ok(),
-                "expected root-owned {:o} for non-root euid to be accepted",
+                validate_libpq_sslkey_metadata(0, mode).is_ok(),
+                "expected root-owned {:o} to be accepted",
                 mode & 0o777
             );
         }
         for mode in [0o100660, 0o100650, 0o100644, 0o100604] {
             assert!(
                 matches!(
-                    validate_libpq_sslkey_metadata_for_uid(0, mode, 1000),
+                    validate_libpq_sslkey_metadata(0, mode),
                     Err(BackupError::PgDump(msg)) if msg.contains("permissions")
                 ),
-                "expected root-owned {:o} for non-root euid to be rejected",
+                "expected root-owned {:o} to be rejected",
                 mode & 0o777
             );
         }
-
-        // Root-running (`uid == 0`, `euid == 0`): `uid == euid` rule applies, so 0640 is rejected.
-        assert!(validate_libpq_sslkey_metadata_for_uid(0, 0o100600, 0).is_ok());
-        assert!(validate_libpq_sslkey_metadata_for_uid(0, 0o100400, 0).is_ok());
-        assert!(matches!(
-            validate_libpq_sslkey_metadata_for_uid(0, 0o100640, 0),
-            Err(BackupError::PgDump(msg)) if msg.contains("permissions")
-        ));
-
-        // Foreign-owned (`uid == 2000`, `euid == 1000`): rejected even with 0600/0400.
-        for mode in [0o100600, 0o100400] {
-            assert!(matches!(
-                validate_libpq_sslkey_metadata_for_uid(2000, mode, 1000),
-                Err(BackupError::PgDump(msg)) if msg.contains("owned")
-            ));
-        }
-
-        // Verify `current_effective_uid()` matches the owner of a freshly created directory.
-        let mut rnd = [0u8; 4];
-        SystemRandom::new().fill(&mut rnd).unwrap();
-        let probe_dir = std::env::temp_dir().join(format!(
-            "om-euid-check-{}-{:02x}{:02x}{:02x}{:02x}",
-            std::process::id(),
-            rnd[0],
-            rnd[1],
-            rnd[2],
-            rnd[3],
-        ));
-        create_dir_0700(&probe_dir).unwrap();
-        let dir_uid = fs::metadata(&probe_dir).unwrap().uid();
-        assert_eq!(current_effective_uid().unwrap(), dir_uid);
-        let _ = fs::remove_dir_all(&probe_dir);
     }
 
     #[tokio::test]
@@ -6394,9 +6464,15 @@ mod tests {
             Err(BackupError::PgDump(_))
         ));
 
-        // Overly open permissions (`0644` and `0640` on user-owned key) must fail preflight in
-        // EVERY TLS-capable `sslmode` (`prefer`, `require`, `verify-ca`, `verify-full`).
-        for bad_mode in [0o644u32, 0o640u32] {
+        let key_uid = fs::metadata(&key_path).unwrap().uid();
+        let mut forbidden_modes = vec![0o644u32, 0o660u32];
+        if key_uid != 0 {
+            forbidden_modes.push(0o640u32);
+        }
+
+        // Overly open permissions must fail preflight in EVERY TLS-capable `sslmode`
+        // (`prefer`, `require`, `verify-ca`, `verify-full`).
+        for bad_mode in forbidden_modes {
             fs::set_permissions(&key_path, fs::Permissions::from_mode(bad_mode)).unwrap();
             for url in [
                 format!(
@@ -6430,6 +6506,18 @@ mod tests {
                     bad_mode
                 );
             }
+        }
+
+        // When root-owned (`uid == 0`), `0640` is explicitly accepted by upstream PG 18.1 libpq.
+        if key_uid == 0 {
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640)).unwrap();
+            let cfg_req_root_grp = parse_validated_pg_uri(&format!(
+                "postgres://u:p@127.0.0.1:5432/db?sslmode=require&sslcert={}&sslkey={}",
+                cert_path.display(),
+                key_path.display(),
+            ))
+            .unwrap();
+            verify_pg_tls_preflight(&cfg_req_root_grp).await.unwrap();
         }
 
         // Tightening permissions back to `0600` restores preflight acceptance.
