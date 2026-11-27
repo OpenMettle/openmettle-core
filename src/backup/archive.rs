@@ -755,15 +755,13 @@ fn json_looks_like_secret_material(val: &serde_json::Value) -> bool {
     }
 }
 
-/// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
-/// reads, refusing backup/vault key files, reserved generated names, private keys, and JSON
-/// objects holding vault/backup key material. Fails closed whenever a configured vault keyring
-/// environment variable cannot be read or parsed.
-pub fn load_non_secret_config_files(
-    specs: &[(String, PathBuf)],
+/// Collect every `(dev, ino)` belonging to the active backup keyring and any configured vault
+/// keyring (`OPENMETTLE_{API,WORKER,ADMIN}_VAULT_KEYS_CONFIG`, `VAULT_KEYS_CONFIG`). Fails closed
+/// whenever a configured vault keyring or any referenced key file is unreadable or malformed.
+pub(crate) fn collect_protected_key_inodes(
     keyring_paths: &KeyRingPaths,
-) -> Result<Vec<BundledConfigFile>, ArchiveError> {
-    let mut vault_inodes = BTreeSet::new();
+) -> Result<BTreeSet<(u64, u64)>, ArchiveError> {
+    let mut protected = keyring_paths.protected_inodes.clone();
     for var in [
         "OPENMETTLE_API_VAULT_KEYS_CONFIG",
         "OPENMETTLE_WORKER_VAULT_KEYS_CONFIG",
@@ -778,37 +776,49 @@ pub fn load_non_secret_config_files(
         }
         let p = Path::new(&raw);
         let ino = file_dev_ino(p).ok_or(ArchiveError::Invalid(
-            "configured vault keyring is unreadable; refusing to bundle config files",
+            "configured vault keyring is unreadable; refusing to bundle external files",
         ))?;
-        vault_inodes.insert(ino);
+        protected.insert(ino);
         let bytes = fs::read(p).map_err(|_| {
             ArchiveError::Invalid(
-                "configured vault keyring is unreadable; refusing to bundle config files",
+                "configured vault keyring is unreadable; refusing to bundle external files",
             )
         })?;
         let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
             ArchiveError::Invalid(
-                "configured vault keyring is malformed; refusing to bundle config files",
+                "configured vault keyring is malformed; refusing to bundle external files",
             )
         })?;
         let keys = val
             .get("keys")
             .and_then(serde_json::Value::as_array)
             .ok_or(ArchiveError::Invalid(
-                "configured vault keyring is malformed; refusing to bundle config files",
+                "configured vault keyring is malformed; refusing to bundle external files",
             ))?;
         for item in keys {
             let file = item.get("file").and_then(serde_json::Value::as_str).ok_or(
                 ArchiveError::Invalid(
-                    "configured vault keyring entry is malformed; refusing to bundle config files",
+                    "configured vault keyring entry is malformed; refusing to bundle external files",
                 ),
             )?;
             let key_ino = file_dev_ino(Path::new(file)).ok_or(ArchiveError::Invalid(
-                "configured vault key file is unreadable; refusing to bundle config files",
+                "configured vault key file is unreadable; refusing to bundle external files",
             ))?;
-            vault_inodes.insert(key_ino);
+            protected.insert(key_ino);
         }
     }
+    Ok(protected)
+}
+
+/// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
+/// reads, refusing backup/vault key files, reserved generated names, private keys, and JSON
+/// objects holding vault/backup key material. Fails closed whenever a configured vault keyring
+/// environment variable cannot be read or parsed.
+pub fn load_non_secret_config_files(
+    specs: &[(String, PathBuf)],
+    keyring_paths: &KeyRingPaths,
+) -> Result<Vec<BundledConfigFile>, ArchiveError> {
+    let protected_inodes = collect_protected_key_inodes(keyring_paths)?;
 
     let mut seen_names = BTreeSet::new();
     let mut out = Vec::with_capacity(specs.len());
@@ -831,7 +841,7 @@ pub fn load_non_secret_config_files(
             ));
         }
         let dev_ino = (meta.dev(), meta.ino());
-        if keyring_paths.protected_inodes.contains(&dev_ino) || vault_inodes.contains(&dev_ino) {
+        if protected_inodes.contains(&dev_ino) {
             return Err(ArchiveError::Invalid(
                 "--config-file refuses vault or backup key files",
             ));

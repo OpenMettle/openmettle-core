@@ -45,28 +45,24 @@ async fn pool(connections: u32) -> Result<PgPool, &'static str> {
         .map_err(|_| "database connection failed")
 }
 
-async fn validated_backup_pool(connections: u32) -> Result<(String, PgPool), &'static str> {
+async fn validated_backup_pool(
+    connections: u32,
+) -> Result<(String, backup::ValidatedPgPool), &'static str> {
     let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
         .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
     let pg_cfg = backup::parse_validated_pg_uri(&url).map_err(|err| {
-        eprintln!("backup capture: {err}");
+        eprintln!("backup: {err}");
         "OPENMETTLE_ADMIN_DATABASE_URL is invalid or contains unsupported parameters"
     })?;
-    let opts = pg_cfg.to_sqlx_options().map_err(|err| {
-        eprintln!("backup capture: {err}");
-        "OPENMETTLE_ADMIN_DATABASE_URL is invalid or contains unsupported parameters"
-    })?;
-    backup::verify_pg_tls_preflight(&pg_cfg)
+    let db = backup::connect_validated_pool(&pg_cfg, connections)
         .await
         .map_err(|err| {
-            eprintln!("backup capture: {err}");
-            "PostgreSQL TLS preflight failed"
+            eprintln!("backup: {err}");
+            match err {
+                backup::BackupError::PgDump(_) => "PostgreSQL TLS or URL validation failed",
+                _ => "database connection failed",
+            }
         })?;
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(connections)
-        .connect_with(opts)
-        .await
-        .map_err(|_| "database connection failed")?;
     Ok((url, db))
 }
 
@@ -1625,9 +1621,12 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
             if !args.is_empty() {
                 return Err("usage: openmettle-admin backup status");
             }
-            let st = backup::status(&pool(1).await?)
+            let (_url, db) = validated_backup_pool(1).await?;
+            let res = backup::status(db.pool())
                 .await
-                .map_err(report_backup_error("backup status"))?;
+                .map_err(report_backup_error("backup status"));
+            db.close().await;
+            let st = res?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&st).map_err(|_| "backup status encode failed")?
@@ -1641,14 +1640,17 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                 false,
                 "usage: openmettle-admin backup enter-maintenance --operator-id UUID --request-key KEY --reason REASON",
             )?;
-            let (entered, entered_at) = backup::enter_maintenance(
-                &pool(1).await?,
+            let (_url, db) = validated_backup_pool(1).await?;
+            let res = backup::enter_maintenance(
+                db.pool(),
                 &parsed.operator_id,
                 &parsed.request_key,
                 &parsed.reason,
             )
             .await
-            .map_err(report_backup_error("backup enter-maintenance"))?;
+            .map_err(report_backup_error("backup enter-maintenance"));
+            db.close().await;
+            let (entered, entered_at) = res?;
             println!(
                 "{} backup.maintenance_entered entered_at={}",
                 if entered { "applied" } else { "replayed" },
@@ -1663,15 +1665,18 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                 false,
                 "usage: openmettle-admin backup release-maintenance --operator-id UUID --request-key KEY --reason REASON [--abort-active-run]",
             )?;
-            let (released, aborted) = backup::release_maintenance(
-                &pool(1).await?,
+            let (_url, db) = validated_backup_pool(1).await?;
+            let res = backup::release_maintenance(
+                db.pool(),
                 &parsed.operator_id,
                 &parsed.request_key,
                 &parsed.reason,
                 parsed.abort_active_run,
             )
             .await
-            .map_err(report_backup_error("backup release-maintenance"))?;
+            .map_err(report_backup_error("backup release-maintenance"));
+            db.close().await;
+            let (released, aborted) = res?;
             println!(
                 "{} backup.maintenance_released aborted_run_id={}",
                 if released { "applied" } else { "replayed" },
@@ -1687,22 +1692,25 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                 "usage: openmettle-admin backup arm-rpo --operator-id UUID --request-key KEY --reason REASON [--rpo-seconds 86400]",
             )?;
             let rpo_seconds = parsed.rpo_seconds.unwrap_or(86_400);
-            let (target, armed_at) = backup::arm_rpo(
-                &pool(1).await?,
+            let (_url, db) = validated_backup_pool(1).await?;
+            let res = backup::arm_rpo(
+                db.pool(),
                 &parsed.operator_id,
                 &parsed.request_key,
                 &parsed.reason,
                 rpo_seconds,
             )
             .await
-            .map_err(report_backup_error("backup arm-rpo"))?;
+            .map_err(report_backup_error("backup arm-rpo"));
+            db.close().await;
+            let (target, armed_at) = res?;
             println!("applied backup.rpo_armed rpo_target_seconds={target} armed_at={armed_at}");
             Ok(())
         }
         Some("capture") => {
             let parsed = parse_backup_capture_args(args)?;
             let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
-            let (url, db) = validated_backup_pool(3).await?;
+            let (url, db) = validated_backup_pool(4).await?;
             let prune_policy = if parsed.no_prune {
                 None
             } else {
@@ -1716,12 +1724,15 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                 Some(path) => Some(path),
                 None => match env::var("OPENMETTLE_PG_DUMP_BIN") {
                     Ok(raw) if !raw.is_empty() => Some(PathBuf::from(raw)),
-                    Ok(_) => return Err("OPENMETTLE_PG_DUMP_BIN must not be empty"),
+                    Ok(_) => {
+                        db.close().await;
+                        return Err("OPENMETTLE_PG_DUMP_BIN must not be empty");
+                    }
                     Err(_) => None,
                 },
             };
-            let report = backup::capture(
-                &db,
+            let res = backup::capture(
+                db.pool(),
                 &keyring,
                 &CaptureOptions {
                     database_url: url,
@@ -1744,7 +1755,9 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                 },
             )
             .await
-            .map_err(report_backup_error("backup capture"))?;
+            .map_err(report_backup_error("backup capture"));
+            db.close().await;
+            let report = res?;
             println!(
                 "backup.capture_succeeded run_id={} dir={} key_id={} bundle_digest={} journal_seq={} pruned={} skipped_unverified={} maintenance_released={}",
                 report.backup_run_id,

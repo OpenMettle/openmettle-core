@@ -22,7 +22,11 @@ Use this runbook to operate nightly coordinated backups (`V1-30`, [ADR 0046](../
    ```
 
    - **Strict separation from vault keys:** Never point `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` (or `--backup-keys-config`) at `OPENMETTLE_*_VAULT_KEYS_CONFIG` or reuse credential-vault key material ([ADR 0045](../adr/0045-credential-vault-and-external-connection-lifecycle.md)). Keep backup keys and vault master keys in separate off-host custody outside the backup destination.
-   - Generate a 32-byte key with `head -c 32 /dev/urandom > backup-2026-11.key && chmod 0400 backup-2026-11.key`.
+   - Generate a 32-byte key exclusively with owner-only permissions from birth (`umask 077` + noclobber `set -C` so an existing key is never truncated):
+
+     ```sh
+     (umask 077 && set -C && head -c 32 /dev/urandom > /etc/openmettle/backup-keys/backup-2026-11.key && chmod 0400 /etc/openmettle/backup-keys/backup-2026-11.key)
+     ```
 
 4. **Arm nightly 24h RPO tracking:** Fresh databases start with RPO tracking unarmed so local development and test instances do not emit spurious `overdue` alerts. Either arm explicitly before the first scheduled job or let the first `backup capture` arm it automatically:
 
@@ -174,6 +178,7 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
 
    ```sh
    PGPASSFILE=/run/secrets/openmettle-owner.pgpass \
+   PGGSSENCMODE=disable \
    PGSSLMODE=verify-full \
    PGSSLROOTCERT=/etc/openmettle/pg-ca.pem \
    pg_restore --no-owner --exit-on-error \
@@ -196,22 +201,36 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
 
    Extract the watermark headers (`origin`, `lifecycle_origin`, `lifecycle_baseline`, `connection_origin`, and `watermark <origin> <seq> <digest> <ts>`) directly from `"$SELECTED_JOURNAL"` and run `openmettle-admin restore lock` with those exact values.
 
-4. **Copy/mount the restored artifact tree and run `storage rebind`:**
+4. **Restore artifacts according to `manifest.artifact_volume.volume_id`:**
 
-   Copy `/var/restore/openmettle-recovery/artifacts/` into the target `ARTIFACTS_DIR` PVC (preserving permissions) and follow [Restore the artifact volume](restore-artifact-volume.md):
+   Inspect `manifest.json` (`artifact_volume.volume_id`) in `/var/restore/openmettle-recovery/manifest.json`:
 
-   ```sh
-   openmettle-admin storage rebind "$ARTIFACT_ROOT"
-   ```
+   - **Pinned artifact volume (`manifest.artifact_volume.volume_id` is non-null):** Copy `/var/restore/openmettle-recovery/artifacts/` into the target `ARTIFACTS_DIR` PVC (preserving permissions) and follow [Restore the artifact volume](restore-artifact-volume.md):
 
-   If a payload is unrecoverable across all backup copies, follow [Declaring an unrecoverable payload lost](restore-artifact-volume.md#declaring-an-unrecoverable-payload-lost).
+     ```sh
+     openmettle-admin storage rebind "$ARTIFACT_ROOT"
+     ```
+
+     If a payload is unrecoverable across all backup copies, follow [Declaring an unrecoverable payload lost](restore-artifact-volume.md#declaring-an-unrecoverable-payload-lost).
+   - **Storage-disabled deployment (`manifest.artifact_volume.volume_id` is `null`):** Skip `storage rebind` (which refuses unpinned volumes) and proceed directly to step 5 without `$ARTIFACT_ROOT`.
 
 5. **Replay the same `"$SELECTED_JOURNAL"` and verify zero drift:**
 
-   ```sh
-   openmettle-admin restore replay "$SELECTED_JOURNAL" "$ARTIFACT_ROOT"
-   openmettle-admin quota verify "$ARTIFACT_ROOT"
-   ```
+   - **Pinned artifact volume (`manifest.artifact_volume.volume_id` is non-null):**
+
+     ```sh
+     openmettle-admin restore replay "$SELECTED_JOURNAL" "$ARTIFACT_ROOT"
+     openmettle-admin quota verify "$ARTIFACT_ROOT"
+     ```
+
+   - **Storage-disabled deployment (`manifest.artifact_volume.volume_id` is `null`):**
+
+     ```sh
+     openmettle-admin restore replay "$SELECTED_JOURNAL"
+     openmettle-admin quota verify
+     ```
+
+     Omitting `$ARTIFACT_ROOT` replays the deletion journal, opens `restore_reconciliation_gate`, and verifies SQL ledgers without requiring an artifact volume.
 
 6. **Complete pre-worker security and external-store checks:**
    - Complete the [Database backup restore checklist](../../README.md#database-backup-restore-pre-worker-checklist) (session/provider invalidation, login/cursor key rotation, identity/grant reconciliation, parked `waiting` runs).

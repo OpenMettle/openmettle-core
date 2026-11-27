@@ -422,7 +422,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.backup_observe_telemetry()',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.backup_enter_maintenance(uuid,text,text)',false,ARRAY[]::text[]),
         ('openmettle.backup_release_maintenance(uuid,text,text,boolean)',false,ARRAY[]::text[]),
-        ('openmettle.backup_release_capture_maintenance(uuid,uuid,text,text)',false,ARRAY[]::text[]),
+        ('openmettle.backup_release_capture_maintenance(uuid,uuid,text)',false,ARRAY[]::text[]),
         ('openmettle.backup_arm_rpo(uuid,text,text,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_start_capture(uuid,text,text,text,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_renew_lease(uuid,integer)',false,ARRAY[]::text[]),

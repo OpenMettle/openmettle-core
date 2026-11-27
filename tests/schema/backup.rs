@@ -245,11 +245,12 @@ fn resolve_pg18_tools(
          if [ -n \"${{PGPASSFILE:-}}\" ] && [ -f \"$PGPASSFILE\" ]; then\n\
              sed -E 's/^[^:]*:[^:]*:/\\*:\\*:/' \"$PGPASSFILE\" | docker exec -i \\\n\
                  -e \"PGSSLMODE=${{PGSSLMODE:-disable}}\" \\\n\
+                 -e \"PGGSSENCMODE=${{PGGSSENCMODE:-disable}}\" \\\n\
                  \"$CONTAINER\" sh -eu -c \\\n\
                  'f=$(mktemp); chmod 600 \"$f\"; trap \"rm -f \\\"$f\\\"\" EXIT; cat > \"$f\"; PGPASSFILE=\"$f\" pg_dump \"$@\" </dev/null' \\\n\
                  _ \"$@\"\n\
          else\n\
-             docker exec -e \"PGSSLMODE=${{PGSSLMODE:-disable}}\" \"$CONTAINER\" pg_dump \"$@\"\n\
+             docker exec -e \"PGSSLMODE=${{PGSSLMODE:-disable}}\" -e \"PGGSSENCMODE=${{PGGSSENCMODE:-disable}}\" \"$CONTAINER\" pg_dump \"$@\"\n\
          fi\n"
     );
     fs::write(&wrapper, posix_script).unwrap();
@@ -3291,8 +3292,72 @@ async fn audit_request_key_collision_blocked_during_inflight_capture() {
         other => panic!("expected SQLSTATE 23505 for cross-operator collision, got {other:?}"),
     }
 
-    // Complete run 1 through quiesce -> stage -> confirm; confirmation MUST succeed and write a
-    // distinct `backup.capture_succeeded:<run_id>` audit key preserving `capture_request_key`.
+    // Reserved `sys.backup:` audit namespace MUST be rejected for every caller-supplied key
+    // across backup functions (`22023`) AND non-backup operator audit rows (`23514` table CHECK)
+    // so nothing can ever pre-occupy `sys.backup:capture_succeeded:<run_id>` or
+    // `sys.backup:capture_release:<run_id>`!
+    let reserved_key = format!("sys.backup:capture_succeeded:{run1}");
+    for err in [
+        backup::arm_rpo(
+            &owner_pool,
+            OPERATOR_1,
+            &reserved_key,
+            "try reserved namespace arm-rpo",
+            86_400,
+        )
+        .await
+        .unwrap_err(),
+        backup::enter_maintenance(
+            &owner_pool,
+            OPERATOR_1,
+            &reserved_key,
+            "try reserved namespace enter",
+        )
+        .await
+        .unwrap_err(),
+        backup::release_maintenance(
+            &owner_pool,
+            OPERATOR_1,
+            &reserved_key,
+            "try reserved namespace release",
+            false,
+        )
+        .await
+        .unwrap_err(),
+    ] {
+        match err {
+            BackupError::Database(sqlx::Error::Database(db_err)) => {
+                assert_eq!(db_err.code().as_deref(), Some("22023"), "{db_err}");
+            }
+            other => panic!("expected SQLSTATE 22023 for sys.backup: key, got {other:?}"),
+        }
+    }
+    let direct_non_backup_err = sqlx::query(
+        "INSERT INTO openmettle.authorization_audit
+            (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
+             request_key, reason, details)
+         VALUES
+            ('operator', NULL, $1::uuid, 'restore.accept_coverage_gap', 'restore_gate',
+             'singleton', $2, 'attempt to spoof sys.backup namespace', '{}'::jsonb)",
+    )
+    .bind(OPERATOR_1)
+    .bind(&reserved_key)
+    .execute(&owner_pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        direct_non_backup_err
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23514"),
+        "table CHECK must forbid sys.backup: prefix on non-backup audit actions: {direct_non_backup_err}"
+    );
+
+    // Complete run 1 through quiesce -> stage -> confirm -> auto-release; confirmation MUST
+    // succeed and write distinct `sys.backup:capture_succeeded:<run_id>` and
+    // `sys.backup:capture_release:<run_id>` audit keys preserving `capture_request_key`.
     sqlx::query("SELECT * FROM openmettle.backup_mark_quiesced($1::uuid, clock_timestamp(), 300)")
         .bind(&run1)
         .execute(&owner_pool)
@@ -3323,14 +3388,49 @@ async fn audit_request_key_collision_blocked_during_inflight_capture() {
             AND request_key = $2",
     )
     .bind(OPERATOR_1)
-    .bind(format!("backup.capture_succeeded:{run1}"))
+    .bind(format!("sys.backup:capture_succeeded:{run1}"))
     .fetch_one(&owner_pool)
     .await
     .unwrap();
     let succeeded_json: Value = serde_json::from_str(&succeeded_details).unwrap();
     assert_eq!(succeeded_json["capture_request_key"], "inflight-shared-key");
 
-    // Start a second run and fail it; verify distinct `backup.capture_failed:<run_id>` audit key.
+    let auto_released: bool = sqlx::query_scalar(
+        "SELECT openmettle.backup_release_capture_maintenance($1::uuid, $2::uuid, 'auto release')",
+    )
+    .bind(&run1)
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert!(auto_released);
+    // Calling auto-release a second time is idempotent (`false`) via `sys.backup:capture_release:<run_id>`.
+    let auto_released_again: bool = sqlx::query_scalar(
+        "SELECT openmettle.backup_release_capture_maintenance($1::uuid, $2::uuid, 'auto release')",
+    )
+    .bind(&run1)
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert!(!auto_released_again);
+
+    let release_audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM openmettle.authorization_audit
+          WHERE actor_kind = 'operator'
+            AND operator_id = $1::uuid
+            AND action = 'backup.maintenance_released'
+            AND request_key = $2",
+    )
+    .bind(OPERATOR_1)
+    .bind(format!("sys.backup:capture_release:{run1}"))
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(release_audit_count, 1);
+
+    // Start a second run and fail it; verify distinct `sys.backup:capture_failed:<run_id>` audit key.
     let (run2,): (String,) = sqlx::query_as(
         "SELECT backup_run_id::text
            FROM openmettle.backup_start_capture(
@@ -3355,7 +3455,7 @@ async fn audit_request_key_collision_blocked_during_inflight_capture() {
             AND request_key = $2",
     )
     .bind(OPERATOR_1)
-    .bind(format!("backup.capture_failed:{run2}"))
+    .bind(format!("sys.backup:capture_failed:{run2}"))
     .fetch_one(&owner_pool)
     .await
     .unwrap();
@@ -3997,15 +4097,17 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     async fn spawn_pg_tls_proxy(
         upstream_host: String,
         upstream_port: u16,
-        server_cfg: Arc<rustls::ServerConfig>,
+        server_cfg: Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>,
+        post_accept_connections: Arc<std::sync::atomic::AtomicUsize>,
     ) -> (u16, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
         let handle = tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                let acc = acceptor.clone();
+                let cfg = Arc::clone(&server_cfg.read().unwrap());
+                let acc = tokio_rustls::TlsAcceptor::from(cfg);
                 let up_host = upstream_host.clone();
+                let accepted_count = Arc::clone(&post_accept_connections);
                 tokio::spawn(async move {
                     let mut req = [0u8; 8];
                     if read_exact_tcp(&client, &mut req).await.is_err() || req != PG_SSL_REQ {
@@ -4017,6 +4119,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
                     let Ok(tls_stream) = acc.accept(client).await else {
                         return;
                     };
+                    accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let Ok(upstream) = TcpStream::connect((up_host.as_str(), upstream_port)).await
                     else {
                         return;
@@ -4043,23 +4146,37 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
 
     let (ca_server, ca_server_der) = make_ca("OpenMettle PG18 Test CA");
-    let (_ca_other, ca_other_der) = make_ca("OpenMettle Unrelated CA");
+    let (ca_other, ca_other_der) = make_ca("OpenMettle Unrelated CA");
     let ca_server_path =
         PathBuf::from(dir.write("ca-server.pem", &pem_cert(ca_server_der.as_ref())));
     let ca_other_path = PathBuf::from(dir.write("ca-other.pem", &pem_cert(ca_other_der.as_ref())));
     fs::set_permissions(&ca_server_path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&ca_other_path, fs::Permissions::from_mode(0o600)).unwrap();
 
+    let proxy_ip_cfg = Arc::new(std::sync::RwLock::new(make_server_config(
+        &ca_server,
+        &ca_server_der,
+        "127.0.0.1",
+    )));
+    let proxy_ip_accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (proxy_ip_port, proxy_ip_handle) = spawn_pg_tls_proxy(
         base_cfg.host.clone(),
         base_cfg.port,
-        make_server_config(&ca_server, &ca_server_der, "127.0.0.1"),
+        Arc::clone(&proxy_ip_cfg),
+        Arc::clone(&proxy_ip_accepted),
     )
     .await;
+    let proxy_dns_cfg = Arc::new(std::sync::RwLock::new(make_server_config(
+        &ca_server,
+        &ca_server_der,
+        "other.example.test",
+    )));
+    let proxy_dns_accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (proxy_dns_port, proxy_dns_handle) = spawn_pg_tls_proxy(
         base_cfg.host.clone(),
         base_cfg.port,
-        make_server_config(&ca_server, &ca_server_der, "other.example.test"),
+        proxy_dns_cfg,
+        proxy_dns_accepted,
     )
     .await;
 
@@ -4169,22 +4286,17 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     );
 
     // 3. `verify-ca` against mismatched SAN with matching `ca_server` succeeds over real TLS
-    //    (both SQLx pool and real `pg_dump` 18 when available).
+    //    via `ValidatedPgPool` (and real `pg_dump` 18 when available).
     let verify_ca_url = build_proxy_url(
         proxy_dns_port,
         &format!("sslmode=verify-ca&sslrootcert={}", ca_server_path.display()),
     );
     let verify_ca_cfg = backup::parse_validated_pg_uri(&verify_ca_url).unwrap();
-    backup::verify_pg_tls_preflight(&verify_ca_cfg)
-        .await
-        .unwrap();
-    let tls_pool_ca = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(verify_ca_cfg.to_sqlx_options().unwrap())
+    let tls_pool_ca = backup::connect_validated_pool(&verify_ca_cfg, 4)
         .await
         .unwrap();
     let rep_ca = backup::capture_with_runner(
-        &tls_pool_ca,
+        tls_pool_ca.pool(),
         &keyring,
         &CaptureOptions {
             database_url: verify_ca_url,
@@ -4212,7 +4324,8 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     backup::verify_backup(&rep_ca.backup_dir, &keyring).unwrap();
     tls_pool_ca.close().await;
 
-    // 4. `verify-full` against matching `127.0.0.1` IP SAN + `ca_server` succeeds over real TLS.
+    // 4. `verify-full` against matching `127.0.0.1` IP SAN + `ca_server` succeeds over real TLS
+    //    via `ValidatedPgPool`.
     let verify_full_url = build_proxy_url(
         proxy_ip_port,
         &format!(
@@ -4221,16 +4334,11 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
         ),
     );
     let verify_full_cfg = backup::parse_validated_pg_uri(&verify_full_url).unwrap();
-    backup::verify_pg_tls_preflight(&verify_full_cfg)
-        .await
-        .unwrap();
-    let tls_pool_full = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(verify_full_cfg.to_sqlx_options().unwrap())
+    let tls_pool_full = backup::connect_validated_pool(&verify_full_cfg, 4)
         .await
         .unwrap();
     let rep_full = backup::capture_with_runner(
-        &tls_pool_full,
+        tls_pool_full.pool(),
         &keyring,
         &CaptureOptions {
             database_url: verify_full_url,
@@ -4259,8 +4367,8 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     tls_pool_full.close().await;
 
     // 5. Poisoned `$HOME/.postgresql/root.crt` (holding `ca_other`) + `sslmode=require`:
-    //    Both SQLx AND real `pg_dump` 18 (isolated by `CliPgDumpRunner`'s ephemeral PG env)
-    //    succeed over TLS even though unisolated `pg_dump` with that `HOME` fails!
+    //    Both SQLx (`ValidatedPgPool`) AND real `pg_dump` 18 (isolated by `CliPgDumpRunner`'s
+    //    ephemeral PG env) succeed over TLS even though unisolated `pg_dump` with that `HOME` fails!
     let poisoned_home = PathBuf::from(dir.path("poisoned-home"));
     let dot_pg = poisoned_home.join(".postgresql");
     fs::create_dir_all(&dot_pg).unwrap();
@@ -4276,9 +4384,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
 
     let require_url = build_proxy_url(proxy_ip_port, "sslmode=require");
     let require_cfg = backup::parse_validated_pg_uri(&require_url).unwrap();
-    let tls_pool_req = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(require_cfg.to_sqlx_options().unwrap())
+    let tls_pool_req = backup::connect_validated_pool(&require_cfg, 4)
         .await
         .unwrap();
 
@@ -4339,7 +4445,7 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     };
 
     let rep_req = backup::capture_with_runner(
-        &tls_pool_req,
+        tls_pool_req.pool(),
         &keyring,
         &CaptureOptions {
             database_url: require_url,
@@ -4367,6 +4473,241 @@ async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump()
     backup::verify_backup(&rep_req.backup_dir, &keyring).unwrap();
     tls_pool_req.close().await;
 
+    // 6. Mid-pool certificate rotation / reconnect fail-closed proof:
+    //    Open `ValidatedPgPool` (`max_connections=1`) against `ca_server`, verify `SELECT 1`,
+    //    atomically rotate the proxy server certificate to `ca_other`, terminate the first
+    //    pooled backend so SQLx must reconnect through `StrictTlsTunnel`, and prove the reconnect
+    //    fails closed during TLS verification with zero accepted post-rotation handshakes!
+    let rotate_pool = backup::connect_validated_pool(&verify_full_cfg, 1)
+        .await
+        .unwrap();
+    let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(rotate_pool.pool())
+        .await
+        .unwrap();
+    *proxy_ip_cfg.write().unwrap() = make_server_config(&ca_other, &ca_other_der, "127.0.0.1");
+    proxy_ip_accepted.store(0, std::sync::atomic::Ordering::SeqCst);
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(first_pid)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+    assert!(terminated);
+    // First query may observe the dead connection or immediately dial; a second query is
+    // guaranteed to dial a new connection through `StrictTlsTunnel` against the rotated cert.
+    for _ in 0..2 {
+        let res = sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(rotate_pool.pool())
+            .await;
+        assert!(
+            res.is_err(),
+            "ValidatedPgPool must reject reconnecting to a rotated cert outside sslrootcert"
+        );
+    }
+    assert_eq!(
+        proxy_ip_accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rotated untrusted TLS server must never complete a TLS handshake or receive StartupMessage"
+    );
+    rotate_pool.close().await;
+
     proxy_ip_handle.abort();
     proxy_dns_handle.abort();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn unix_socket_pgpass_auth_and_external_archive_key_custody_guards() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-custody"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-cust", &[("bk-cust", [0xbc; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+    let backup_key_file = keyring_path.parent().unwrap().join("bk-bk-cust.key");
+    assert!(backup_key_file.is_file());
+
+    // 1. Both `--neo4j-dump` and `--chroma-archive` refuse backup key custody files BEFORE
+    //    entering maintenance.
+    let err_neo4j = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-cust".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "custody-neo4j-reject".to_owned(),
+            reason: "reject key file as neo4j dump".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::OfflineDump(backup_key_file.clone()),
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err_neo4j, BackupError::Invalid(_)),
+        "{err_neo4j:?}"
+    );
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    let err_chroma = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest,
+            destination_domain: "offhost-cust".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "custody-chroma-reject".to_owned(),
+            reason: "reject key file as chroma archive".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::Archive(backup_key_file),
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err_chroma, BackupError::Invalid(_)),
+        "{err_chroma:?}"
+    );
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // 2. When PostgreSQL's Unix socket directory is locally reachable alongside real `pg_dump` 18,
+    //    verify `CliPgDumpRunner` authenticates cleanly using the dual-entry `PGPASSFILE`
+    //    (socket directory + `localhost`) over the Unix socket.
+    if pg_tool_major_version("pg_dump").is_some_and(|v| v >= 18) {
+        let mut admin_cn = db.admin().await;
+        let (sock_dirs, pg_port): (String, String) = sqlx::query_as(
+            "SELECT current_setting('unix_socket_directories'), current_setting('port')",
+        )
+        .fetch_one(&mut admin_cn)
+        .await
+        .unwrap();
+        let local_requires_password: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_hba_file_rules
+                  WHERE type = 'local'
+                    AND auth_method IN ('scram-sha-256', 'md5', 'password')
+             )",
+        )
+        .fetch_one(&mut admin_cn)
+        .await
+        .unwrap_or(false);
+        drop(admin_cn);
+        let port: u16 = pg_port.parse().unwrap();
+        let reachable_dir = sock_dirs
+            .split(',')
+            .map(str::trim)
+            .find(|d| !d.is_empty() && Path::new(d).join(format!(".s.PGSQL.{port}")).exists());
+        if std::env::var_os("OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST").is_some() {
+            assert!(
+                reachable_dir.is_some(),
+                "expected reachable PostgreSQL Unix socket in {sock_dirs} for port {port}"
+            );
+            assert!(
+                local_requires_password,
+                "expected local Unix socket SCRAM/password auth when OPENMETTLE_REQUIRE_UNIX_SOCKET_PGPASS_TEST is set"
+            );
+        }
+        if let Some(sock_dir) = reachable_dir {
+            let base_cfg = backup::parse_validated_pg_uri(&db.url(OWNER)).unwrap();
+            let encoded_sock = sock_dir.replace('/', "%2F");
+            let sock_url = match base_cfg.password.as_deref() {
+                Some(pw) => format!(
+                    "postgres://{}:{}@{encoded_sock}:{port}/{}?sslmode=disable",
+                    base_cfg.username, pw, base_cfg.database
+                ),
+                None => format!(
+                    "postgres://{}@{encoded_sock}:{port}/{}?sslmode=disable",
+                    base_cfg.username, base_cfg.database
+                ),
+            };
+            // Negative control: when `local` requires SCRAM/password auth on libpq's default
+            // socket dir, a single-line `{sock_dir}:...` PGPASSFILE without `localhost:` fails.
+            if local_requires_password && let Some(pw) = base_cfg.password.as_deref() {
+                let bad_pgpass = PathBuf::from(
+                    dir.write(
+                        "socket-only.pgpass",
+                        format!(
+                            "{sock_dir}:{port}:{}:{}:{pw}\n",
+                            base_cfg.database, base_cfg.username
+                        )
+                        .as_bytes(),
+                    ),
+                );
+                fs::set_permissions(&bad_pgpass, fs::Permissions::from_mode(0o600)).unwrap();
+                let mut raw = Command::new("pg_dump");
+                raw.env_clear()
+                    .env("PATH", std::env::var("PATH").unwrap_or_default())
+                    .env("PGPASSFILE", &bad_pgpass)
+                    .env("PGSSLMODE", "disable")
+                    .env("PGGSSENCMODE", "disable")
+                    .args([
+                        "--format=custom",
+                        "--schema=openmettle",
+                        "--no-owner",
+                        &format!("--host={sock_dir}"),
+                        &format!("--port={port}"),
+                        &format!("--username={}", base_cfg.username),
+                        &format!("--dbname={}", base_cfg.database),
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+                if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
+                    raw.env("LD_LIBRARY_PATH", ld);
+                }
+                let raw_out = raw.output().unwrap();
+                assert!(
+                    !raw_out.status.success(),
+                    "negative control failed: socket-only PGPASSFILE without localhost entry unexpectedly authenticated on {sock_dir}"
+                );
+            }
+            let runner = CliPgDumpRunner::default();
+            let mut dump_bytes = Vec::new();
+            let written = runner
+                .dump(&sock_url, None, &DumpCancel::new(), &mut dump_bytes)
+                .unwrap();
+            assert!(
+                written > 100,
+                "unexpectedly small Unix socket pg_dump: {written}"
+            );
+            assert!(
+                dump_bytes.starts_with(b"PGDMP"),
+                "expected PostgreSQL custom-format PGDMP header"
+            );
+        }
+    }
 }

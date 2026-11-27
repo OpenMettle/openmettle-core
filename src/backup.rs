@@ -13,10 +13,11 @@ use crate::{
 };
 use archive::{
     ArchiveError, ArtifactArchiveSummary, BackupMeta, BundledConfigFile, GfsPolicy,
-    MAX_BACKUP_META_BYTES, PruneReport, SettledArtifactRecord, create_dir_0700, fsync_dir,
-    fsync_regular_file_nofollow, load_non_secret_config_files, open_new_file_0600,
-    open_regular_nofollow, prune_destination_with_verifier, read_regular_bounded_nofollow,
-    unpack_artifact_archive, validate_destination_root, write_artifact_archive, write_file_0600,
+    MAX_BACKUP_META_BYTES, PruneReport, SettledArtifactRecord, collect_protected_key_inodes,
+    create_dir_0700, fsync_dir, fsync_regular_file_nofollow, load_non_secret_config_files,
+    open_new_file_0600, open_regular_nofollow, prune_destination_with_verifier,
+    read_regular_bounded_nofollow, unpack_artifact_archive, validate_destination_root,
+    write_artifact_archive, write_file_0600,
 };
 use chrono::{DateTime, Utc};
 use crypto::{BackupKeyRing, CryptoError, EncryptedStats, StreamEncryptor};
@@ -35,22 +36,29 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
     PgConnection, PgPool, Postgres, Row, Transaction,
-    postgres::{PgConnectOptions, PgSslMode},
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    ops::Deref,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::{Duration, Instant},
 };
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
 
 pub const MANIFEST_FORMAT: &str = "openmettle-backup-manifest/v1";
 pub const META_FORMAT: &str = "openmettle-backup-meta/v1";
@@ -432,12 +440,7 @@ impl ValidatedPgConfig {
         Ok(ssl_mode)
     }
 
-    /// Build `sqlx::postgres::PgConnectOptions` via `PgConnectOptions::new_without_pgpass()`
-    /// with every endpoint and TLS parameter set explicitly from `self`, matching the exact
-    /// values passed to `pg_dump`. Fails closed if any ambient optional `PG*` env var that
-    /// `new_without_pgpass()` reads would diverge from the scrubbed `pg_dump` environment.
-    pub fn to_sqlx_options(&self) -> Result<PgConnectOptions, BackupError> {
-        let ssl_mode = self.validate_tls_parity()?;
+    fn check_ambient_pg_env(&self) -> Result<(), BackupError> {
         if std::env::var_os("PGOPTIONS").is_some() {
             return Err(BackupError::PgDump(
                 "ambient PGOPTIONS environment variable is not supported for backup capture",
@@ -468,6 +471,16 @@ impl ValidatedPgConfig {
                 "ambient PGAPPNAME environment variable conflicts with database URL without application_name",
             ));
         }
+        Ok(())
+    }
+
+    /// Build `sqlx::postgres::PgConnectOptions` via `PgConnectOptions::new_without_pgpass()`
+    /// with every endpoint and TLS parameter set explicitly from `self`, matching the exact
+    /// values passed to `pg_dump`. Fails closed if any ambient optional `PG*` env var that
+    /// `new_without_pgpass()` reads would diverge from the scrubbed `pg_dump` environment.
+    pub fn to_sqlx_options(&self) -> Result<PgConnectOptions, BackupError> {
+        let ssl_mode = self.validate_tls_parity()?;
+        self.check_ambient_pg_env()?;
 
         let mut opts = PgConnectOptions::new_without_pgpass()
             .port(self.port)
@@ -906,17 +919,9 @@ async fn read_exact_tcp(stream: &TcpStream, mut buf: &mut [u8]) -> io::Result<()
     Ok(())
 }
 
-/// Strictly verify PostgreSQL server TLS trust against ONLY `cfg.sslrootcert` (zero system or
-/// WebPKI fallback roots) before opening any SQLx pool or closing admission.
-///
-/// `sqlx-postgres` 0.9.0 appends `ssl_root_cert` to its built-in/native root store rather than
-/// replacing it; this preflight closes that trust-store gap so `sslmode=verify-ca` and
-/// `sslmode=verify-full` behave identically across SQLx and `libpq` (`pg_dump`).
-pub async fn verify_pg_tls_preflight(cfg: &ValidatedPgConfig) -> Result<(), BackupError> {
-    cfg.validate_tls_parity()?;
-    if !matches!(cfg.sslmode.as_str(), "verify-ca" | "verify-full") {
-        return Ok(());
-    }
+fn build_strict_tls_client(
+    cfg: &ValidatedPgConfig,
+) -> Result<(Arc<ClientConfig>, ServerName<'static>), BackupError> {
     let ca_path = cfg.sslrootcert.as_deref().ok_or(BackupError::PgDump(
         "sslmode=verify-ca and verify-full require an explicit sslrootcert CA file path",
     ))?;
@@ -979,35 +984,337 @@ pub async fn verify_pg_tls_preflight(cfg: &ValidatedPgConfig) -> Result<(), Back
         }),
     };
 
-    let host = cfg.host.clone();
-    let port = cfg.port;
+    Ok((Arc::new(tls_config), server_name))
+}
+
+async fn connect_strict_pg_tls(
+    host: &str,
+    port: u16,
+    tls_config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, BackupError> {
+    let host = host.to_owned();
     tokio::time::timeout(TLS_PREFLIGHT_TIMEOUT, async move {
         let tcp = TcpStream::connect((host.as_str(), port))
             .await
-            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight connection failed"))?;
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS connection failed"))?;
         write_all_tcp(&tcp, &PG_SSL_REQUEST)
             .await
-            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight SSLRequest failed"))?;
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS SSLRequest failed"))?;
         let mut reply = [0u8; 1];
         read_exact_tcp(&tcp, &mut reply)
             .await
-            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight SSLRequest reply failed"))?;
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS SSLRequest reply failed"))?;
         if reply[0] != b'S' {
             return Err(BackupError::PgDump(
-                "PostgreSQL server declined TLS during sslrootcert preflight",
+                "PostgreSQL server declined TLS during strict sslrootcert verification",
             ));
         }
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let tls_stream = connector.connect(server_name, tcp).await.map_err(|_| {
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        connector.connect(server_name, tcp).await.map_err(|_| {
             BackupError::PgDump(
                 "PostgreSQL TLS server certificate failed strict sslrootcert verification",
             )
-        })?;
-        drop(tls_stream);
-        Ok(())
+        })
     })
     .await
-    .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight timed out"))?
+    .map_err(|_| BackupError::PgDump("PostgreSQL TLS handshake timed out"))?
+}
+
+async fn forward_duplex<A, B>(mut a: A, mut b: B)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut a_to_b = vec![0u8; 16 * 1024];
+    let mut a_pos = 0usize;
+    let mut a_len = 0usize;
+    let mut a_eof = false;
+    let mut b_needs_flush = false;
+    let mut b_shutdown = false;
+
+    let mut b_to_a = vec![0u8; 16 * 1024];
+    let mut b_pos = 0usize;
+    let mut b_len = 0usize;
+    let mut b_eof = false;
+    let mut a_needs_flush = false;
+    let mut a_shutdown = false;
+
+    let _ = std::future::poll_fn(|cx| {
+        loop {
+            let mut progressed = false;
+
+            if a_pos < a_len {
+                match Pin::new(&mut b).poll_write(cx, &a_to_b[a_pos..a_len]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                    Poll::Ready(Ok(n)) => {
+                        a_pos += n;
+                        b_needs_flush = true;
+                        if a_pos == a_len {
+                            a_pos = 0;
+                            a_len = 0;
+                        }
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if b_needs_flush {
+                match Pin::new(&mut b).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        b_needs_flush = false;
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if !a_eof {
+                let mut rb = ReadBuf::new(&mut a_to_b);
+                match Pin::new(&mut a).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => {
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            a_eof = true;
+                        } else {
+                            a_len = n;
+                            a_pos = 0;
+                        }
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if !b_shutdown {
+                match Pin::new(&mut b).poll_shutdown(cx) {
+                    Poll::Ready(Ok(())) => {
+                        b_shutdown = true;
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            }
+
+            if b_pos < b_len {
+                match Pin::new(&mut a).poll_write(cx, &b_to_a[b_pos..b_len]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                    Poll::Ready(Ok(n)) => {
+                        b_pos += n;
+                        a_needs_flush = true;
+                        if b_pos == b_len {
+                            b_pos = 0;
+                            b_len = 0;
+                        }
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if a_needs_flush {
+                match Pin::new(&mut a).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        a_needs_flush = false;
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if !b_eof {
+                let mut rb = ReadBuf::new(&mut b_to_a);
+                match Pin::new(&mut b).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => {
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            b_eof = true;
+                        } else {
+                            b_len = n;
+                            b_pos = 0;
+                        }
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            } else if !a_shutdown {
+                match Pin::new(&mut a).poll_shutdown(cx) {
+                    Poll::Ready(Ok(())) => {
+                        a_shutdown = true;
+                        progressed = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
+            }
+
+            if a_shutdown && b_shutdown {
+                return Poll::Ready(());
+            }
+            if !progressed {
+                return Poll::Pending;
+            }
+        }
+    })
+    .await;
+}
+
+/// In-process loopback TCP->TLS tunnel enforcing strict `sslrootcert`-only `rustls` verification
+/// on EVERY PostgreSQL connection and pool reconnect before reading a single byte (e.g.,
+/// `StartupMessage` or credentials) from SQLx.
+struct StrictTlsTunnel {
+    local_port: u16,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl StrictTlsTunnel {
+    async fn start(
+        remote_host: String,
+        remote_port: u16,
+        tls_config: Arc<ClientConfig>,
+        server_name: ServerName<'static>,
+    ) -> Result<Self, BackupError> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|_| BackupError::PgDump("failed to bind local strict-TLS tunnel"))?;
+        let local_port = listener
+            .local_addr()
+            .map_err(|_| BackupError::PgDump("failed to inspect local strict-TLS tunnel address"))?
+            .port();
+        let accept_task = tokio::spawn(async move {
+            let mut active: JoinSet<()> = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((local_tcp, _)) = accepted else {
+                            break;
+                        };
+                        let host = remote_host.clone();
+                        let cfg = Arc::clone(&tls_config);
+                        let name = server_name.clone();
+                        active.spawn(async move {
+                            // Verify remote TLS strictly against `sslrootcert` BEFORE reading a
+                            // single byte from SQLx so zero credentials or SQL leave the process
+                            // if a failover/cert rotation presents an untrusted certificate.
+                            let Ok(remote_tls) =
+                                connect_strict_pg_tls(&host, remote_port, cfg, name).await
+                            else {
+                                drop(local_tcp);
+                                return;
+                            };
+                            forward_duplex(local_tcp, remote_tls).await;
+                        });
+                    }
+                    Some(_) = active.join_next(), if !active.is_empty() => {}
+                }
+            }
+        });
+        Ok(Self {
+            local_port,
+            accept_task,
+        })
+    }
+}
+
+impl Drop for StrictTlsTunnel {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+/// A validated PostgreSQL pool whose `sslmode=verify-ca` and `sslmode=verify-full` connections
+/// (including every pool reconnect) are routed through [`StrictTlsTunnel`] enforcing strict
+/// `sslrootcert`-only verification (zero host native or WebPKI fallback roots).
+pub struct ValidatedPgPool {
+    pool: PgPool,
+    _tunnel: Option<StrictTlsTunnel>,
+}
+
+impl ValidatedPgPool {
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn close(self) {
+        self.pool.close().await;
+        drop(self._tunnel);
+    }
+}
+
+impl Deref for ValidatedPgPool {
+    type Target = PgPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+/// Open a [`ValidatedPgPool`] enforcing identical endpoint and TLS trust semantics to `libpq`
+/// (`pg_dump`) across initial connect and every subsequent pool reconnect.
+pub async fn connect_validated_pool(
+    cfg: &ValidatedPgConfig,
+    max_connections: u32,
+) -> Result<ValidatedPgPool, BackupError> {
+    cfg.validate_tls_parity()?;
+    cfg.check_ambient_pg_env()?;
+    if !matches!(cfg.sslmode.as_str(), "verify-ca" | "verify-full") {
+        let opts = cfg.to_sqlx_options()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(opts)
+            .await?;
+        return Ok(ValidatedPgPool {
+            pool,
+            _tunnel: None,
+        });
+    }
+
+    let (tls_config, server_name) = build_strict_tls_client(cfg)?;
+    // Verify immediately before starting the tunnel/pool so cert errors surface cleanly as
+    // `BackupError::PgDump(...)` instead of a generic pool-connect EOF.
+    let probe = connect_strict_pg_tls(
+        &cfg.host,
+        cfg.port,
+        Arc::clone(&tls_config),
+        server_name.clone(),
+    )
+    .await?;
+    drop(probe);
+
+    let tunnel =
+        StrictTlsTunnel::start(cfg.host.clone(), cfg.port, tls_config, server_name).await?;
+    let mut loopback_opts = PgConnectOptions::new_without_pgpass()
+        .host("127.0.0.1")
+        .port(tunnel.local_port)
+        .username(&cfg.username)
+        .database(&cfg.database)
+        .ssl_mode(PgSslMode::Disable);
+    if let Some(password) = &cfg.password {
+        loopback_opts = loopback_opts.password(password);
+    }
+    if let Some(app) = &cfg.application_name {
+        loopback_opts = loopback_opts.application_name(app);
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(loopback_opts)
+        .await?;
+    Ok(ValidatedPgPool {
+        pool,
+        _tunnel: Some(tunnel),
+    })
+}
+
+/// Strictly verify PostgreSQL server TLS trust against ONLY `cfg.sslrootcert` (zero system or
+/// WebPKI fallback roots) before opening any SQLx pool or closing admission.
+pub async fn verify_pg_tls_preflight(cfg: &ValidatedPgConfig) -> Result<(), BackupError> {
+    cfg.validate_tls_parity()?;
+    if !matches!(cfg.sslmode.as_str(), "verify-ca" | "verify-full") {
+        return Ok(());
+    }
+    let (tls_config, server_name) = build_strict_tls_client(cfg)?;
+    let tls_stream = connect_strict_pg_tls(&cfg.host, cfg.port, tls_config, server_name).await?;
+    drop(tls_stream);
+    Ok(())
 }
 
 /// Cooperative cancellation handle shared between the async capture supervisor and blocking
@@ -1147,7 +1454,12 @@ impl EphemeralPgEnv {
             let db = escape_pgpass(&parsed.database);
             let user = escape_pgpass(&parsed.username);
             let pass = escape_pgpass(password);
-            let content = format!("{host}:{port}:{db}:{user}:{pass}\n");
+            let mut content = format!("{host}:{port}:{db}:{user}:{pass}\n");
+            if parsed.host.starts_with('/') {
+                // `libpq` maps its compiled-in default Unix socket directory to `localhost` when
+                // consulting `PGPASSFILE`.
+                content.push_str(&format!("localhost:{port}:{db}:{user}:{pass}\n"));
+            }
             if let Err(err) = write_file_0600(&file, content.as_bytes()) {
                 let _ = fs::remove_dir_all(&dir);
                 return Err(err.into());
@@ -1208,6 +1520,7 @@ impl PgDumpRunner for CliPgDumpRunner {
         cmd.arg(format!("--username={}", parsed.username));
         cmd.arg(format!("--dbname={}", parsed.database));
         cmd.env("PGSSLMODE", &parsed.sslmode);
+        cmd.env("PGGSSENCMODE", "disable");
         // Pin every libpq home-directory fallback path into the ephemeral 0700 directory so
         // libpq never consults $HOME/.postgresql/{root.crt,postgresql.crt,postgresql.key,root.crl},
         // $HOME/.pgpass, or $HOME/.pg_service.conf.
@@ -1365,6 +1678,7 @@ struct ExternalFileErrors {
     not_absolute: &'static str,
     unreadable: &'static str,
     empty: &'static str,
+    protected_key: &'static str,
     changed: &'static str,
 }
 
@@ -1372,6 +1686,7 @@ const NEO4J_DUMP_ERRORS: ExternalFileErrors = ExternalFileErrors {
     not_absolute: "--neo4j-dump path must be absolute",
     unreadable: "--neo4j-dump must be a readable non-symlink regular file",
     empty: "--neo4j-dump must be a non-empty regular file",
+    protected_key: "--neo4j-dump refuses vault or backup key custody files",
     changed: "--neo4j-dump changed or was truncated during backup capture",
 };
 
@@ -1379,6 +1694,7 @@ const CHROMA_ARCHIVE_ERRORS: ExternalFileErrors = ExternalFileErrors {
     not_absolute: "--chroma-archive path must be absolute",
     unreadable: "--chroma-archive must be a readable non-symlink regular file",
     empty: "--chroma-archive must be a non-empty regular file",
+    protected_key: "--chroma-archive refuses vault or backup key custody files",
     changed: "--chroma-archive changed or was truncated during backup capture",
 };
 
@@ -1393,7 +1709,11 @@ struct OpenedExternalFile {
 }
 
 impl OpenedExternalFile {
-    fn open(path: &Path, errors: &'static ExternalFileErrors) -> Result<Self, BackupError> {
+    fn open(
+        path: &Path,
+        protected_inodes: &BTreeSet<(u64, u64)>,
+        errors: &'static ExternalFileErrors,
+    ) -> Result<Self, BackupError> {
         if !path.is_absolute() {
             return Err(BackupError::Invalid(errors.not_absolute));
         }
@@ -1402,6 +1722,9 @@ impl OpenedExternalFile {
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() == 0 {
             return Err(BackupError::Invalid(errors.empty));
+        }
+        if protected_inodes.contains(&(meta.dev(), meta.ino())) {
+            return Err(BackupError::Invalid(errors.protected_key));
         }
         Ok(Self {
             file,
@@ -1675,16 +1998,14 @@ async fn release_capture_maintenance(
     pool: &PgPool,
     run_id: &str,
     operator_id: &str,
-    request_key: &str,
     reason: &str,
 ) -> Result<bool, BackupError> {
     let mut tx = read_committed(pool).await?;
     let released: bool = sqlx::query_scalar(
-        "SELECT openmettle.backup_release_capture_maintenance($1::uuid, $2::uuid, $3, $4)",
+        "SELECT openmettle.backup_release_capture_maintenance($1::uuid, $2::uuid, $3)",
     )
     .bind(run_id)
     .bind(operator_id)
-    .bind(request_key)
     .bind(reason)
     .fetch_one(&mut *tx)
     .await?;
@@ -2647,17 +2968,7 @@ async fn try_finalize_staged_or_succeeded_retry(
     };
 
     let released_maintenance = if opts.release_on_success {
-        let release_key = hex(&Sha256::digest(
-            format!("backup.capture.release:{}", opts.request_key).as_bytes(),
-        ));
-        release_capture_maintenance(
-            pool,
-            &existing_run_id,
-            &opts.operator_id,
-            &release_key,
-            &opts.reason,
-        )
-        .await?
+        release_capture_maintenance(pool, &existing_run_id, &opts.operator_id, &opts.reason).await?
     } else {
         false
     };
@@ -2694,7 +3005,6 @@ pub async fn capture_with_runner(
     }
     let validated_pg = parse_validated_pg_uri(&opts.database_url)?;
     let _ = validated_pg.to_sqlx_options()?;
-    verify_pg_tls_preflight(&validated_pg).await?;
     if !(30..=3600).contains(&opts.lease_seconds) {
         return Err(BackupError::Invalid(
             "lease seconds must be between 30 and 3600",
@@ -2711,70 +3021,99 @@ pub async fn capture_with_runner(
         opts.allow_local_test_paths,
     )?;
 
-    // 2. Check for an existing `publishing` or `succeeded` run for this exact request_key BEFORE
-    //    opening `--neo4j-dump`, `--chroma-archive`, or `--config-file`, so retrying an
-    //    interrupted publication works even after source files have moved or changed.
-    if let Some(report) =
-        try_finalize_staged_or_succeeded_retry(pool, keyring, opts, &dest_root).await?
-    {
-        return Ok(report);
-    }
+    // Enforce strict `sslrootcert`-only verification on EVERY PostgreSQL connection and pool
+    // reconnect for `verify-ca` / `verify-full`, even when a library caller supplies an unverified
+    // `&PgPool`.
+    let strict_pool = if matches!(validated_pg.sslmode.as_str(), "verify-ca" | "verify-full") {
+        Some(connect_validated_pool(&validated_pg, 4).await?)
+    } else {
+        None
+    };
+    let active_pool = strict_pool.as_ref().map_or(pool, ValidatedPgPool::pool);
 
-    // 3. Validate non-secret config files and optional external archives BEFORE entering
-    //    maintenance.
-    let bundled_configs = load_non_secret_config_files(&opts.config_files, keyring.paths())?;
-    let opened_neo4j = match &opts.graphiti_mode {
-        GraphitiMode::NotProvisioned => None,
-        GraphitiMode::OfflineDump(neo4j_path) => {
-            Some(OpenedExternalFile::open(neo4j_path, &NEO4J_DUMP_ERRORS)?)
+    let result = async {
+        // 2. Check for an existing `publishing` or `succeeded` run for this exact request_key
+        //    BEFORE opening `--neo4j-dump`, `--chroma-archive`, or `--config-file`, so retrying an
+        //    interrupted publication works even after source files have moved or changed.
+        if let Some(report) =
+            try_finalize_staged_or_succeeded_retry(active_pool, keyring, opts, &dest_root).await?
+        {
+            return Ok(report);
         }
-    };
-    let opened_chroma = match &opts.chroma_mode {
-        ChromaMode::Archive(chroma_path) => Some(OpenedExternalFile::open(
-            chroma_path,
-            &CHROMA_ARCHIVE_ERRORS,
-        )?),
-        ChromaMode::NotProvisioned | ChromaMode::QualifiedRebuild { .. } => None,
-    };
 
-    // 4. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
-    //    `draining` backup_runs row.
-    let started = start_capture(
-        pool,
-        &opts.operator_id,
-        &opts.request_key,
-        &opts.reason,
-        &opts.destination_domain,
-        opts.lease_seconds,
-    )
-    .await?;
+        // 3. Validate non-secret config files and optional external archives (including backup and
+        //    vault key-custody inode checks) BEFORE entering maintenance.
+        let protected_key_inodes = collect_protected_key_inodes(keyring.paths())?;
+        let bundled_configs = load_non_secret_config_files(&opts.config_files, keyring.paths())?;
+        let opened_neo4j = match &opts.graphiti_mode {
+            GraphitiMode::NotProvisioned => None,
+            GraphitiMode::OfflineDump(neo4j_path) => Some(OpenedExternalFile::open(
+                neo4j_path,
+                &protected_key_inodes,
+                &NEO4J_DUMP_ERRORS,
+            )?),
+        };
+        let opened_chroma = match &opts.chroma_mode {
+            ChromaMode::Archive(chroma_path) => Some(OpenedExternalFile::open(
+                chroma_path,
+                &protected_key_inodes,
+                &CHROMA_ARCHIVE_ERRORS,
+            )?),
+            ChromaMode::NotProvisioned | ChromaMode::QualifiedRebuild { .. } => None,
+        };
 
-    let staging_dir = dest_root.join(format!(".staging.{}", started.run_id));
-    let outcome = capture_body(
-        pool,
-        keyring,
-        opts,
-        pg_dump,
-        &dest_root,
-        &staging_dir,
-        &started,
-        bundled_configs,
-        opened_neo4j,
-        opened_chroma,
-    )
+        // 4. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
+        //    `draining` backup_runs row.
+        let started = start_capture(
+            active_pool,
+            &opts.operator_id,
+            &opts.request_key,
+            &opts.reason,
+            &opts.destination_domain,
+            opts.lease_seconds,
+        )
+        .await?;
+
+        let staging_dir = dest_root.join(format!(".staging.{}", started.run_id));
+        let outcome = capture_body(
+            active_pool,
+            keyring,
+            opts,
+            pg_dump,
+            &dest_root,
+            &staging_dir,
+            &started,
+            bundled_configs,
+            opened_neo4j,
+            opened_chroma,
+        )
+        .await;
+
+        match outcome {
+            Ok(report) => Ok(report),
+            Err(CaptureFailure::BeforeCommit(err)) => {
+                let staging_cleanup = staging_dir.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || fs::remove_dir_all(&staging_cleanup)).await;
+                let fail_reason = format!("backup capture failed ({})", err.failure_code());
+                fail_capture(
+                    active_pool,
+                    &started.run_id,
+                    err.failure_code(),
+                    &fail_reason,
+                )
+                .await;
+                Err(err)
+            }
+            Err(CaptureFailure::PreserveStaging(err)) => Err(err),
+        }
+    }
     .await;
 
-    match outcome {
-        Ok(report) => Ok(report),
-        Err(CaptureFailure::BeforeCommit(err)) => {
-            let staging_cleanup = staging_dir.clone();
-            let _ = tokio::task::spawn_blocking(move || fs::remove_dir_all(&staging_cleanup)).await;
-            let fail_reason = format!("backup capture failed ({})", err.failure_code());
-            fail_capture(pool, &started.run_id, err.failure_code(), &fail_reason).await;
-            Err(err)
-        }
-        Err(CaptureFailure::PreserveStaging(err)) => Err(err),
+    if let Some(sp) = strict_pool {
+        sp.close().await;
     }
+    result
 }
 
 fn is_serialization_failure(err: &sqlx::Error) -> bool {
@@ -3696,10 +4035,7 @@ async fn capture_body(
     };
 
     let released_maintenance = if opts.release_on_success {
-        let release_key = hex(&Sha256::digest(
-            format!("backup.capture.release:{}", opts.request_key).as_bytes(),
-        ));
-        release_capture_maintenance(pool, run_id, &opts.operator_id, &release_key, &opts.reason)
+        release_capture_maintenance(pool, run_id, &opts.operator_id, &opts.reason)
             .await
             .map_err(CaptureFailure::PreserveStaging)?
     } else {
@@ -4391,10 +4727,12 @@ mod tests {
              printf 'PGPASSFILE=%s\\n' \"${{PGPASSFILE:-}}\" >> \"{}\"\n\
              printf 'PGPASSWORD=%s\\n' \"${{PGPASSWORD:-}}\" >> \"{}\"\n\
              printf 'PGSSLMODE=%s\\n' \"${{PGSSLMODE:-}}\" >> \"{}\"\n\
+             printf 'PGGSSENCMODE=%s\\n' \"${{PGGSSENCMODE:-}}\" >> \"{}\"\n\
              printf 'PGSSLROOTCERT=%s\\n' \"${{PGSSLROOTCERT:-}}\" >> \"{}\"\n\
              printf 'PGAPPNAME=%s\\n' \"${{PGAPPNAME:-}}\" >> \"{}\"\n\
              printf 'CONTENT=%s\\n' \"$(tr '\\n' '|' < \"$PGPASSFILE\")\" >> \"{}\"\n\
              printf 'PGDMP-SYNTHETIC-PAYLOAD'\n",
+            observed.display(),
             observed.display(),
             observed.display(),
             observed.display(),
@@ -4441,6 +4779,7 @@ mod tests {
         assert!(!Path::new(pgpass_line).exists());
         assert!(obs.contains("PGPASSWORD=\n"));
         assert!(obs.contains("PGSSLMODE=verify-ca\n"));
+        assert!(obs.contains("PGGSSENCMODE=disable\n"));
         assert!(obs.contains("PGSSLROOTCERT=/etc/ca.pem\n"));
         assert!(obs.contains("PGAPPNAME=om-backup\n"));
         assert!(
@@ -4503,15 +4842,23 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let pid_file = dir.join("child.pid");
+        let pid_tmp = dir.join("child.pid.tmp");
         let pgpass_record = dir.join("pgpass.path");
+        let pgpass_tmp = dir.join("pgpass.path.tmp");
         let stalled = dir.join("stalled-pg-dump.sh");
         let body = format!(
             "#!/bin/sh\nset -eu\n\
-             printf '%s' \"$$\" > \"{}\"\n\
              printf '%s' \"${{PGPASSFILE:-}}\" > \"{}\"\n\
+             mv \"{}\" \"{}\"\n\
+             printf '%s' \"$$\" > \"{}\"\n\
+             mv \"{}\" \"{}\"\n\
              exec sleep 60\n",
-            pid_file.display(),
+            pgpass_tmp.display(),
+            pgpass_tmp.display(),
             pgpass_record.display(),
+            pid_tmp.display(),
+            pid_tmp.display(),
+            pid_file.display(),
         );
         fs::write(&stalled, body).unwrap();
         fs::set_permissions(&stalled, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4862,7 +5209,9 @@ mod tests {
              printf 'PGSSLCRL=%s\\n' \"${{PGSSLCRL:-}}\" >> \"{}\"\n\
              printf 'PGSSLCRLDIR=%s\\n' \"${{PGSSLCRLDIR:-}}\" >> \"{}\"\n\
              printf 'PGSERVICEFILE=%s\\n' \"${{PGSERVICEFILE:-}}\" >> \"{}\"\n\
+             printf 'PGGSSENCMODE=%s\\n' \"${{PGGSSENCMODE:-}}\" >> \"{}\"\n\
              printf 'OK'\n",
+            observed.display(),
             observed.display(),
             observed.display(),
             observed.display(),
@@ -4885,6 +5234,7 @@ mod tests {
             )
             .unwrap();
         let obs = fs::read_to_string(&observed).unwrap();
+        assert!(obs.contains("PGGSSENCMODE=disable\n"), "{obs}");
         let mut parent_dirs = BTreeSet::new();
         for key in [
             "PGPASSFILE",
@@ -5217,6 +5567,333 @@ mod tests {
         verify_pg_tls_preflight(&cfg_mtls).await.unwrap();
         let _ = h.await;
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_pg_dump_runner_writes_localhost_pgpass_entry_for_unix_socket_hosts() {
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-pgpass-sock-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-pg-dump.sh");
+        let observed = dir.join("pgpass-observed.txt");
+        let body = format!(
+            "#!/bin/sh\nset -eu\ncp \"$PGPASSFILE\" \"{}\"\nprintf 'PGDMP'\n",
+            observed.display(),
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runner = CliPgDumpRunner::with_program(&script);
+        let mut out = Vec::new();
+        runner
+            .dump(
+                "postgres://openmettle_owner:s%3Aecret@%2Fvar%2Frun%2Fpostgresql:5432/openmettle?sslmode=disable",
+                None,
+                &DumpCancel::new(),
+                &mut out,
+            )
+            .unwrap();
+        let content = fs::read_to_string(&observed).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                r"/var/run/postgresql:5432:openmettle:openmettle_owner:s\:ecret",
+                r"localhost:5432:openmettle:openmettle_owner:s\:ecret",
+            ],
+            "Unix socket host PGPASSFILE must contain both socket-dir and localhost lines: {content}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_archives_refuse_backup_and_vault_key_custody_inodes() {
+        if std::env::var_os("OPENMETTLE_TEST_EXT_KEY_CHILD").is_some() {
+            let dir = PathBuf::from(std::env::var("OPENMETTLE_TEST_EXT_KEY_DIR").unwrap());
+            let backup_cfg = dir.join("backup-keyring.json");
+            let backup_key = dir.join("backup-k1.key");
+            let vault_cfg = dir.join("vault-keyring.json");
+            let vault_key = dir.join("vault-k1.key");
+            let binary_archive = dir.join("valid-binary.dump");
+
+            let keyring = BackupKeyRing::load_from_config(&backup_cfg).unwrap();
+            let protected = collect_protected_key_inodes(keyring.paths()).unwrap();
+
+            // Binary (non-UTF-8) archive outside key custody succeeds for both Neo4j and Chroma.
+            assert!(
+                OpenedExternalFile::open(&binary_archive, &protected, &NEO4J_DUMP_ERRORS).is_ok()
+            );
+            assert!(
+                OpenedExternalFile::open(&binary_archive, &protected, &CHROMA_ARCHIVE_ERRORS)
+                    .is_ok()
+            );
+
+            // Backup key, backup keyring config, vault key, and vault keyring config are ALL
+            // rejected for both `--neo4j-dump` and `--chroma-archive`.
+            for forbidden in [&backup_key, &backup_cfg, &vault_key, &vault_cfg] {
+                assert!(
+                    matches!(
+                        OpenedExternalFile::open(forbidden, &protected, &NEO4J_DUMP_ERRORS),
+                        Err(BackupError::Invalid(msg)) if msg.contains("key custody")
+                    ),
+                    "expected --neo4j-dump to refuse {}",
+                    forbidden.display()
+                );
+                assert!(
+                    matches!(
+                        OpenedExternalFile::open(forbidden, &protected, &CHROMA_ARCHIVE_ERRORS),
+                        Err(BackupError::Invalid(msg)) if msg.contains("key custody")
+                    ),
+                    "expected --chroma-archive to refuse {}",
+                    forbidden.display()
+                );
+            }
+            return;
+        }
+
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-ext-key-custody-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        create_dir_0700(&dir).unwrap();
+
+        let backup_key = dir.join("backup-k1.key");
+        let backup_cfg = dir.join("backup-keyring.json");
+        let vault_key = dir.join("vault-k1.key");
+        let vault_cfg = dir.join("vault-keyring.json");
+        let binary_archive = dir.join("valid-binary.dump");
+
+        write_file_0600(&backup_key, &[0x11u8; 32]).unwrap();
+        write_file_0600(
+            &backup_cfg,
+            json!({
+                "version": 1,
+                "active_key_id": "bk1",
+                "keys": [{ "id": "bk1", "file": backup_key.to_str().unwrap() }]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        write_file_0600(&vault_key, &[0x22u8; 32]).unwrap();
+        write_file_0600(
+            &vault_cfg,
+            json!({
+                "version": 1,
+                "active_key_id": "vk1",
+                "keys": [{ "id": "vk1", "file": vault_key.to_str().unwrap() }]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        // Deliberately non-UTF-8 binary payload.
+        write_file_0600(&binary_archive, &[0xff, 0xfe, 0x00, 0x01, 0x80, 0x99]).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let out = Command::new(&exe)
+            .args([
+                "--exact",
+                "backup::tests::external_archives_refuse_backup_and_vault_key_custody_inodes",
+            ])
+            .env("OPENMETTLE_TEST_EXT_KEY_CHILD", "1")
+            .env("OPENMETTLE_TEST_EXT_KEY_DIR", &dir)
+            .env("OPENMETTLE_ADMIN_VAULT_KEYS_CONFIG", &vault_cfg)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "external archive key custody subprocess failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_tls_tunnel_blocks_forwarding_bytes_after_cert_rotation() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::sync::{RwLock, atomic::AtomicUsize};
+
+        fn pem_cert(der: &[u8]) -> Vec<u8> {
+            let body = STANDARD.encode(der);
+            let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+            for line in body.as_bytes().chunks(64) {
+                out.push_str(std::str::from_utf8(line).unwrap());
+                out.push('\n');
+            }
+            out.push_str("-----END CERTIFICATE-----\n");
+            out.into_bytes()
+        }
+
+        fn make_ca(
+            cn: &str,
+        ) -> (
+            rcgen::Issuer<'static, rcgen::KeyPair>,
+            CertificateDer<'static>,
+        ) {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, cn);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::DigitalSignature,
+            ];
+            let der = params.self_signed(&key).unwrap().der().clone();
+            (rcgen::Issuer::new(params, key), der)
+        }
+
+        fn make_srv(
+            issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+            ca_der: &CertificateDer<'static>,
+        ) -> Arc<rustls::ServerConfig> {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let cert = params.signed_by(&key, issuer).unwrap();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![cert.der().clone(), ca_der.clone()],
+                        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                    )
+                    .unwrap(),
+            )
+        }
+
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-tls-tunnel-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        create_dir_0700(&dir).unwrap();
+
+        let (ca_good, ca_good_der) = make_ca("Tunnel Good CA");
+        let (ca_bad, ca_bad_der) = make_ca("Tunnel Rotated Untrusted CA");
+        let ca_good_path = dir.join("ca-good.pem");
+        write_file_0600(&ca_good_path, &pem_cert(ca_good_der.as_ref())).unwrap();
+
+        let active_cfg = Arc::new(RwLock::new(make_srv(&ca_good, &ca_good_der)));
+        let forwarded_bytes = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let remote_port = listener.local_addr().unwrap().port();
+        let cfg_srv = Arc::clone(&active_cfg);
+        let bytes_srv = Arc::clone(&forwarded_bytes);
+        let server_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let cfg = Arc::clone(&cfg_srv.read().unwrap());
+                let bytes = Arc::clone(&bytes_srv);
+                tokio::spawn(async move {
+                    let mut req = [0u8; 8];
+                    if read_exact_tcp(&tcp, &mut req).await.is_err() || req != PG_SSL_REQUEST {
+                        return;
+                    }
+                    if write_all_tcp(&tcp, b"S").await.is_err() {
+                        return;
+                    }
+                    let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(cfg).accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 128];
+                    let n = std::future::poll_fn(|cx| {
+                        let mut rb = ReadBuf::new(&mut buf);
+                        match Pin::new(&mut tls).poll_read(cx, &mut rb) {
+                            Poll::Ready(Ok(())) => Poll::Ready(rb.filled().len()),
+                            Poll::Ready(Err(_)) => Poll::Ready(0),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                    .await;
+                    bytes.fetch_add(n, Ordering::SeqCst);
+                    if n > 0 {
+                        let _ = std::future::poll_fn(|cx| {
+                            Pin::new(&mut tls).poll_write(cx, b"ECHO-OK")
+                        })
+                        .await;
+                        let _ = std::future::poll_fn(|cx| Pin::new(&mut tls).poll_flush(cx)).await;
+                    }
+                });
+            }
+        });
+
+        let pg_cfg = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{remote_port}/db?sslmode=verify-full&sslrootcert={}",
+            ca_good_path.display()
+        ))
+        .unwrap();
+        let (tls_cfg, server_name) = build_strict_tls_client(&pg_cfg).unwrap();
+        let tunnel =
+            StrictTlsTunnel::start("127.0.0.1".to_owned(), remote_port, tls_cfg, server_name)
+                .await
+                .unwrap();
+
+        // First connection against trusted `ca_good` forwards traffic cleanly.
+        let c1 = TcpStream::connect(("127.0.0.1", tunnel.local_port))
+            .await
+            .unwrap();
+        write_all_tcp(&c1, b"STARTUP-1").await.unwrap();
+        let mut resp = [0u8; 7];
+        read_exact_tcp(&c1, &mut resp).await.unwrap();
+        assert_eq!(&resp, b"ECHO-OK");
+        drop(c1);
+
+        // Rotate server to untrusted `ca_bad` and reset received-byte counter.
+        *active_cfg.write().unwrap() = make_srv(&ca_bad, &ca_bad_der);
+        forwarded_bytes.store(0, Ordering::SeqCst);
+
+        // Second connection through the SAME tunnel must close before forwarding any bytes.
+        let c2 = TcpStream::connect(("127.0.0.1", tunnel.local_port))
+            .await
+            .unwrap();
+        let _ = write_all_tcp(&c2, b"SECRET-STARTUP-MUST-NOT-LEAK").await;
+        let mut probe = [0u8; 1];
+        let read_res = read_exact_tcp(&c2, &mut probe).await;
+        assert!(
+            read_res.is_err(),
+            "tunnel must close connection when rotated cert is outside sslrootcert"
+        );
+        assert_eq!(
+            forwarded_bytes.load(Ordering::SeqCst),
+            0,
+            "zero bytes may reach an untrusted rotated server"
+        );
+
+        drop(tunnel);
+        server_task.abort();
         let _ = fs::remove_dir_all(&dir);
     }
 }

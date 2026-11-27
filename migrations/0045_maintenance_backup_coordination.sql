@@ -72,6 +72,7 @@ CREATE TABLE openmettle.backup_runs (
             octet_length(request_key) BETWEEN 1 AND 128
             AND btrim(request_key) = request_key
             AND request_key COLLATE "C" !~ '[[:cntrl:]]'
+            AND request_key NOT LIKE 'sys.backup:%'
         ),
     operator_id uuid NOT NULL,
     state text NOT NULL
@@ -341,36 +342,69 @@ ALTER TABLE openmettle.authorization_audit
         'backup_maintenance', 'backup_run')),
     ADD CONSTRAINT authorization_audit_backup_check CHECK (
         (
-            action IN (
-                'backup.maintenance_entered',
-                'backup.maintenance_released',
-                'backup.rpo_armed'
+            (
+                action IN (
+                    'backup.maintenance_entered',
+                    'backup.maintenance_released',
+                    'backup.rpo_armed'
+                )
+                AND target_kind = 'backup_maintenance'
+                AND actor_kind = 'operator'
+                AND actor_user_id IS NULL
+                AND operator_id IS NOT NULL
             )
-            AND target_kind = 'backup_maintenance'
-            AND actor_kind = 'operator'
-            AND actor_user_id IS NULL
-            AND operator_id IS NOT NULL
+            OR (
+                action IN (
+                    'backup.capture_started',
+                    'backup.capture_succeeded',
+                    'backup.capture_failed'
+                )
+                AND target_kind = 'backup_run'
+                AND actor_kind = 'operator'
+                AND actor_user_id IS NULL
+                AND operator_id IS NOT NULL
+            )
+            OR (
+                action NOT IN (
+                    'backup.maintenance_entered',
+                    'backup.maintenance_released',
+                    'backup.rpo_armed',
+                    'backup.capture_started',
+                    'backup.capture_succeeded',
+                    'backup.capture_failed'
+                )
+                AND target_kind NOT IN ('backup_maintenance', 'backup_run')
+            )
         )
-        OR (
-            action IN (
-                'backup.capture_started',
-                'backup.capture_succeeded',
-                'backup.capture_failed'
+        AND (
+            request_key NOT LIKE 'sys.backup:%'
+            OR (
+                actor_kind = 'operator'
+                AND actor_user_id IS NULL
+                AND operator_id IS NOT NULL
+                AND (
+                    (
+                        action = 'backup.capture_succeeded'
+                        AND target_kind = 'backup_run'
+                        AND request_key = 'sys.backup:capture_succeeded:' || target_id
+                    )
+                    OR (
+                        action = 'backup.capture_failed'
+                        AND target_kind = 'backup_run'
+                        AND request_key = 'sys.backup:capture_failed:' || target_id
+                    )
+                    OR (
+                        action = 'backup.maintenance_entered'
+                        AND target_kind = 'backup_maintenance'
+                        AND request_key LIKE 'sys.backup:capture_enter:%'
+                    )
+                    OR (
+                        action = 'backup.maintenance_released'
+                        AND target_kind = 'backup_maintenance'
+                        AND request_key LIKE 'sys.backup:capture_release:%'
+                    )
+                )
             )
-            AND target_kind = 'backup_run'
-            AND actor_kind = 'operator'
-            AND actor_user_id IS NULL
-            AND operator_id IS NOT NULL
-        )
-        OR (
-            action NOT IN (
-                'backup.maintenance_entered',
-                'backup.maintenance_released',
-                'backup.rpo_armed',
-                'backup.capture_succeeded',
-                'backup.capture_failed'
-            )
-            AND target_kind NOT IN ('backup_maintenance', 'backup_run')
         )
     );
 
@@ -566,6 +600,7 @@ BEGIN
        OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
        OR btrim(p_request_key) <> p_request_key
        OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR p_request_key LIKE 'sys.backup:%'
        OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
         RAISE EXCEPTION 'invalid backup maintenance parameters' USING ERRCODE = '22023';
     END IF;
@@ -660,6 +695,7 @@ BEGIN
        OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
        OR btrim(p_request_key) <> p_request_key
        OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR p_request_key LIKE 'sys.backup:%'
        OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
         RAISE EXCEPTION 'invalid backup maintenance release parameters' USING ERRCODE = '22023';
     END IF;
@@ -776,14 +812,13 @@ REVOKE ALL ON FUNCTION openmettle.backup_release_maintenance(uuid, text, text, b
 CREATE FUNCTION openmettle.backup_release_capture_maintenance(
     p_backup_run_id uuid,
     p_operator_id uuid,
-    p_request_key text,
     p_reason text)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.backup_maintenance_gate%ROWTYPE;
     r openmettle.backup_runs%ROWTYPE;
-    v_existing record;
+    v_release_key text;
     v_now timestamptz;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
@@ -798,10 +833,6 @@ BEGIN
     END IF;
     IF p_backup_run_id IS NULL
        OR p_operator_id IS NULL
-       OR p_request_key IS NULL
-       OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
-       OR btrim(p_request_key) <> p_request_key
-       OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
        OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
         RAISE EXCEPTION 'invalid backup capture maintenance release parameters'
             USING ERRCODE = '22023';
@@ -813,24 +844,15 @@ BEGIN
         RETURN false;
     END IF;
 
-    SELECT a.operator_id, a.action, a.target_kind, a.target_id, a.reason
-      INTO v_existing
-      FROM openmettle.authorization_audit a
-     WHERE a.actor_kind = 'operator'
-       AND a.operator_id = p_operator_id
-       AND a.request_key = p_request_key
-     LIMIT 1;
-    IF FOUND THEN
-        IF v_existing.action = 'backup.maintenance_released'
-           AND v_existing.target_kind = 'backup_maintenance'
-           AND v_existing.target_id = 'singleton'
-           AND v_existing.reason = p_reason THEN
-            RETURN false;
-        END IF;
-        RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
-    END IF;
-    IF EXISTS (SELECT 1 FROM openmettle.backup_runs br WHERE br.request_key = p_request_key) THEN
-        RAISE EXCEPTION 'request key already used by a backup capture run' USING ERRCODE = '23505';
+    v_release_key := 'sys.backup:capture_release:' || p_backup_run_id::text;
+    IF EXISTS (
+        SELECT 1
+          FROM openmettle.authorization_audit a
+         WHERE a.actor_kind = 'operator'
+           AND a.operator_id = p_operator_id
+           AND a.request_key = v_release_key
+    ) THEN
+        RETURN false;
     END IF;
 
     IF NOT g.maintenance_active
@@ -865,7 +887,7 @@ BEGIN
          request_key, reason, details)
     VALUES
         ('operator', NULL, p_operator_id, 'backup.maintenance_released', 'backup_maintenance',
-         'singleton', p_request_key, p_reason,
+         'singleton', v_release_key, p_reason,
          jsonb_build_object(
              'was_active', true,
              'abort_active_run', false,
@@ -877,7 +899,7 @@ BEGIN
     RETURN true;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.backup_release_capture_maintenance(uuid, uuid, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.backup_release_capture_maintenance(uuid, uuid, text) FROM PUBLIC;
 
 -- Owner only: arm RPO overdue tracking and optionally configure rpo_target_seconds.
 CREATE FUNCTION openmettle.backup_arm_rpo(
@@ -911,6 +933,7 @@ BEGIN
        OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
        OR btrim(p_request_key) <> p_request_key
        OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR p_request_key LIKE 'sys.backup:%'
        OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
         RAISE EXCEPTION 'invalid backup arm-rpo parameters' USING ERRCODE = '22023';
     END IF;
@@ -988,8 +1011,6 @@ DECLARE
     v_entered_at timestamptz;
     v_lease_until timestamptz;
     v_opened boolean;
-    v_enter_key text;
-    v_enter_bytes bytea;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'backup capture start requires READ COMMITTED' USING ERRCODE = '25000';
@@ -1007,6 +1028,7 @@ BEGIN
        OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
        OR btrim(p_request_key) <> p_request_key
        OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR p_request_key LIKE 'sys.backup:%'
        OR p_destination_domain IS NULL
        OR octet_length(p_destination_domain) NOT BETWEEN 1 AND 128
        OR btrim(p_destination_domain) <> p_destination_domain
@@ -1079,19 +1101,12 @@ BEGIN
                updated_at = v_now
          WHERE id;
 
-        v_enter_bytes := CASE
-            WHEN pg_catalog.getdatabaseencoding() = 'SQL_ASCII'
-                THEN pg_catalog.convert_to('backup.capture.enter:' || p_request_key, 'SQL_ASCII')
-            ELSE pg_catalog.convert_to('backup.capture.enter:' || p_request_key, 'UTF8')
-        END;
-        v_enter_key := encode(pg_catalog.sha256(v_enter_bytes), 'hex');
-
         INSERT INTO openmettle.authorization_audit
             (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
              request_key, reason, details)
         VALUES
             ('operator', NULL, p_operator_id, 'backup.maintenance_entered', 'backup_maintenance',
-             'singleton', v_enter_key, p_reason,
+             'singleton', 'sys.backup:capture_enter:' || v_run_id::text, p_reason,
              jsonb_build_object(
                  'already_active', false,
                  'backup_run_id', v_run_id,
@@ -1407,7 +1422,7 @@ BEGIN
          request_key, reason, details)
     VALUES
         ('operator', NULL, r.operator_id, 'backup.capture_succeeded', 'backup_run',
-         p_backup_run_id::text, 'backup.capture_succeeded:' || p_backup_run_id::text,
+         p_backup_run_id::text, 'sys.backup:capture_succeeded:' || p_backup_run_id::text,
          p_reason, v_details);
 
     RETURN v_now;
@@ -1477,7 +1492,7 @@ BEGIN
          request_key, reason, details)
     VALUES
         ('operator', NULL, r.operator_id, 'backup.capture_failed', 'backup_run',
-         p_backup_run_id::text, 'backup.capture_failed:' || p_backup_run_id::text, p_reason,
+         p_backup_run_id::text, 'sys.backup:capture_failed:' || p_backup_run_id::text, p_reason,
          jsonb_build_object(
              'capture_request_key', r.request_key,
              'failure_code', p_failure_code,
