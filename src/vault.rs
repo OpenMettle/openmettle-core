@@ -2530,16 +2530,15 @@ impl RefreshClient for HttpsRefreshClient {
                 total,
             };
             let send_buf = std::mem::take(&mut body_bytes);
-            let started = std::time::Instant::now();
+            let metric = provider_http::ProviderMetricSlot::new(
+                crate::telemetry::metrics::ProviderOperation::OauthRefresh,
+            );
+            metric.arm();
             let reply = self
                 .route()
                 .send(Method::POST, &headers, send_buf, &limits)
                 .await;
-            crate::telemetry::metrics::global().record_provider_http(
-                crate::telemetry::metrics::ProviderOperation::OauthRefresh,
-                provider_http::provider_outcome(&reply),
-                started.elapsed(),
-            );
+            metric.finish(provider_http::provider_outcome(&reply));
             match reply {
                 Ok(response) => match response.status() {
                     StatusCode::OK => match parse_oauth_refresh_reply(response.body()) {
@@ -4255,5 +4254,68 @@ mod tests {
             before_unconf_refused
         );
         assert_eq!(step.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn https_refresh_client_records_metric_when_dropped_in_flight() {
+        use crate::provider_http::fixture::{Ca, HOST, Reply, Server, loopback};
+        use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
+        use tokio::sync::Notify;
+
+        let ca = Ca::new();
+        let arrived = Arc::new(Notify::new());
+        let hold = Arc::new(Notify::new());
+        let arrived_srv = Arc::clone(&arrived);
+        let hold_srv = Arc::clone(&hold);
+        let server = Server::start(ca.leaf(HOST, false), move |_| {
+            arrived_srv.notify_one();
+            Reply::Split(Vec::new(), Arc::clone(&hold_srv), Vec::new())
+        })
+        .await;
+
+        let client = HttpsRefreshClient::new(
+            "github",
+            &["https://mcp.vendor.example.test"],
+            &format!("https://{HOST}:{}/token", server.port),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            Some("synthetic-client".into()),
+            RefreshTimeouts::default(),
+        )
+        .unwrap()
+        .with_lookup(loopback)
+        .allow_loopback_fixture();
+
+        let refresh_tok = SecretText::new_refresh("CANARY-DROP-REFRESH").unwrap();
+        let scopes = vec!["issues.read".to_owned()];
+        let before = metrics::global()
+            .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Transport);
+
+        let mut fut = Box::pin(client.refresh(
+            RefreshRequest {
+                connection_id: "00000000-0000-4000-8000-000000000001",
+                provider_kind: "github",
+                account_id: "acct-1",
+                endpoint_origin: "https://mcp.vendor.example.test",
+                refresh_token: &refresh_tok,
+                allowed_scopes: &scopes,
+                current_granted_scopes: &scopes,
+            },
+            Instant::now() + Duration::from_secs(5),
+        ));
+
+        // Poll until the request reaches the server, then drop the pending future mid-flight.
+        tokio::select! {
+            _ = &mut fut => panic!("expected server to hold response open"),
+            _ = arrived.notified() => {}
+        }
+        drop(fut);
+        hold.notify_one();
+
+        assert_eq!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::OauthRefresh, ProviderOutcome::Transport),
+            before + 1
+        );
     }
 }

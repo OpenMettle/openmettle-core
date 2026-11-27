@@ -566,10 +566,14 @@ impl Gateway {
                     },
                 )
                 .await;
-            match &exchanged {
-                Ok(_) => metric.finish(ProviderOutcome::Ok),
-                Err(Error::Timeout) => metric.finish(ProviderOutcome::Timeout),
-                Err(_) => metric.finish(ProviderOutcome::Transport),
+            // Finalize inner errors immediately (preserving any more-specific HTTP status or
+            // body-limit classification already set by `decode::receive`). Defer recording `Ok`
+            // until after the outer `within_overall` deadline and run-stop checks succeed.
+            if let Err(err) = &exchanged {
+                metric.finish(match err {
+                    Error::Timeout => ProviderOutcome::Timeout,
+                    _ => ProviderOutcome::Transport,
+                });
             }
             exchanged
         };

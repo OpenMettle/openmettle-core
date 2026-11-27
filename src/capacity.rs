@@ -25,12 +25,19 @@
 //! `Decision::Insufficient` and `Decision::Unavailable`, leaves the transaction intact.
 use crate::{
     runs::is_canonical_uuid,
-    telemetry::metrics::{self, CapacityOperation, CapacityOutcome, CapacityStaleSurface},
+    telemetry::{
+        self,
+        metrics::{self, CapacityOperation, CapacityOutcome, CapacityStaleSurface},
+    },
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, Row};
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
+use tracing::Instrument;
 
 pub mod adapter;
 
@@ -283,21 +290,35 @@ pub(super) async fn resume_with_metrics(
     controller: &Controller,
     m: &metrics::Metrics,
 ) -> Result<bool, Error> {
-    let result: Result<bool, Error> =
-        sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
-            .bind(&controller.group_id)
-            .bind(controller.secret.as_slice())
-            .bind(controller.epoch)
-            .fetch_one(c)
-            .await
-            .map_err(Error::from);
-    let outcome = match &result {
-        Ok(true) => CapacityOutcome::Resumed,
-        Ok(false) => CapacityOutcome::Unavailable,
-        Err(err) => error_outcome(err),
-    };
-    m.record_capacity_grant(CapacityOperation::Resume, outcome);
-    result
+    let started = Instant::now();
+    let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Resume);
+    async {
+        let result: Result<bool, Error> =
+            sqlx::query_scalar("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
+                .bind(&controller.group_id)
+                .bind(controller.secret.as_slice())
+                .bind(controller.epoch)
+                .fetch_one(c)
+                .await
+                .map_err(Error::from);
+        let outcome = match &result {
+            Ok(true) => CapacityOutcome::Resumed,
+            Ok(false) => CapacityOutcome::Unavailable,
+            Err(err) => error_outcome(err),
+        };
+        m.record_capacity_grant(CapacityOperation::Resume, outcome);
+        tracing::Span::current().record("operation.outcome", outcome.as_str());
+        telemetry::capacity_grant_completed(
+            None,
+            None,
+            CapacityOperation::Resume,
+            outcome,
+            started.elapsed(),
+        );
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 /// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
@@ -367,39 +388,57 @@ pub async fn grant(
     controller: &Controller,
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
-    let result = match grant_inner(&mut *c, controller, request).await {
-        Ok(Decision::Unavailable) => {
-            match group_observation_stale(&mut *c, &controller.group_id).await {
-                Ok(true) => {
+    let started = Instant::now();
+    let span = telemetry::capacity_grant_span(Some(request.run_id), None, CapacityOperation::Grant);
+    async {
+        let result = match grant_inner(&mut *c, controller, request).await {
+            Ok(Decision::Unavailable) => {
+                match group_observation_stale(&mut *c, &controller.group_id).await {
+                    Ok(true) => {
+                        metrics::global()
+                            .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+                        Ok(Decision::Unavailable)
+                    }
+                    Ok(false) => Ok(Decision::Unavailable),
+                    Err(err) => Err(err),
+                }
+            }
+            other => other,
+        };
+        let (grant_id, outcome) = match &result {
+            Ok(Decision::Grant { grant_id, state }) => {
+                telemetry::record_capacity_span_grant_id(grant_id);
+                let outcome = match state {
+                    GrantState::Granted => CapacityOutcome::Granted,
+                    GrantState::Releasing => CapacityOutcome::Releasing,
+                    GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
+                    GrantState::Released => CapacityOutcome::Released,
+                };
+                (Some(grant_id.as_str()), outcome)
+            }
+            Ok(Decision::Insufficient) => (None, CapacityOutcome::Insufficient),
+            Ok(Decision::Unavailable) => (None, CapacityOutcome::Unavailable),
+            Err(err) => {
+                if *err == Error::Expired {
                     metrics::global()
                         .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-                    Ok(Decision::Unavailable)
                 }
-                Ok(false) => Ok(Decision::Unavailable),
-                Err(err) => Err(err),
+                (None, error_outcome(err))
             }
-        }
-        other => other,
-    };
-    let outcome = match &result {
-        Ok(Decision::Grant { state, .. }) => match state {
-            GrantState::Granted => CapacityOutcome::Granted,
-            GrantState::Releasing => CapacityOutcome::Releasing,
-            GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
-            GrantState::Released => CapacityOutcome::Released,
-        },
-        Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
-        Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
-        Err(err) => {
-            if *err == Error::Expired {
-                metrics::global()
-                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-            }
-            error_outcome(err)
-        }
-    };
-    metrics::global().record_capacity_grant(CapacityOperation::Grant, outcome);
-    result
+        };
+        metrics::global().record_capacity_grant(CapacityOperation::Grant, outcome);
+        tracing::Span::current().record("operation.outcome", outcome.as_str());
+        telemetry::capacity_grant_completed(
+            Some(request.run_id),
+            grant_id,
+            CapacityOperation::Grant,
+            outcome,
+            started.elapsed(),
+        );
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 async fn grant_inner(
@@ -474,19 +513,33 @@ pub(super) async fn reconcile_with_metrics(
     evidence: Evidence<'_>,
     m: &metrics::Metrics,
 ) -> Result<GrantState, Error> {
-    let result = reconcile_inner(c, controller, grant_id, evidence).await;
-    let outcome = match &result {
-        Ok(GrantState::Granted) => CapacityOutcome::Granted,
-        Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
-        Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
-        Ok(GrantState::Released) => match evidence {
-            Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
-            _ => CapacityOutcome::Released,
-        },
-        Err(err) => error_outcome(err),
-    };
-    m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
-    result
+    let started = Instant::now();
+    let span = telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+    async {
+        let result = reconcile_inner(c, controller, grant_id, evidence).await;
+        let outcome = match &result {
+            Ok(GrantState::Granted) => CapacityOutcome::Granted,
+            Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
+            Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
+            Ok(GrantState::Released) => match evidence {
+                Evidence::NotAllocated(_) => CapacityOutcome::NotAllocated,
+                _ => CapacityOutcome::Released,
+            },
+            Err(err) => error_outcome(err),
+        };
+        m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
+        tracing::Span::current().record("operation.outcome", outcome.as_str());
+        telemetry::capacity_grant_completed(
+            None,
+            Some(grant_id),
+            CapacityOperation::Reconcile,
+            outcome,
+            started.elapsed(),
+        );
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 /// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is

@@ -306,8 +306,6 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     let lease_id = derive_run_lease_id(run_id, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
     let correlated = CorrelationIds {
         run_id: Some(run_id.to_owned()),
-        operation_id: Some(op_id.to_owned()),
-        lease_id: Some(lease_id.clone()),
     };
     request_completed(
         id,
@@ -399,7 +397,7 @@ fn every_constructor_passes_the_guard_with_its_fields() {
         (
             "http.request.completed",
             "DEBUG",
-            request(&["request_id", "run_id", "operation_id", "lease_id"]),
+            request(&["request_id", "run_id"]),
         ),
         (
             "run.stream.ended",
@@ -464,8 +462,6 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     assert_eq!(field(12, "http.response.status_code"), 404);
     assert_eq!(field(12, "duration_us"), 7);
     assert_eq!(field(14, "run_id"), run_id);
-    assert_eq!(field(14, "operation_id"), op_id);
-    assert_eq!(field(14, "lease_id"), lease_id.as_str());
     assert_eq!(field(15, "run_id"), run_id);
     assert_eq!(field(16, "run_id"), run_id);
     assert_eq!(field(16, "lease_id"), lease_id.as_str());
@@ -494,21 +490,14 @@ fn derive_run_lease_id_is_deterministic_rotates_and_never_exposes_claim_token() 
     assert!(!id_1.contains(token_1));
     assert!(!id_1.contains(&token_1.replace('-', "")));
 
-    // Correlation defensively rejects unvalidated/canary IDs and raw non-UUID strings.
+    // Correlation defensively rejects unvalidated/canary IDs.
     let corr = Correlation::default();
     corr.set_run_id("not-a-uuid-CANARY");
-    corr.set_operation_id("not-a-uuid-CANARY");
-    corr.set_lease_id("rl-UPPERCASE000000000000000000000000");
-    corr.set_lease_id("not-a-lease-CANARY");
     assert_eq!(corr.snapshot(), CorrelationIds::default());
 
     corr.set_run_id(run_a);
-    corr.set_operation_id(run_b);
-    corr.set_lease_id(&id_1);
     let snap = corr.snapshot();
     assert_eq!(snap.run_id.as_deref(), Some(run_a));
-    assert_eq!(snap.operation_id.as_deref(), Some(run_b));
-    assert_eq!(snap.lease_id.as_deref(), Some(id_1.as_str()));
 }
 
 /// The shutdown deadline covers draining and the final flush together.

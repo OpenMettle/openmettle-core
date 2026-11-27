@@ -85,12 +85,14 @@ The API and the worker read three keys under their own prefix (`OPENMETTLE_API_`
 - **Span limits.** At most 8 attributes and no events or links per span. *Update, 27 November
   2026:* `SPAN_FIELDS` now allows 11 fields (`otel.kind`, `request_id`, `run_id`,
   `operation_id`, `lease_id`, `run.outcome`, `operation.kind`, `operation.outcome`,
-  `http.route`, `http.request.method`, `http.response.status_code`) across three spans:
-  `http.server.request` (4–7 exported attributes, adding validated `run_id`/`operation_id`/
-  `lease_id` when present on authenticated `/v1` routes), root `worker.run` (3 attributes:
-  `run_id`, derived non-reversible `rl-…` `lease_id`, `run.outcome`), and child
-  `worker.operation` (5 attributes: `run_id`, `lease_id`, `operation_id`, `operation.kind`,
-  `operation.outcome`). Every span stays within the 8-attribute ceiling
+  `http.route`, `http.request.method`, `http.response.status_code`) across four spans:
+  `http.server.request` (4–5 exported attributes, adding validated `run_id` on authenticated
+  `/v1` run/approval routes and centrally suppressing resource IDs on `401 Unauthorized`),
+  root `worker.run` (3 attributes: `run_id`, derived non-reversible `rl-…` `lease_id`,
+  `run.outcome`), child `worker.operation` (5 attributes: `run_id`, `lease_id`,
+  `operation_id`, `operation.kind`, `operation.outcome`), and `capacity.grant` (3 attributes:
+  public `grant_id` UUID as `lease_id`, `operation.kind`, `operation.outcome`, never
+  `fence_token` or controller secrets). Every span stays within the 8-attribute ceiling
   (`dropped_attributes_count == 0`).
 
 ### Delivery

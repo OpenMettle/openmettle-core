@@ -44,7 +44,10 @@ use crate::{
     bounded_positive,
     provider_http::gateway::UsageReport,
     runs::{digest, identity as framed_identity, is_canonical_uuid},
-    telemetry::{self, RequestId, UsageGap},
+    telemetry::{
+        self, RequestId, UsageGap,
+        metrics::{GatewayCause, GatewayStep},
+    },
     v1::{Problem, problem},
 };
 use axum::{
@@ -740,6 +743,7 @@ impl Proxy {
         };
         unrecorded.routing = Some(routing.clone());
         if routing.model != self.settings.model {
+            telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Policy);
             unrecorded.gap = Some(UsageGap::ModelNotServed);
             return Err(NOT_SERVED.into());
         }
@@ -747,12 +751,25 @@ impl Proxy {
         let body = match timeout(REQUEST_READ, axum::body::to_bytes(body, MAX_REQUEST_BYTES)).await
         {
             Ok(Ok(body)) => body,
-            _ => return Err(BODY.into()),
+            Ok(Err(_)) => {
+                telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Protocol);
+                return Err(BODY.into());
+            }
+            Err(_) => {
+                telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Timeout);
+                return Err(BODY.into());
+            }
         };
         let outbound_body =
             match prepare_outbound_body(&body, self.settings.cache_mode, &routing, &id) {
                 Ok(outbound) => outbound,
                 Err((gap, problem)) => {
+                    let cause = match gap {
+                        UsageGap::RequestBody => GatewayCause::Policy,
+                        UsageGap::ModelMismatch => GatewayCause::Protocol,
+                        _ => GatewayCause::Unknown,
+                    };
+                    telemetry::gateway_failure(GatewayStep::Policy, cause);
                     unrecorded.gap = Some(gap);
                     return Err(problem.into());
                 }
@@ -771,11 +788,28 @@ impl Proxy {
         }
         // Nothing is sent before the connection exists, also when the caller leaves meanwhile.
         unrecorded.gap = Some(UsageGap::UpstreamConnect);
-        let stream = self.settings.connect().await?;
+        let stream = match self.settings.connect().await {
+            Ok(stream) => stream,
+            Err(problem) => {
+                let cause = if problem == UPSTREAM_TIMEOUT {
+                    GatewayCause::Timeout
+                } else {
+                    GatewayCause::Transport
+                };
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
+                return Err(problem.into());
+            }
+        };
         unrecorded.gap = Some(UsageGap::CallerDisconnected);
         let (upstream, response) = match self.exchange(stream, outbound).await {
             Ok(exchanged) => exchanged,
             Err(gap) => {
+                let cause = if gap == UsageGap::UpstreamTimeout {
+                    GatewayCause::Timeout
+                } else {
+                    GatewayCause::Transport
+                };
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
                 unrecorded.gap = Some(gap);
                 return Err(match gap {
                     UsageGap::UpstreamTimeout => UPSTREAM_TIMEOUT,
@@ -790,11 +824,20 @@ impl Proxy {
         // `upstream_status`, and answer with a value-free problem document.
         if head.status != StatusCode::OK {
             drop((upstream, body));
+            let cause = match head.status {
+                StatusCode::GATEWAY_TIMEOUT => GatewayCause::Timeout,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                    GatewayCause::Protection
+                }
+                _ => GatewayCause::Protocol,
+            };
+            telemetry::gateway_failure(GatewayStep::Policy, cause);
             unrecorded.gap = Some(UsageGap::UpstreamStatus);
             return Err(upstream_status_error(head.status, &head.headers));
         }
         // Neither relayed unlabelled nor read for usage; the upstream connection closes here.
         if !identity(&head.headers) {
+            telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Protocol);
             unrecorded.gap = Some(UsageGap::UpstreamEncoding);
             return Err(ENCODED_RESPONSE.into());
         }
@@ -842,9 +885,31 @@ impl Proxy {
         let spent = tokio::spawn(async move { gateway::consume(&pool, &id, &bearer).await });
         match timeout(self.database_timeout * WRITE_ATTEMPT_TIMEOUTS, spent).await {
             Ok(Ok(Ok(Consumed::Once(routing)))) => Ok(routing),
-            Ok(Ok(Ok(Consumed::Replay))) => Err(REPLAY),
-            Ok(Ok(Ok(Consumed::Refused))) => Err(UNAUTHENTICATED),
-            _ => Err(UNAVAILABLE),
+            Ok(Ok(Ok(Consumed::Replay))) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Policy);
+                Err(REPLAY)
+            }
+            Ok(Ok(Ok(Consumed::Refused))) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::ServiceAuth);
+                Err(UNAUTHENTICATED)
+            }
+            Ok(Ok(Err(error))) => {
+                let cause = match error {
+                    StoreError::Protection => GatewayCause::Protection,
+                    StoreError::Refused | StoreError::Conflict => GatewayCause::Policy,
+                    StoreError::Database | StoreError::Retryable => GatewayCause::Transport,
+                };
+                telemetry::gateway_failure(GatewayStep::Principal, cause);
+                Err(UNAVAILABLE)
+            }
+            Ok(Err(_)) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Unknown);
+                Err(UNAVAILABLE)
+            }
+            Err(_) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Timeout);
+                Err(UNAVAILABLE)
+            }
         }
     }
 
@@ -1138,10 +1203,17 @@ async fn record(
         let task = tokio::spawn(async move {
             settlement::ingest_for_proxy(&pool, &owned, reason, lock_timeout).await
         });
-        let outcome = match timeout(limit, task).await {
-            Ok(Ok(outcome)) => outcome,
-            // Abandoned past `limit`, or the attempt panicked.
-            _ => Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+        let (outcome, timed_out) = match timeout(limit, task).await {
+            Ok(Ok(outcome)) => (outcome, false),
+            Ok(Err(_)) => (
+                Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+                false,
+            ),
+            // Abandoned past `limit`.
+            Err(_) => (
+                Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+                true,
+            ),
         };
         match outcome {
             Ok(_) => return,
@@ -1153,6 +1225,7 @@ async fn record(
                     tokio::time::sleep(LOCK_RETRY_BACKOFF).await;
                     continue;
                 }
+                telemetry::gateway_failure(GatewayStep::Usage, GatewayCause::Timeout);
                 return telemetry::gateway_usage_failed(&report.request, &StoreError::Database);
             }
             Err(settlement::ProxyStoreError::Store(
@@ -1162,6 +1235,18 @@ async fn record(
                 attempt += 1;
             }
             Err(settlement::ProxyStoreError::Store(error)) => {
+                let cause = match error {
+                    StoreError::Protection => GatewayCause::Protection,
+                    StoreError::Refused | StoreError::Conflict => GatewayCause::Policy,
+                    StoreError::Database | StoreError::Retryable => {
+                        if timed_out {
+                            GatewayCause::Timeout
+                        } else {
+                            GatewayCause::Transport
+                        }
+                    }
+                };
+                telemetry::gateway_failure(GatewayStep::Usage, cause);
                 return telemetry::gateway_usage_failed(&report.request, &error);
             }
         }
@@ -1878,5 +1963,99 @@ mod tests {
         };
         let (copied, ()) = tokio::join!(relay.copy(), leave);
         assert_eq!(copied, Err(UsageGap::CallerDisconnected));
+    }
+
+    /// Real `gateway_proxy::router` entry point and `record` exhaustion must increment
+    /// `openmettle_gateway_failures_total` for production failure paths.
+    #[tokio::test]
+    async fn forward_and_record_increment_gateway_failures_metric() {
+        use crate::telemetry::metrics;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A closed lazy pool fails acquisition immediately as a database transport error
+        // (`sqlx::Error::PoolClosed` -> `StoreError::Database`, `timed_out = false`).
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy_with(
+                "postgres://unused@127.0.0.1:1/unused?sslmode=disable"
+                    .parse()
+                    .unwrap(),
+            );
+        pool.close().await;
+        let settings = parse(&[("UPSTREAM_URL", "http://127.0.0.1:1"), SERVED]).unwrap();
+        let (app, _relays) = router(settings, pool.clone(), Duration::from_secs(2));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // 1. Dispatch consume failure against closed pool -> (Principal, Transport) +1, 503.
+        let before_principal = metrics::global()
+            .gateway_failure_count(GatewayStep::Principal, GatewayCause::Transport);
+        let token = URL_SAFE_NO_PAD.encode(BEARER);
+        let body = r#"{"model":"synthetic-model","messages":[]}"#;
+        let raw_req = format!(
+            "POST {ROUTE} HTTP/1.1\r\nhost: 127.0.0.1\r\nx-request-id: {ID}\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(raw_req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        server.abort();
+        assert!(resp.starts_with("HTTP/1.1 503 "), "{resp}");
+        assert!(
+            metrics::global()
+                .gateway_failure_count(GatewayStep::Principal, GatewayCause::Transport)
+                > before_principal
+        );
+
+        // 2. Usage report write exhaustion against closed pool -> (Usage, Transport) +1.
+        let before_usage_transport =
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Transport);
+        record(
+            &pool,
+            ID.to_owned(),
+            routing(),
+            Err(UsageGap::UpstreamStatus),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Transport)
+                > before_usage_transport
+        );
+
+        // 3. Usage report write timing out against a stalled DB socket -> (Usage, Timeout) +1.
+        let stalled_db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_db.local_addr().unwrap().port();
+        let _accept_forever = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = stalled_db.accept().await {
+                held.push(sock);
+            }
+        });
+        let stalled_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(
+                format!("postgres://unused@127.0.0.1:{stalled_port}/unused?sslmode=disable")
+                    .parse()
+                    .unwrap(),
+            );
+        let before_usage_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Timeout);
+        record(
+            &stalled_pool,
+            ID.to_owned(),
+            routing(),
+            Err(UsageGap::UpstreamStatus),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Timeout)
+                > before_usage_timeout
+        );
     }
 }

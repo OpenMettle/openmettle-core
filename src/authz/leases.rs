@@ -303,7 +303,7 @@ pub enum FailReason {
     ApprovalExpired,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Settled {
     Terminal { state: &'static str },
     Reconciling { unresolved: u32 },
@@ -521,26 +521,38 @@ const SETTLEMENT_INPUTS: &str = concat!(
          FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid"
 );
 
+/// Committed disposition of [`handoff`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// Claim was released for another worker to reclaim without transitioning state.
+    Released,
+    /// Handoff settled the run (either terminally or into `reconciling` with claim released).
+    Settled(Settled),
+}
+
 /// Decide handover under the same lock that excludes new intents and cancellation.
-pub(crate) async fn handoff(
+pub async fn handoff(
     c: &mut PgConnection,
     lease: &Lease<'_>,
     settings: &LeaseSettings,
-) -> Result<(), LeaseError> {
+) -> Result<Handoff, LeaseError> {
     fenced(c, lease, Fence::Hold, async |tx, held| {
         let c = tx.connection()?;
         if held.state == ExecState::Reconciling {
-            return release_locked(c, lease).await;
+            release_locked(c, lease).await?;
+            return Ok(Handoff::Released);
         }
         let (pending, _, time_to_reclaim) = settlement_inputs(c, lease, settings).await?;
         if held.cancel.is_some() || pending > 0 || !time_to_reclaim {
             let settled =
                 settle_locked(c, lease, held.state, held.cancel, settings, Settle::Stopped).await?;
-            if matches!(settled, Settled::Terminal { .. }) {
-                return Ok(());
+            if !matches!(settled, Settled::Terminal { .. }) {
+                release_locked(c, lease).await?;
             }
+            return Ok(Handoff::Settled(settled));
         }
-        release_locked(c, lease).await
+        release_locked(c, lease).await?;
+        Ok(Handoff::Released)
     })
     .await
 }

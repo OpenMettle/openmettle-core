@@ -579,28 +579,12 @@ pub struct Correlation(Arc<Mutex<CorrelationIds>>);
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct CorrelationIds {
     run_id: Option<String>,
-    operation_id: Option<String>,
-    lease_id: Option<String>,
 }
 
 impl Correlation {
     pub fn set_run_id(&self, id: &str) {
         if let Some(id) = valid_uuid(id) {
             self.0.lock().unwrap().run_id = Some(id.to_owned());
-        }
-    }
-
-    pub fn set_operation_id(&self, id: &str) {
-        if let Some(id) = valid_uuid(id) {
-            self.0.lock().unwrap().operation_id = Some(id.to_owned());
-        }
-    }
-
-    /// Accepts either a validated public capacity `grant_id` UUID or a derived `rl-…` lease ID;
-    /// never pass a raw `claim_token` or `fence_token`.
-    pub fn set_lease_id(&self, id: &str) {
-        if let Some(id) = valid_lease_id(id) {
-            self.0.lock().unwrap().lease_id = Some(id.to_owned());
         }
     }
 
@@ -612,19 +596,6 @@ impl Correlation {
 pub(crate) fn record_request_run_id(extensions: &axum::http::Extensions, run_id: &str) {
     if let Some(correlation) = extensions.get::<Correlation>() {
         correlation.set_run_id(run_id);
-    }
-}
-
-pub(crate) fn record_request_operation_id(extensions: &axum::http::Extensions, operation_id: &str) {
-    if let Some(correlation) = extensions.get::<Correlation>() {
-        correlation.set_operation_id(operation_id);
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn record_request_lease_id(extensions: &axum::http::Extensions, lease_id: &str) {
-    if let Some(correlation) = extensions.get::<Correlation>() {
-        correlation.set_lease_id(lease_id);
     }
 }
 
@@ -735,18 +706,19 @@ async fn request(mut request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let elapsed = started.elapsed();
-    let ids = correlation.snapshot();
+    // Centrally suppress resource correlation IDs on any 401 Unauthorized response (including
+    // post-session DB principal/approval recheck rejections) so unauthenticated callers never
+    // populate resource identifiers in spans or structured logs.
+    let ids = if status == axum::http::StatusCode::UNAUTHORIZED.as_u16() {
+        CorrelationIds::default()
+    } else {
+        correlation.snapshot()
+    };
     if let Some(span) = &span {
         // As i64: the bridge has no u64 visitor and would export the code as a string.
         span.record("http.response.status_code", i64::from(status));
         if let Some(run_id) = ids.run_id.as_deref() {
             span.record("run_id", run_id);
-        }
-        if let Some(operation_id) = ids.operation_id.as_deref() {
-            span.record("operation_id", operation_id);
-        }
-        if let Some(lease_id) = ids.lease_id.as_deref() {
-            span.record("lease_id", lease_id);
         }
     }
     metrics::global().record_http(
@@ -762,9 +734,9 @@ async fn request(mut request: Request, next: Next) -> Response {
 /// A root server span, never entered and never parented: an inbound `traceparent` or
 /// `tracestate` is not read, so every request starts a new trace. It ends when dropped,
 /// after the response head is ready. Disabled, and almost free, unless OTLP is configured.
-/// Carries at most 7 exported attributes (`request_id`, `http.route`, `http.request.method`,
-/// `http.response.status_code`, plus optional validated `run_id`, `operation_id`, `lease_id`),
-/// staying within `SpanLimits::max_attributes_per_span = 8`.
+/// Carries at most 5 exported attributes (`request_id`, `http.route`, `http.request.method`,
+/// `http.response.status_code`, plus optional validated `run_id`), staying within
+/// `SpanLimits::max_attributes_per_span = 8`.
 fn request_span(id: Option<RequestId>, route: &Route, method: Method) -> tracing::Span {
     let id: Option<DisplayValue<RequestId>> = id.map(display);
     tracing::info_span!(
@@ -777,8 +749,6 @@ fn request_span(id: Option<RequestId>, route: &Route, method: Method) -> tracing
         http.request.method = method.as_str(),
         http.response.status_code = tracing::field::Empty,
         run_id = tracing::field::Empty,
-        operation_id = tracing::field::Empty,
-        lease_id = tracing::field::Empty,
     )
 }
 
@@ -800,8 +770,6 @@ fn request_completed(
     let method = method.as_str();
     let duration = micros(elapsed);
     let run_id = ids.run_id.as_deref();
-    let operation_id = ids.operation_id.as_deref();
-    let lease_id = ids.lease_id.as_deref();
     macro_rules! emit {
         ($level:expr) => {
             tracing::event!(
@@ -810,8 +778,6 @@ fn request_completed(
                 event = "http.request.completed",
                 request_id = id,
                 run_id = run_id,
-                operation_id = operation_id,
-                lease_id = lease_id,
                 http.route = route,
                 http.request.method = method,
                 http.response.status_code = status,
@@ -954,6 +920,81 @@ pub(crate) fn worker_operation_completed(
         };
     }
     if outcome.is_warning() {
+        emit!(Level::WARN)
+    } else {
+        emit!(Level::DEBUG)
+    }
+}
+
+/// Internal span for one capacity controller grant, reconciliation, reclaim, or resume lifecycle
+/// step (`<= 4` exported attributes). Carries the public capacity `grant_id` UUID as `lease_id`
+/// when present; never accepts controller secrets, `claim_token`, or `fence_token`.
+pub(crate) fn capacity_grant_span(
+    run_id: Option<&str>,
+    grant_id: Option<&str>,
+    operation: metrics::CapacityOperation,
+) -> tracing::Span {
+    let run_id = run_id.and_then(valid_uuid);
+    let lease_id = grant_id.and_then(valid_uuid);
+    tracing::info_span!(
+        target: TARGET,
+        "capacity.grant",
+        otel.kind = "internal",
+        run_id = run_id,
+        lease_id = lease_id,
+        "operation.kind" = operation.as_str(),
+        "operation.outcome" = tracing::field::Empty,
+    )
+}
+
+/// Records the validated public capacity `grant_id` UUID as `lease_id` on the current
+/// `capacity.grant` span once durable grant identity is known.
+pub(crate) fn record_capacity_span_grant_id(grant_id: &str) {
+    if let Some(id) = valid_uuid(grant_id) {
+        tracing::Span::current().record("lease_id", id);
+    }
+}
+
+/// Structured lifecycle log emitted when a capacity controller grant, reconciliation, reclaim,
+/// or resume step completes. Emits public `grant_id` as `lease_id` and never logs secrets or
+/// fencing tokens.
+pub(crate) fn capacity_grant_completed(
+    run_id: Option<&str>,
+    grant_id: Option<&str>,
+    operation: metrics::CapacityOperation,
+    outcome: metrics::CapacityOutcome,
+    elapsed: Duration,
+) {
+    let run_id = run_id.and_then(valid_uuid);
+    let lease_id = grant_id.and_then(valid_uuid);
+    let duration = micros(elapsed);
+    let kind_str = operation.as_str();
+    let outcome_str = outcome.as_str();
+    let is_warn = !matches!(
+        outcome,
+        metrics::CapacityOutcome::Granted
+            | metrics::CapacityOutcome::Released
+            | metrics::CapacityOutcome::NotAllocated
+            | metrics::CapacityOutcome::Resumed
+            | metrics::CapacityOutcome::Insufficient
+            | metrics::CapacityOutcome::Releasing
+    );
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                target: TARGET,
+                $level,
+                event = "capacity.grant.completed",
+                role = Process::Worker.as_str(),
+                run_id = run_id,
+                lease_id = lease_id,
+                "operation.kind" = kind_str,
+                "operation.outcome" = outcome_str,
+                duration_us = duration,
+            )
+        };
+    }
+    if is_warn {
         emit!(Level::WARN)
     } else {
         emit!(Level::DEBUG)

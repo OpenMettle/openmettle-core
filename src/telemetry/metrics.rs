@@ -1166,6 +1166,10 @@ impl Metrics {
     pub fn record_gateway_failure(&self, step: GatewayStep, cause: GatewayCause) {
         self.gateway_failures[step as usize][cause as usize].fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn gateway_failure_count(&self, step: GatewayStep, cause: GatewayCause) -> u64 {
+        self.gateway_failures[step as usize][cause as usize].load(Ordering::Relaxed)
+    }
     pub fn record_gateway_lag(&self, age_seconds: i64) {
         let bucket = match age_seconds {
             ..60 => 0,
@@ -1571,10 +1575,15 @@ impl Metrics {
         push_counter(&mut metrics, &DESCRIPTORS[16], backup_points);
 
         // 17: openmettle.runs.queue.age
+        // Always emit all 4 closed outcome histograms (including count=0 zero baselines) on
+        // `openmettle-api` and `openmettle-worker` from startup so Prometheus records a zero
+        // baseline before any first slow queue exit; otherwise `increase(..._bucket[10m])`
+        // treats a first slow exit (`0` absent -> `1`) as a series appearance with zero increase.
+        // These 4 streams (56 Prometheus series) are already counted in `max_series: 4`.
         let mut queue_age_hpoints = Vec::new();
         for &outcome in RunQueueAgeOutcome::ALL {
             let (count, sum, buckets) = self.run_queue_age[outcome.index()].snapshot();
-            if count > 0 {
+            if count > 0 || matches!(role, Process::Api | Process::Worker) {
                 queue_age_hpoints.push(histogram_point(
                     start,
                     now,
@@ -1756,5 +1765,38 @@ mod tests {
             }
             other => panic!("expected Sum, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_queue_age_emits_zero_baseline_histograms_on_api_and_worker_only() {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+        for role in [Process::Api, Process::Worker] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            let metric = encoded.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .find(|m| m.name == "openmettle.runs.queue.age")
+                .unwrap_or_else(|| panic!("expected zero-baseline queue age on {role:?}"));
+            match metric.data.as_ref().unwrap() {
+                metric::Data::Histogram(hist) => {
+                    assert_eq!(hist.data_points.len(), RunQueueAgeOutcome::ALL.len());
+                    for dp in &hist.data_points {
+                        assert_eq!(dp.count, 0);
+                        assert_eq!(dp.sum, Some(0.0));
+                        assert_eq!(dp.explicit_bounds.as_slice(), &QUEUE_AGE_BUCKETS);
+                        assert_eq!(dp.bucket_counts, vec![0; QUEUE_AGE_BUCKETS.len() + 1]);
+                    }
+                }
+                other => panic!("expected Histogram, got {other:?}"),
+            }
+        }
+        let gateway = store.encode_otlp(Process::Gateway, instance).unwrap();
+        assert!(
+            !gateway.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .any(|m| m.name == "openmettle.runs.queue.age")
+        );
     }
 }

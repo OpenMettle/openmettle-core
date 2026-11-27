@@ -278,10 +278,13 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     let store = Metrics::new();
     let baseline = store
         .encode_otlp(Process::Api, Some(instance_id))
-        .expect("fresh registry emits zero-initialized openmettle.telemetry.dropped baseline");
+        .expect("fresh API registry emits zero-initialized baseline series");
     let baseline_metrics = &baseline.resource_metrics[0].scope_metrics[0].metrics;
-    assert_eq!(baseline_metrics.len(), 1);
-    assert_eq!(baseline_metrics[0].name, "openmettle.telemetry.dropped");
+    let api_baseline_names: Vec<&str> = baseline_metrics.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        api_baseline_names,
+        ["openmettle.telemetry.dropped", "openmettle.runs.queue.age"]
+    );
     match baseline_metrics[0].data.as_ref().unwrap() {
         metric::Data::Sum(sum) => {
             assert_eq!(sum.data_points.len(), DroppedSignal::ALL.len());
@@ -296,10 +299,34 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         }
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
     }
+    match baseline_metrics[1].data.as_ref().unwrap() {
+        metric::Data::Histogram(hist) => {
+            assert_eq!(hist.data_points.len(), RunQueueAgeOutcome::ALL.len());
+            for dp in &hist.data_points {
+                assert_eq!(dp.count, 0);
+                assert_eq!(dp.sum, Some(0.0));
+                assert_eq!(dp.explicit_bounds.as_slice(), &QUEUE_AGE_BUCKETS);
+                assert_eq!(dp.bucket_counts, vec![0; QUEUE_AGE_BUCKETS.len() + 1]);
+            }
+        }
+        other => panic!("expected Histogram for openmettle.runs.queue.age, got {other:?}"),
+    }
 
-    // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs
-    // and all 8 quota drift outcomes, omitting `openmettle.backup.runs` until the worker seeds
-    // durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on restart).
+    // Gateway baseline emits only dropped-telemetry counters (never run queue age).
+    let gateway_baseline = store
+        .encode_otlp(Process::Gateway, Some(instance_id))
+        .expect("fresh gateway registry emits zero-initialized drop baseline");
+    let gateway_names: Vec<&str> = gateway_baseline.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(gateway_names, ["openmettle.telemetry.dropped"]);
+
+    // Worker baseline before durable DB backup-run seeding emits zero-initialized overdue handoffs,
+    // all 8 quota drift outcomes, and all 4 queue-age histograms, omitting `openmettle.backup.runs`
+    // until the worker seeds durable totals from PostgreSQL (preventing spurious `0 -> N` jumps on
+    // restart).
     let worker_unseeded = store
         .encode_otlp(Process::Worker, Some(instance_id))
         .expect("fresh worker registry emits zero-initialized baseline series");
@@ -314,6 +341,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.telemetry.dropped",
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
+            "openmettle.runs.queue.age",
         ]
     );
 
@@ -331,6 +359,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
             "openmettle.backup.runs",
+            "openmettle.runs.queue.age",
         ]
     );
     match worker_metrics[2].data.as_ref().unwrap() {

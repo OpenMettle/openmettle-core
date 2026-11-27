@@ -125,64 +125,66 @@ const CANCEL_ONE_LEGACY: &str = concat!(
                      ELSE NULL END AS queue_age_s"
 );
 
-// Lock all affected runs in the same order across archive, delete and disable.
-macro_rules! cancel_bulk {
+// Lock all affected runs in deterministic ID order across archive, delete and disable BEFORE
+// reading `run_approval_decisions` in a fresh `READ COMMITTED` statement so any concurrent
+// `approvals::decide` that held a run row lock commits and becomes visible to the update snapshot.
+macro_rules! lock_bulk {
     ($column:literal) => {
         concat!(
-            "WITH doomed AS MATERIALIZED (
-               SELECT r.id, r.state AS prior_state, r.wait_reason AS prior_wait_reason,
-                      r.created_at, clock_timestamp() AS t,
-                      d.decision, d.decided_at, p.approval_expires_at, p.resume_execution_expires_at
-                 FROM openmettle.runs r
-                 LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
-                 LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
-                WHERE r.",
+            "SELECT id::text FROM openmettle.runs WHERE ",
             $column,
             " = $1::uuid AND ",
             cancellable!(),
-            " ORDER BY r.id FOR NO KEY UPDATE OF r)
-                UPDATE openmettle.runs r ",
-            cancel_set!("'revoked'"),
-            " FROM doomed WHERE r.id = doomed.id AND ",
-            cancellable!(),
-            " RETURNING r.scope_id::text, r.id::text, r.state,
-                        CASE WHEN doomed.prior_state = 'queued'
-                               THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
-                             WHEN doomed.prior_state = 'waiting'
-                                  AND doomed.prior_wait_reason = 'approval'
-                                  AND doomed.decision = 'approve'
-                                  AND doomed.approval_expires_at > doomed.t
-                                  AND doomed.resume_execution_expires_at > doomed.t
-                               THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.decided_at)), 0)::float8
-                             ELSE NULL END AS queue_age_s"
+            " ORDER BY id FOR NO KEY UPDATE"
         )
     };
 }
-macro_rules! cancel_bulk_legacy {
-    ($column:literal) => {
-        concat!(
-            "WITH doomed AS MATERIALIZED (
-               SELECT id, state AS prior_state, created_at, clock_timestamp() AS t
-                 FROM openmettle.runs WHERE ",
-            $column,
-            " = $1::uuid AND ",
-            cancellable!(),
-            " ORDER BY id FOR NO KEY UPDATE)
-                UPDATE openmettle.runs r ",
-            cancel_set!("'revoked'"),
-            " FROM doomed WHERE r.id = doomed.id AND ",
-            cancellable!(),
-            " RETURNING r.scope_id::text, r.id::text, r.state,
-                        CASE WHEN doomed.prior_state = 'queued'
-                               THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
-                             ELSE NULL END AS queue_age_s"
-        )
-    };
-}
-const CANCEL_SCOPE: &str = cancel_bulk!("scope_id");
-const CANCEL_SCOPE_LEGACY: &str = cancel_bulk_legacy!("scope_id");
-const CANCEL_USER: &str = cancel_bulk!("actor_user_id");
-const CANCEL_USER_LEGACY: &str = cancel_bulk_legacy!("actor_user_id");
+const LOCK_SCOPE_RUNS: &str = lock_bulk!("scope_id");
+const LOCK_USER_RUNS: &str = lock_bulk!("actor_user_id");
+
+const CANCEL_BY_IDS: &str = concat!(
+    "WITH doomed AS MATERIALIZED (
+       SELECT r.id, r.state AS prior_state, r.wait_reason AS prior_wait_reason,
+              r.created_at, clock_timestamp() AS t,
+              d.decision, d.decided_at, p.approval_expires_at, p.resume_execution_expires_at
+         FROM openmettle.runs r
+         LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
+         LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
+        WHERE r.id = ANY($1::text[]::uuid[]) AND ",
+    cancellable!(),
+    " ORDER BY r.id)
+     UPDATE openmettle.runs r ",
+    cancel_set!("'revoked'"),
+    " FROM doomed WHERE r.id = doomed.id AND ",
+    cancellable!(),
+    " RETURNING r.scope_id::text, r.id::text, r.state,
+                CASE WHEN doomed.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
+                     WHEN doomed.prior_state = 'waiting'
+                          AND doomed.prior_wait_reason = 'approval'
+                          AND doomed.decision = 'approve'
+                          AND doomed.approval_expires_at > doomed.t
+                          AND doomed.resume_execution_expires_at > doomed.t
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.decided_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
+);
+
+const CANCEL_BY_IDS_LEGACY: &str = concat!(
+    "WITH doomed AS MATERIALIZED (
+       SELECT id, state AS prior_state, created_at, clock_timestamp() AS t
+         FROM openmettle.runs
+        WHERE id = ANY($1::text[]::uuid[]) AND ",
+    cancellable!(),
+    " ORDER BY id)
+     UPDATE openmettle.runs r ",
+    cancel_set!("'revoked'"),
+    " FROM doomed WHERE r.id = doomed.id AND ",
+    cancellable!(),
+    " RETURNING r.scope_id::text, r.id::text, r.state,
+                CASE WHEN doomed.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
+);
 
 /// The append key of the one terminal event a run may have (ADR 0032).
 pub(super) const TERMINAL_KEY: &str = "run-terminal";
@@ -742,12 +744,7 @@ pub(super) async fn cancel_scope_runs(
     c: &mut PgConnection,
     scope_id: &str,
 ) -> Result<Vec<f64>, StoreError> {
-    let sql = if has_approval_schema(c).await? {
-        CANCEL_SCOPE
-    } else {
-        CANCEL_SCOPE_LEGACY
-    };
-    cancel_revoked(c, sql, scope_id).await
+    cancel_revoked(c, LOCK_SCOPE_RUNS, scope_id).await
 }
 
 /// Record cancellation for live runs the user owns. Disablement calls this after locking
@@ -756,12 +753,7 @@ pub(super) async fn cancel_user_runs(
     c: &mut PgConnection,
     user_id: &str,
 ) -> Result<Vec<f64>, StoreError> {
-    let sql = if has_approval_schema(c).await? {
-        CANCEL_USER
-    } else {
-        CANCEL_USER_LEGACY
-    };
-    cancel_revoked(c, sql, user_id).await
+    cancel_revoked(c, LOCK_USER_RUNS, user_id).await
 }
 
 /// Release held run-level parent quota reservations for a batch of terminal runs in one
@@ -792,11 +784,29 @@ pub(super) async fn release_terminal_runs(
 
 async fn cancel_revoked(
     c: &mut PgConnection,
-    sql: &'static str,
+    lock_sql: &'static str,
     id: &str,
 ) -> Result<Vec<f64>, StoreError> {
-    let mut rows: Vec<(String, String, String, Option<f64>)> =
-        sqlx::query_as(sql).bind(id).fetch_all(&mut *c).await?;
+    // 1. Lock candidate runs in deterministic ID order first.
+    let locked_ids: Vec<String> = sqlx::query_scalar(lock_sql)
+        .bind(id)
+        .fetch_all(&mut *c)
+        .await?;
+    if locked_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 2. In a fresh `READ COMMITTED` statement snapshot after all run row locks are held, read
+    // latest approval decisions (including any concurrent `approvals::decide` that committed
+    // while step 1 waited on a run lock) and apply the cancellation update.
+    let update_sql = if has_approval_schema(c).await? {
+        CANCEL_BY_IDS
+    } else {
+        CANCEL_BY_IDS_LEGACY
+    };
+    let mut rows: Vec<(String, String, String, Option<f64>)> = sqlx::query_as(update_sql)
+        .bind(&locked_ids)
+        .fetch_all(&mut *c)
+        .await?;
     rows.sort_by(|a, b| a.1.cmp(&b.1));
     let mut cancelled = Vec::new();
     let mut queue_ages = Vec::new();
@@ -2081,27 +2091,19 @@ mod tests {
         for sql in [
             CANCEL_ONE,
             CANCEL_ONE_LEGACY,
-            CANCEL_SCOPE,
-            CANCEL_SCOPE_LEGACY,
-            CANCEL_USER,
-            CANCEL_USER_LEGACY,
+            CANCEL_BY_IDS,
+            CANCEL_BY_IDS_LEGACY,
         ] {
             assert!(
                 sql.contains("WHEN state IN ('queued', 'waiting') THEN 'cancelled'")
                     && sql.contains("OR cancel_reason IS NULL"),
                 "{sql}"
             );
-        }
-        for sql in [CANCEL_SCOPE, CANCEL_USER] {
-            assert!(
-                sql.contains("ORDER BY r.id FOR NO KEY UPDATE OF r"),
-                "{sql}"
-            );
             assert!(sql.contains("AS MATERIALIZED"), "{sql}");
         }
-        for sql in [CANCEL_SCOPE_LEGACY, CANCEL_USER_LEGACY] {
+        for sql in [LOCK_SCOPE_RUNS, LOCK_USER_RUNS] {
             assert!(sql.contains("ORDER BY id FOR NO KEY UPDATE"), "{sql}");
-            assert!(sql.contains("AS MATERIALIZED"), "{sql}");
+            assert!(sql.contains("OR cancel_reason IS NULL"), "{sql}");
         }
     }
 
@@ -2585,12 +2587,7 @@ mod tests {
         assert!(EXPIRE.contains(live));
         assert!(EXPIRE.contains("ORDER BY id LIMIT $1 FOR NO KEY UPDATE SKIP LOCKED"));
         assert!(EXPIRE.contains("queue_expires_at IS NULL"));
-        for sql in [
-            CANCEL_SCOPE,
-            CANCEL_SCOPE_LEGACY,
-            CANCEL_USER,
-            CANCEL_USER_LEGACY,
-        ] {
+        for sql in [CANCEL_BY_IDS, CANCEL_BY_IDS_LEGACY] {
             assert!(
                 sql.contains("RETURNING r.scope_id::text, r.id::text, r.state,")
                     && sql.ends_with("AS queue_age_s"),

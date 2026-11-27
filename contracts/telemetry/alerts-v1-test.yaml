@@ -280,6 +280,29 @@ tests:
               summary: "OpenMettle runs waiting over 60s in durable work queue"
               description: "One or more runs waited longer than 60 seconds in the durable work queue before leaving the queue over the last 10 minutes."
 
+  - name: run_queue_high_age_fires_on_single_slow_exit_from_zero_baseline_and_resolves
+    interval: 30s
+    input_series:
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
+        values: '0x40'
+      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
+        values: '0x10 1x30'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: OpenMettleRunQueueHighAge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: claimed
+            exp_annotations:
+              summary: "OpenMettle runs waiting over 60s in durable work queue"
+              description: "One or more runs waited longer than 60 seconds in the durable work queue before leaving the queue over the last 10 minutes."
+      - eval_time: 16m
+        alertname: OpenMettleRunQueueHighAge
+        exp_alerts: []
+
   - name: run_queue_high_age_silent_when_all_runs_under_60s
     interval: 30s
     input_series:

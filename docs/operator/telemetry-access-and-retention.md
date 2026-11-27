@@ -66,8 +66,8 @@ compliance/audit stores:
   process prefix. Ambient `OTEL_*` environment variables have no effect.
 - **Trace sampling when enabled:** Processes ignore inbound `traceparent`/`tracestate`
   headers and sample locally emitted root spans (`http.server.request` excluding
-  `/healthz` and `/readyz`, and `worker.run`) plus their child `worker.operation` spans
-  with parent-consistent always-on sampling (`Sampler::AlwaysOn` in `openmettle-core`;
+  `/healthz` and `/readyz`, `worker.run`, and `capacity.grant`) plus child `worker.operation`
+  spans with parent-consistent always-on sampling (`Sampler::AlwaysOn` in `openmettle-core`;
   collectors may apply tail or head sampling downstream).
 - **Aggregate metrics independent of trace sampling:** All 18 v1 counters and histograms
   in `contracts/telemetry/v1.json` (at most 520 data-point streams / 1,534 Prometheus

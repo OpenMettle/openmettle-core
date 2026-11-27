@@ -14,9 +14,12 @@
 use super::{Controller, DeviceBytes, Error as StoreError, Evidence, GrantRequest, GrantState};
 use crate::{
     runs::{self, WriteTransaction, bounded, is_canonical_uuid},
-    telemetry::metrics::{
-        self, CapacityOperation, CapacityOutcome, CapacityStaleSurface, CapacityWaitOutcome,
-        Metrics,
+    telemetry::{
+        self,
+        metrics::{
+            self, CapacityOperation, CapacityOutcome, CapacityStaleSurface, CapacityWaitOutcome,
+            Metrics,
+        },
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -31,6 +34,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tracing::Instrument;
 
 /// Wire version of the internal controller/adapter protocol.
 pub const ADAPTER_CONTRACT_VERSION: &str = "openmettle.capacity-adapter/1";
@@ -1836,6 +1840,50 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         request: &GrantRequest<'_>,
         wait: &CapacityWait,
     ) -> Result<DispatchOutcome, CoordinatorError> {
+        let started = Instant::now();
+        let span =
+            telemetry::capacity_grant_span(Some(request.run_id), None, CapacityOperation::Grant);
+        async {
+            let mut observed_grant_id: Option<String> = None;
+            let result = self
+                .dispatch_grant_inner(request, wait, &mut observed_grant_id)
+                .await;
+            let outcome = match &result {
+                Ok(DispatchOutcome::Dispatched { .. }) => CapacityOutcome::Granted,
+                Ok(DispatchOutcome::Existing { state, .. }) => match state {
+                    GrantState::Granted => CapacityOutcome::Granted,
+                    GrantState::Releasing => CapacityOutcome::Releasing,
+                    GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
+                    GrantState::Released => CapacityOutcome::Released,
+                },
+                Ok(DispatchOutcome::Insufficient) => CapacityOutcome::Insufficient,
+                Ok(DispatchOutcome::Unavailable) => CapacityOutcome::Unavailable,
+                Err(CoordinatorError::Store(err)) => super::store_error_outcome(err),
+                Err(CoordinatorError::Adapter(
+                    AdapterError::StaleEpoch { .. } | AdapterError::Unfenced,
+                )) => CapacityOutcome::Fenced,
+                Err(CoordinatorError::Adapter(_)) => CapacityOutcome::UnknownAllocation,
+            };
+            tracing::Span::current().record("operation.outcome", outcome.as_str());
+            telemetry::capacity_grant_completed(
+                Some(request.run_id),
+                observed_grant_id.as_deref(),
+                CapacityOperation::Grant,
+                outcome,
+                started.elapsed(),
+            );
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn dispatch_grant_inner(
+        &self,
+        request: &GrantRequest<'_>,
+        wait: &CapacityWait,
+        observed_grant_id: &mut Option<String>,
+    ) -> Result<DispatchOutcome, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
         if !self.reconciled_clean.load(Ordering::Acquire) {
             self.metrics()
@@ -1859,6 +1907,8 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
 
         match prepared {
             PreparedDispatch::AlreadySettled { grant_id, state } => {
+                telemetry::record_capacity_span_grant_id(&grant_id);
+                *observed_grant_id = Some(grant_id.clone());
                 Ok(DispatchOutcome::Existing { grant_id, state })
             }
             PreparedDispatch::Insufficient => {
@@ -1879,6 +1929,8 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 grant_id,
                 is_replay,
             } => {
+                telemetry::record_capacity_span_grant_id(&grant_id);
+                *observed_grant_id = Some(grant_id.clone());
                 let command = DispatchGrantCommand {
                     version: ADAPTER_CONTRACT_VERSION.to_owned(),
                     group_id: self.controller.group_id().to_owned(),
@@ -1979,59 +2031,107 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         request_key: &str,
         targets: &[DeviceBytes],
     ) -> Result<ReclaimKvResponse, CoordinatorError> {
-        let _guard = self.op_lock.lock().await;
-        let command = ReclaimKvCommand {
-            version: ADAPTER_CONTRACT_VERSION.to_owned(),
-            group_id: self.controller.group_id().to_owned(),
-            controller_epoch: self.controller.epoch(),
-            request_key: request_key.to_owned(),
-            targets: targets.to_vec(),
-        };
-        let target_map = command.validate()?;
-        if let Err(err) = check_controller_tx(&self.pool, &self.controller).await {
-            self.metrics().record_capacity_grant(
-                CapacityOperation::Reclaim,
-                super::store_error_outcome(&err),
-            );
-            return Err(CoordinatorError::Store(err));
-        }
-        let result = self.adapter.reclaim_kv(command).await;
-        let outcome = match &result {
-            Ok(resp) => {
-                let valid = resp.version == ADAPTER_CONTRACT_VERSION
-                    && resp.group_id == self.controller.group_id()
-                    && resp.controller_epoch == self.controller.epoch()
-                    && resp.request_key == request_key
-                    && resp.reclaimed.len() == target_map.len()
-                    && {
-                        let mut seen = BTreeSet::new();
-                        resp.reclaimed.iter().all(|item| {
-                            target_map.get(&item.device_id).is_some_and(|&target| {
-                                seen.insert(item.device_id.as_str())
-                                    && item.reclaimed_bytes >= 0
-                                    && item.reclaimed_bytes <= target
-                            })
-                        }) && seen.len() == target_map.len()
-                    };
-                if !valid {
-                    self.metrics()
-                        .record_capacity_grant(CapacityOperation::Reclaim, CapacityOutcome::Error);
-                    return Err(CoordinatorError::Adapter(AdapterError::Invalid));
+        let started = Instant::now();
+        let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Reclaim);
+        async {
+            let _guard = self.op_lock.lock().await;
+            let command = ReclaimKvCommand {
+                version: ADAPTER_CONTRACT_VERSION.to_owned(),
+                group_id: self.controller.group_id().to_owned(),
+                controller_epoch: self.controller.epoch(),
+                request_key: request_key.to_owned(),
+                targets: targets.to_vec(),
+            };
+            let target_map = match command.validate() {
+                Ok(map) => map,
+                Err(err) => {
+                    let outcome = CapacityOutcome::Refused;
+                    tracing::Span::current().record("operation.outcome", outcome.as_str());
+                    telemetry::capacity_grant_completed(
+                        None,
+                        None,
+                        CapacityOperation::Reclaim,
+                        outcome,
+                        started.elapsed(),
+                    );
+                    return Err(CoordinatorError::Adapter(err));
                 }
-                CapacityOutcome::Released
+            };
+            if let Err(err) = check_controller_tx(&self.pool, &self.controller).await {
+                let outcome = super::store_error_outcome(&err);
+                self.metrics()
+                    .record_capacity_grant(CapacityOperation::Reclaim, outcome);
+                tracing::Span::current().record("operation.outcome", outcome.as_str());
+                telemetry::capacity_grant_completed(
+                    None,
+                    None,
+                    CapacityOperation::Reclaim,
+                    outcome,
+                    started.elapsed(),
+                );
+                return Err(CoordinatorError::Store(err));
             }
-            Err(AdapterError::StaleEpoch { .. } | AdapterError::Unfenced) => {
-                CapacityOutcome::Fenced
-            }
-            Err(AdapterError::InsufficientCapacity) => CapacityOutcome::Insufficient,
-            Err(AdapterError::Unavailable) => CapacityOutcome::Unavailable,
-            Err(
-                AdapterError::UnsupportedVersion | AdapterError::Invalid | AdapterError::Conflict,
-            ) => CapacityOutcome::Refused,
-        };
-        self.metrics()
-            .record_capacity_grant(CapacityOperation::Reclaim, outcome);
-        result.map_err(CoordinatorError::Adapter)
+            let result = self.adapter.reclaim_kv(command).await;
+            let outcome = match &result {
+                Ok(resp) => {
+                    let valid = resp.version == ADAPTER_CONTRACT_VERSION
+                        && resp.group_id == self.controller.group_id()
+                        && resp.controller_epoch == self.controller.epoch()
+                        && resp.request_key == request_key
+                        && resp.reclaimed.len() == target_map.len()
+                        && {
+                            let mut seen = BTreeSet::new();
+                            resp.reclaimed.iter().all(|item| {
+                                target_map.get(&item.device_id).is_some_and(|&target| {
+                                    seen.insert(item.device_id.as_str())
+                                        && item.reclaimed_bytes >= 0
+                                        && item.reclaimed_bytes <= target
+                                })
+                            }) && seen.len() == target_map.len()
+                        };
+                    if !valid {
+                        self.metrics().record_capacity_grant(
+                            CapacityOperation::Reclaim,
+                            CapacityOutcome::Error,
+                        );
+                        tracing::Span::current()
+                            .record("operation.outcome", CapacityOutcome::Error.as_str());
+                        telemetry::capacity_grant_completed(
+                            None,
+                            None,
+                            CapacityOperation::Reclaim,
+                            CapacityOutcome::Error,
+                            started.elapsed(),
+                        );
+                        return Err(CoordinatorError::Adapter(AdapterError::Invalid));
+                    }
+                    CapacityOutcome::Released
+                }
+                Err(AdapterError::StaleEpoch { .. } | AdapterError::Unfenced) => {
+                    CapacityOutcome::Fenced
+                }
+                Err(AdapterError::InsufficientCapacity) => CapacityOutcome::Insufficient,
+                Err(AdapterError::Unavailable) => CapacityOutcome::Unavailable,
+                Err(
+                    AdapterError::UnsupportedVersion
+                    | AdapterError::Invalid
+                    | AdapterError::Conflict,
+                ) => CapacityOutcome::Refused,
+            };
+            self.metrics()
+                .record_capacity_grant(CapacityOperation::Reclaim, outcome);
+            tracing::Span::current().record("operation.outcome", outcome.as_str());
+            telemetry::capacity_grant_completed(
+                None,
+                None,
+                CapacityOperation::Reclaim,
+                outcome,
+                started.elapsed(),
+            );
+            result.map_err(CoordinatorError::Adapter)
+        }
+        .instrument(span)
+        .await
     }
 
     /// Inspect fenced backend inventory under a committed controller lease, durably close the
@@ -2041,6 +2141,44 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
     /// device slot only once every durable and extra device has confirmed `Released` or
     /// `NotAllocated`.
     pub async fn release_grant(
+        &self,
+        grant_id: &str,
+        devices: &[String],
+    ) -> Result<GrantState, CoordinatorError> {
+        let started = Instant::now();
+        let span =
+            telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+        async {
+            let result = self.release_grant_inner(grant_id, devices).await;
+            let outcome = match &result {
+                Ok(GrantState::Granted) => CapacityOutcome::Granted,
+                Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
+                Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
+                Ok(GrantState::Released) => CapacityOutcome::Released,
+                Err(CoordinatorError::Store(err)) => super::store_error_outcome(err),
+                Err(CoordinatorError::Adapter(
+                    AdapterError::StaleEpoch { .. } | AdapterError::Unfenced,
+                )) => CapacityOutcome::Fenced,
+                Err(CoordinatorError::Adapter(AdapterError::Unavailable)) => {
+                    CapacityOutcome::Unavailable
+                }
+                Err(CoordinatorError::Adapter(_)) => CapacityOutcome::Refused,
+            };
+            tracing::Span::current().record("operation.outcome", outcome.as_str());
+            telemetry::capacity_grant_completed(
+                None,
+                Some(grant_id),
+                CapacityOperation::Reconcile,
+                outcome,
+                started.elapsed(),
+            );
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn release_grant_inner(
         &self,
         grant_id: &str,
         devices: &[String],

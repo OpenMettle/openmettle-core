@@ -31,11 +31,13 @@ It records:
   [`docs/operator/telemetry-access-and-retention.md`](../operator/telemetry-access-and-retention.md)),
   disallowed metric label substrings, and fields excluded from all telemetry.
 - The exact stderr log field allowlist (`telemetry::FIELDS`, 26 fields) and event catalog
-  (including bounded correlation of validated `request_id`, `run_id`, `operation_id`, and
-  non-reversible derived `rl-…` `lease_id` across HTTP and worker execution).
+  (including bounded correlation of validated `request_id`, `run_id`, `operation_id`,
+  non-reversible derived `rl-…` worker `lease_id`, and public `grant_id` UUID `lease_id` on
+  `capacity.grant.completed`, with `401 Unauthorized` HTTP responses centrally suppressing
+  resource correlation IDs).
 - The exact trace span field allowlist (`telemetry::SPAN_FIELDS`, 11 fields) and span limits
-  across `http.server.request`, `worker.run`, and child `worker.operation` spans (`<= 8`
-  exported attributes per span, `dropped_attributes_count == 0`).
+  across `http.server.request`, `worker.run`, child `worker.operation`, and `capacity.grant`
+  spans (`<= 8` exported attributes per span, `dropped_attributes_count == 0`).
 - Every v1 metric: OTel name, Prometheus normalized name, instrument kind (`counter` or
   `histogram`), unit, explicit histogram bucket bounds (`DURATION_BUCKETS` for short-latency
   histograms; `QUEUE_AGE_BUCKETS` up to `300.0` s for `openmettle.runs.queue.age`), closed
@@ -50,10 +52,11 @@ It records:
   `openmettle.runs.queue.age` (`openmettle_runs_queue_age_seconds`, `QUEUE_AGE_BUCKETS`,
   `outcome ∈ {claimed, resumed, cancelled, expired}`) into the implemented v1 catalog. It
   is recorded **strictly after transaction commit** (`claimed` from `runs.created_at`,
-  `resumed` from `run_approval_decisions.decided_at`, `expired` from `runs.created_at`, and
-  `cancelled` only when a run leaves the queue while `queued` or while `waiting` with an
-  eligible decided `'approve'` decision—never when cancelling an executing run or an
-  undecided human-approval wait). Earlier reserved signals `openmettle.capacity.grants`
+  `resumed` from `run_approval_decisions.decided_at`, `expired` from `runs.created_at` on
+  `expire_queued` and from `run_approval_decisions.decided_at` on `expire_waits` for approved
+  resumable waits, and `cancelled` only when a run leaves the queue while `queued` or while
+  `waiting` with an eligible decided `'approve'` decision—never when cancelling an executing
+  run or an undecided human-approval wait). Earlier reserved signals `openmettle.capacity.grants`
   (V1-18 PR3), `openmettle.storage.quota.drift` (V1-17), and `openmettle.backup.runs`
   (V1-30 / [ADR 0046](0046-maintenance-window-coordinated-backup-capture.md)) are likewise
   implemented.
@@ -103,12 +106,14 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   or user identities.
 - When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
   cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
-  (`DroppedSignal::ALL`) series from process startup (and, on `openmettle-worker`, the
-  zero-initialized `openmettle.quota.overdue.handoffs` series, all eight
-  `openmettle.storage.quota.drift` `QuotaDriftOutcome::ALL` series, and all four
-  `openmettle.backup.runs` `BackupRunOutcome::ALL` series) so Prometheus records a
-  zero baseline before any first collector outage, hourly drift, or backup failure/overdue
-  event, encodes
+  (`DroppedSignal::ALL`) series from process startup, all four zero-initialized
+  `openmettle.runs.queue.age` (`RunQueueAgeOutcome::ALL`) histogram points on
+  `openmettle-api` and `openmettle-worker` (omitted on `openmettle-gateway` when unrecorded),
+  and, on `openmettle-worker`, the zero-initialized `openmettle.quota.overdue.handoffs`
+  series, all eight `openmettle.storage.quota.drift` `QuotaDriftOutcome::ALL` series, and
+  all four `openmettle.backup.runs` `BackupRunOutcome::ALL` series, so Prometheus records a
+  zero baseline before any first collector outage, slow queue exit, hourly drift, or backup
+  failure/overdue event, encodes
   `ExportMetricsServiceRequest` via `opentelemetry-proto` (`metrics` feature enabled with zero
   new crates in `Cargo.lock`), and POSTs with `Content-Type: application/x-protobuf` over the
   ADR 0010 `Route`.

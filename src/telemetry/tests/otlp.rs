@@ -1217,19 +1217,12 @@ async fn traces_and_metrics_export_concurrently_and_stop_cleanly() {
 }
 
 #[tokio::test]
-async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_unvalidated_input() {
-    use crate::telemetry::{
-        derive_run_lease_id, record_request_lease_id, record_request_operation_id,
-        record_request_run_id,
-    };
-    use axum::http::Extensions;
+async fn http_correlation_propagates_validated_ids_and_suppresses_on_401() {
+    use crate::telemetry::record_request_run_id;
+    use axum::http::{Extensions, StatusCode};
 
     const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
-    const OP_ID: &str = "22222222-2222-4222-8222-222222222222";
-    const RAW_CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333333";
-
-    let lease_id = derive_run_lease_id(RUN_ID, RAW_CLAIM_TOKEN);
-    let valid_lease = lease_id.clone();
+    const UNAUTH_RUN_ID: &str = "22222222-2222-4222-8222-222222222222";
 
     let collector = Collector::accepting().await;
     let (tracer, exporter) = start_traces(collector.destination(), Process::Api);
@@ -1239,23 +1232,26 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
         Router::new()
             .route(
                 "/v1/runs/{run_id}",
-                get(move |ext: Extensions| {
-                    let valid_lease = valid_lease.clone();
-                    async move {
-                        record_request_run_id(&ext, RUN_ID);
-                        record_request_operation_id(&ext, OP_ID);
-                        record_request_lease_id(&ext, &valid_lease);
-                        "ok\n"
-                    }
+                get(move |ext: Extensions| async move {
+                    record_request_run_id(&ext, RUN_ID);
+                    "ok\n"
+                }),
+            )
+            .route(
+                "/v1/recheck-401/{run_id}",
+                get(move |ext: Extensions| async move {
+                    // Simulates recording run_id after initial session validation, followed by
+                    // a post-auth DB principal/approval recheck returning 401 Unauthorized.
+                    record_request_run_id(&ext, UNAUTH_RUN_ID);
+                    StatusCode::UNAUTHORIZED
                 }),
             )
             .route(
                 "/v1/bad",
                 get(|ext: Extensions| async move {
-                    // Unvalidated canary strings and non-canonical IDs must be silently ignored.
+                    // Unvalidated canary strings must be silently ignored.
                     record_request_run_id(&ext, CANARY);
-                    record_request_operation_id(&ext, "not-a-uuid-canary");
-                    record_request_lease_id(&ext, "rl-not-hex-canary");
+                    record_request_run_id(&ext, "not-a-uuid-canary");
                     "ok\n"
                 }),
             ),
@@ -1273,6 +1269,14 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
         200
     );
     assert_eq!(
+        exchange(
+            address,
+            get_request(&format!("/v1/recheck-401/{UNAUTH_RUN_ID}")).as_bytes()
+        )
+        .await,
+        401
+    );
+    assert_eq!(
         exchange(address, get_request("/v1/bad").as_bytes()).await,
         200
     );
@@ -1280,7 +1284,7 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
     finish(exporter).await;
 
     let spans = collector.spans();
-    assert_eq!(spans.len(), 2, "{spans:#?}");
+    assert_eq!(spans.len(), 3, "{spans:#?}");
 
     let run_span = spans
         .iter()
@@ -1298,8 +1302,6 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
             "http.request.method",
             "http.response.status_code",
             "http.route",
-            "lease_id",
-            "operation_id",
             "request_id",
             "run_id",
         ]
@@ -1307,8 +1309,26 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
     );
     let run_req_id = text(run_attrs["request_id"]).unwrap();
     assert_eq!(text(run_attrs["run_id"]), Some(RUN_ID));
-    assert_eq!(text(run_attrs["operation_id"]), Some(OP_ID));
-    assert_eq!(text(run_attrs["lease_id"]), Some(lease_id.as_str()));
+
+    // Post-auth 401 must centrally suppress `run_id` on both span and completion log.
+    let unauth_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/recheck-401/{run_id}"))
+        .expect("401 recheck span");
+    assert_eq!(unauth_span.dropped_attributes_count, 0);
+    let unauth_attrs = attributes(&unauth_span.attributes);
+    assert_eq!(
+        unauth_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "request_id",
+        ]
+        .into()
+    );
+    let unauth_req_id = text(unauth_attrs["request_id"]).unwrap();
+    assert_eq!(int(unauth_attrs["http.response.status_code"]), Some(401));
 
     let bad_span = spans
         .iter()
@@ -1316,9 +1336,8 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
         .expect("/v1/bad span");
     assert_eq!(bad_span.dropped_attributes_count, 0);
     let bad_attrs = attributes(&bad_span.attributes);
-    let bad_keys: BTreeSet<&str> = bad_attrs.keys().copied().collect();
     assert_eq!(
-        bad_keys,
+        bad_attrs.keys().copied().collect::<BTreeSet<_>>(),
         [
             "http.request.method",
             "http.response.status_code",
@@ -1329,36 +1348,112 @@ async fn http_correlation_propagates_validated_ids_to_span_and_log_and_rejects_u
     );
 
     let completed = capture.events("http.request.completed");
-    assert_eq!(completed.len(), 2, "{}", capture.text());
+    assert_eq!(completed.len(), 3, "{}", capture.text());
     let run_log = completed
         .iter()
         .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/runs/{run_id}"))
         .expect("correlated completion log");
     assert_eq!(run_log["request_id"].as_str(), Some(run_req_id));
     assert_eq!(run_log["run_id"].as_str(), Some(RUN_ID));
-    assert_eq!(run_log["operation_id"].as_str(), Some(OP_ID));
-    assert_eq!(run_log["lease_id"].as_str(), Some(lease_id.as_str()));
+
+    let unauth_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/recheck-401/{run_id}"))
+        .expect("401 recheck completion log");
+    assert_eq!(unauth_log["request_id"].as_str(), Some(unauth_req_id));
+    assert!(unauth_log.get("run_id").is_none());
 
     let bad_log = completed
         .iter()
         .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/bad"))
         .expect("/v1/bad completion log");
     assert!(bad_log.get("run_id").is_none());
-    assert!(bad_log.get("operation_id").is_none());
-    assert!(bad_log.get("lease_id").is_none());
 
     collector.assert_absent(&[
         CANARY.as_bytes(),
         b"not-a-uuid-canary",
-        b"rl-not-hex-canary",
-        RAW_CLAIM_TOKEN.as_bytes(),
+        UNAUTH_RUN_ID.as_bytes(),
     ]);
     capture.assert_absent(&[
         CANARY.as_bytes(),
         b"not-a-uuid-canary",
-        b"rl-not-hex-canary",
-        RAW_CLAIM_TOKEN.as_bytes(),
+        UNAUTH_RUN_ID.as_bytes(),
     ]);
+}
+
+#[tokio::test]
+async fn capacity_grant_lifecycle_emits_public_grant_id_as_lease_id_without_fence_secrets() {
+    use crate::telemetry::{
+        capacity_grant_completed, capacity_grant_span,
+        metrics::{CapacityOperation, CapacityOutcome},
+        record_capacity_span_grant_id,
+    };
+    use tracing::Instrument;
+
+    const RUN_ID: &str = "77777777-7777-4777-8777-777777777777";
+    const GRANT_ID: &str = "88888888-8888-4888-8888-888888888888";
+    const FENCE_SECRET_CANARY: &str = "CANARY-controller-fence-secret-9999";
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    // 1. Grant lifecycle: `grant_id` discovered mid-span and recorded as `lease_id`.
+    let grant_span = capacity_grant_span(Some(RUN_ID), None, CapacityOperation::Grant);
+    async {
+        record_capacity_span_grant_id(FENCE_SECRET_CANARY); // rejected (not a UUID)
+        record_capacity_span_grant_id(GRANT_ID);
+        tracing::Span::current().record("operation.outcome", CapacityOutcome::Granted.as_str());
+        capacity_grant_completed(
+            Some(RUN_ID),
+            Some(GRANT_ID),
+            CapacityOperation::Grant,
+            CapacityOutcome::Granted,
+            Duration::from_millis(8),
+        );
+    }
+    .instrument(grant_span)
+    .await;
+
+    // 2. Reconcile / release lifecycle with known `grant_id`.
+    let rel_span = capacity_grant_span(None, Some(GRANT_ID), CapacityOperation::Reconcile);
+    async {
+        tracing::Span::current().record("operation.outcome", CapacityOutcome::Released.as_str());
+        capacity_grant_completed(
+            None,
+            Some(GRANT_ID),
+            CapacityOperation::Reconcile,
+            CapacityOutcome::Released,
+            Duration::from_millis(4),
+        );
+    }
+    .instrument(rel_span)
+    .await;
+
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    for span in &spans {
+        assert_eq!(span.name, "capacity.grant");
+        assert_eq!(span.kind, SpanKind::Internal as i32);
+        assert_eq!(span.dropped_attributes_count, 0);
+        let attrs = attributes(&span.attributes);
+        assert_eq!(text(attrs["lease_id"]), Some(GRANT_ID));
+    }
+
+    let events = capture.events("capacity.grant.completed");
+    assert_eq!(events.len(), 2, "{}", capture.text());
+    assert_eq!(events[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(events[0]["lease_id"].as_str(), Some(GRANT_ID));
+    assert_eq!(events[0]["operation.kind"].as_str(), Some("grant"));
+    assert_eq!(events[0]["operation.outcome"].as_str(), Some("granted"));
+    assert_eq!(events[1]["lease_id"].as_str(), Some(GRANT_ID));
+    assert_eq!(events[1]["operation.kind"].as_str(), Some("reconcile"));
+    assert_eq!(events[1]["operation.outcome"].as_str(), Some("released"));
+
+    collector.assert_absent(&[FENCE_SECRET_CANARY.as_bytes()]);
+    capture.assert_absent(&[FENCE_SECRET_CANARY.as_bytes()]);
 }
 
 #[tokio::test]
