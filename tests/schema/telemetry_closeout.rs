@@ -1835,7 +1835,7 @@ async fn takeover_and_reconcile_emits_correlated_capacity_grant_spans_and_events
     // Expire Epoch 1 controller lease so Epoch 2 takes over.
     sqlx::query(
         "UPDATE openmettle.capacity_groups
-            SET controller_lease_until = clock_timestamp() - interval '1 second'
+            SET lease_expires_at = clock_timestamp() - interval '1 second'
           WHERE id = $1::uuid",
     )
     .bind(GROUP)
@@ -1934,7 +1934,7 @@ async fn takeover_and_reconcile_emits_correlated_capacity_grant_spans_and_events
     // Deferred commit failure during Epoch 3 reattestation must emit `error`, NEVER `granted`.
     sqlx::query(
         "UPDATE openmettle.capacity_groups
-            SET controller_lease_until = clock_timestamp() - interval '1 second'
+            SET lease_expires_at = clock_timestamp() - interval '1 second'
           WHERE id = $1::uuid",
     )
     .bind(GROUP)
@@ -2136,8 +2136,23 @@ async fn worker_tool_operation_known_fault_and_replay_emit_failed_outcome_preser
     let expected_lease_id = derive_run_lease_id(&claim.run_id, &claim.claim_token);
     let adapter = ScopedAdapter::new(worker_pool, store, LEASES);
 
+    // Seed an existing readable artifact owned by Alice in her scope so `record_fenced_intent`
+    // authorizes the read intent and dispatches into `EffectDispatch::send` -> `range::read`,
+    // where the missing `revision_id` produces a known `ToolFault::Semantic` observation.
+    const ARTIFACT_ID: &str = "00000000-0000-4000-8000-00000000f001";
+    sqlx::query(
+        "INSERT INTO openmettle.artifacts (id, scope_id, scope_kind, owner_user_id)
+         VALUES ($1::uuid, $2::uuid, 'personal', $3::uuid)",
+    )
+    .bind(ARTIFACT_ID)
+    .bind(&alice_scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
     let missing_args = json!({
-        "artifact_id": "00000000-0000-4000-8000-00000000f001",
+        "artifact_id": ARTIFACT_ID,
         "revision_id": "00000000-0000-4000-8000-00000000f002",
         "offset": 0,
         "max_bytes": 1024,
