@@ -7,6 +7,8 @@
 //!
 //! Zero external crates, zero `unsafe`. Never shipped in production images.
 
+#![cfg_attr(test, allow(dead_code))]
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -345,7 +347,8 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let mut size_line = String::new();
-        if read_line_bounded(reader, &mut size_line, 1024)? == 0 {
+        let n = read_line_bounded(reader, &mut size_line, 1024)?;
+        if n == 0 || !size_line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "eof in chunk size",
@@ -368,7 +371,8 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
             // Drain trailer lines until empty CRLF line.
             loop {
                 let mut trailer = String::new();
-                if read_line_bounded(reader, &mut trailer, 4096)? == 0 {
+                let n = read_line_bounded(reader, &mut trailer, 4096)?;
+                if n == 0 || !trailer.ends_with('\n') {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "eof in chunk trailers",
@@ -458,4 +462,45 @@ fn write_simple(stream: &mut TcpStream, status: &str, content_type: &str, body: 
     );
     stream.write_all(resp.as_bytes())?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_chunked_body;
+    use std::io::{self, Cursor};
+
+    #[test]
+    fn read_chunked_body_distinguishes_eof_from_missing_crlf() {
+        for truncated in [
+            b"0\r\n".as_slice(),
+            b"0\r\nX-Check: partial".as_slice(),
+            b"4".as_slice(),
+        ] {
+            let mut cursor = Cursor::new(truncated);
+            let err = read_chunked_body(&mut cursor)
+                .expect_err("truncated chunked body must fail with UnexpectedEof");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "expected UnexpectedEof for {truncated:?}, got {err:?}"
+            );
+        }
+
+        for lf_only in [
+            b"0\r\nX-Check: lf\n\r\n".as_slice(),
+            b"4\n".as_slice(),
+        ] {
+            let mut cursor = Cursor::new(lf_only);
+            let err = read_chunked_body(&mut cursor)
+                .expect_err("LF-only chunked framing must fail with InvalidData");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "expected InvalidData for {lf_only:?}, got {err:?}"
+            );
+        }
+
+        let mut valid = Cursor::new(b"5\r\nhello\r\n0\r\nX-Check: ok\r\n\r\n".as_slice());
+        assert_eq!(read_chunked_body(&mut valid).unwrap(), b"hello");
+    }
 }

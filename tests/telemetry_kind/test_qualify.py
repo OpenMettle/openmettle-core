@@ -626,6 +626,22 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         proc = None
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                test_binary = Path(tmp) / "otlp-delay-relay-tests"
+                subprocess.run(
+                    [
+                        "rustc", "--edition", "2024", "--test", "-D", "warnings",
+                        str(relay_src), "-o", str(test_binary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    [str(test_binary)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
                 binary = Path(tmp) / "otlp-delay-relay"
                 subprocess.run(
                     [
@@ -739,6 +755,18 @@ class SeriesValidationAndParserTests(unittest.TestCase):
                         b"Host: relay\r\n"
                         b"Transfer-Encoding: chunked\r\n\r\n"
                         b"5\nhello\r\n0\r\n\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"0\r\nX-Check: partial"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"0\r\nX-Check: lf\n\r\n"
                     ),
                 ):
                     with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as raw_sock:

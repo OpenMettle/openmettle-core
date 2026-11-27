@@ -37,7 +37,6 @@ use std::{
     fmt,
     time::{Duration, Instant},
 };
-use tracing::Instrument;
 
 pub mod adapter;
 
@@ -372,6 +371,59 @@ pub(super) async fn resume_query(
         .map_err(Error::from)
 }
 
+/// Detects whether `c` is currently inside a caller-owned SQL transaction (such as a literal
+/// `BEGIN` block that bypassed SQLx's `Transaction` API, where `c.is_in_transaction()` stays
+/// `false`).
+///
+/// - When the write `succeeded`, every `Ok` path in `openmettle.capacity_resume`,
+///   `openmettle.capacity_grant`, and `openmettle.capacity_reconcile` runs `capacity_fence` ->
+///   `capacity_lock_group` (`FOR NO KEY UPDATE`), assigning a PostgreSQL transaction ID (`xid`).
+///   In autocommit mode that statement has already committed, so `pg_current_xact_id_if_assigned()`
+///   is `NULL` in the follow-up query; inside an uncommitted `BEGIN` block it remains non-`NULL`.
+/// - When the write failed (`!succeeded`), it may have failed before touching PostgreSQL (such as
+///   `Error::Invalid`) or aborted an outer `BEGIN` block (`25P02`). A brief pause ensures
+///   `statement_timestamp() > transaction_timestamp()` inside an open transaction; any probe error
+///   (including `25P02`) likewise indicates a caller-owned transaction.
+async fn caller_owns_transaction(c: &mut PgConnection, succeeded: bool) -> Result<bool, Error> {
+    if succeeded {
+        let in_tx: bool = sqlx::query_scalar("SELECT pg_current_xact_id_if_assigned() IS NOT NULL")
+            .fetch_one(&mut *c)
+            .await?;
+        Ok(in_tx)
+    } else {
+        tokio::time::sleep(Duration::from_micros(2)).await;
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT pg_current_xact_id_if_assigned() IS NOT NULL \
+                 OR transaction_timestamp() < statement_timestamp()",
+        )
+        .fetch_one(&mut *c)
+        .await
+        {
+            Ok(in_tx) => Ok(in_tx),
+            Err(_) => Ok(true),
+        }
+    }
+}
+
+fn emit_capacity_telemetry(
+    m: &metrics::Metrics,
+    run_id: Option<&str>,
+    grant_id: Option<&str>,
+    operation: CapacityOperation,
+    outcome: CapacityOutcome,
+    elapsed: Duration,
+) {
+    let span = telemetry::capacity_grant_span(run_id, None, operation);
+    if let Some(id) = grant_id {
+        telemetry::record_capacity_span_grant_id_on(&span, id);
+    }
+    span.record("operation.outcome", outcome.as_str());
+    span.in_scope(|| {
+        telemetry::capacity_grant_completed(run_id, grant_id, operation, outcome, elapsed);
+    });
+    m.record_capacity_grant(operation, outcome);
+}
+
 async fn resume_with_metrics(
     c: &mut PgConnection,
     controller: &Controller,
@@ -380,29 +432,35 @@ async fn resume_with_metrics(
     if c.is_in_transaction() {
         return resume_query(c, controller).await;
     }
-    let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Resume);
-    let guard_span = span.clone();
-    async {
-        let guard = CapacityGrantGuard::new(guard_span, None, None, CapacityOperation::Resume, m);
-        let result = resume_query(c, controller).await;
-        let outcome = match &result {
-            Ok(true) => CapacityOutcome::Resumed,
-            Ok(false) => CapacityOutcome::Unavailable,
-            Err(err) => error_outcome(err),
-        };
-        guard.finish(outcome);
-        result
+    let started = Instant::now();
+    let result = resume_query(&mut *c, controller).await;
+    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+        return result;
     }
-    .instrument(span)
-    .await
+    let outcome = match &result {
+        Ok(true) => CapacityOutcome::Resumed,
+        Ok(false) => CapacityOutcome::Unavailable,
+        Err(err) => error_outcome(err),
+    };
+    emit_capacity_telemetry(
+        m,
+        None,
+        None,
+        CapacityOperation::Resume,
+        outcome,
+        started.elapsed(),
+    );
+    result
 }
 
 /// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
 /// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
 /// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
 ///
-/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`); callers
-/// composing an outer transaction own the commit boundary (use [`adapter::GroupCoordinator`]).
+/// Emits durable `capacity.grant` telemetry strictly post-commit in autocommit mode (suppressing
+/// `WriteTransaction`, `sqlx::Transaction`, and raw SQL `BEGIN` blocks); callers composing an
+/// outer transaction own the commit boundary (use [`adapter::GroupCoordinator`], which emits at
+/// its owned `WriteTransaction::commit` boundary).
 pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
     resume_with_metrics(c, controller, metrics::global()).await
 }
@@ -463,9 +521,11 @@ pub enum Decision {
 /// it returns `LeaseLost`, `Fenced` or `Expired`, raised by PostgreSQL: the caller's transaction,
 /// including writes it made earlier, is already aborted. Roll back on any `Err`.
 ///
-/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`) so a
-/// rolled-back or dropped outer transaction can never emit durable `granted` telemetry; callers
-/// composing transactions should use [`adapter::GroupCoordinator`].
+/// Emits durable `capacity.grant` telemetry strictly post-commit in autocommit mode (suppressing
+/// `WriteTransaction`, `sqlx::Transaction`, and raw SQL `BEGIN` blocks) so a rolled-back or
+/// dropped outer transaction can never emit durable `granted` telemetry; callers composing
+/// transactions should use [`adapter::GroupCoordinator`], which emits at its owned
+/// `WriteTransaction::commit` boundary.
 pub async fn grant(
     c: &mut PgConnection,
     controller: &Controller,
@@ -474,55 +534,50 @@ pub async fn grant(
     if c.is_in_transaction() {
         return grant_inner(c, controller, request).await;
     }
-    let span = telemetry::capacity_grant_span(Some(request.run_id), None, CapacityOperation::Grant);
-    let guard_span = span.clone();
-    async {
-        let mut guard = CapacityGrantGuard::new(
-            guard_span,
-            Some(request.run_id),
-            None,
-            CapacityOperation::Grant,
-            metrics::global(),
-        );
-        let result = match grant_inner(&mut *c, controller, request).await {
-            Ok(Decision::Unavailable) => {
-                match group_observation_stale(&mut *c, &controller.group_id).await {
-                    Ok(true) => {
-                        metrics::global()
-                            .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-                        Ok(Decision::Unavailable)
-                    }
-                    Ok(false) => Ok(Decision::Unavailable),
-                    Err(err) => Err(err),
-                }
-            }
-            other => other,
-        };
-        let outcome = match &result {
-            Ok(Decision::Grant { grant_id, state }) => {
-                guard.set_grant_id(grant_id);
-                match state {
-                    GrantState::Granted => CapacityOutcome::Granted,
-                    GrantState::Releasing => CapacityOutcome::Releasing,
-                    GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
-                    GrantState::Released => CapacityOutcome::Released,
-                }
-            }
-            Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
-            Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
-            Err(err) => {
-                if *err == Error::Expired {
-                    metrics::global()
-                        .record_capacity_stale_observation(CapacityStaleSurface::Controller);
-                }
-                error_outcome(err)
-            }
-        };
-        guard.finish(outcome);
-        result
+    let started = Instant::now();
+    let mut result = grant_inner(&mut *c, controller, request).await;
+    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+        return result;
     }
-    .instrument(span)
-    .await
+    if matches!(result, Ok(Decision::Unavailable)) {
+        match group_observation_stale(&mut *c, &controller.group_id).await {
+            Ok(true) => {
+                metrics::global()
+                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+            }
+            Ok(false) => {}
+            Err(err) => result = Err(err),
+        }
+    }
+    let (grant_id, outcome) = match &result {
+        Ok(Decision::Grant { grant_id, state }) => {
+            let outcome = match state {
+                GrantState::Granted => CapacityOutcome::Granted,
+                GrantState::Releasing => CapacityOutcome::Releasing,
+                GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
+                GrantState::Released => CapacityOutcome::Released,
+            };
+            (Some(grant_id.as_str()), outcome)
+        }
+        Ok(Decision::Insufficient) => (None, CapacityOutcome::Insufficient),
+        Ok(Decision::Unavailable) => (None, CapacityOutcome::Unavailable),
+        Err(err) => {
+            if *err == Error::Expired {
+                metrics::global()
+                    .record_capacity_stale_observation(CapacityStaleSurface::Controller);
+            }
+            (None, error_outcome(err))
+        }
+    };
+    emit_capacity_telemetry(
+        metrics::global(),
+        Some(request.run_id),
+        grant_id,
+        CapacityOperation::Grant,
+        outcome,
+        started.elapsed(),
+    );
+    result
 }
 
 async fn grant_inner(
@@ -616,23 +671,21 @@ async fn reconcile_with_metrics(
     if c.is_in_transaction() {
         return reconcile_inner(c, controller, grant_id, evidence).await;
     }
-    let span = telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
-    let guard_span = span.clone();
-    async {
-        let guard = CapacityGrantGuard::new(
-            guard_span,
-            None,
-            Some(grant_id),
-            CapacityOperation::Reconcile,
-            m,
-        );
-        let result = reconcile_inner(c, controller, grant_id, evidence).await;
-        let outcome = reconcile_outcome(&result, evidence);
-        guard.finish(outcome);
-        result
+    let started = Instant::now();
+    let result = reconcile_inner(&mut *c, controller, grant_id, evidence).await;
+    if caller_owns_transaction(&mut *c, result.is_ok()).await? {
+        return result;
     }
-    .instrument(span)
-    .await
+    let outcome = reconcile_outcome(&result, evidence);
+    emit_capacity_telemetry(
+        m,
+        None,
+        Some(grant_id),
+        CapacityOperation::Reconcile,
+        outcome,
+        started.elapsed(),
+    );
+    result
 }
 
 /// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
@@ -640,8 +693,10 @@ async fn reconcile_with_metrics(
 /// the controller lease expires while any step waits for a lock, every change rolls back and it
 /// returns `Fenced`, with the caller's transaction already aborted.
 ///
-/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`); callers
-/// composing an outer transaction own the commit boundary (use [`adapter::GroupCoordinator`]).
+/// Emits durable `capacity.grant` telemetry strictly post-commit in autocommit mode (suppressing
+/// `WriteTransaction`, `sqlx::Transaction`, and raw SQL `BEGIN` blocks); callers composing an
+/// outer transaction own the commit boundary (use [`adapter::GroupCoordinator`], which emits at
+/// its owned `WriteTransaction::commit` boundary).
 pub async fn reconcile(
     c: &mut PgConnection,
     controller: &Controller,

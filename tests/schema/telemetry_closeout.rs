@@ -1641,6 +1641,120 @@ async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry
         st.events.clear();
     }
 
+    // 2b. Literal SQL `BEGIN` on a raw `PgConnection` bypasses SQLx's `is_in_transaction()` flag;
+    //     `capacity::resume`, `capacity::grant`, and `capacity::reconcile` (including pre-SQL
+    //     `Error::Invalid`) must still suppress telemetry and roll back cleanly.
+    let before_raw_granted =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted);
+    let before_raw_refused =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Refused);
+    let before_raw_resumed =
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed);
+    let before_raw_releasing = metrics::global()
+        .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing);
+    {
+        let mut raw_conn = worker(&db).await;
+        sqlx::query("BEGIN").execute(&mut raw_conn).await.unwrap();
+
+        let bad_req = GrantRequest {
+            scope_id: "not-a-uuid",
+            run_id: &claims[1].run_id,
+            claim_token: &claims[1].claim_token,
+            request_key: "raw-begin-invalid-grant",
+            profile: "synthetic-image",
+            footprint: &footprint,
+        };
+        assert_eq!(
+            capacity::grant(&mut raw_conn, coord.controller(), &bad_req).await,
+            Err(capacity::Error::Invalid)
+        );
+
+        assert!(
+            capacity::resume(&mut raw_conn, coord.controller())
+                .await
+                .unwrap()
+        );
+        let raw_req = GrantRequest {
+            scope_id: &scope,
+            run_id: &claims[1].run_id,
+            claim_token: &claims[1].claim_token,
+            request_key: "raw-begin-rollback-grant",
+            profile: "synthetic-image",
+            footprint: &footprint,
+        };
+        let raw_decision = capacity::grant(&mut raw_conn, coord.controller(), &raw_req)
+            .await
+            .unwrap();
+        assert!(matches!(
+            raw_decision,
+            Decision::Grant {
+                state: GrantState::Granted,
+                ..
+            }
+        ));
+        let raw_reconcile = capacity::reconcile(
+            &mut raw_conn,
+            coord.controller(),
+            &autocommit_grant_id,
+            capacity::Evidence::Releasing,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_reconcile, GrantState::Releasing);
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut raw_conn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        before_raw_granted,
+        "rolled-back literal BEGIN must not emit global Granted metric"
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Refused),
+        before_raw_refused,
+        "literal BEGIN pre-SQL Invalid must not emit global Refused metric"
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+        before_raw_resumed,
+        "rolled-back literal BEGIN must not emit global Resumed metric"
+    );
+    assert_eq!(
+        metrics::global()
+            .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing),
+        before_raw_releasing,
+        "rolled-back literal BEGIN must not emit global Releasing metric"
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert!(
+            st.closed_spans.is_empty() && st.events.is_empty(),
+            "literal BEGIN block must not emit pre-commit capacity.grant spans or events"
+        );
+    }
+    let post_rollback_grant_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openmettle.capacity_grants")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(
+        post_rollback_grant_rows, 1,
+        "only autocommit grant row should remain after ROLLBACK"
+    );
+    let autocommit_grant_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
+            .bind(&autocommit_grant_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(
+        autocommit_grant_state, "granted",
+        "reconcile(Releasing) inside rolled-back literal BEGIN must leave DB state unchanged"
+    );
+
     // 3. Deferred commit failure on `GroupCoordinator::dispatch_grant`'s `confirm_dispatch_tx`
     //    must record `Error`, NEVER `Granted`.
     sqlx::query(
