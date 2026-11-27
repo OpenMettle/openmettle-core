@@ -2350,9 +2350,9 @@ async fn a_detached_relay_gives_the_upstream_one_idle_timeout_to_finish() {
     )
     .await;
     let (fixture, _, events) = h.stop().await;
-    fixture.assert_closed(&id, "upstream_timeout").await;
+    fixture.assert_closed(&id, "caller_disconnected").await;
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
-    assert_eq!(events, [unrecorded(&id, "upstream_timeout")]);
+    assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
 }
 
 /// A settlement attempt whose database connection goes silent is abandoned after its

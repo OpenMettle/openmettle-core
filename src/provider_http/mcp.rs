@@ -440,24 +440,45 @@ impl McpTransport {
             return Err(pre_send(FaultKind::TerminalRefusal));
         }
 
+        let metric =
+            super::ProviderMetricSlot::new(crate::telemetry::metrics::ProviderOperation::Mcp);
         let bytes_sent = AtomicBool::new(false);
         let work = async {
-            let connection = route.connect(setup).await.map_err(map_pre_send_error)?;
+            metric.arm();
+            let connection = route.connect(setup).await.map_err(|err| {
+                metric.finish(super::provider_error_outcome(err));
+                map_pre_send_error(err)
+            })?;
             bytes_sent.store(true, Ordering::SeqCst);
-            exchange_mcp(
+            let res = exchange_mcp(
                 connection,
                 outbound,
                 expected_id,
                 redact_bearer,
                 total,
                 self.timeouts.idle_read,
+                &metric,
             )
-            .await
+            .await;
+            match &res {
+                Ok(_) => metric.finish(crate::telemetry::metrics::ProviderOutcome::Ok),
+                Err(TransportFault {
+                    kind: FaultKind::Semantic { .. },
+                    ..
+                }) => metric.finish(crate::telemetry::metrics::ProviderOutcome::Ok),
+                Err(_) => metric.finish(crate::telemetry::metrics::ProviderOutcome::Transport),
+            }
+            res
         };
         tokio::select! {
             biased;
             waited = stop.wait_for(Option::is_some) => {
                 let why = waited.ok().and_then(|v| *v).unwrap_or(Stop::LeaseLost);
+                metric.finish(if why == Stop::Deadline {
+                    crate::telemetry::metrics::ProviderOutcome::Timeout
+                } else {
+                    crate::telemetry::metrics::ProviderOutcome::Cancelled
+                });
                 Err(TransportFault {
                     kind: FaultKind::Stopped(why),
                     bytes_may_have_left: bytes_sent.load(Ordering::SeqCst),
@@ -567,6 +588,7 @@ async fn exchange_mcp(
     redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
+    metric: &super::ProviderMetricSlot,
 ) -> Result<(Value, Option<Value>), TransportFault> {
     let interim_count = Arc::new(AtomicUsize::new(0));
     let interim_overflow = Arc::new(Notify::new());
@@ -607,10 +629,12 @@ async fn exchange_mcp(
                 },
                 _ = interim_activity.notified() => {
                     if Instant::now() >= deadline {
+                        metric.finish(crate::telemetry::metrics::ProviderOutcome::Timeout);
                         return Err(post_send(FaultKind::Transient(RetryAfter::None)));
                     }
                 }
                 _ = sleep_until(step_deadline) => {
+                    metric.finish(crate::telemetry::metrics::ProviderOutcome::Timeout);
                     return Err(post_send(FaultKind::Transient(RetryAfter::None)));
                 }
             }
@@ -618,7 +642,7 @@ async fn exchange_mcp(
         if interim_count.load(Ordering::SeqCst) > MAX_INTERIM_RESPONSES {
             return Err(post_send(FaultKind::TerminalRefusal));
         }
-        decode_response(res, expected_id, redact_bearer, deadline, idle_read).await
+        decode_response(res, expected_id, redact_bearer, deadline, idle_read, metric).await
     };
 
     tokio::pin!(conn, response_fut);
@@ -709,11 +733,15 @@ fn parse_media_type(headers: &HeaderMap) -> Result<ResponseMedia, TransportFault
     Ok(media)
 }
 
-fn map_body_frame_error(err: Box<dyn std::error::Error + Send + Sync>) -> TransportFault {
+fn map_body_frame_error(
+    err: Box<dyn std::error::Error + Send + Sync>,
+    metric: &super::ProviderMetricSlot,
+) -> TransportFault {
     if err
         .downcast_ref::<http_body_util::LengthLimitError>()
         .is_some()
     {
+        metric.finish(crate::telemetry::metrics::ProviderOutcome::BodyLimit);
         return post_send(FaultKind::TerminalRefusal);
     }
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
@@ -753,22 +781,32 @@ async fn decode_response(
     redact_bearer: Option<&str>,
     deadline: Instant,
     idle_read: Duration,
+    metric: &super::ProviderMetricSlot,
 ) -> Result<(Value, Option<Value>), TransportFault> {
+    use crate::telemetry::metrics::ProviderOutcome;
+
     let (head, body) = response.into_parts();
     if head.status == StatusCode::SWITCHING_PROTOCOLS {
+        metric.finish(ProviderOutcome::HttpError);
         return Err(post_send(FaultKind::TerminalRefusal));
     }
     match head.status.as_u16() {
         200 => {}
         408 | 429 | 502 | 503 | 504 => {
+            metric.finish(ProviderOutcome::HttpError);
             return Err(post_send(FaultKind::Transient(parse_retry_after(
                 &head.headers,
             ))));
         }
-        _ => return Err(post_send(FaultKind::TerminalRefusal)),
+        _ => {
+            metric.finish(ProviderOutcome::HttpError);
+            return Err(post_send(FaultKind::TerminalRefusal));
+        }
     }
-    let length = transport::framed_length(&head, MAX_RESPONSE_BODY_BYTES)
-        .map_err(|_| post_send(FaultKind::TerminalRefusal))?;
+    let length = transport::framed_length(&head, MAX_RESPONSE_BODY_BYTES).map_err(|err| {
+        metric.finish(super::provider_error_outcome(err));
+        post_send(FaultKind::TerminalRefusal)
+    })?;
     let media = parse_media_type(&head.headers)?;
     let mut limited = Limited::new(body, MAX_RESPONSE_BODY_BYTES);
     let mut total: usize = 0;
@@ -778,13 +816,17 @@ async fn decode_response(
             let mut buf = Vec::with_capacity(length.unwrap_or(0).min(65_536) as usize);
             loop {
                 let read_deadline = deadline.min(Instant::now() + idle_read);
-                let Some(frame) = timeout_at(read_deadline, limited.frame())
-                    .await
-                    .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
+                let Some(frame) =
+                    timeout_at(read_deadline, limited.frame())
+                        .await
+                        .map_err(|_| {
+                            metric.finish(ProviderOutcome::Timeout);
+                            post_send(FaultKind::Transient(RetryAfter::None))
+                        })?
                 else {
                     break;
                 };
-                let frame = frame.map_err(map_body_frame_error)?;
+                let frame = frame.map_err(|e| map_body_frame_error(e, metric))?;
                 let data = frame
                     .into_data()
                     .map_err(|_| post_send(FaultKind::TerminalRefusal))?;
@@ -813,13 +855,17 @@ async fn decode_response(
             let mut final_payload: Option<(FinalPayload, Option<Value>)> = None;
             loop {
                 let read_deadline = deadline.min(Instant::now() + idle_read);
-                let Some(frame) = timeout_at(read_deadline, limited.frame())
-                    .await
-                    .map_err(|_| post_send(FaultKind::Transient(RetryAfter::None)))?
+                let Some(frame) =
+                    timeout_at(read_deadline, limited.frame())
+                        .await
+                        .map_err(|_| {
+                            metric.finish(ProviderOutcome::Timeout);
+                            post_send(FaultKind::Transient(RetryAfter::None))
+                        })?
                 else {
                     break;
                 };
-                let frame = frame.map_err(map_body_frame_error)?;
+                let frame = frame.map_err(|e| map_body_frame_error(e, metric))?;
                 let data = frame
                     .into_data()
                     .map_err(|_| post_send(FaultKind::TerminalRefusal))?;
@@ -2285,5 +2331,106 @@ mod tests {
                 bytes_may_have_left: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_records_provider_http_metrics() {
+        use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ca = Ca::new();
+        let step = Arc::new(AtomicUsize::new(0));
+        let server_step = Arc::clone(&step);
+        let server = Server::start(ca.leaf(HOST, false), move |req| {
+            if server_step.fetch_add(1, Ordering::SeqCst) == 0 {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let id = body["id"].as_str().unwrap();
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": "ok" }] }
+                })
+                .to_string();
+                Reply::Bytes(response(
+                    200,
+                    &[("content-type", "application/json")],
+                    payload.as_bytes(),
+                ))
+            } else {
+                Reply::Bytes(response(500, &[], b"internal error"))
+            }
+        })
+        .await;
+
+        let transport = mcp_transport(server.port, &ca);
+        let (_tx, mut stop) = stop_rx();
+        let args = json!({});
+        let deadline = || Instant::now() + Duration::from_secs(5);
+
+        let before_ok =
+            metrics::global().provider_http_count(ProviderOperation::Mcp, ProviderOutcome::Ok);
+        let ok = transport
+            .tools_call(
+                &ToolCallRequest {
+                    request_id: "metric-ok",
+                    tool_name: "ping",
+                    arguments: &args,
+                    bearer_token: None,
+                    idempotency_header: None,
+                    idempotency_meta: None,
+                },
+                deadline(),
+                &mut stop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.text, "ok");
+        assert!(
+            metrics::global().provider_http_count(ProviderOperation::Mcp, ProviderOutcome::Ok)
+                > before_ok
+        );
+
+        let before_http_err = metrics::global()
+            .provider_http_count(ProviderOperation::Mcp, ProviderOutcome::HttpError);
+        let err = transport
+            .tools_call(
+                &ToolCallRequest {
+                    request_id: "metric-500",
+                    tool_name: "ping",
+                    arguments: &args,
+                    bearer_token: None,
+                    idempotency_header: None,
+                    idempotency_meta: None,
+                },
+                deadline(),
+                &mut stop,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, FaultKind::TerminalRefusal);
+        assert!(
+            metrics::global()
+                .provider_http_count(ProviderOperation::Mcp, ProviderOutcome::HttpError)
+                > before_http_err
+        );
+
+        // Pre-send validation failure (bearer token containing space) must not contact server.
+        let local_err = transport
+            .tools_call(
+                &ToolCallRequest {
+                    request_id: "metric-local",
+                    tool_name: "ping",
+                    arguments: &args,
+                    bearer_token: Some("bad token with spaces"),
+                    idempotency_header: None,
+                    idempotency_meta: None,
+                },
+                deadline(),
+                &mut stop,
+            )
+            .await
+            .unwrap_err();
+        assert!(!local_err.bytes_may_have_left);
+        assert_eq!(step.load(Ordering::SeqCst), 2);
     }
 }

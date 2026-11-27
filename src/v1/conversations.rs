@@ -108,6 +108,9 @@ impl Api {
             return Err(PROVISIONING);
         }
         let context = self.authenticate(&session).await?;
+        if op == Op::CancelRun {
+            crate::telemetry::record_request_run_id(&parts.extensions, target);
+        }
         let call = Call {
             op,
             context: &context,
@@ -129,6 +132,7 @@ impl Api {
                         .await?
                 }
             };
+            crate::telemetry::record_request_run_id(&parts.extensions, &run);
             return self
                 .run_response(
                     &context,

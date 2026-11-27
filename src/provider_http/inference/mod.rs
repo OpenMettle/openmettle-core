@@ -503,8 +503,11 @@ impl Gateway {
         mut run: Option<RunStop>,
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
+        use crate::telemetry::metrics::{ProviderOperation, ProviderOutcome};
+
         let start = Instant::now();
         let server = run.is_some();
+        let metric = super::ProviderMetricSlot::new(ProviderOperation::Inference);
         let dispatch = async {
             let stream = match &input {
                 Outbound::Raw(_, _, request) => request.stream,
@@ -544,43 +547,87 @@ impl Gateway {
                 setup: self.timeouts.setup,
                 total: self.timeouts.overall,
             };
+            metric.arm();
             let connection = route
                 .connect(start + self.timeouts.setup)
                 .await
-                .map_err(Error::from)?;
-            route
+                .map_err(|err| {
+                    metric.finish(super::provider_error_outcome(err));
+                    Error::from(err)
+                })?;
+            let exchanged = route
                 .exchange(
                     connection,
                     outbound,
                     Instant::now() + self.timeouts.idle,
                     &limits,
-                    |response| decode::receive(response, self, profile, request, server, visible),
+                    |response| {
+                        decode::receive(response, self, profile, request, server, visible, &metric)
+                    },
                 )
-                .await
+                .await;
+            // Finalize inner errors immediately (preserving any more-specific HTTP status or
+            // body-limit classification already set by `decode::receive`). Defer recording `Ok`
+            // until after the outer `within_overall` deadline and run-stop checks succeed.
+            if let Err(err) = &exchanged {
+                metric.finish(match err {
+                    Error::Timeout => ProviderOutcome::Timeout,
+                    _ => ProviderOutcome::Transport,
+                });
+            }
+            exchanged
         };
         let overall = start + self.timeouts.overall;
         let bounded = timeout_at(overall, dispatch);
-        if let Some(run) = run.as_mut() {
+        let result = if let Some(run) = run.as_mut() {
             // Scope the HTTP future so the socket drops before waiting for the runner's deadline signal.
             let deadline = run.execution_deadline;
             let completed = tokio::select! {
                 biased;
-                e = run.signal() => return Err(e),
+                e = run.signal() => {
+                    metric.finish(match e {
+                        Error::Stopped(Stop::Deadline) => ProviderOutcome::Timeout,
+                        Error::Stopped(_) => ProviderOutcome::Cancelled,
+                        _ => ProviderOutcome::Transport,
+                    });
+                    return Err(e);
+                }
                 _ = sleep_until(deadline) => None,
                 result = bounded => Some(result),
             };
             if let Some(cause) = *run.stop.borrow() {
+                metric.finish(if cause == Stop::Deadline {
+                    ProviderOutcome::Timeout
+                } else {
+                    ProviderOutcome::Cancelled
+                });
                 return Err(Error::Stopped(cause));
             }
             if let Some(result) = completed
                 && Instant::now() < deadline
             {
-                return within_overall(result, overall);
+                within_overall(result, overall)
+            } else {
+                let err = run.signal().await;
+                metric.finish(match err {
+                    Error::Stopped(Stop::Deadline) => ProviderOutcome::Timeout,
+                    Error::Stopped(_) => ProviderOutcome::Cancelled,
+                    _ => ProviderOutcome::Transport,
+                });
+                return Err(err);
             }
-            Err(run.signal().await)
         } else {
             within_overall(bounded.await, overall)
+        };
+        match &result {
+            Ok(_) => metric.finish(ProviderOutcome::Ok),
+            Err(Error::Timeout | Error::Stopped(Stop::Deadline)) => {
+                metric.finish(ProviderOutcome::Timeout)
+            }
+            Err(Error::Stopped(_)) => metric.finish(ProviderOutcome::Cancelled),
+            Err(_) => metric.finish(ProviderOutcome::Transport),
         }
+        result
     }
 }
 

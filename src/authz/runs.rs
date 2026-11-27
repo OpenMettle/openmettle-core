@@ -81,32 +81,110 @@ macro_rules! cancellable {
     };
 }
 const CANCEL_ONE: &str = concat!(
-    "UPDATE openmettle.runs ",
-    cancel_set!("$3"),
-    " WHERE scope_id = $1::uuid AND id = $2::uuid AND ",
+    "WITH prior AS MATERIALIZED (
+       SELECT r.id, r.state AS prior_state, r.wait_reason AS prior_wait_reason,
+              r.created_at, clock_timestamp() AS t,
+              d.decision, d.decided_at, p.approval_expires_at, p.resume_execution_expires_at
+         FROM openmettle.runs r
+         LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
+         LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
+        WHERE r.scope_id = $1::uuid AND r.id = $2::uuid AND ",
     cancellable!(),
-    " RETURNING state"
+    " FOR NO KEY UPDATE OF r)
+     UPDATE openmettle.runs r ",
+    cancel_set!("$3"),
+    " FROM prior WHERE r.id = prior.id AND ",
+    cancellable!(),
+    " RETURNING r.state,
+                CASE WHEN prior.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (prior.t - prior.created_at)), 0)::float8
+                     WHEN prior.prior_state = 'waiting'
+                          AND prior.prior_wait_reason = 'approval'
+                          AND prior.decision = 'approve'
+                          AND prior.approval_expires_at > prior.t
+                          AND prior.resume_execution_expires_at > prior.t
+                       THEN GREATEST(EXTRACT(EPOCH FROM (prior.t - prior.decided_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
 );
 
-// Lock all affected runs in the same order across archive, delete and disable.
-macro_rules! cancel_bulk {
+// Pre-migration-0022 fallback when `openmettle.run_approval_decisions` does not exist yet.
+const CANCEL_ONE_LEGACY: &str = concat!(
+    "WITH prior AS MATERIALIZED (
+       SELECT id, state AS prior_state, created_at, clock_timestamp() AS t
+         FROM openmettle.runs
+        WHERE scope_id = $1::uuid AND id = $2::uuid AND ",
+    cancellable!(),
+    " FOR NO KEY UPDATE)
+     UPDATE openmettle.runs r ",
+    cancel_set!("$3"),
+    " FROM prior WHERE r.id = prior.id AND ",
+    cancellable!(),
+    " RETURNING r.state,
+                CASE WHEN prior.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (prior.t - prior.created_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
+);
+
+// Lock all affected runs in deterministic ID order across archive, delete and disable BEFORE
+// reading `run_approval_decisions` in a fresh `READ COMMITTED` statement so any concurrent
+// `approvals::decide` that held a run row lock commits and becomes visible to the update snapshot.
+macro_rules! lock_bulk {
     ($column:literal) => {
         concat!(
-            "WITH doomed AS MATERIALIZED (SELECT id FROM openmettle.runs WHERE ",
+            "SELECT r.id::text FROM openmettle.runs r WHERE r.",
             $column,
-            " = $1::uuid AND ",
+            " = $1::uuid AND r.",
             cancellable!(),
-            " ORDER BY id FOR NO KEY UPDATE)
-                UPDATE openmettle.runs r ",
-            cancel_set!("'revoked'"),
-            " FROM doomed WHERE r.id = doomed.id AND ",
-            cancellable!(),
-            " RETURNING r.scope_id::text, r.id::text, r.state"
+            " ORDER BY r.id FOR NO KEY UPDATE"
         )
     };
 }
-const CANCEL_SCOPE: &str = cancel_bulk!("scope_id");
-const CANCEL_USER: &str = cancel_bulk!("actor_user_id");
+const LOCK_SCOPE_RUNS: &str = lock_bulk!("scope_id");
+const LOCK_USER_RUNS: &str = lock_bulk!("actor_user_id");
+
+const CANCEL_BY_IDS: &str = concat!(
+    "WITH doomed AS MATERIALIZED (
+       SELECT r.id, r.state AS prior_state, r.wait_reason AS prior_wait_reason,
+              r.created_at, clock_timestamp() AS t,
+              d.decision, d.decided_at, p.approval_expires_at, p.resume_execution_expires_at
+         FROM openmettle.runs r
+         LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
+         LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
+        WHERE r.id = ANY($1::text[]::uuid[]) AND ",
+    cancellable!(),
+    " ORDER BY r.id)
+     UPDATE openmettle.runs r ",
+    cancel_set!("'revoked'"),
+    " FROM doomed WHERE r.id = doomed.id AND ",
+    cancellable!(),
+    " RETURNING r.scope_id::text, r.id::text, r.state,
+                CASE WHEN doomed.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
+                     WHEN doomed.prior_state = 'waiting'
+                          AND doomed.prior_wait_reason = 'approval'
+                          AND doomed.decision = 'approve'
+                          AND doomed.approval_expires_at > doomed.t
+                          AND doomed.resume_execution_expires_at > doomed.t
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.decided_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
+);
+
+const CANCEL_BY_IDS_LEGACY: &str = concat!(
+    "WITH doomed AS MATERIALIZED (
+       SELECT id, state AS prior_state, created_at, clock_timestamp() AS t
+         FROM openmettle.runs
+        WHERE id = ANY($1::text[]::uuid[]) AND ",
+    cancellable!(),
+    " ORDER BY id)
+     UPDATE openmettle.runs r ",
+    cancel_set!("'revoked'"),
+    " FROM doomed WHERE r.id = doomed.id AND ",
+    cancellable!(),
+    " RETURNING r.scope_id::text, r.id::text, r.state,
+                CASE WHEN doomed.prior_state = 'queued'
+                       THEN GREATEST(EXTRACT(EPOCH FROM (doomed.t - doomed.created_at)), 0)::float8
+                     ELSE NULL END AS queue_age_s"
+);
 
 /// The append key of the one terminal event a run may have (ADR 0032).
 pub(super) const TERMINAL_KEY: &str = "run-terminal";
@@ -183,7 +261,11 @@ pub async fn recheck_run(
     request: &RunRecheckRequest<'_>,
 ) -> Result<RunRecheckOutcome, StoreError> {
     request.validate()?;
-    transaction(c, async |c| recheck_locked(c, request).await).await
+    let (outcome, queue_age_s) = transaction(c, async |c| recheck_locked(c, request).await).await?;
+    if let Some(age_s) = queue_age_s {
+        record_cancelled_queue_ages(&[age_s]);
+    }
+    Ok(outcome)
 }
 
 /// One bounded READ COMMITTED transaction ([`store::begin`]): commit on success, roll back
@@ -238,7 +320,7 @@ async fn terminal_event(
 async fn recheck_locked(
     c: &mut PgConnection,
     r: &RunRecheckRequest<'_>,
-) -> Result<RunRecheckOutcome, StoreError> {
+) -> Result<(RunRecheckOutcome, Option<f64>), StoreError> {
     let (owner, conversation, approval, state): (String, String, Option<String>, String) =
         sqlx::query_as(LOCK_RUN)
             .bind(r.scope_id)
@@ -253,14 +335,16 @@ async fn recheck_locked(
         return Err(StoreError::InvalidInput("actor_approval_id"));
     }
     if is_terminal(&state) {
-        return Ok(RunRecheckOutcome::Terminal { state });
+        return Ok((RunRecheckOutcome::Terminal { state }, None));
     }
     let decision = recheck_decision(c, r, &owner, &conversation).await?;
     if let RunContinuation::Invalidate(reason) = decision {
-        cancel_one(c, r.scope_id, r.run_id, CancelReason::Revoked).await?;
-        return Ok(RunRecheckOutcome::Invalidated(reason));
+        let queue_age_s = cancel_one(c, r.scope_id, r.run_id, CancelReason::Revoked)
+            .await?
+            .and_then(|(_, age)| age);
+        return Ok((RunRecheckOutcome::Invalidated(reason), queue_age_s));
     }
-    Ok(RunRecheckOutcome::Continue)
+    Ok((RunRecheckOutcome::Continue, None))
 }
 
 pub(crate) async fn recheck_decision(
@@ -634,22 +718,42 @@ fn evaluate(
     }
 }
 
+/// Record `openmettle.runs.queue.age{outcome="cancelled"}` samples after the owning transaction
+/// commits. Never call before `tx.commit()` succeeds.
+pub(super) fn record_cancelled_queue_ages(ages: &[f64]) {
+    let metrics = crate::telemetry::metrics::global();
+    for &age_s in ages {
+        metrics.record_run_queue_age(
+            crate::telemetry::metrics::RunQueueAgeOutcome::Cancelled,
+            age_s,
+        );
+    }
+}
+
+async fn has_approval_schema(c: &mut PgConnection) -> Result<bool, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('openmettle.run_approval_decisions') IS NOT NULL")
+            .fetch_one(c)
+            .await?,
+    )
+}
+
 /// Record cancellation for live runs in one scope. Archive and delete call this after locking
-/// the project.
+/// the project, and record the returned queue ages only after their outer transaction commits.
 pub(super) async fn cancel_scope_runs(
     c: &mut PgConnection,
     scope_id: &str,
-) -> Result<u64, StoreError> {
-    cancel_revoked(c, CANCEL_SCOPE, scope_id).await
+) -> Result<Vec<f64>, StoreError> {
+    cancel_revoked(c, LOCK_SCOPE_RUNS, scope_id).await
 }
 
 /// Record cancellation for live runs the user owns. Disablement calls this after locking
-/// `account_admin_lock` and the user.
+/// `account_admin_lock` and the user, and records the returned queue ages only after commit.
 pub(super) async fn cancel_user_runs(
     c: &mut PgConnection,
     user_id: &str,
-) -> Result<u64, StoreError> {
-    cancel_revoked(c, CANCEL_USER, user_id).await
+) -> Result<Vec<f64>, StoreError> {
+    cancel_revoked(c, LOCK_USER_RUNS, user_id).await
 }
 
 /// Release held run-level parent quota reservations for a batch of terminal runs in one
@@ -680,21 +784,43 @@ pub(super) async fn release_terminal_runs(
 
 async fn cancel_revoked(
     c: &mut PgConnection,
-    sql: &'static str,
+    lock_sql: &'static str,
     id: &str,
-) -> Result<u64, StoreError> {
-    let mut rows: Vec<(String, String, String)> =
-        sqlx::query_as(sql).bind(id).fetch_all(&mut *c).await?;
+) -> Result<Vec<f64>, StoreError> {
+    // 1. Lock candidate runs in deterministic ID order first.
+    let locked_ids: Vec<String> = sqlx::query_scalar(lock_sql)
+        .bind(id)
+        .fetch_all(&mut *c)
+        .await?;
+    if locked_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 2. In a fresh `READ COMMITTED` statement snapshot after all run row locks are held, read
+    // latest approval decisions (including any concurrent `approvals::decide` that committed
+    // while step 1 waited on a run lock) and apply the cancellation update.
+    let update_sql = if has_approval_schema(c).await? {
+        CANCEL_BY_IDS
+    } else {
+        CANCEL_BY_IDS_LEGACY
+    };
+    let mut rows: Vec<(String, String, String, Option<f64>)> = sqlx::query_as(update_sql)
+        .bind(&locked_ids)
+        .fetch_all(&mut *c)
+        .await?;
     rows.sort_by(|a, b| a.1.cmp(&b.1));
     let mut cancelled = Vec::new();
-    for (scope, id, state) in &rows {
+    let mut queue_ages = Vec::new();
+    for (scope, id, state, age_s) in &rows {
         cancel_event(c, scope, id, state, CancelReason::Revoked).await?;
         if state == "cancelled" {
             cancelled.push(id.clone());
+            if let Some(age) = age_s {
+                queue_ages.push(*age);
+            }
         }
     }
     release_terminal_runs(c, &cancelled).await?;
-    Ok(rows.len() as u64)
+    Ok(queue_ages)
 }
 
 pub(super) async fn cancel_one(
@@ -702,20 +828,25 @@ pub(super) async fn cancel_one(
     scope: &str,
     id: &str,
     reason: CancelReason,
-) -> Result<Option<String>, StoreError> {
-    let state: Option<String> = sqlx::query_scalar(CANCEL_ONE)
+) -> Result<Option<(String, Option<f64>)>, StoreError> {
+    let sql = if has_approval_schema(c).await? {
+        CANCEL_ONE
+    } else {
+        CANCEL_ONE_LEGACY
+    };
+    let row: Option<(String, Option<f64>)> = sqlx::query_as(sql)
         .bind(scope)
         .bind(id)
         .bind(reason.as_str())
         .fetch_optional(&mut *c)
         .await?;
-    if let Some(state) = &state {
+    if let Some((state, _)) = &row {
         cancel_event(c, scope, id, state, reason).await?;
         if state == "cancelled" {
             release_terminal_runs(c, &[id.to_owned()]).await?;
         }
     }
-    Ok(state)
+    Ok(row)
 }
 
 async fn cancel_event(
@@ -1497,7 +1628,7 @@ pub async fn cancel_run(
     super::require(Some(principal)).map_err(StoreError::Denied)?;
     uuid(scope_id, "scope_id")?;
     uuid(run_id, "run_id")?;
-    transaction(c, async |c| {
+    let (outcome, queue_age_s) = transaction(c, async |c| {
         crate::restore::require_open_gate(c).await?;
         crate::backup::require_open_maintenance(c).await?;
         let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(LOCK_RUN)
@@ -1510,30 +1641,36 @@ pub async fn cancel_run(
             return Err(StoreError::Denied(DenialReason::NotFound));
         };
         if is_terminal(&state) {
-            return Ok(CancelOutcome::Terminal { state });
+            return Ok((CancelOutcome::Terminal { state }, None));
         }
-        let state = cancel_one(c, scope_id, run_id, CancelReason::Requested)
+        let (state, queue_age_s) = cancel_one(c, scope_id, run_id, CancelReason::Requested)
             .await?
-            .unwrap_or(state);
-        Ok(if state == "cancelled" {
+            .unwrap_or((state, None));
+        let outcome = if state == "cancelled" {
             CancelOutcome::Cancelled
         } else {
             CancelOutcome::Requested { state }
-        })
+        };
+        Ok((outcome, queue_age_s))
     })
-    .await
+    .await?;
+    if let Some(age_s) = queue_age_s {
+        record_cancelled_queue_ages(&[age_s]);
+    }
+    Ok(outcome)
 }
 
 const EXPIRE: &str = concat!(
     "WITH due AS MATERIALIZED (
-       SELECT id FROM openmettle.runs WHERE ",
+       SELECT id, created_at, clock_timestamp() AS t FROM openmettle.runs WHERE ",
     non_terminal!(),
     " AND state = 'queued'
          AND (queue_expires_at <= clock_timestamp() OR queue_expires_at IS NULL)
        ORDER BY id LIMIT $1 FOR NO KEY UPDATE SKIP LOCKED)
      UPDATE openmettle.runs r SET state = 'failed', wait_reason = NULL
        FROM due WHERE r.id = due.id AND r.state = 'queued'
-     RETURNING r.scope_id::text, r.id::text"
+     RETURNING r.scope_id::text, r.id::text,
+               GREATEST(EXTRACT(EPOCH FROM (due.t - due.created_at)), 0)::float8 AS queue_age_s"
 );
 
 /// Fail up to `limit` (1 to 1000) queued runs whose deadline has passed or that have none
@@ -1543,18 +1680,31 @@ pub async fn expire_queued(c: &mut PgConnection, limit: u32) -> Result<Vec<Strin
     if !(1..=1000).contains(&limit) {
         return Err(StoreError::InvalidInput("limit"));
     }
-    transaction(c, async |c| {
-        let mut expired: Vec<(String, String)> = sqlx::query_as(EXPIRE)
+    let (ids, ages) = transaction(c, async |c| {
+        let mut expired: Vec<(String, String, f64)> = sqlx::query_as(EXPIRE)
             .bind(i64::from(limit))
             .fetch_all(&mut *c)
             .await?;
         expired.sort_by(|a, b| a.1.cmp(&b.1));
-        let ids: Vec<String> = expired.iter().map(|(_, run)| run.clone()).collect();
+        let ids: Vec<String> = expired.iter().map(|(_, run, _)| run.clone()).collect();
+        let ages: Vec<f64> = expired.iter().map(|(_, _, age)| *age).collect();
+        let pairs: Vec<(String, String)> = expired
+            .into_iter()
+            .map(|(scope, run, _)| (scope, run))
+            .collect();
         release_terminal_runs(c, &ids).await?;
-        terminal_events(c, expired, EXPIRED).await?;
-        Ok(ids)
+        terminal_events(c, pairs, EXPIRED).await?;
+        Ok((ids, ages))
     })
-    .await
+    .await?;
+    let metrics = crate::telemetry::metrics::global();
+    for age_s in ages {
+        metrics.record_run_queue_age(
+            crate::telemetry::metrics::RunQueueAgeOutcome::Expired,
+            age_s,
+        );
+    }
+    Ok(ids)
 }
 
 // --- fair claim (ADR 0032, `openmettle_worker`) ------------------------------------------------
@@ -1630,8 +1780,8 @@ const CLAIM: &str = concat!(
      ), scope_load AS (
        SELECT scope_id, count(*) AS n FROM executing GROUP BY scope_id
      ), locked AS MATERIALIZED (
-       SELECT r.id, r.state, r.queue_expires_at, p.approval_expires_at,
-              p.resume_execution_expires_at FROM openmettle.runs r
+       SELECT r.id, r.state, r.created_at, r.queue_expires_at, d.decided_at,
+              p.approval_expires_at, p.resume_execution_expires_at FROM openmettle.runs r
          LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
          LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
          LEFT JOIN actor_load a ON a.actor_user_id = r.actor_user_id
@@ -1662,6 +1812,10 @@ const CLAIM: &str = concat!(
             execution_expires_at = e.deadline
        FROM eligible e WHERE r.id = e.id
      RETURNING r.scope_id::text, r.id::text, r.claim_token::text, e.state = 'waiting' AS resumed,
+               GREATEST(
+                   EXTRACT(EPOCH FROM (e.t - CASE WHEN e.state = 'waiting' THEN e.decided_at ELSE e.created_at END)),
+                   0
+               )::float8 AS queue_age_s,
                r.actor_approval_id::text, r.round_limit, ",
     leases::remaining_sql!()
 );
@@ -1681,8 +1835,8 @@ const CLAIM_WITH_QUOTAS: &str = concat!(
      ), scope_load AS (
        SELECT scope_id, count(*) AS n FROM executing GROUP BY scope_id
      ), locked AS MATERIALIZED (
-       SELECT r.id, r.state, r.queue_expires_at, p.approval_expires_at,
-              p.resume_execution_expires_at FROM openmettle.runs r
+       SELECT r.id, r.state, r.created_at, r.queue_expires_at, d.decided_at,
+              p.approval_expires_at, p.resume_execution_expires_at FROM openmettle.runs r
          JOIN openmettle.scopes sc_target ON sc_target.id = r.scope_id
          JOIN openmettle.scopes sc_actor
            ON sc_actor.personal_user_id = r.actor_user_id AND sc_actor.kind = 'personal'
@@ -1734,6 +1888,10 @@ const CLAIM_WITH_QUOTAS: &str = concat!(
             execution_expires_at = e.deadline
        FROM eligible e WHERE r.id = e.id
      RETURNING r.scope_id::text, r.id::text, r.claim_token::text, e.state = 'waiting' AS resumed,
+               GREATEST(
+                   EXTRACT(EPOCH FROM (e.t - CASE WHEN e.state = 'waiting' THEN e.decided_at ELSE e.created_at END)),
+                   0
+               )::float8 AS queue_age_s,
                r.actor_approval_id::text, r.round_limit, ",
     leases::remaining_sql!()
 );
@@ -1760,7 +1918,7 @@ pub async fn claim_next(
 ) -> Result<Option<ClaimedRun>, StoreError> {
     limits.validate()?;
     settings.validate()?;
-    transaction(c, async |c| {
+    let claimed = transaction(c, async |c| {
         // Claims serialize here, so the next statement's snapshot includes every earlier claim
         // and any concurrent `executing_runs_*` quota override write (ADR 0040).
         sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
@@ -1796,8 +1954,10 @@ pub async fn claim_next(
             return Ok(None);
         };
         let run = ClaimedRun::from_row(&row)?;
+        let resumed: bool = row.try_get("resumed")?;
+        let queue_age_s: f64 = row.try_get("queue_age_s")?;
         let key = format!("claim:{}", run.claim_token);
-        let event = if row.try_get("resumed")? {
+        let event = if resumed {
             Payload {
                 format: "openmettle.run-resumed",
                 ..CLAIMED
@@ -1806,9 +1966,18 @@ pub async fn claim_next(
             CLAIMED
         };
         append(c, &run.scope_id, &run.run_id, &key, event).await?;
-        Ok(Some(run))
+        Ok(Some((run, resumed, queue_age_s)))
     })
-    .await
+    .await?;
+    Ok(claimed.map(|(run, resumed, queue_age_s)| {
+        let outcome = if resumed {
+            crate::telemetry::metrics::RunQueueAgeOutcome::Resumed
+        } else {
+            crate::telemetry::metrics::RunQueueAgeOutcome::Claimed
+        };
+        crate::telemetry::metrics::global().record_run_queue_age(outcome, queue_age_s);
+        run
+    }))
 }
 
 #[cfg(test)]
@@ -1919,16 +2088,27 @@ mod tests {
         for state in ["", "Cancelled", "cancelled ", "done"] {
             assert!(!is_terminal(state), "{state:?}");
         }
-        for sql in [CANCEL_ONE, CANCEL_SCOPE, CANCEL_USER] {
+        for sql in [
+            CANCEL_ONE,
+            CANCEL_ONE_LEGACY,
+            CANCEL_BY_IDS,
+            CANCEL_BY_IDS_LEGACY,
+        ] {
             assert!(
                 sql.contains("WHEN state IN ('queued', 'waiting') THEN 'cancelled'")
                     && sql.contains("OR cancel_reason IS NULL"),
                 "{sql}"
             );
-        }
-        for sql in [CANCEL_SCOPE, CANCEL_USER] {
-            assert!(sql.contains("ORDER BY id FOR NO KEY UPDATE"), "{sql}");
             assert!(sql.contains("AS MATERIALIZED"), "{sql}");
+        }
+        for sql in [LOCK_SCOPE_RUNS, LOCK_USER_RUNS] {
+            assert!(
+                sql.starts_with("SELECT r.id::text FROM openmettle.runs r WHERE r."),
+                "{sql}"
+            );
+            assert!(sql.contains("ORDER BY r.id FOR NO KEY UPDATE"), "{sql}");
+            assert!(!sql.contains("ORDER BY id "), "{sql}");
+            assert!(sql.contains("OR cancel_reason IS NULL"), "{sql}");
         }
     }
 
@@ -2412,9 +2592,10 @@ mod tests {
         assert!(EXPIRE.contains(live));
         assert!(EXPIRE.contains("ORDER BY id LIMIT $1 FOR NO KEY UPDATE SKIP LOCKED"));
         assert!(EXPIRE.contains("queue_expires_at IS NULL"));
-        for sql in [CANCEL_SCOPE, CANCEL_USER] {
+        for sql in [CANCEL_BY_IDS, CANCEL_BY_IDS_LEGACY] {
             assert!(
-                sql.ends_with("RETURNING r.scope_id::text, r.id::text, r.state"),
+                sql.contains("RETURNING r.scope_id::text, r.id::text, r.state,")
+                    && sql.ends_with("AS queue_age_s"),
                 "{sql}"
             );
         }

@@ -21,25 +21,47 @@ the base signals already present in `openmettle-core`.
 versioned independently at `1.0.0` with pinned OpenTelemetry semantic conventions (`1.37.0`).
 It records:
 
-- Privacy and transport policy: inbound `traceparent` ignored, logs on stderr, HTTPS HTTP/1.1
-  protobuf OTLP export, Prometheus translation mode `UnderscoreEscapingWithSuffixes`, resource
-  attributes (`service.name` and per-process random UUIDv4 `service.instance.id`), retention
-  ceiling defaults (traces 72 h, logs 7 d, metrics 14 d; operator-confirmed per jurisdiction),
+- Privacy, access control, and transport policy: inbound `traceparent` ignored, logs on
+  stderr, HTTPS HTTP/1.1 protobuf OTLP export, Prometheus translation mode
+  `UnderscoreEscapingWithSuffixes`, resource attributes (`service.name` and per-process
+  random UUIDv4 `service.instance.id`), retention ceiling defaults (traces 72 h, logs 7 d,
+  metrics 14 d; operator-confirmed per jurisdiction), `policy.access_control` enforcing an
+  infrastructure-operator-only reader boundary independent from `/v1/*`, tenant/project
+  roles, product memory, and `openmettle.authorization_audit` (see
+  [`docs/operator/telemetry-access-and-retention.md`](../operator/telemetry-access-and-retention.md)),
   disallowed metric label substrings, and fields excluded from all telemetry.
-- The exact stderr log field allowlist (`telemetry::FIELDS`) and event catalog.
-- The exact trace span field allowlist (`telemetry::SPAN_FIELDS`) and span limits.
+- The exact stderr log field allowlist (`telemetry::FIELDS`, 26 fields) and event catalog
+  (including bounded correlation of validated `request_id`, `run_id`, `operation_id`,
+  non-reversible derived `rl-…` worker `lease_id`, and public `grant_id` UUID `lease_id` on
+  `capacity.grant.completed`, with `401 Unauthorized` HTTP responses centrally suppressing
+  resource correlation IDs).
+- The exact trace span field allowlist (`telemetry::SPAN_FIELDS`, 11 fields) and span limits
+  across `http.server.request`, `worker.run`, child `worker.operation`, and `capacity.grant`
+  spans (`<= 8` exported attributes per span, `dropped_attributes_count == 0`).
 - Every v1 metric: OTel name, Prometheus normalized name, instrument kind (`counter` or
-  `histogram`), unit, explicit histogram bucket bounds, closed label enum values (including
-  `openmettle.route_class` so metric buckets never collide with SemConv `http.route` templates
-  on trace spans), storage helper attempt semantics (counts helper executions including retries
-  before transaction commit), and exact per-metric and total ceilings.
+  `histogram`), unit, explicit histogram bucket bounds (`DURATION_BUCKETS` for short-latency
+  histograms; `QUEUE_AGE_BUCKETS` up to `300.0` s for `openmettle.runs.queue.age`), closed
+  label enum values (including `openmettle.route_class` so metric buckets never collide with
+  SemConv `http.route` templates on trace spans, and `ProviderOperation` covering
+  `discovery`, `jwks`, `token`, `inference`, `mcp`, and `oauth_refresh`), storage helper
+  attempt semantics (counts helper executions including retries before transaction commit),
+  and exact per-metric and total ceilings.
 - ADR 0033 adds `openmettle.runs.cancellations`. It counts terminal cancellation events
   appended by store helpers before commit. Its reason is `requested` or `revoked`.
-- Reserved future signal namespaces (`openmettle.runs.queue.age`), owned by V1-10
-  (`openmettle.capacity.grants` moved into the implemented v1 metrics catalog in V1-18 PR3,
-  `openmettle.storage.quota.drift` moved into the implemented v1 metrics catalog in V1-17,
-  and `openmettle.backup.runs` moved into the implemented v1 metrics catalog in V1-30 /
-  [ADR 0046](0046-maintenance-window-coordinated-backup-capture.md)).
+- *Update, 27 November 2026:* `reserved_signals` is now empty (`[]`). V1-10 promoted
+  `openmettle.runs.queue.age` (`openmettle_runs_queue_age_seconds`, `QUEUE_AGE_BUCKETS`,
+  `outcome ∈ {claimed, resumed, cancelled, expired}`) and its companion slow-exit counter
+  `openmettle.runs.queue.slow_exits` (`openmettle_runs_queue_slow_exits_total`, incremented
+  post-commit when a queue wait strictly exceeds `60.0` s) into the implemented v1 catalog. It
+  is recorded **strictly after transaction commit** (`claimed` from `runs.created_at`,
+  `resumed` from `run_approval_decisions.decided_at`, `expired` from `runs.created_at` on
+  `expire_queued` and from `run_approval_decisions.decided_at` on `expire_waits` for approved
+  resumable waits, and `cancelled` only when a run leaves the queue while `queued` or while
+  `waiting` with an eligible decided `'approve'` decision—never when cancelling an executing
+  run or an undecided human-approval wait). Earlier reserved signals `openmettle.capacity.grants`
+  (V1-18 PR3), `openmettle.storage.quota.drift` (V1-17), and `openmettle.backup.runs`
+  (V1-30 / [ADR 0046](0046-maintenance-window-coordinated-backup-capture.md)) are likewise
+  implemented.
 
 ### Statically bounded metrics registry
 
@@ -50,17 +72,21 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   `ReadinessOutcome`, `ProviderOperation`, `ProviderOutcome`, `StorageOperation`,
   `StorageOutcome`, `DroppedSignal`, `CancelReason`, `GatewayStep`, `GatewayCause`,
   `CapacityOperation`, `CapacityOutcome`, `CapacityStaleSurface`, `CapacityWaitOutcome`,
-  `QuotaDriftOutcome`, `BackupRunOutcome`, plus the fixed 3-bucket `lag` label for gateway
-  backfill age). No `String`, raw path, user ID, scope ID, run ID, or request ID can be
-  supplied as a metric label.
+  `QuotaDriftOutcome`, `BackupRunOutcome`, `RunQueueAgeOutcome`, plus the fixed 3-bucket
+  `lag` label for gateway backfill age). No `String`, raw path, user ID, scope ID, run ID,
+  operation ID, lease ID, or request ID can be supplied as a metric label.
 - Total worst-case cardinality across all nine original v1 metrics was **359**
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
-  *Update, 26 November 2026:* the contract now defines **17** metrics, **480** data-point
-  streams and **1,208** Prometheus series per process (adding V1-06 gateway failure/backfill
-  signals, V1-17 overdue handoffs and `openmettle.storage.quota.drift`, V1-18 capacity
-  grant, stale observation and wait duration signals, and V1-30 `openmettle.backup.runs`).
+  *Update, 27 November 2026:* the contract now defines **19** metrics, **536** data-point
+  streams and **1,628** Prometheus series per process (extending `ProviderOperation` to
+  `inference`, `mcp`, and `oauth_refresh`, adding `ProviderOutcome::Cancelled` for
+  caller-cancelled/dropped in-flight calls, and promoting V1-10 `openmettle.runs.queue.age`
+  with `QUEUE_AGE_BUCKETS` plus `openmettle.runs.queue.slow_exits`, alongside V1-06 gateway
+  failure/backfill signals, V1-17 overdue handoffs and `openmettle.storage.quota.drift`,
+  V1-18 capacity grant, stale observation and wait duration signals, and V1-30
+  `openmettle.backup.runs`).
   `policy.max_data_point_streams` and `policy.max_prometheus_series_per_process` in
   `contracts/telemetry/v1.json` define the current ceilings; `tests/telemetry_contract.rs`
   checks them against `metrics::DESCRIPTORS`.
@@ -82,31 +108,56 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   random UUIDv4 `service.instance.id` generated at exporter startup so multi-replica API and
   worker processes produce disjoint Prometheus `instance` streams without exposing host, pod,
   or user identities.
-- When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
-  cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
-  (`DroppedSignal::ALL`) series from process startup (and, on `openmettle-worker`, the
-  zero-initialized `openmettle.quota.overdue.handoffs` series, all eight
-  `openmettle.storage.quota.drift` `QuotaDriftOutcome::ALL` series, and all four
-  `openmettle.backup.runs` `BackupRunOutcome::ALL` series) so Prometheus records a
-  zero baseline before any first collector outage, hourly drift, or backup failure/overdue
-  event, encodes
+- When `OTLP_METRICS_ENDPOINT` is set, exporter startup synchronously pre-captures an
+  immutable zero-valued startup baseline at `time_unix_nano == start_time_unix_nano` and
+  delivers it immediately on task start, while subsequent periodic snapshots carry
+  `time_unix_nano >= start_time_unix_nano + 1ms` (strictly newer at Prometheus millisecond
+  resolution). On retryable failures (`429`/`502`/`503`/`504` or transport/timeout errors
+  before an HTTP response), the startup zero baseline is retained ahead of the first live
+  snapshot on the next cycle; on permanent rejections (`400` and all other non-2xx HTTP
+  responses per the OTLP/HTTP specification), it is discarded immediately so live snapshots
+  are never blocked behind a permanently rejected baseline. Downstream collectors forwarding
+  cumulative metrics to Prometheus `/api/v1/otlp` must serialize delivery (for example
+  `sending_queue { enabled = true, num_consumers = 1 }` on Grafana Alloy
+  `otelcol.exporter.otlphttp` / OpenTelemetry Collector `otlphttpexporter`, or a bounded
+  Prometheus `out_of_order_time_window`) so a delayed baseline cannot be overtaken by the
+  next cumulative snapshot. Zero-initialized baselines cover all three `openmettle.telemetry.dropped`
+  (`DroppedSignal::ALL`) series on every role, all three `openmettle.db.readiness.checks`
+  (`ReadinessOutcome::ALL`) series on serving roles (`api`, `worker`, `gateway`), all 42
+  `openmettle.provider.http.requests` (`ProviderOperation::ALL × ProviderOutcome::ALL`)
+  series on `api` and `worker`, all 49 `openmettle.gateway.failures`
+  (`GatewayStep::ALL × GatewayCause::ALL`) series on `openmettle-gateway`, all four
+  `openmettle.runs.queue.age` histogram points and all four `openmettle.runs.queue.slow_exits`
+  counter series (`RunQueueAgeOutcome::ALL`) on `openmettle-api` and `openmettle-worker`, and,
+  on `openmettle-worker`, `openmettle.quota.overdue.handoffs`, all eight
+  `openmettle.storage.quota.drift` (`QuotaDriftOutcome::ALL`) series, and (strictly after
+  durable PostgreSQL seeding so restarts never fabricate `0 -> N` jumps) all four
+  `openmettle.backup.runs` (`BackupRunOutcome::ALL`) series. Requests are encoded as
   `ExportMetricsServiceRequest` via `opentelemetry-proto` (`metrics` feature enabled with zero
-  new crates in `Cargo.lock`), and POSTs with `Content-Type: application/x-protobuf` over the
+  new crates in `Cargo.lock`), and POSTed with `Content-Type: application/x-protobuf` over the
   ADR 0010 `Route`.
 - Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
-  cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
-  emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr.
+  cycle without inline retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`,
+  and emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr (with only
+  the pre-captured startup baseline retained across cycles on retryable failures and discarded
+  immediately on permanent rejections).
 - On shutdown, trace and metrics export tasks drain concurrently within the existing half-slice
   of `shutdown_budget` and are aborted on deadline expiry.
 
 ### Deterministic alert rules
 
-`contracts/telemetry/alerts-v1.yaml` defines Prometheus alert rules strictly over the v1
-metrics emitted today: `OpenMettleApiHighServerErrorRatio` (scoped to `job="openmettle-api"`
-and excluding `healthz`/`readyz` probes), `OpenMettleDatabaseReadinessFailing`,
-`OpenMettleTelemetryDropsDetected` (`increase(openmettle_telemetry_dropped_total[15m]) > 0`
-with `for: 5m` so a single collector outage transitions from zero baseline to `firing` and
-resolves cleanly), `OpenMettleProviderTransportFailures`, and
+`contracts/telemetry/alerts-v1.yaml` defines eight Prometheus alert rules strictly over the
+v1 metrics emitted today: `OpenMettleApiHighServerErrorRatio` (scoped to
+`job="openmettle-api"` and excluding `healthz`/`readyz` probes),
+`OpenMettleDatabaseReadinessFailing`, `OpenMettleTelemetryDropsDetected`
+(`increase(openmettle_telemetry_dropped_total[15m]) > 0` with `for: 5m` so a single
+collector outage transitions from zero baseline to `firing` and resolves cleanly),
+`OpenMettleProviderTransportFailures` (covering all six outbound `operation` values
+including `inference`, `mcp`, and `oauth_refresh` across API and worker),
+`OpenMettleGatewayFailuresDetected`
+(`sum by (step, cause) (increase(openmettle_gateway_failures_total[5m])) >= 3` with
+`for: 2m`), `OpenMettleRunQueueHighAge` (`sum by (outcome) (increase(openmettle_runs_queue_slow_exits_total[10m])) >= 1`
+with `for: 5m`, avoiding bucket subtraction extrapolation and fixed-step subquery stepping),
 `OpenMettleStorageQuotaDriftDetected`
 (`sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[3h])) > 0`
 with `for: 5m` so any non-healthy ledger mismatch, filesystem drift, quarantined row,
@@ -117,7 +168,7 @@ clear), and `OpenMettleBackupFailedOrOverdue`
 with `for: 0m`, `severity: critical`, `component: backup` so any failed or incomplete backup run
 or RPO overdue observation fires immediately from the worker's zero baseline).
 `contracts/telemetry/alerts-v1-test.yaml` supplies deterministic positive and negative
-`promtool test rules` cases for all six alerts, executed alongside `promtool check rules`
+`promtool test rules` cases for all eight alerts, executed alongside `promtool check rules`
 in CI via the pinned Prometheus image.
 
 ## Dependencies
@@ -147,11 +198,14 @@ package enters `Cargo.lock`, and the ADR 0026 banned-crate guard in
 - `.github/workflows/telemetry-qualification.yml` and `tests/telemetry_kind/qualify.py`
   (V1-29 increment 4 of 4) run `tests/telemetry_kind/test_qualify.py`, execute `promtool check
   rules` and `promtool test rules` against `contracts/telemetry/alerts-v1-test.yaml`, and
-  qualify live `openmettle-api` and `openmettle-worker` pods against pinned Grafana Alloy
-  (`v1.10.0`) and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP
-  trace and metrics ingestion with synthetic CA, inbound `traceparent` / secret redaction,
-  per-process UUIDv4 `instance` separation, closed-enum contract label verification on every
-  live `openmettle_*` series, single-outage collector resilience (zero probe failures and zero
-  restarts while `telemetry.dropped` is logged, `openmettle_telemetry_dropped_total` rises
+  qualify live `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` pods against
+  pinned Grafana Alloy (`v1.10.0`, with `sending_queue { enabled = true, num_consumers = 1 }`)
+  and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP trace and metrics
+  ingestion with synthetic CA, inbound `traceparent` / secret redaction, per-process UUIDv4
+  `instance` separation, closed-enum contract label verification on every live `openmettle_*`
+  series, live delayed-first-POST serialization through an in-cluster HTTP/1.1 delay relay
+  confirming `[0, 1]` sample preservation and `increase(...[10m]) >= 1` with zero Prometheus
+  `4xx` out-of-order rejections, single-outage collector resilience (zero probe failures and
+  zero restarts while `telemetry.dropped` is logged, `openmettle_telemetry_dropped_total` rises
   from its zero baseline, and `OpenMettleTelemetryDropsDetected` reaches `firing` in
   Prometheus), and clean SIGTERM shutdown.

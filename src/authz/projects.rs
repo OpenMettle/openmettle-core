@@ -848,6 +848,7 @@ async fn lifecycle(
     cancel_runs: bool,
 ) -> Result<WriteOutcome, StoreError> {
     let change = project_change(action, project_id, json!({}));
+    let mut cancelled_queue_ages = Vec::new();
     let apply = async |tx: &mut WriteTransaction<'_>, scope: &str, _: &Principal| {
         let c = tx.connection()?;
         let changed = sqlx::query(sql)
@@ -859,7 +860,7 @@ async fn lifecycle(
         if changed == 1 {
             if cancel_runs {
                 // Last statement: run rows are locked after the project row (`authz::runs`).
-                super::runs::cancel_scope_runs(c, scope).await?;
+                cancelled_queue_ages = super::runs::cancel_scope_runs(c, scope).await?;
             }
             return Ok(());
         }
@@ -876,7 +877,7 @@ async fn lifecycle(
         })
     };
     let authorize = manages(required);
-    project_write(
+    let outcome = project_write(
         c,
         ctx,
         project_id,
@@ -887,7 +888,9 @@ async fn lifecycle(
         apply,
         async |_, _| Ok(()),
     )
-    .await
+    .await?;
+    super::runs::record_cancelled_queue_ages(&cancelled_queue_ages);
+    Ok(outcome)
 }
 
 pub async fn archive_project(

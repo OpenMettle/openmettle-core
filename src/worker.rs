@@ -14,7 +14,11 @@ use crate::{
         store::StoreError,
     },
     runs::{Observation, Payload, record_observation},
-    telemetry::{Sweep, sweep_failed},
+    telemetry::{
+        Sweep, WorkerOperationKind, WorkerOperationOutcome, WorkerRunOutcome, derive_run_lease_id,
+        sweep_failed, worker_operation_completed, worker_operation_span, worker_run_claimed,
+        worker_run_settled, worker_run_span,
+    },
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::{PgPool, Postgres, pool::PoolConnection};
@@ -28,6 +32,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
+use tracing::Instrument;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -664,11 +669,173 @@ impl RunContext {
     }
 }
 
+/// RAII guard for one `worker.operation` span and its matching `worker.operation.completed`
+/// structured log event. Disarmed on normal completion via [`Self::finish`]; if the enclosing
+/// future is dropped mid-flight (for example when worker drain hits its deadline), `Drop`
+/// records `lease_lost` or `stopped` directly on the open span handle and emits the event once.
+pub(crate) struct WorkerOperationGuard {
+    span: tracing::Span,
+    run_id: String,
+    lease_id: String,
+    operation_id: String,
+    kind: WorkerOperationKind,
+    started: std::time::Instant,
+    stop: Option<watch::Receiver<Option<Stop>>>,
+    finished: bool,
+}
+
+impl WorkerOperationGuard {
+    pub(crate) fn new(
+        span: tracing::Span,
+        run_id: &str,
+        lease_id: &str,
+        operation_id: &str,
+        kind: WorkerOperationKind,
+        stop: Option<watch::Receiver<Option<Stop>>>,
+    ) -> Self {
+        Self {
+            span,
+            run_id: run_id.to_owned(),
+            lease_id: lease_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            kind,
+            started: std::time::Instant::now(),
+            stop,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: WorkerOperationOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: WorkerOperationOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("operation.outcome", outcome.as_str());
+        worker_operation_completed(
+            &self.run_id,
+            &self.lease_id,
+            &self.operation_id,
+            self.kind,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for WorkerOperationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let outcome = match self.stop.as_ref().and_then(|rx| *rx.borrow()) {
+                Some(Stop::LeaseLost) => WorkerOperationOutcome::LeaseLost,
+                _ => WorkerOperationOutcome::Stopped,
+            };
+            let span = self.span.clone();
+            span.in_scope(|| self.record(outcome));
+        }
+    }
+}
+
+async fn reconcile_operation<E: Executor>(
+    pool: &PgPool,
+    run: &ActiveRun,
+    op: &UnresolvedOperation,
+    executor: &E,
+    context: &RunContext,
+    lease_id: &str,
+) -> Result<Option<WorkEnd>, LeaseError> {
+    let lease = run.claim.lease();
+    let op_span = worker_operation_span(
+        lease.run_id,
+        lease_id,
+        &op.id,
+        WorkerOperationKind::Reconcile,
+    );
+    let guard_span = op_span.clone();
+    async {
+        let guard = WorkerOperationGuard::new(
+            guard_span,
+            lease.run_id,
+            lease_id,
+            &op.id,
+            WorkerOperationKind::Reconcile,
+            Some(context.stop.clone()),
+        );
+        let res: Result<(WorkerOperationOutcome, Option<WorkEnd>), LeaseError> = async {
+            if let Some(o) = executor.reconcile(run, op, context.step()).await {
+                let mut c = connection(pool).await?;
+                if context.stopped() == Some(Stop::LeaseLost) {
+                    Ok((
+                        WorkerOperationOutcome::LeaseLost,
+                        Some(WorkEnd::Stop(Stop::LeaseLost)),
+                    ))
+                } else {
+                    leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
+                        record_observation(
+                            tx,
+                            &Observation {
+                                scope: lease.scope_id,
+                                run: lease.run_id,
+                                operation: &op.id,
+                                key: &o.key,
+                                expected_revision: op.revision,
+                                outcome: &o.outcome,
+                                handle: o.handle.as_deref(),
+                                evidence: Payload {
+                                    format: &o.format,
+                                    version: o.version,
+                                    bytes: &o.evidence,
+                                },
+                            },
+                        )
+                        .await
+                    })
+                    .await?;
+                    Ok((WorkerOperationOutcome::Ok, None))
+                }
+            } else if let Some(why) = context.stopped() {
+                let outcome = if why == Stop::LeaseLost {
+                    WorkerOperationOutcome::LeaseLost
+                } else {
+                    WorkerOperationOutcome::Stopped
+                };
+                Ok((outcome, Some(WorkEnd::Stop(why))))
+            } else {
+                Ok((WorkerOperationOutcome::Handoff, None))
+            }
+        }
+        .await;
+        match res {
+            Ok((outcome, end)) => {
+                guard.finish(outcome);
+                Ok(end)
+            }
+            Err(err) => {
+                let outcome = match err {
+                    LeaseError::Stopping(_) => WorkerOperationOutcome::Stopped,
+                    LeaseError::StaleClaim | LeaseError::Expired | LeaseError::Terminal { .. } => {
+                        WorkerOperationOutcome::LeaseLost
+                    }
+                    LeaseError::Store(_) => WorkerOperationOutcome::Failed,
+                };
+                guard.finish(outcome);
+                Err(err)
+            }
+        }
+    }
+    .instrument(op_span)
+    .await
+}
+
 async fn reconcile<E: Executor>(
     pool: &PgPool,
     run: &ActiveRun,
     executor: &E,
     context: &RunContext,
+    lease_id: &str,
 ) -> Result<WorkEnd, LeaseError> {
     let lease = run.claim.lease();
     let mut after = None;
@@ -683,34 +850,10 @@ async fn reconcile<E: Executor>(
             if let Some(why) = context.stopped() {
                 return Ok(WorkEnd::Stop(why));
             }
-            if let Some(o) = executor.reconcile(run, op, context.step()).await {
-                let mut c = connection(pool).await?;
-                if context.stopped() == Some(Stop::LeaseLost) {
-                    return Ok(WorkEnd::Stop(Stop::LeaseLost));
-                }
-                leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
-                    record_observation(
-                        tx,
-                        &Observation {
-                            scope: lease.scope_id,
-                            run: lease.run_id,
-                            operation: &op.id,
-                            key: &o.key,
-                            expected_revision: op.revision,
-                            outcome: &o.outcome,
-                            handle: o.handle.as_deref(),
-                            evidence: Payload {
-                                format: &o.format,
-                                version: o.version,
-                                bytes: &o.evidence,
-                            },
-                        },
-                    )
-                    .await
-                })
-                .await?;
-            } else if let Some(why) = context.stopped() {
-                return Ok(WorkEnd::Stop(why));
+            if let Some(end) =
+                reconcile_operation(pool, run, op, executor, context, lease_id).await?
+            {
+                return Ok(end);
             }
         }
         if page.len() < 100 {
@@ -736,9 +879,10 @@ async fn execute<E: Executor>(
     recovered: bool,
     settings: &LeaseSettings,
     context: &RunContext,
+    lease_id: &str,
 ) -> Result<WorkEnd, LeaseError> {
     if run.state == ExecState::Reconciling {
-        return reconcile(pool, run, adapters.executor, context).await;
+        return reconcile(pool, run, adapters.executor, context, lease_id).await;
     }
     if run.state == ExecState::Cancelling
         || (recovered
@@ -850,6 +994,80 @@ async fn execute<E: Executor>(
     }
 }
 
+fn settled_run_outcome(result: &Result<Settled, LeaseError>) -> WorkerRunOutcome {
+    match result {
+        Ok(Settled::Terminal { state: "succeeded" }) => WorkerRunOutcome::Succeeded,
+        Ok(Settled::Terminal { state: "cancelled" }) => WorkerRunOutcome::Cancelled,
+        Ok(Settled::Terminal {
+            state: "interrupted",
+        }) => WorkerRunOutcome::Interrupted,
+        Ok(Settled::Terminal { .. }) => WorkerRunOutcome::Failed,
+        Ok(Settled::Reconciling { .. }) => WorkerRunOutcome::Reconciling,
+        Err(LeaseError::Expired | LeaseError::StaleClaim | LeaseError::Terminal { .. }) => {
+            WorkerRunOutcome::LeaseLost
+        }
+        Err(_) => WorkerRunOutcome::Aborted,
+    }
+}
+
+fn handoff_run_outcome(result: &Result<leases::Handoff, LeaseError>) -> WorkerRunOutcome {
+    match result {
+        Ok(leases::Handoff::Released) => WorkerRunOutcome::Handoff,
+        Ok(leases::Handoff::Settled(settled)) => settled_run_outcome(&Ok(*settled)),
+        Err(LeaseError::Expired | LeaseError::StaleClaim | LeaseError::Terminal { .. }) => {
+            WorkerRunOutcome::LeaseLost
+        }
+        Err(_) => WorkerRunOutcome::Aborted,
+    }
+}
+
+struct WorkerRunGuard {
+    span: tracing::Span,
+    run_id: String,
+    lease_id: String,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl WorkerRunGuard {
+    fn new(span: tracing::Span, run_id: &str, lease_id: &str) -> Self {
+        Self {
+            span,
+            run_id: run_id.to_owned(),
+            lease_id: lease_id.to_owned(),
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, outcome: WorkerRunOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: WorkerRunOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("run.outcome", outcome.as_str());
+        worker_run_settled(
+            &self.run_id,
+            &self.lease_id,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for WorkerRunGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let span = self.span.clone();
+            span.in_scope(|| self.record(WorkerRunOutcome::Aborted));
+        }
+    }
+}
+
 async fn run_one<E: Executor>(
     pool: &PgPool,
     adapters: Adapters<'_, E>,
@@ -857,8 +1075,36 @@ async fn run_one<E: Executor>(
     sent: Instant,
     recovered: bool,
     settings: LeaseSettings,
-    mut shutdown: watch::Receiver<Option<Instant>>,
+    shutdown: watch::Receiver<Option<Instant>>,
 ) {
+    let run_id = run.claim.run_id.clone();
+    let lease_id = derive_run_lease_id(&run_id, &run.claim.claim_token);
+    let span = worker_run_span(&run_id, &lease_id);
+    let guard_span = span.clone();
+    async {
+        worker_run_claimed(&run_id, &lease_id);
+        let guard = WorkerRunGuard::new(guard_span, &run_id, &lease_id);
+        let outcome = run_one_inner(
+            pool, adapters, run, sent, recovered, settings, shutdown, &lease_id,
+        )
+        .await;
+        guard.finish(outcome);
+    }
+    .instrument(span)
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_inner<E: Executor>(
+    pool: &PgPool,
+    adapters: Adapters<'_, E>,
+    run: ActiveRun,
+    sent: Instant,
+    recovered: bool,
+    settings: LeaseSettings,
+    mut shutdown: watch::Receiver<Option<Instant>>,
+    lease_id: &str,
+) -> WorkerRunOutcome {
     let lease = run.claim.lease();
     let children = StepTasks::default();
     let (stop, rx) = watch::channel(None);
@@ -875,7 +1121,11 @@ async fn run_one<E: Executor>(
         tasks: children.handle(),
     };
     let mut work = Box::pin(async {
-        match execute(pool, adapters, &run, recovered, &settings, &context).await {
+        match execute(
+            pool, adapters, &run, recovered, &settings, &context, lease_id,
+        )
+        .await
+        {
             Ok(end) => end,
             Err(LeaseError::Stopping(_)) => WorkEnd::Stop(Stop::Cancel),
             Err(_) => WorkEnd::Stop(Stop::LeaseLost),
@@ -938,10 +1188,10 @@ async fn run_one<E: Executor>(
     // Cancel any pending renewal and return its connection before settling.
     drop(renewal);
     if cause == Some(Stop::LeaseLost) || matches!(end, WorkEnd::Stop(Stop::LeaseLost)) {
-        return;
+        return WorkerRunOutcome::LeaseLost;
     }
     let Ok(mut c) = connection(pool).await else {
-        return;
+        return WorkerRunOutcome::Aborted;
     };
     let input = match end {
         WorkEnd::Answer(answer) if cause.is_none() => {
@@ -952,28 +1202,29 @@ async fn run_one<E: Executor>(
                 }
                 Ok(Settled::Reconciling { .. }) => {
                     let _ = leases::release_lease(&mut c, &lease).await;
-                    return;
+                    return WorkerRunOutcome::Reconciling;
                 }
-                _ => return,
+                other => return settled_run_outcome(&other),
             }
         }
         WorkEnd::Invalidated(settled) => {
             if matches!(settled, Settled::Reconciling { .. }) {
                 let _ = leases::release_lease(&mut c, &lease).await;
+                return WorkerRunOutcome::Reconciling;
             }
-            return;
+            return WorkerRunOutcome::Invalidated;
         }
         WorkEnd::Handoff => {
-            let _ = leases::handoff(&mut c, &lease, &settings).await;
-            return;
+            let outcome = leases::handoff(&mut c, &lease, &settings).await;
+            return handoff_run_outcome(&outcome);
         }
         WorkEnd::Complete(input @ (Settle::Succeeded | Settle::Failed(_))) => input,
         WorkEnd::Complete(Settle::Stopped) if run.state == ExecState::Reconciling => {
             Settle::Stopped
         }
         _ if cause == Some(Stop::Shutdown) => {
-            let _ = leases::handoff(&mut c, &lease, &settings).await;
-            return;
+            let outcome = leases::handoff(&mut c, &lease, &settings).await;
+            return handoff_run_outcome(&outcome);
         }
         _ => Settle::Stopped,
     };
@@ -986,6 +1237,7 @@ async fn run_one<E: Executor>(
     if matches!(settled, Ok(Settled::Reconciling { .. })) {
         let _ = leases::release_lease(&mut c, &lease).await;
     }
+    settled_run_outcome(&settled)
 }
 
 /// Shared by live turns and resumed approvals. An existing write never gains a send
@@ -997,14 +1249,104 @@ pub(crate) struct EffectDispatch<'a> {
     pub settings: &'a LeaseSettings,
 }
 
+pub(crate) struct DispatchStep {
+    pub(crate) step: StepResult,
+    pub(crate) outcome: WorkerOperationOutcome,
+}
+
+impl DispatchStep {
+    pub(crate) fn from_step(step: StepResult) -> Self {
+        let outcome = operation_outcome(&step);
+        Self { step, outcome }
+    }
+
+    pub(crate) fn observed_output(output: String, succeeded: bool) -> Self {
+        Self {
+            step: StepResult::ToolOutput(output),
+            outcome: observed_output_outcome(succeeded),
+        }
+    }
+}
+
+fn observed_output_outcome(succeeded: bool) -> WorkerOperationOutcome {
+    if succeeded {
+        WorkerOperationOutcome::Ok
+    } else {
+        WorkerOperationOutcome::Failed
+    }
+}
+
+fn observed_replay_step(step: &StepContext, succeeded: bool, output: String) -> DispatchStep {
+    if let Some(why) = *step.stop.borrow() {
+        DispatchStep::from_step(stopped_step(why))
+    } else if Instant::now() >= step.deadline {
+        DispatchStep::from_step(StepResult::Handoff)
+    } else {
+        DispatchStep::observed_output(output, succeeded)
+    }
+}
+
+fn operation_outcome(result: &StepResult) -> WorkerOperationOutcome {
+    match result {
+        StepResult::Answer(_)
+        | StepResult::ToolOutput(_)
+        | StepResult::ToolSuccess { .. }
+        | StepResult::ToolResponse(Ok(_))
+        | StepResult::Continue
+        | StepResult::Finished => WorkerOperationOutcome::Ok,
+        StepResult::ToolResponse(Err(_)) | StepResult::Failed(_) => WorkerOperationOutcome::Failed,
+        StepResult::Stopped => WorkerOperationOutcome::Stopped,
+        StepResult::Handoff => WorkerOperationOutcome::Handoff,
+        StepResult::LeaseLost => WorkerOperationOutcome::LeaseLost,
+        StepResult::Invalidated(_) => WorkerOperationOutcome::Invalidated,
+    }
+}
+
 impl EffectDispatch<'_> {
     pub async fn send(
         &self,
         run: &ActiveRun,
         proposal: &Proposal,
         intent: IntentResult,
-        mut step: StepContext,
+        step: StepContext,
     ) -> StepResult {
+        let fail = StepResult::Failed(FailReason::StepFailed);
+        let (op, fresh) = match intent {
+            IntentResult::Applied(i) => (i.operation_id.clone(), Some(i)),
+            IntentResult::Replayed(id) => (id, None),
+            IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
+            IntentResult::ApprovalRequired => return fail,
+        };
+        let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
+        let op_span =
+            worker_operation_span(&run.claim.run_id, &lease_id, &op, WorkerOperationKind::Tool);
+        let guard_span = op_span.clone();
+        let stop_rx = step.stop.clone();
+        async {
+            let guard = WorkerOperationGuard::new(
+                guard_span,
+                &run.claim.run_id,
+                &lease_id,
+                &op,
+                WorkerOperationKind::Tool,
+                Some(stop_rx),
+            );
+            let dispatched = self.send_operation(run, proposal, &op, fresh, step).await;
+            guard.finish(dispatched.outcome);
+            dispatched.step
+        }
+        .instrument(op_span)
+        .await
+    }
+
+    async fn send_operation(
+        &self,
+        run: &ActiveRun,
+        proposal: &Proposal,
+        op: &str,
+        fresh: Option<approvals::CommittedIntent>,
+        mut step: StepContext,
+    ) -> DispatchStep {
         let Self {
             pool,
             artifacts,
@@ -1013,16 +1355,10 @@ impl EffectDispatch<'_> {
         } = *self;
         use approvals::ReplayEffect;
         let fail = StepResult::Failed(FailReason::StepFailed);
-        let (op, fresh) = match intent {
-            IntentResult::Applied(i) => (i.operation_id.clone(), Some(i)),
-            IntentResult::Replayed(id) => (id, None),
-            IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
-            IntentResult::ApprovalRequired => return fail,
-        };
         let policy = Some(effects);
         let lease = run.claim.lease();
         let Ok(mut c) = pool.acquire().await else {
-            return StepResult::LeaseLost;
+            return DispatchStep::from_step(StepResult::LeaseLost);
         };
         let op_row: Result<(String, Option<i32>), _> = sqlx::query_as(
             "SELECT capability, dispatched_attempts FROM openmettle.operations
@@ -1030,19 +1366,19 @@ impl EffectDispatch<'_> {
         )
         .bind(lease.scope_id)
         .bind(lease.run_id)
-        .bind(&op)
+        .bind(op)
         .fetch_one(&mut *c)
         .await;
         let permit = match op_row {
-            Err(_) => return StepResult::LeaseLost,
+            Err(_) => return DispatchStep::from_step(StepResult::LeaseLost),
             Ok((cap, _)) if cap == "repeatable_read" => {
                 if let Some(why) = *step.stop.borrow() {
-                    return stopped_step(why);
+                    return DispatchStep::from_step(stopped_step(why));
                 }
                 if Instant::now() >= step.deadline {
-                    return StepResult::Handoff;
+                    return DispatchStep::from_step(StepResult::Handoff);
                 }
-                approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
+                approvals::start_replayed_read(&mut c, &lease, op, proposal, settings, &policy)
                     .await
             }
             // Only legacy single-phase rows (`dispatched_attempts IS NULL`, created while
@@ -1054,25 +1390,25 @@ impl EffectDispatch<'_> {
             // MUST go through Transaction 2 (`start_write_attempt`).
             Ok((_, Some(attempts))) if attempts == 0 || fresh.is_some() => {
                 if let Some(why) = *step.stop.borrow() {
-                    return stopped_step(why);
+                    return DispatchStep::from_step(stopped_step(why));
                 }
                 if Instant::now() >= step.deadline {
-                    return StepResult::Handoff;
+                    return DispatchStep::from_step(StepResult::Handoff);
                 }
-                approvals::start_write_attempt(&mut c, &lease, &op, proposal, settings, &policy)
+                approvals::start_write_attempt(&mut c, &lease, op, proposal, settings, &policy)
                     .await
             }
             Ok(_) => {
                 approvals::recheck_replay_effect_authority(
-                    &mut c, &lease, &op, proposal, settings, &policy,
+                    &mut c, &lease, op, proposal, settings, &policy,
                 )
                 .await
             }
         };
-        let bytes = match start_permit(
+        let bytes = match start_permit_with_outcome(
             &mut c,
             &lease,
-            (&op, proposal),
+            (op, proposal),
             settings,
             &policy,
             &mut step,
@@ -1081,17 +1417,19 @@ impl EffectDispatch<'_> {
         .await
         {
             Ok(bytes) => bytes,
-            Err(step) => return step,
+            Err(dispatched) => return dispatched,
         };
         drop(c);
         let result = match timeout_at(
             step.deadline,
-            effects.adapter.send(run, op.clone(), bytes, step.clone()),
+            effects
+                .adapter
+                .send(run, op.to_owned(), bytes, step.clone()),
         )
         .await
         {
             Ok(r) => r,
-            Err(_) => return StepResult::Handoff,
+            Err(_) => return DispatchStep::from_step(StepResult::Handoff),
         };
         let output = match result {
             StepResult::ToolSuccess { text, handle } if proposal.tool != crate::mcp::READ_RANGE => {
@@ -1099,7 +1437,7 @@ impl EffectDispatch<'_> {
                     pool,
                     lease,
                     proposal,
-                    operation: &op,
+                    operation: op,
                     step: &step,
                 };
                 return artifact_fs::publish_bytes_with_handle(
@@ -1114,23 +1452,23 @@ impl EffectDispatch<'_> {
             }
             StepResult::ToolSuccess { text, handle } => {
                 if *step.stop.borrow() == Some(Stop::LeaseLost) {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 }
                 let Ok(mut c) = pool.acquire().await else {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 };
                 if let Err(e) = crate::mcp::observe_known_with_handle(
                     &mut c,
                     &lease,
                     &step,
-                    &op,
+                    op,
                     true,
                     handle.as_deref(),
                     &text,
                 )
                 .await
                 {
-                    return turns::lease_step(e);
+                    return DispatchStep::from_step(turns::lease_step(e));
                 }
                 text
             }
@@ -1139,10 +1477,13 @@ impl EffectDispatch<'_> {
                     pool,
                     lease,
                     proposal,
-                    operation: &op,
+                    operation: op,
                     step: &step,
                 };
-                return artifact_fs::publish_bytes(&cx, artifacts, &text, settings, &policy).await;
+                return artifact_fs::publish_bytes_with_handle(
+                    &cx, artifacts, &text, None, settings, &policy,
+                )
+                .await;
             }
             StepResult::ToolResponse(known) => {
                 // Range pages have already been sized after JSON escaping. Known faults
@@ -1150,46 +1491,47 @@ impl EffectDispatch<'_> {
                 let success = known.is_ok();
                 let output = known.unwrap_or_else(crate::mcp::ToolFault::envelope);
                 if *step.stop.borrow() == Some(Stop::LeaseLost) {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 }
                 let Ok(mut c) = pool.acquire().await else {
-                    return StepResult::LeaseLost;
+                    return DispatchStep::from_step(StepResult::LeaseLost);
                 };
                 if let Err(e) =
-                    crate::mcp::observe_known(&mut c, &lease, &step, &op, success, &output).await
+                    crate::mcp::observe_known(&mut c, &lease, &step, op, success, &output).await
                 {
-                    return turns::lease_step(e);
+                    return DispatchStep::from_step(turns::lease_step(e));
                 }
                 output
             }
             StepResult::ToolOutput(output) => output,
-            other => return other,
+            other => return DispatchStep::from_step(other),
         };
         if let Some(why) = *step.stop.borrow() {
-            return stopped_step(why);
+            return DispatchStep::from_step(stopped_step(why));
         }
         if Instant::now() >= step.deadline {
-            return StepResult::Handoff;
+            return DispatchStep::from_step(StepResult::Handoff);
         }
         let Ok(mut c) = pool.acquire().await else {
-            return StepResult::LeaseLost;
+            return DispatchStep::from_step(StepResult::LeaseLost);
         };
         match approvals::recheck_replay_effect_authority(
-            &mut c, &lease, &op, proposal, settings, &policy,
+            &mut c, &lease, op, proposal, settings, &policy,
         )
         .await
         {
             Ok(ReplayEffect::Observed {
+                succeeded,
                 output: Some(stored),
                 ..
-            }) => StepResult::ToolOutput(stored),
+            }) => DispatchStep::observed_output(stored, succeeded),
             // Preserve the output of legacy adapters with their own observation format.
             Ok(ReplayEffect::Observed {
                 succeeded: true, ..
-            }) if output.len() <= 65536 => StepResult::ToolOutput(output),
-            Ok(ReplayEffect::Invalidated(s)) => StepResult::Invalidated(s),
-            Err(e) => turns::lease_step(e),
-            _ => fail,
+            }) if output.len() <= 65536 => DispatchStep::observed_output(output, true),
+            Ok(ReplayEffect::Invalidated(s)) => DispatchStep::from_step(StepResult::Invalidated(s)),
+            Err(e) => DispatchStep::from_step(turns::lease_step(e)),
+            _ => DispatchStep::from_step(fail),
         }
     }
 }
@@ -1203,16 +1545,34 @@ pub(crate) async fn start_permit(
     settings: &LeaseSettings,
     policy: &impl EffectPolicy,
     step: &mut StepContext,
-    mut permit: Result<approvals::ReplayEffect, LeaseError>,
+    permit: Result<approvals::ReplayEffect, LeaseError>,
 ) -> Result<Vec<u8>, StepResult> {
+    start_permit_with_outcome(c, lease, effect, settings, policy, step, permit)
+        .await
+        .map_err(|dispatched| dispatched.step)
+}
+
+async fn start_permit_with_outcome(
+    c: &mut sqlx::PgConnection,
+    lease: &leases::Lease<'_>,
+    effect: (&str, &Proposal),
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+    step: &mut StepContext,
+    mut permit: Result<approvals::ReplayEffect, LeaseError>,
+) -> Result<Vec<u8>, DispatchStep> {
     use approvals::{ReplayEffect, StartPermit};
     let (operation, proposal) = effect;
     let mut refreshed = false;
     loop {
         match permit {
             Ok(ReplayEffect::Ready(intent)) => match intent.start(step) {
-                StartPermit::Stopped(stop) => return Err(stopped_step(stop)),
-                StartPermit::LeaseMarginExhausted => return Err(StepResult::Handoff),
+                StartPermit::Stopped(stop) => {
+                    return Err(DispatchStep::from_step(stopped_step(stop)));
+                }
+                StartPermit::LeaseMarginExhausted => {
+                    return Err(DispatchStep::from_step(StepResult::Handoff));
+                }
                 StartPermit::AuthorityExpired { .. } if !refreshed => {
                     refreshed = true;
                     permit = approvals::expire_unstarted_intent(
@@ -1220,29 +1580,36 @@ pub(crate) async fn start_permit(
                     )
                     .await;
                 }
-                StartPermit::AuthorityExpired { .. } => return Err(StepResult::Handoff),
+                StartPermit::AuthorityExpired { .. } => {
+                    return Err(DispatchStep::from_step(StepResult::Handoff));
+                }
                 StartPermit::Ready { request, deadline } => {
                     step.deadline = deadline;
                     return Ok(request);
                 }
             },
             Ok(ReplayEffect::Observed {
+                succeeded,
                 output: Some(output),
                 ..
             }) => {
-                return Err(if let Some(why) = *step.stop.borrow() {
-                    stopped_step(why)
-                } else if Instant::now() >= step.deadline {
-                    StepResult::Handoff
-                } else {
-                    StepResult::ToolOutput(output)
-                });
+                return Err(observed_replay_step(step, succeeded, output));
             }
-            Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
-            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => return Err(StepResult::Handoff),
-            Ok(ReplayEffect::Exhausted) => return Err(StepResult::Stopped),
-            Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
-            Err(e) => return Err(turns::lease_step(e)),
+            Ok(ReplayEffect::Invalidated(s)) => {
+                return Err(DispatchStep::from_step(StepResult::Invalidated(s)));
+            }
+            Ok(ReplayEffect::Handoff | ReplayEffect::Pending) => {
+                return Err(DispatchStep::from_step(StepResult::Handoff));
+            }
+            Ok(ReplayEffect::Exhausted) => {
+                return Err(DispatchStep::from_step(StepResult::Stopped));
+            }
+            Ok(_) => {
+                return Err(DispatchStep::from_step(StepResult::Failed(
+                    FailReason::StepFailed,
+                )));
+            }
+            Err(e) => return Err(DispatchStep::from_step(turns::lease_step(e))),
         }
     }
 }
@@ -1377,5 +1744,538 @@ mod tests {
                 ("timeout".to_owned(), 1),
             ])
         );
+    }
+
+    #[test]
+    fn handoff_run_outcome_reports_committed_disposition_and_fence_errors() {
+        assert_eq!(
+            handoff_run_outcome(&Ok(leases::Handoff::Released)),
+            WorkerRunOutcome::Handoff
+        );
+        assert_eq!(
+            handoff_run_outcome(&Ok(leases::Handoff::Settled(Settled::Terminal {
+                state: "cancelled",
+            }))),
+            WorkerRunOutcome::Cancelled
+        );
+        assert_eq!(
+            handoff_run_outcome(&Ok(leases::Handoff::Settled(Settled::Reconciling {
+                unresolved: 1,
+            }))),
+            WorkerRunOutcome::Reconciling
+        );
+        assert_eq!(
+            handoff_run_outcome(&Err(LeaseError::StaleClaim)),
+            WorkerRunOutcome::LeaseLost
+        );
+        assert_eq!(
+            handoff_run_outcome(&Err(LeaseError::Expired)),
+            WorkerRunOutcome::LeaseLost
+        );
+        assert_eq!(
+            handoff_run_outcome(&Err(LeaseError::Terminal {
+                state: "cancelled".to_owned(),
+            })),
+            WorkerRunOutcome::LeaseLost
+        );
+        assert_eq!(
+            handoff_run_outcome(&Err(LeaseError::Store(StoreError::InvalidInput("x")))),
+            WorkerRunOutcome::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_operation_records_outcome_and_event_when_db_connection_fails() {
+        use crate::telemetry::{Format, Verbosity, tests::Capture};
+        use sqlx::postgres::PgPoolOptions;
+
+        struct FakeExecutor;
+        impl Executor for FakeExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                Some(OwnedObservation {
+                    key: "obs-1".to_owned(),
+                    outcome: "succeeded".to_owned(),
+                    handle: None,
+                    format: "synthetic.obs".to_owned(),
+                    version: 1,
+                    evidence: b"{}".to_vec(),
+                })
+            }
+        }
+
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let db_url = format!("postgres://unused@127.0.0.1:{closed_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy_with(db_url.parse().unwrap());
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
+        const OP_ID: &str = "22222222-2222-4222-8222-222222222222";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-444444444444".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-555555555555".to_owned(),
+                round_limit: 5,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Reconciling,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let op = UnresolvedOperation {
+            id: OP_ID.to_owned(),
+            logical_key: "synthetic-key".to_owned(),
+            target: "tool".to_owned(),
+            capability: "cap".to_owned(),
+            outcome: "outcome_unknown".to_owned(),
+            revision: 0,
+            downstream_handle: None,
+            dispatched_attempts: Some(1),
+        };
+        let children = StepTasks::default();
+        let (_stop_tx, stop_rx) = watch::channel(None);
+        let (_dl_tx, dl_rx) =
+            watch::channel((Instant::now() + Duration::from_secs(30), Stop::Deadline));
+        let context = RunContext {
+            deadline: dl_rx,
+            stop: stop_rx,
+            tasks: children.handle(),
+        };
+
+        let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+        let res = reconcile_operation(&pool, &run, &op, &FakeExecutor, &context, &lease_id).await;
+        assert!(matches!(res, Err(LeaseError::Store(_))));
+
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 1, "{}", capture.text());
+        assert_eq!(events[0]["run_id"].as_str(), Some(RUN_ID));
+        assert_eq!(events[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(events[0]["operation_id"].as_str(), Some(OP_ID));
+        assert_eq!(events[0]["operation.kind"].as_str(), Some("reconcile"));
+        assert_eq!(events[0]["operation.outcome"].as_str(), Some("failed"));
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_operation_records_outcome_and_event_when_dropped_while_pending() {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        struct PendingExecutor(Arc<Notify>);
+        impl Executor for PendingExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                StepResult::Finished
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let db_url = format!("postgres://unused@127.0.0.1:{closed_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy_with(db_url.parse().unwrap());
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111112";
+        const OP_ID: &str = "22222222-2222-4222-8222-222222222223";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333334";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-444444444445".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-555555555556".to_owned(),
+                round_limit: 5,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Reconciling,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let op = UnresolvedOperation {
+            id: OP_ID.to_owned(),
+            logical_key: "synthetic-pending-key".to_owned(),
+            target: "tool".to_owned(),
+            capability: "cap".to_owned(),
+            outcome: "outcome_unknown".to_owned(),
+            revision: 0,
+            downstream_handle: None,
+            dispatched_attempts: Some(1),
+        };
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        // Case 1: dropped while pending with no lease loss -> `stopped`.
+        {
+            let children = StepTasks::default();
+            let (_stop_tx, stop_rx) = watch::channel(None);
+            let (_dl_tx, dl_rx) =
+                watch::channel((Instant::now() + Duration::from_secs(30), Stop::Deadline));
+            let context = RunContext {
+                deadline: dl_rx,
+                stop: stop_rx,
+                tasks: children.handle(),
+            };
+            let entered = Arc::new(Notify::new());
+            let exec = PendingExecutor(entered.clone());
+            let mut fut = std::pin::pin!(reconcile_operation(
+                &pool, &run, &op, &exec, &context, &lease_id
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending executor must not resolve"),
+                _ = entered.notified() => {}
+            }
+        }
+
+        // Case 2: `Stop::LeaseLost` observed before drop -> `lease_lost`.
+        {
+            let children = StepTasks::default();
+            let (stop_tx, stop_rx) = watch::channel(None);
+            let (_dl_tx, dl_rx) =
+                watch::channel((Instant::now() + Duration::from_secs(30), Stop::Deadline));
+            let context = RunContext {
+                deadline: dl_rx,
+                stop: stop_rx,
+                tasks: children.handle(),
+            };
+            let entered = Arc::new(Notify::new());
+            let exec = PendingExecutor(entered.clone());
+            let mut fut = std::pin::pin!(reconcile_operation(
+                &pool, &run, &op, &exec, &context, &lease_id
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending executor must not resolve"),
+                _ = entered.notified() => {}
+            }
+            stop_tx.send(Some(Stop::LeaseLost)).unwrap();
+        }
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.operation")
+            .collect();
+        assert_eq!(spans.len(), 2);
+
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 2, "{}", capture.text());
+
+        for (i, expected_outcome) in ["stopped", "lease_lost"].into_iter().enumerate() {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+            assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+            assert_eq!(text(attrs["operation_id"]), Some(OP_ID));
+            assert_eq!(text(attrs["operation.kind"]), Some("reconcile"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["run_id"].as_str(), Some(RUN_ID));
+            assert_eq!(ev["lease_id"].as_str(), Some(lease_id.as_str()));
+            assert_eq!(ev["operation_id"].as_str(), Some(OP_ID));
+            assert_eq!(ev["operation.kind"].as_str(), Some("reconcile"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn run_one_records_aborted_outcome_and_settled_event_when_dropped_while_pending() {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use tokio::{net::TcpListener, sync::Notify};
+
+        struct PendingStepExecutor;
+        impl Executor for PendingStepExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                std::future::pending().await
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                None
+            }
+        }
+
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_listener.local_addr().unwrap().port();
+        let accepted = Arc::new(Notify::new());
+        let accepted_tx = accepted.clone();
+        let stalled_server = tokio::spawn(async move {
+            let (_sock, _) = stalled_listener.accept().await.unwrap();
+            accepted_tx.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let db_url = format!("postgres://unused@127.0.0.1:{stalled_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(db_url.parse().unwrap());
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111119";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333339";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-444444444449".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-555555555559".to_owned(),
+                round_limit: 5,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        {
+            let exec = PendingStepExecutor;
+            let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+            let adapters = Adapters {
+                artifacts: None,
+                executor: &exec,
+                approved: None,
+            };
+            let mut fut = std::pin::pin!(run_one(
+                &pool,
+                adapters,
+                run,
+                Instant::now(),
+                false,
+                LeaseSettings {
+                    lease: Duration::from_secs(30),
+                    execution_timeout: Duration::from_secs(120),
+                },
+                shutdown_rx,
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending run_one must not complete while DB socket stalls"),
+                _ = accepted.notified() => {}
+            }
+        }
+        stalled_server.abort();
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.run")
+            .collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].dropped_attributes_count, 0);
+        let attrs = attributes(&spans[0].attributes);
+        assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+        assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+        assert_eq!(text(attrs["run.outcome"]), Some("aborted"));
+
+        let claimed = capture.events("worker.run.claimed");
+        assert_eq!(claimed.len(), 1, "{}", capture.text());
+        assert_eq!(claimed[0]["run_id"].as_str(), Some(RUN_ID));
+        assert_eq!(claimed[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+
+        let settled = capture.events("worker.run.settled");
+        assert_eq!(settled.len(), 1, "{}", capture.text());
+        assert_eq!(settled[0]["run_id"].as_str(), Some(RUN_ID));
+        assert_eq!(settled[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(settled[0]["run.outcome"].as_str(), Some("aborted"));
+        assert!(settled[0]["duration_us"].as_u64().is_some());
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn observed_tool_output_classifies_known_fault_as_failed_and_preserves_envelope() {
+        use crate::mcp::ToolFault;
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111121";
+        const OP_FRESH: &str = "22222222-2222-4222-8222-222222222221";
+        const OP_REPLAY: &str = "22222222-2222-4222-8222-222222222222";
+        const OP_OK: &str = "22222222-2222-4222-8222-222222222223";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333321";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+
+        let (_stop_tx, stop_rx) = watch::channel(None);
+        let step = StepContext {
+            deadline: Instant::now() + Duration::from_secs(30),
+            stop: stop_rx.clone(),
+            tasks: StepTasks::default().handle(),
+        };
+
+        let semantic_env = ToolFault::Semantic.envelope();
+        let refusal_env = ToolFault::TerminalRefusal.envelope();
+        let ok_env = r#"{"status":"ok","text":"synthetic-page"}"#.to_owned();
+
+        // Fresh known fault observed via `recheck_replay_effect_authority` (`succeeded: false`).
+        let fresh_fault = DispatchStep::observed_output(semantic_env.clone(), false);
+        assert_eq!(fresh_fault.outcome, WorkerOperationOutcome::Failed);
+        assert!(matches!(&fresh_fault.step, StepResult::ToolOutput(s) if s == &semantic_env));
+
+        // Replayed failed observed output via `start_permit_with_outcome` (`succeeded: false`).
+        let replayed_fault = observed_replay_step(&step, false, refusal_env.clone());
+        assert_eq!(replayed_fault.outcome, WorkerOperationOutcome::Failed);
+        assert!(matches!(&replayed_fault.step, StepResult::ToolOutput(s) if s == &refusal_env));
+
+        // Replayed succeeded observed output (`succeeded: true`).
+        let replayed_ok = observed_replay_step(&step, true, ok_env.clone());
+        assert_eq!(replayed_ok.outcome, WorkerOperationOutcome::Ok);
+        assert!(matches!(&replayed_ok.step, StepResult::ToolOutput(s) if s == &ok_env));
+
+        // Stopped/expired step still wins over observed output on replay.
+        let (stopped_tx, stopped_rx) = watch::channel(Some(Stop::LeaseLost));
+        let stopped_ctx = StepContext {
+            deadline: Instant::now() + Duration::from_secs(30),
+            stop: stopped_rx,
+            tasks: StepTasks::default().handle(),
+        };
+        let stopped_replay = observed_replay_step(&stopped_ctx, false, refusal_env.clone());
+        assert_eq!(stopped_replay.outcome, WorkerOperationOutcome::LeaseLost);
+        assert!(matches!(stopped_replay.step, StepResult::LeaseLost));
+        drop(stopped_tx);
+
+        // Emit OTLP spans + structured completion logs via `WorkerOperationGuard` just as
+        // `EffectDispatch::send` does for fresh fault, replayed fault, and succeeded output.
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        for (op_id, dispatched) in [
+            (OP_FRESH, fresh_fault),
+            (OP_REPLAY, replayed_fault),
+            (OP_OK, replayed_ok),
+        ] {
+            let span = worker_operation_span(RUN_ID, &lease_id, op_id, WorkerOperationKind::Tool);
+            let guard_span = span.clone();
+            let rx = stop_rx.clone();
+            async {
+                let guard = WorkerOperationGuard::new(
+                    guard_span,
+                    RUN_ID,
+                    &lease_id,
+                    op_id,
+                    WorkerOperationKind::Tool,
+                    Some(rx),
+                );
+                guard.finish(dispatched.outcome);
+            }
+            .instrument(span)
+            .await;
+        }
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.operation")
+            .collect();
+        assert_eq!(spans.len(), 3);
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 3, "{}", capture.text());
+
+        for (i, (op_id, expected_outcome, expected_level)) in [
+            (OP_FRESH, "failed", "WARN"),
+            (OP_REPLAY, "failed", "WARN"),
+            (OP_OK, "ok", "DEBUG"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+            assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+            assert_eq!(text(attrs["operation_id"]), Some(op_id));
+            assert_eq!(text(attrs["operation.kind"]), Some("tool"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["level"].as_str(), Some(expected_level));
+            assert_eq!(ev["run_id"].as_str(), Some(RUN_ID));
+            assert_eq!(ev["lease_id"].as_str(), Some(lease_id.as_str()));
+            assert_eq!(ev["operation_id"].as_str(), Some(op_id));
+            assert_eq!(ev["operation.kind"].as_str(), Some("tool"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
     }
 }

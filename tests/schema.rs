@@ -3360,3 +3360,6 @@ mod vault;
 
 #[path = "schema/backup.rs"]
 mod backup;
+
+#[path = "schema/telemetry_closeout.rs"]
+mod telemetry_closeout;

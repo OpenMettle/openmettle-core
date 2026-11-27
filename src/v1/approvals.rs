@@ -55,6 +55,7 @@ impl Api {
             None
         };
         let session = self.authenticate(channel).await?;
+        crate::telemetry::record_request_run_id(&parts.extensions, run);
         let policy = parts.extensions.get::<ApprovalDisplayPolicy>();
         self.with_connection(async |c| {
             crate::restore::require_open_gate(c).await?;

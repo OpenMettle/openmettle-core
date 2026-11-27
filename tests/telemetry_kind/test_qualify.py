@@ -97,6 +97,7 @@ class ManifestTests(unittest.TestCase):
             "api": "openmettle-api:telemetry-qual-x",
             "worker": "openmettle-worker:telemetry-qual-x",
             "gateway": "openmettle-gateway:telemetry-qual-x",
+            "relay": "openmettle-otlp-delay-relay:telemetry-qual-x",
         }
         self.items = qualify.render_manifests(
             self.contract, images, self.passwords, self.tls, self.alerts_yaml, "0123abcd"
@@ -166,7 +167,26 @@ class ManifestTests(unittest.TestCase):
         alloy_cfg = self.find("ConfigMap", "alloy-config")["data"]["config.alloy"]
         self.assertIn("cert_file", alloy_cfg)
         self.assertIn("insecure = true", alloy_cfg)
-        self.assertIn("/api/v1/otlp", alloy_cfg)
+        self.assertIn(f"http://{qualify.RELAY_HOST}:{qualify.RELAY_PORT}/api/v1/otlp", alloy_cfg)
+        self.assertIn('compression = "none"', alloy_cfg)
+        self.assertIn("sending_queue {", alloy_cfg)
+        self.assertRegex(alloy_cfg, r"enabled\s*=\s*true")
+        self.assertRegex(alloy_cfg, r"num_consumers\s*=\s*1\b")
+
+        relay_dep = self.find("Deployment", "otlp-delay-relay")
+        self.assertEqual(relay_dep["metadata"]["namespace"], qualify.TELEMETRY_NAMESPACE)
+        relay_pod = relay_dep["spec"]["template"]["spec"]
+        self.assertIs(relay_pod["automountServiceAccountToken"], False)
+        self.assertIs(relay_pod["enableServiceLinks"], False)
+        self.assertIs(relay_pod["securityContext"]["runAsNonRoot"], True)
+        relay_ctr = relay_pod["containers"][0]
+        self.assertEqual(relay_ctr["image"], "openmettle-otlp-delay-relay:telemetry-qual-x")
+        self.assertEqual(relay_ctr["imagePullPolicy"], "Never")
+        self.assertIs(relay_ctr["securityContext"]["allowPrivilegeEscalation"], False)
+        self.assertIs(relay_ctr["securityContext"]["readOnlyRootFilesystem"], True)
+        self.assertEqual(relay_ctr["securityContext"]["capabilities"], {"drop": ["ALL"]})
+        relay_svc = self.find("Service", "otlp-delay-relay")
+        self.assertEqual(relay_svc["spec"]["ports"][0]["port"], qualify.RELAY_PORT)
 
 
 class SeriesValidationAndParserTests(unittest.TestCase):
@@ -503,6 +523,275 @@ class SeriesValidationAndParserTests(unittest.TestCase):
                 "77777777-7777-4777-8777-777777777777",
             ],
         )
+
+    def test_validate_delayed_baseline_samples_accepts_ordered_and_rejects_reordered(self):
+        good_range = [{"values": [[1700000000.000, "0"], [1700000000.001, "1"]]}]
+        good_inc = [{"value": [1700000005.0, "1"]}]
+        good_stats = {"forwarded": 4, "delayed": 1, "armed_ms": 0, "status_4xx": 0}
+        res = qualify.validate_delayed_baseline_samples(good_range, good_inc, good_stats)
+        self.assertEqual(res["samples"], 2)
+        self.assertEqual(res["first_value"], 0.0)
+        self.assertEqual(res["last_value"], 1.0)
+        self.assertEqual(res["increase_10m"], 1.0)
+        self.assertEqual(res["relay_delayed"], 1)
+        self.assertEqual(res["relay_status_4xx"], 0)
+
+        # Single stored sample `[1]` (what happens when 0 is rejected out-of-order) must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, r"\[0, 1\]"):
+            qualify.validate_delayed_baseline_samples(
+                [{"values": [[1700000000.001, "1"]]}], good_inc, good_stats
+            )
+
+        # Equal timestamps must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, "timestamp"):
+            qualify.validate_delayed_baseline_samples(
+                [{"values": [[1700000000.0, "0"], [1700000000.0, "1"]]}], good_inc, good_stats
+            )
+
+        # Empty, non-finite (NaN/Inf), or <1 increase must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, "returned no result"):
+            qualify.validate_delayed_baseline_samples(good_range, [], good_stats)
+        for bad_inc in ("0", "NaN", "Inf", "+Inf", "-Inf"):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "increase"):
+                qualify.validate_delayed_baseline_samples(
+                    good_range, [{"value": [1700000005.0, bad_inc]}], good_stats
+                )
+        for bad_sample in ("NaN", "Inf"):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "non-finite"):
+                qualify.validate_delayed_baseline_samples(
+                    [{"values": [[1700000000.0, "0"], [1700000000.001, bad_sample]]}],
+                    good_inc,
+                    good_stats,
+                )
+
+        # Missing or non-integer (including boolean) relay_stats keys must fail.
+        for bad_stats in (
+            {"forwarded": 4, "delayed": 1, "armed_ms": 0},
+            {"forwarded": 4, "armed_ms": 0, "status_4xx": 0},
+            {**good_stats, "delayed": True},
+            {**good_stats, "status_4xx": False},
+        ):
+            with self.assertRaisesRegex(qualify.QualificationFailure, "missing integer field"):
+                qualify.validate_delayed_baseline_samples(good_range, good_inc, bad_stats)
+
+        # Unfired delay or any 4xx rejection from Prometheus must fail.
+        with self.assertRaisesRegex(qualify.QualificationFailure, "delay"):
+            qualify.validate_delayed_baseline_samples(
+                good_range, good_inc, {**good_stats, "delayed": 0}
+            )
+        with self.assertRaisesRegex(qualify.QualificationFailure, "4xx"):
+            qualify.validate_delayed_baseline_samples(
+                good_range, good_inc, {**good_stats, "status_4xx": 1}
+            )
+
+    def test_delay_relay_compiles_and_delays_only_matched_one_shot_post(self):
+        import http.client
+        import http.server
+        import shutil
+        import socket
+        import threading
+        import time
+
+        if shutil.which("rustc") is None:
+            self.skipTest("rustc not available in PATH")
+
+        relay_src = Path(__file__).resolve().parent / "delay_relay.rs"
+        received: list[tuple[str, bytes]] = []
+        fail_next = [False]
+
+        class UpstreamHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                received.append((self.path, body))
+                status = 400 if fail_next[0] else 200
+                fail_next[0] = False
+                self.send_response(status)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_):
+                return
+
+        upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        up_port = upstream.server_address[1]
+        up_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        up_thread.start()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            relay_port = sock.getsockname()[1]
+
+        proc = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                test_binary = Path(tmp) / "otlp-delay-relay-tests"
+                subprocess.run(
+                    [
+                        "rustc", "--edition", "2024", "--test", "-D", "warnings",
+                        str(relay_src), "-o", str(test_binary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    [str(test_binary)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                binary = Path(tmp) / "otlp-delay-relay"
+                subprocess.run(
+                    [
+                        "rustc", "--edition", "2024", "-D", "warnings",
+                        str(relay_src), "-o", str(binary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                proc = subprocess.Popen(
+                    [str(binary)],
+                    env={
+                        "RELAY_BIND": f"127.0.0.1:{relay_port}",
+                        "UPSTREAM_ADDR": f"127.0.0.1:{up_port}",
+                    },
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if qualify.http_request(relay_port, "/healthz") == (200, "ok\n"):
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("otlp-delay-relay did not become healthy")
+
+                probe_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                other_id = "11111111-2222-4333-8444-555555555555"
+                st, _ = qualify.http_request(
+                    relay_port,
+                    f"/arm-delay?ms=250&match={probe_id}",
+                    method="POST",
+                    data=b"",
+                )
+                self.assertEqual(st, 200)
+
+                # Unrelated UUID must forward immediately without disarming the probe delay.
+                other_body = qualify.encode_otlp_slow_exit_counter(
+                    other_id, "claimed", 1_700_000_000_000_000_000, 1_700_000_000_000_000_000, 0
+                )
+                t0 = time.monotonic()
+                st, _ = qualify.http_request(
+                    relay_port, "/api/v1/otlp/v1/metrics", method="POST", data=other_body
+                )
+                self.assertEqual(st, 200)
+                self.assertLess(time.monotonic() - t0, 0.2)
+
+                # Matched baseline sent with Transfer-Encoding: chunked MUST trigger the 250ms delay.
+                base_body = qualify.encode_otlp_slow_exit_counter(
+                    probe_id, "claimed", 1_700_000_000_000_000_000, 1_700_000_000_000_000_000, 0
+                )
+                self.assertIn(probe_id.encode("ascii"), base_body)
+                conn = http.client.HTTPConnection("127.0.0.1", relay_port, timeout=5)
+                conn.putrequest("POST", "/api/v1/otlp/v1/metrics")
+                conn.putheader("Content-Type", "application/x-protobuf")
+                conn.putheader("Transfer-Encoding", "chunked")
+                conn.endheaders()
+                t0 = time.monotonic()
+                conn.send(f"{len(base_body):x}\r\n".encode("ascii") + base_body + b"\r\n0\r\n\r\n")
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 200)
+                self.assertGreaterEqual(time.monotonic() - t0, 0.22)
+
+                # Subsequent matched live snapshot must NOT be delayed (one-shot already disarmed).
+                live_body = qualify.encode_otlp_slow_exit_counter(
+                    probe_id, "claimed", 1_700_000_000_000_000_000, 1_700_000_000_001_000_000, 1
+                )
+                t0 = time.monotonic()
+                st, _ = qualify.http_request(
+                    relay_port, "/api/v1/otlp/v1/metrics", method="POST", data=live_body
+                )
+                self.assertEqual(st, 200)
+                self.assertLess(time.monotonic() - t0, 0.2)
+
+                # Upstream 400 must be reflected in status_4xx.
+                fail_next[0] = True
+                st, _ = qualify.http_request(
+                    relay_port, "/api/v1/otlp/v1/metrics", method="POST", data=live_body
+                )
+                self.assertEqual(st, 400)
+
+                st, stats_text = qualify.http_request(relay_port, "/stats")
+                self.assertEqual(st, 200)
+                stats = json.loads(stats_text)
+                self.assertEqual(stats, {"forwarded": 4, "delayed": 1, "armed_ms": 0, "status_4xx": 1})
+                self.assertEqual(received[0], ("/api/v1/otlp/v1/metrics", other_body))
+                self.assertEqual(received[1], ("/api/v1/otlp/v1/metrics", base_body))
+                self.assertEqual(received[2], ("/api/v1/otlp/v1/metrics", live_body))
+
+                # Malformed chunked bodies (missing chunk CRLF, truncated trailer EOF, or LF-only
+                # chunk size line) must return 400 Bad Request and never forward upstream.
+                before_bad = len(received)
+                for raw_bad in (
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\r\nhelloXX0\r\n\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\r\nhello\r\n0\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"5\nhello\r\n0\r\n\r\n"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"0\r\nX-Check: partial"
+                    ),
+                    (
+                        b"POST /api/v1/otlp/v1/metrics HTTP/1.1\r\n"
+                        b"Host: relay\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        b"0\r\nX-Check: lf\n\r\n"
+                    ),
+                ):
+                    with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as raw_sock:
+                        raw_sock.sendall(raw_bad)
+                        raw_sock.shutdown(socket.SHUT_WR)
+                        reply = b""
+                        while True:
+                            chunk = raw_sock.recv(4096)
+                            if not chunk:
+                                break
+                            reply += chunk
+                    self.assertTrue(
+                        reply.startswith(b"HTTP/1.1 400 Bad Request\r\n"),
+                        f"expected 400 Bad Request for malformed chunked body {raw_bad!r}, got {reply!r}",
+                    )
+                self.assertEqual(len(received), before_bad)
+        finally:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            upstream.shutdown()
+            upstream.server_close()
 
 
 class GuardTests(unittest.TestCase):

@@ -44,7 +44,10 @@ use crate::{
     bounded_positive,
     provider_http::gateway::UsageReport,
     runs::{digest, identity as framed_identity, is_canonical_uuid},
-    telemetry::{self, RequestId, UsageGap},
+    telemetry::{
+        self, RequestId, UsageGap,
+        metrics::{GatewayCause, GatewayStep},
+    },
     v1::{Problem, problem},
 };
 use axum::{
@@ -740,6 +743,7 @@ impl Proxy {
         };
         unrecorded.routing = Some(routing.clone());
         if routing.model != self.settings.model {
+            telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Policy);
             unrecorded.gap = Some(UsageGap::ModelNotServed);
             return Err(NOT_SERVED.into());
         }
@@ -747,12 +751,25 @@ impl Proxy {
         let body = match timeout(REQUEST_READ, axum::body::to_bytes(body, MAX_REQUEST_BYTES)).await
         {
             Ok(Ok(body)) => body,
-            _ => return Err(BODY.into()),
+            Ok(Err(_)) => {
+                telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Protocol);
+                return Err(BODY.into());
+            }
+            Err(_) => {
+                telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Timeout);
+                return Err(BODY.into());
+            }
         };
         let outbound_body =
             match prepare_outbound_body(&body, self.settings.cache_mode, &routing, &id) {
                 Ok(outbound) => outbound,
                 Err((gap, problem)) => {
+                    let cause = match gap {
+                        UsageGap::RequestBody => GatewayCause::Policy,
+                        UsageGap::ModelMismatch => GatewayCause::Protocol,
+                        _ => GatewayCause::Unknown,
+                    };
+                    telemetry::gateway_failure(GatewayStep::Policy, cause);
                     unrecorded.gap = Some(gap);
                     return Err(problem.into());
                 }
@@ -771,11 +788,28 @@ impl Proxy {
         }
         // Nothing is sent before the connection exists, also when the caller leaves meanwhile.
         unrecorded.gap = Some(UsageGap::UpstreamConnect);
-        let stream = self.settings.connect().await?;
+        let stream = match self.settings.connect().await {
+            Ok(stream) => stream,
+            Err(problem) => {
+                let cause = if problem == UPSTREAM_TIMEOUT {
+                    GatewayCause::Timeout
+                } else {
+                    GatewayCause::Transport
+                };
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
+                return Err(problem.into());
+            }
+        };
         unrecorded.gap = Some(UsageGap::CallerDisconnected);
         let (upstream, response) = match self.exchange(stream, outbound).await {
             Ok(exchanged) => exchanged,
             Err(gap) => {
+                let cause = if gap == UsageGap::UpstreamTimeout {
+                    GatewayCause::Timeout
+                } else {
+                    GatewayCause::Transport
+                };
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
                 unrecorded.gap = Some(gap);
                 return Err(match gap {
                     UsageGap::UpstreamTimeout => UPSTREAM_TIMEOUT,
@@ -790,11 +824,20 @@ impl Proxy {
         // `upstream_status`, and answer with a value-free problem document.
         if head.status != StatusCode::OK {
             drop((upstream, body));
+            let cause = match head.status {
+                StatusCode::GATEWAY_TIMEOUT => GatewayCause::Timeout,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                    GatewayCause::Protection
+                }
+                _ => GatewayCause::Protocol,
+            };
+            telemetry::gateway_failure(GatewayStep::Policy, cause);
             unrecorded.gap = Some(UsageGap::UpstreamStatus);
             return Err(upstream_status_error(head.status, &head.headers));
         }
         // Neither relayed unlabelled nor read for usage; the upstream connection closes here.
         if !identity(&head.headers) {
+            telemetry::gateway_failure(GatewayStep::Policy, GatewayCause::Protocol);
             unrecorded.gap = Some(UsageGap::UpstreamEncoding);
             return Err(ENCODED_RESPONSE.into());
         }
@@ -842,9 +885,31 @@ impl Proxy {
         let spent = tokio::spawn(async move { gateway::consume(&pool, &id, &bearer).await });
         match timeout(self.database_timeout * WRITE_ATTEMPT_TIMEOUTS, spent).await {
             Ok(Ok(Ok(Consumed::Once(routing)))) => Ok(routing),
-            Ok(Ok(Ok(Consumed::Replay))) => Err(REPLAY),
-            Ok(Ok(Ok(Consumed::Refused))) => Err(UNAUTHENTICATED),
-            _ => Err(UNAVAILABLE),
+            Ok(Ok(Ok(Consumed::Replay))) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Policy);
+                Err(REPLAY)
+            }
+            Ok(Ok(Ok(Consumed::Refused))) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::ServiceAuth);
+                Err(UNAUTHENTICATED)
+            }
+            Ok(Ok(Err(error))) => {
+                let cause = match error {
+                    StoreError::Protection => GatewayCause::Protection,
+                    StoreError::Refused | StoreError::Conflict => GatewayCause::Policy,
+                    StoreError::Database | StoreError::Retryable => GatewayCause::Transport,
+                };
+                telemetry::gateway_failure(GatewayStep::Principal, cause);
+                Err(UNAVAILABLE)
+            }
+            Ok(Err(_)) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Unknown);
+                Err(UNAVAILABLE)
+            }
+            Err(_) => {
+                telemetry::gateway_failure(GatewayStep::Principal, GatewayCause::Timeout);
+                Err(UNAVAILABLE)
+            }
         }
     }
 
@@ -1015,37 +1080,58 @@ impl Relay {
         };
         if let Err(gap) = usage {
             telemetry::gateway_usage_unrecorded(&id, gap);
+            if let Some(cause) = relay_failure_cause(gap) {
+                telemetry::gateway_failure(GatewayStep::Policy, cause);
+            }
         }
         record(&pool, id, routing, usage, write_limit).await;
     }
 
     /// Reads the upstream body to its end. The caller gets every chunk until it leaves or stops
     /// reading; after that the rest is read only while the usage may still be in hand, checked
-    /// after every read, and reading stops once one idle timeout has passed since then. A body
-    /// that ends as that deadline falls still counts. Otherwise the upstream connection is
-    /// dropped.
+    /// after every read, and reading stops once one idle timeout has passed since then.
+    ///
+    /// The per-frame upstream idle deadline (`idle_by`) is preserved across caller detachment so a
+    /// stalled upstream still times out as `UpstreamTimeout` (when `idle_by <= drain_by`), whereas
+    /// an actively streaming upstream whose bounded detached drain window expires first stops as
+    /// `CallerDisconnected`. A body that ends as the active deadline falls still counts.
     async fn copy(&mut self) -> Result<(), UsageGap> {
+        let mut idle_by = Instant::now() + self.idle;
         loop {
-            let drain_by = self.drain_by;
+            let (deadline, timeout_gap) = match self.drain_by {
+                Some(drain_by) if drain_by < idle_by => (drain_by, UsageGap::CallerDisconnected),
+                _ => (idle_by, UsageGap::UpstreamTimeout),
+            };
             let frame = tokio::select! {
+                biased;
+                frame = self.upstream.drive(self.body.frame()) => Ok(frame),
                 () = self.frames.closed(), if self.delivering => {
-                    self.detach()?;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(timeout_gap);
+                    }
+                    self.detach(now)?;
                     continue;
                 }
-                () = sleep_until(drain_by.unwrap_or_else(Instant::now)), if drain_by.is_some() => {
-                    return Err(UsageGap::UpstreamTimeout);
-                }
-                frame = self.upstream.drive(timeout(self.idle, self.body.frame())) => frame,
+                () = sleep_until(deadline) => Err(timeout_gap),
             };
             let data = match frame {
-                Err(_) => return Err(UsageGap::UpstreamTimeout),
+                Err(gap) => return Err(gap),
                 Ok(None) => return Ok(()),
                 Ok(Some(Err(_))) => return Err(UsageGap::Incomplete),
-                Ok(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => data,
-                    // Trailers carry no body bytes.
-                    Err(_) => continue,
-                },
+                Ok(Some(Ok(frame))) => {
+                    if Instant::now() >= deadline {
+                        return Err(timeout_gap);
+                    }
+                    match frame.into_data() {
+                        Ok(data) => data,
+                        // Trailers carry no body bytes.
+                        Err(_) => {
+                            idle_by = Instant::now() + self.idle;
+                            continue;
+                        }
+                    }
+                }
             };
             if let Some(extract) = &mut self.extract {
                 extract.feed(&data);
@@ -1053,22 +1139,28 @@ impl Relay {
             if self.delivering {
                 // A caller that takes no chunk for an idle timeout is treated as gone.
                 if !matches!(timeout(self.idle, self.frames.send(data)).await, Ok(Ok(()))) {
-                    self.detach()?;
+                    let now = Instant::now();
+                    self.detach(now)?;
+                    idle_by = now + self.idle;
+                } else {
+                    idle_by = Instant::now() + self.idle;
                 }
             } else if !self.draining() {
                 return Err(UsageGap::CallerDisconnected);
+            } else {
+                idle_by = Instant::now() + self.idle;
             }
         }
     }
 
     /// The caller has gone or stopped reading, so it will not get the rest. Reading on is worth
     /// it only while the usage may already be in hand.
-    fn detach(&mut self) -> Result<(), UsageGap> {
+    fn detach(&mut self, now: Instant) -> Result<(), UsageGap> {
         self.delivering = false;
         if !self.draining() {
             return Err(UsageGap::CallerDisconnected);
         }
-        self.drain_by = Some(Instant::now() + self.idle);
+        self.drain_by = Some(now + self.idle);
         Ok(())
     }
 
@@ -1080,6 +1172,19 @@ impl Relay {
 
     fn draining(&self) -> bool {
         self.extract.as_ref().is_some_and(Extract::worth_draining)
+    }
+}
+
+/// Classifies a post-200 relay [`UsageGap`] into its gateway failure cause.
+///
+/// Caller disconnects are not upstream/gateway failures, and non-200 statuses (`UpstreamStatus`)
+/// are already counted in [`Proxy::forward`] before a relay is spawned.
+fn relay_failure_cause(gap: UsageGap) -> Option<GatewayCause> {
+    match gap {
+        UsageGap::UpstreamTimeout => Some(GatewayCause::Timeout),
+        UsageGap::Incomplete => Some(GatewayCause::Transport),
+        UsageGap::Unparsable | UsageGap::NoUsage => Some(GatewayCause::Protocol),
+        _ => None,
     }
 }
 
@@ -1138,10 +1243,17 @@ async fn record(
         let task = tokio::spawn(async move {
             settlement::ingest_for_proxy(&pool, &owned, reason, lock_timeout).await
         });
-        let outcome = match timeout(limit, task).await {
-            Ok(Ok(outcome)) => outcome,
-            // Abandoned past `limit`, or the attempt panicked.
-            _ => Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+        let (outcome, timed_out) = match timeout(limit, task).await {
+            Ok(Ok(outcome)) => (outcome, false),
+            Ok(Err(_)) => (
+                Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+                false,
+            ),
+            // Abandoned past `limit`.
+            Err(_) => (
+                Err(settlement::ProxyStoreError::Store(StoreError::Database)),
+                true,
+            ),
         };
         match outcome {
             Ok(_) => return,
@@ -1153,6 +1265,7 @@ async fn record(
                     tokio::time::sleep(LOCK_RETRY_BACKOFF).await;
                     continue;
                 }
+                telemetry::gateway_failure(GatewayStep::Usage, GatewayCause::Timeout);
                 return telemetry::gateway_usage_failed(&report.request, &StoreError::Database);
             }
             Err(settlement::ProxyStoreError::Store(
@@ -1162,6 +1275,18 @@ async fn record(
                 attempt += 1;
             }
             Err(settlement::ProxyStoreError::Store(error)) => {
+                let cause = match error {
+                    StoreError::Protection => GatewayCause::Protection,
+                    StoreError::Refused | StoreError::Conflict => GatewayCause::Policy,
+                    StoreError::Database | StoreError::Retryable => {
+                        if timed_out {
+                            GatewayCause::Timeout
+                        } else {
+                            GatewayCause::Transport
+                        }
+                    }
+                };
+                telemetry::gateway_failure(GatewayStep::Usage, cause);
                 return telemetry::gateway_usage_failed(&report.request, &error);
             }
         }
@@ -1878,5 +2003,414 @@ mod tests {
         };
         let (copied, ()) = tokio::join!(relay.copy(), leave);
         assert_eq!(copied, Err(UsageGap::CallerDisconnected));
+    }
+
+    /// Serializes tests that assert deltas on process-global `openmettle_gateway_failures_total`.
+    static GATEWAY_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Real `gateway_proxy::router` entry point and `record` exhaustion must increment
+    /// `openmettle_gateway_failures_total` for production failure paths.
+    #[tokio::test]
+    async fn forward_and_record_increment_gateway_failures_metric() {
+        use crate::telemetry::metrics;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _metric_lock = GATEWAY_METRIC_LOCK.lock().await;
+
+        // A closed lazy pool fails acquisition immediately as a database transport error
+        // (`sqlx::Error::PoolClosed` -> `StoreError::Database`, `timed_out = false`).
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy_with(
+                "postgres://unused@127.0.0.1:1/unused?sslmode=disable"
+                    .parse()
+                    .unwrap(),
+            );
+        pool.close().await;
+        let settings = parse(&[("UPSTREAM_URL", "http://127.0.0.1:1"), SERVED]).unwrap();
+        let (app, _relays) = router(settings, pool.clone(), Duration::from_secs(2));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // 1. Dispatch consume failure against closed pool -> (Principal, Transport) +1, 503.
+        let before_principal = metrics::global()
+            .gateway_failure_count(GatewayStep::Principal, GatewayCause::Transport);
+        let token = URL_SAFE_NO_PAD.encode(BEARER);
+        let body = r#"{"model":"synthetic-model","messages":[]}"#;
+        let raw_req = format!(
+            "POST {ROUTE} HTTP/1.1\r\nhost: 127.0.0.1\r\nx-request-id: {ID}\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(raw_req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        server.abort();
+        assert!(resp.starts_with("HTTP/1.1 503 "), "{resp}");
+        assert!(
+            metrics::global()
+                .gateway_failure_count(GatewayStep::Principal, GatewayCause::Transport)
+                > before_principal
+        );
+
+        // 2. Usage report write exhaustion against closed pool -> (Usage, Transport) +1.
+        let before_usage_transport =
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Transport);
+        record(
+            &pool,
+            ID.to_owned(),
+            routing(),
+            Err(UsageGap::UpstreamStatus),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Transport)
+                > before_usage_transport
+        );
+
+        // 3. Usage report write timing out against a stalled DB socket -> (Usage, Timeout) +1.
+        let stalled_db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_db.local_addr().unwrap().port();
+        let _accept_forever = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = stalled_db.accept().await {
+                held.push(sock);
+            }
+        });
+        let stalled_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(
+                format!("postgres://unused@127.0.0.1:{stalled_port}/unused?sslmode=disable")
+                    .parse()
+                    .unwrap(),
+            );
+        let before_usage_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Timeout);
+        record(
+            &stalled_pool,
+            ID.to_owned(),
+            routing(),
+            Err(UsageGap::UpstreamStatus),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            metrics::global().gateway_failure_count(GatewayStep::Usage, GatewayCause::Timeout)
+                > before_usage_timeout
+        );
+    }
+
+    /// Post-200 relay failures (upstream body stall past idle timeout or premature body truncation)
+    /// must increment `openmettle_gateway_failures_total` once per relay under `GatewayStep::Policy`
+    /// even when usage-report storage is independent.
+    #[tokio::test]
+    async fn post_200_relay_failures_increment_gateway_failures_metric() {
+        use crate::telemetry::metrics;
+
+        let _metric_lock = GATEWAY_METRIC_LOCK.lock().await;
+
+        // 1. Upstream sends HTTP 200 SSE headers, one chunk, and stalls past the idle timeout ->
+        //    `(GatewayStep::Policy, GatewayCause::Timeout)` increments by 1.
+        let (_hold_tx, hold_rx) = oneshot::channel::<()>();
+        let (stall_addr, stall_upstream) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx).await;
+        let (stall_relay, mut stall_rx) = relay(&stall_addr, Duration::from_millis(60)).await;
+        stall_relay.pool.close().await;
+        let before_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout);
+        let drain_caller = tokio::spawn(async move { while stall_rx.recv().await.is_some() {} });
+        stall_relay.run().await;
+        let _ = drain_caller.await;
+        stall_upstream.abort();
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout),
+            before_timeout + 1
+        );
+
+        // 2. Upstream sends HTTP 200 with Content-Length: 100 and cuts the TCP stream after 10 bytes ->
+        //    `(GatewayStep::Policy, GatewayCause::Transport)` increments by 1.
+        let (cut_tx, cut_rx) = oneshot::channel::<()>();
+        let cut_head =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n";
+        let (cut_addr, cut_upstream) =
+            upstream(cut_head, vec![b"{\"choices\"".to_vec()], Vec::new(), cut_rx).await;
+        let (cut_relay, mut cut_rx_frames) = relay(&cut_addr, Duration::from_secs(2)).await;
+        cut_relay.pool.close().await;
+        // Release the upstream task so it closes the socket after sending only 10 of 100 bytes.
+        let _ = cut_tx.send(());
+        let before_transport =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Transport);
+        let drain_cut = tokio::spawn(async move { while cut_rx_frames.recv().await.is_some() {} });
+        cut_relay.run().await;
+        let _ = drain_cut.await;
+        let _ = cut_upstream.await;
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Transport),
+            before_transport + 1
+        );
+    }
+
+    /// When a caller disconnects after HTTP 200 and the upstream keeps streaming frames within the
+    /// idle interval past the detached drain budget, `Relay` must stop with `CallerDisconnected`
+    /// and emit `gateway.usage.unrecorded` WITHOUT incrementing `openmettle_gateway_failures_total`.
+    #[tokio::test]
+    async fn detached_drain_expiry_while_upstream_streams_does_not_increment_gateway_failures() {
+        use crate::telemetry::{Format, Verbosity, metrics, tests::Capture};
+
+        let _metric_lock = GATEWAY_METRIC_LOCK.lock().await;
+
+        async fn streaming_upstream(
+            interval: Duration,
+            total_chunks: usize,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    req.push(byte[0]);
+                }
+                if socket.write_all(SSE.as_bytes()).await.is_err() {
+                    return;
+                }
+                for n in 1..=total_chunks {
+                    if socket.write_all(&event(n)).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            });
+            (address, task)
+        }
+
+        // 1. Direct `copy()` check: caller leaves after chunk 1 while upstream keeps streaming
+        //    every 15ms (well within the 60ms idle timeout) past the 60ms detached drain budget.
+        let (addr1, task1) = streaming_upstream(Duration::from_millis(15), 30).await;
+        let (mut r1, mut rx1) = relay(&addr1, Duration::from_millis(60)).await;
+        let leave1 = async move {
+            rx1.recv().await.unwrap();
+            drop(rx1);
+        };
+        let (copied, ()) = tokio::join!(r1.copy(), leave1);
+        task1.abort();
+        assert_eq!(copied, Err(UsageGap::CallerDisconnected));
+
+        // 2. Full `Relay::run()` check: `gateway.usage.unrecorded` logs `caller_disconnected`, and
+        //    NO `GatewayStep::Policy` failure counter increments.
+        let (addr2, task2) = streaming_upstream(Duration::from_millis(15), 30).await;
+        let (r2, mut rx2) = relay(&addr2, Duration::from_millis(60)).await;
+        r2.pool.close().await;
+        let before: Vec<u64> = GatewayCause::ALL
+            .iter()
+            .map(|&cause| metrics::global().gateway_failure_count(GatewayStep::Policy, cause))
+            .collect();
+        let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+        let leave2 = async move {
+            rx2.recv().await.unwrap();
+            drop(rx2);
+        };
+        tokio::join!(r2.run(), leave2);
+        task2.abort();
+
+        let after: Vec<u64> = GatewayCause::ALL
+            .iter()
+            .map(|&cause| metrics::global().gateway_failure_count(GatewayStep::Policy, cause))
+            .collect();
+        assert_eq!(
+            after, before,
+            "detached caller disconnect drain expiry must not increment Policy gateway failures"
+        );
+        let unrecorded = capture.events("gateway.usage.unrecorded");
+        assert_eq!(unrecorded.len(), 1, "{}", capture.text());
+        assert_eq!(
+            unrecorded[0]["error.type"].as_str(),
+            Some("caller_disconnected")
+        );
+    }
+
+    /// When the upstream stalls after sending a chunk and the caller disconnects mid-wait (before
+    /// the per-frame idle deadline expires), `Relay::copy` must preserve the existing per-frame
+    /// `idle_by` deadline (`idle_by <= drain_by`), deterministically returning `UpstreamTimeout`
+    /// and incrementing `openmettle_gateway_failures_total{step="policy",cause="timeout"}`.
+    #[tokio::test]
+    async fn stalled_upstream_after_mid_wait_caller_disconnect_preserves_idle_deadline_and_counts_timeout()
+     {
+        use crate::telemetry::{Format, Verbosity, metrics, tests::Capture};
+
+        let _metric_lock = GATEWAY_METRIC_LOCK.lock().await;
+
+        // 1. Direct `copy()` check: 120ms idle limit, upstream stalls after chunk 1, caller
+        //    disconnects 70ms after chunk 1 -> `idle_by` (~120ms) expires BEFORE `drain_by`
+        //    (~190ms) and deterministically reports `UpstreamTimeout`.
+        let (_hold_tx1, hold_rx1) = oneshot::channel::<()>();
+        let (addr1, task1) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx1).await;
+        let (mut r1, mut rx1) = relay(&addr1, Duration::from_millis(120)).await;
+        let leave1 = async move {
+            rx1.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            drop(rx1);
+        };
+        let (copied, ()) = tokio::join!(r1.copy(), leave1);
+        task1.abort();
+        assert_eq!(copied, Err(UsageGap::UpstreamTimeout));
+
+        // 2. Full `Relay::run()` check: increments `(GatewayStep::Policy, GatewayCause::Timeout)`
+        //    by +1 and logs `gateway.usage.unrecorded` with `error.type = "upstream_timeout"`.
+        let (_hold_tx2, hold_rx2) = oneshot::channel::<()>();
+        let (addr2, task2) = upstream(SSE, vec![event(1)], Vec::new(), hold_rx2).await;
+        let (r2, mut rx2) = relay(&addr2, Duration::from_millis(120)).await;
+        r2.pool.close().await;
+        let before_timeout =
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout);
+        let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+        let leave2 = async move {
+            rx2.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            drop(rx2);
+        };
+        tokio::join!(r2.run(), leave2);
+        task2.abort();
+
+        assert_eq!(
+            metrics::global().gateway_failure_count(GatewayStep::Policy, GatewayCause::Timeout),
+            before_timeout + 1
+        );
+        let unrecorded = capture.events("gateway.usage.unrecorded");
+        assert_eq!(unrecorded.len(), 1, "{}", capture.text());
+        assert_eq!(
+            unrecorded[0]["error.type"].as_str(),
+            Some("upstream_timeout")
+        );
+    }
+
+    /// Even when a late JSON data frame and an elapsed detached drain deadline are both ready on
+    /// the same poll, `Relay::copy` must reject the post-deadline data frame with
+    /// `UsageGap::CallerDisconnected`, whereas a clean EOF (`0\r\n\r\n`) ready at or after the
+    /// deadline after all body bytes arrived in time must still succeed with extracted usage.
+    #[tokio::test]
+    async fn detached_drain_rejects_late_data_frame_at_deadline_while_allowing_eof() {
+        const CHUNKED_JSON: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+            transfer-encoding: chunked\r\n\r\n";
+
+        // 1. Late data frame arrives after the detached drain deadline while `copy()` is paused,
+        //    so both `body.frame()` (`Some(Ok(frame))`) and `sleep_until(drain_by)` are ready on
+        //    the exact same poll -> MUST return `Err(UsageGap::CallerDisconnected)`.
+        let (gate1, open1) = oneshot::channel::<()>();
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap().to_string();
+        let chunk2_sent1 = Arc::new(tokio::sync::Notify::new());
+        let chunk2_sent1_tx = chunk2_sent1.clone();
+        let up1 = tokio::spawn(async move {
+            let (mut socket, _) = listener1.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut b).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                req.push(b[0]);
+            }
+            socket.write_all(CHUNKED_JSON.as_bytes()).await.unwrap();
+            socket.write_all(&chunk(b"{\"usage\":")).await.unwrap();
+            // Send a second small chunk after detach so `idle_by` advances past `drain_by`.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket.write_all(&chunk(b" ")).await.unwrap();
+            chunk2_sent1_tx.notify_one();
+            let _ = open1.await;
+            let _ = socket
+                .write_all(&chunk(b"{\"prompt_tokens\":5,\"completion_tokens\":7}}"))
+                .await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (mut r1, mut rx1) = relay(&addr1, Duration::from_millis(60)).await;
+        {
+            let mut copy_fut = std::pin::pin!(r1.copy());
+            let drive_until_detached_and_chunk2 = async {
+                rx1.recv().await.unwrap();
+                drop(rx1);
+                chunk2_sent1.notified().await;
+                // Allow `copy_fut` to read the whitespace chunk and advance `idle_by > drain_by`.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            tokio::select! {
+                res = &mut copy_fut => panic!("copy finished unexpectedly early: {res:?}"),
+                () = drive_until_detached_and_chunk2 => {}
+            }
+            // Pause polling `copy_fut`, wait past `drain_by` (60ms from detach), and release the
+            // late JSON body so BOTH the data frame and the elapsed timer are ready together.
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            let _ = gate1.send(());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let res = copy_fut.await;
+            assert_eq!(res, Err(UsageGap::CallerDisconnected));
+        }
+        up1.abort();
+
+        // 2. Clean EOF (`0\r\n\r\n`) arrives after the body bytes were already read before the
+        //    deadline, so both `body.frame()` (`None`) and `sleep_until(drain_by)` are ready on
+        //    the same poll -> MUST still return `Ok(())` with extracted usage.
+        let (gate2, open2) = oneshot::channel::<()>();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap().to_string();
+        let body_sent2 = Arc::new(tokio::sync::Notify::new());
+        let body_sent2_tx = body_sent2.clone();
+        let up2 = tokio::spawn(async move {
+            let (mut socket, _) = listener2.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut b).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                req.push(b[0]);
+            }
+            socket.write_all(CHUNKED_JSON.as_bytes()).await.unwrap();
+            socket.write_all(&chunk(b"{\"usage\":")).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket
+                .write_all(&chunk(b"{\"prompt_tokens\":5,\"completion_tokens\":7}}"))
+                .await
+                .unwrap();
+            body_sent2_tx.notify_one();
+            let _ = open2.await;
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (mut r2, mut rx2) = relay(&addr2, Duration::from_millis(60)).await;
+        {
+            let mut copy_fut = std::pin::pin!(r2.copy());
+            let drive_until_body_read = async {
+                rx2.recv().await.unwrap();
+                drop(rx2);
+                body_sent2.notified().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            tokio::select! {
+                res = &mut copy_fut => panic!("copy finished before EOF: {res:?}"),
+                () = drive_until_body_read => {}
+            }
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            let _ = gate2.send(());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(copy_fut.await, Ok(()));
+        }
+        up2.abort();
+        assert_eq!(
+            r2.extract.take().unwrap().finish(),
+            Ok(Usage {
+                prompt: 5,
+                completion: 7,
+                reasoning: None,
+            })
+        );
     }
 }

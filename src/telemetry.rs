@@ -25,7 +25,10 @@ use axum::{
     response::Response,
 };
 use opentelemetry_sdk::trace::SdkTracer;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tracing::{
     Level, Metadata, Subscriber,
     field::{DisplayValue, display},
@@ -52,6 +55,12 @@ pub const FIELDS: &[&str] = &[
     "role",
     "signal",
     "request_id",
+    "run_id",
+    "operation_id",
+    "lease_id",
+    "run.outcome",
+    "operation.kind",
+    "operation.outcome",
     "http.route",
     "http.request.method",
     "http.response.status_code",
@@ -70,11 +79,18 @@ pub const FIELDS: &[&str] = &[
     "gateway.request_id",
 ];
 
-/// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
-/// the bridge as the span kind and is not exported as an attribute.
+/// The only field names [`SpanGuard`] admits: the HTTP request span and worker run/operation
+/// spans. `otel.kind` is consumed by the bridge as the span kind and is not exported as an
+/// attribute. Every span keeps at most 8 exported attributes (`SpanLimits::max_attributes_per_span`).
 pub const SPAN_FIELDS: &[&str] = &[
     "otel.kind",
     "request_id",
+    "run_id",
+    "operation_id",
+    "lease_id",
+    "run.outcome",
+    "operation.kind",
+    "operation.outcome",
     "http.route",
     "http.request.method",
     "http.response.status_code",
@@ -510,30 +526,200 @@ impl Route {
     }
 }
 
+/// Domain separator for non-reversible worker run lease correlation IDs.
+const RUN_LEASE_ID_DOMAIN: &[u8] = b"openmettle.telemetry.run-lease/1\0";
+
+/// Derive a deterministic, domain-separated, non-reversible telemetry `lease_id` from a claimed
+/// run's `(run_id, claim_token)`.
+///
+/// Format: `rl-<32 lowercase hex>` (the first 128 bits of SHA-256 over the length-framed inputs).
+/// Raw `runs.claim_token` and `capacity_grants.fence_token` are live fencing secrets and must
+/// never be emitted into logs or traces; this helper correlates a single worker claim attempt
+/// across claim, operations, and settlement, rotates automatically on reclaim, and cannot be
+/// inverted to forge `claim_token`.
+pub fn derive_run_lease_id(run_id: &str, claim_token: &str) -> String {
+    let input = crate::runs::identity(
+        RUN_LEASE_ID_DOMAIN,
+        &[run_id.as_bytes(), claim_token.as_bytes()],
+    );
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let mut out = String::with_capacity(3 + 32);
+    out.push_str("rl-");
+    for byte in &digest.as_ref()[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// True iff `value` matches the exact `rl-<32 lowercase hex>` format produced by
+/// [`derive_run_lease_id`].
+pub fn is_derived_run_lease_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 35
+        && bytes.starts_with(b"rl-")
+        && bytes[3..]
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn valid_uuid(value: &str) -> Option<&str> {
+    crate::runs::is_canonical_uuid(value).then_some(value)
+}
+
+fn valid_lease_id(value: &str) -> Option<&str> {
+    (crate::runs::is_canonical_uuid(value) || is_derived_run_lease_id(value)).then_some(value)
+}
+
+/// Validated correlation identifiers attached to one HTTP request for both the root span and
+/// the completion log event. Rejects unvalidated values defensively at the telemetry boundary.
+#[derive(Clone, Default)]
+pub struct Correlation(Arc<Mutex<CorrelationIds>>);
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct CorrelationIds {
+    run_id: Option<String>,
+}
+
+impl Correlation {
+    pub fn set_run_id(&self, id: &str) {
+        if let Some(id) = valid_uuid(id) {
+            self.0.lock().unwrap().run_id = Some(id.to_owned());
+        }
+    }
+
+    fn snapshot(&self) -> CorrelationIds {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+pub(crate) fn record_request_run_id(extensions: &axum::http::Extensions, run_id: &str) {
+    if let Some(correlation) = extensions.get::<Correlation>() {
+        correlation.set_run_id(run_id);
+    }
+}
+
+/// Closed settlement outcomes recorded on `worker.run` spans and `worker.run.settled` events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerRunOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Invalidated,
+    Handoff,
+    Reconciling,
+    LeaseLost,
+    Aborted,
+}
+
+impl WorkerRunOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::Invalidated => "invalidated",
+            Self::Handoff => "handoff",
+            Self::Reconciling => "reconciling",
+            Self::LeaseLost => "lease_lost",
+            Self::Aborted => "aborted",
+        }
+    }
+
+    const fn is_warning(self) -> bool {
+        matches!(
+            self,
+            Self::Failed | Self::Interrupted | Self::Invalidated | Self::LeaseLost | Self::Aborted
+        )
+    }
+}
+
+/// Closed worker operation classes recorded on `worker.operation` spans and events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerOperationKind {
+    Inference,
+    Tool,
+    Reconcile,
+}
+
+impl WorkerOperationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inference => "inference",
+            Self::Tool => "tool",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+/// Closed outcomes recorded on `worker.operation` spans and `worker.operation.completed` events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerOperationOutcome {
+    Ok,
+    Failed,
+    Stopped,
+    Handoff,
+    LeaseLost,
+    Invalidated,
+}
+
+impl WorkerOperationOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Handoff => "handoff",
+            Self::LeaseLost => "lease_lost",
+            Self::Invalidated => "invalidated",
+        }
+    }
+
+    const fn is_warning(self) -> bool {
+        !matches!(self, Self::Ok | Self::Handoff)
+    }
+}
+
 /// Adds request-ID middleware to every route of `router` and to its fallback. Apply it after
 /// all routes are added.
 pub fn observe<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
     router.layer(axum::middleware::from_fn(request))
 }
 
-/// Assigns a fresh [`RequestId`] (also placed in request extensions for handlers) and records
-/// the route template, method, status and duration when the response head is ready. Every
-/// route except the probes also gets a request span, which only the OTLP layer can see.
+/// Assigns a fresh [`RequestId`] and [`Correlation`] handle (placed in request extensions for
+/// handlers) and records the route template, method, status, duration, and any validated
+/// correlation IDs when the response head is ready. Every route except the probes also gets a
+/// request span, which only the OTLP layer can see.
 async fn request(mut request: Request, next: Next) -> Response {
     let started = Instant::now();
     let id = RequestId::generate();
     if let Some(id) = id {
         request.extensions_mut().insert(id);
     }
+    let correlation = Correlation::default();
+    request.extensions_mut().insert(correlation.clone());
     let route = Route(request.extensions().get::<MatchedPath>().cloned());
     let method = Method::of(request.method());
     let span = (!route.is_probe()).then(|| request_span(id, &route, method));
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let elapsed = started.elapsed();
+    // Centrally suppress resource correlation IDs on any 401 Unauthorized response (including
+    // post-session DB principal/approval recheck rejections) so unauthenticated callers never
+    // populate resource identifiers in spans or structured logs.
+    let ids = if status == axum::http::StatusCode::UNAUTHORIZED.as_u16() {
+        CorrelationIds::default()
+    } else {
+        correlation.snapshot()
+    };
     if let Some(span) = &span {
         // As i64: the bridge has no u64 visitor and would export the code as a string.
         span.record("http.response.status_code", i64::from(status));
+        if let Some(run_id) = ids.run_id.as_deref() {
+            span.record("run_id", run_id);
+        }
     }
     metrics::global().record_http(
         method,
@@ -541,13 +727,16 @@ async fn request(mut request: Request, next: Next) -> Response {
         metrics::StatusClass::of(status),
         elapsed,
     );
-    request_completed(id, &route, method, status, elapsed);
+    request_completed(id, &route, method, status, elapsed, &ids);
     response
 }
 
 /// A root server span, never entered and never parented: an inbound `traceparent` or
 /// `tracestate` is not read, so every request starts a new trace. It ends when dropped,
 /// after the response head is ready. Disabled, and almost free, unless OTLP is configured.
+/// Carries at most 5 exported attributes (`request_id`, `http.route`, `http.request.method`,
+/// `http.response.status_code`, plus optional validated `run_id`), staying within
+/// `SpanLimits::max_attributes_per_span = 8`.
 fn request_span(id: Option<RequestId>, route: &Route, method: Method) -> tracing::Span {
     let id: Option<DisplayValue<RequestId>> = id.map(display);
     tracing::info_span!(
@@ -559,6 +748,7 @@ fn request_span(id: Option<RequestId>, route: &Route, method: Method) -> tracing
         http.route = route.as_str(),
         http.request.method = method.as_str(),
         http.response.status_code = tracing::field::Empty,
+        run_id = tracing::field::Empty,
     )
 }
 
@@ -573,11 +763,13 @@ fn request_completed(
     method: Method,
     status: u16,
     elapsed: Duration,
+    ids: &CorrelationIds,
 ) {
     let id: Option<DisplayValue<RequestId>> = id.map(display);
     let route = route.as_str();
     let method = method.as_str();
     let duration = micros(elapsed);
+    let run_id = ids.run_id.as_deref();
     macro_rules! emit {
         ($level:expr) => {
             tracing::event!(
@@ -585,6 +777,7 @@ fn request_completed(
                 $level,
                 event = "http.request.completed",
                 request_id = id,
+                run_id = run_id,
                 http.route = route,
                 http.request.method = method,
                 http.response.status_code = status,
@@ -600,13 +793,220 @@ fn request_completed(
 }
 
 /// An internal error stopped delivery on an open run event stream.
-pub(crate) fn run_stream_failed(id: Option<RequestId>) {
+pub(crate) fn run_stream_failed(id: Option<RequestId>, run_id: &str) {
+    let run_id = valid_uuid(run_id);
     tracing::error!(
         target: TARGET,
         event = "run.stream.ended",
         request_id = id.map(display),
+        run_id = run_id,
         "error.type" = "internal",
     );
+}
+
+/// Root internal span for one claimed worker run execution segment (`<= 3` exported attributes).
+pub(crate) fn worker_run_span(run_id: &str, lease_id: &str) -> tracing::Span {
+    let run_id = valid_uuid(run_id);
+    let lease_id = valid_lease_id(lease_id);
+    tracing::info_span!(
+        target: TARGET,
+        parent: None,
+        "worker.run",
+        otel.kind = "internal",
+        run_id = run_id,
+        lease_id = lease_id,
+        "run.outcome" = tracing::field::Empty,
+    )
+}
+
+/// Structured lifecycle log emitted when a worker begins executing a claimed/reclaimed run.
+pub(crate) fn worker_run_claimed(run_id: &str, lease_id: &str) {
+    let run_id = valid_uuid(run_id);
+    let lease_id = valid_lease_id(lease_id);
+    tracing::info!(
+        target: TARGET,
+        event = "worker.run.claimed",
+        role = Process::Worker.as_str(),
+        run_id = run_id,
+        lease_id = lease_id,
+    );
+}
+
+/// Structured lifecycle log emitted when a worker finishes or hands off a claimed run segment.
+pub(crate) fn worker_run_settled(
+    run_id: &str,
+    lease_id: &str,
+    outcome: WorkerRunOutcome,
+    elapsed: Duration,
+) {
+    let run_id = valid_uuid(run_id);
+    let lease_id = valid_lease_id(lease_id);
+    let duration = micros(elapsed);
+    let outcome_str = outcome.as_str();
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                target: TARGET,
+                $level,
+                event = "worker.run.settled",
+                role = Process::Worker.as_str(),
+                run_id = run_id,
+                lease_id = lease_id,
+                "run.outcome" = outcome_str,
+                duration_us = duration,
+            )
+        };
+    }
+    if outcome.is_warning() {
+        emit!(Level::WARN)
+    } else {
+        emit!(Level::INFO)
+    }
+}
+
+/// Child internal span for one worker inference round, tool dispatch, or reconciliation step
+/// (`<= 5` exported attributes). Inherits the enclosing `worker.run` span when instrumented.
+pub(crate) fn worker_operation_span(
+    run_id: &str,
+    lease_id: &str,
+    operation_id: &str,
+    kind: WorkerOperationKind,
+) -> tracing::Span {
+    let run_id = valid_uuid(run_id);
+    let lease_id = valid_lease_id(lease_id);
+    let operation_id = valid_uuid(operation_id);
+    tracing::info_span!(
+        target: TARGET,
+        "worker.operation",
+        otel.kind = "internal",
+        run_id = run_id,
+        lease_id = lease_id,
+        operation_id = operation_id,
+        "operation.kind" = kind.as_str(),
+        "operation.outcome" = tracing::field::Empty,
+    )
+}
+
+/// Structured event emitted when a worker inference round, tool dispatch, or reconciliation
+/// operation completes.
+pub(crate) fn worker_operation_completed(
+    run_id: &str,
+    lease_id: &str,
+    operation_id: &str,
+    kind: WorkerOperationKind,
+    outcome: WorkerOperationOutcome,
+    elapsed: Duration,
+) {
+    let run_id = valid_uuid(run_id);
+    let lease_id = valid_lease_id(lease_id);
+    let operation_id = valid_uuid(operation_id);
+    let duration = micros(elapsed);
+    let kind_str = kind.as_str();
+    let outcome_str = outcome.as_str();
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                target: TARGET,
+                $level,
+                event = "worker.operation.completed",
+                role = Process::Worker.as_str(),
+                run_id = run_id,
+                lease_id = lease_id,
+                operation_id = operation_id,
+                "operation.kind" = kind_str,
+                "operation.outcome" = outcome_str,
+                duration_us = duration,
+            )
+        };
+    }
+    if outcome.is_warning() {
+        emit!(Level::WARN)
+    } else {
+        emit!(Level::DEBUG)
+    }
+}
+
+/// Internal span for one capacity controller grant, reconciliation, reclaim, or resume lifecycle
+/// step (`<= 4` exported attributes). Carries the public capacity `grant_id` UUID as `lease_id`
+/// when present; never accepts controller secrets, `claim_token`, or `fence_token`.
+pub(crate) fn capacity_grant_span(
+    run_id: Option<&str>,
+    grant_id: Option<&str>,
+    operation: metrics::CapacityOperation,
+) -> tracing::Span {
+    let run_id = run_id.and_then(valid_uuid);
+    let lease_id = grant_id.and_then(valid_uuid);
+    tracing::info_span!(
+        target: TARGET,
+        "capacity.grant",
+        otel.kind = "internal",
+        run_id = run_id,
+        lease_id = lease_id,
+        "operation.kind" = operation.as_str(),
+        "operation.outcome" = tracing::field::Empty,
+    )
+}
+
+/// Records the validated public capacity `grant_id` UUID as `lease_id` directly on `span` once
+/// durable grant identity is known. Recording on the explicit span handle works under every
+/// `tracing::Subscriber`, including lightweight subscribers that do not track `Span::current()`.
+pub(crate) fn record_capacity_span_grant_id_on(span: &tracing::Span, grant_id: &str) {
+    if let Some(id) = valid_uuid(grant_id) {
+        span.record("lease_id", id);
+    }
+}
+
+/// Records the validated public capacity `grant_id` UUID as `lease_id` on the current
+/// `capacity.grant` span once durable grant identity is known.
+#[cfg(test)]
+pub(crate) fn record_capacity_span_grant_id(grant_id: &str) {
+    record_capacity_span_grant_id_on(&tracing::Span::current(), grant_id);
+}
+
+/// Structured lifecycle log emitted when a capacity controller grant, reconciliation, reclaim,
+/// or resume step completes. Emits public `grant_id` as `lease_id` and never logs secrets or
+/// fencing tokens.
+pub(crate) fn capacity_grant_completed(
+    run_id: Option<&str>,
+    grant_id: Option<&str>,
+    operation: metrics::CapacityOperation,
+    outcome: metrics::CapacityOutcome,
+    elapsed: Duration,
+) {
+    let run_id = run_id.and_then(valid_uuid);
+    let lease_id = grant_id.and_then(valid_uuid);
+    let duration = micros(elapsed);
+    let kind_str = operation.as_str();
+    let outcome_str = outcome.as_str();
+    let is_warn = !matches!(
+        outcome,
+        metrics::CapacityOutcome::Granted
+            | metrics::CapacityOutcome::Released
+            | metrics::CapacityOutcome::NotAllocated
+            | metrics::CapacityOutcome::Resumed
+            | metrics::CapacityOutcome::Insufficient
+            | metrics::CapacityOutcome::Releasing
+    );
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                target: TARGET,
+                $level,
+                event = "capacity.grant.completed",
+                role = Process::Worker.as_str(),
+                run_id = run_id,
+                lease_id = lease_id,
+                "operation.kind" = kind_str,
+                "operation.outcome" = outcome_str,
+                duration_us = duration,
+            )
+        };
+    }
+    if is_warn {
+        emit!(Level::WARN)
+    } else {
+        emit!(Level::DEBUG)
+    }
 }
 
 /// The listener is bound and the process is serving.

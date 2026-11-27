@@ -290,6 +290,7 @@ impl Api {
             .get::<Arc<CursorKeys>>()
             .ok_or(PROVISIONING)?;
         let context = self.authenticate(&session).await?;
+        crate::telemetry::record_request_run_id(&parts.extensions, run);
         self.run_response(&context, keys, run, StatusCode::OK, context.observed_ms())
             .await
     }
@@ -379,6 +380,7 @@ impl Api {
             .ok_or(PROVISIONING)?
             .clone();
         let context = self.authenticate(&session).await?;
+        crate::telemetry::record_request_run_id(&parts.extensions, run);
         let position = cursor
             .as_ref()
             .ok()
@@ -417,7 +419,7 @@ impl Api {
                     _ = tx.closed() => (),
                     result = stream.deliver(first, &tx) => {
                         if result == Err(INTERNAL) {
-                            crate::telemetry::run_stream_failed(id);
+                            crate::telemetry::run_stream_failed(id, &stream.run);
                         }
                     }
                 }

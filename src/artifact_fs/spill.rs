@@ -363,7 +363,9 @@ pub async fn publish_bytes(
     settings: &leases::LeaseSettings,
     policy: &impl crate::authz::approvals::EffectPolicy,
 ) -> crate::worker::StepResult {
-    publish_bytes_with_handle(cx, store, text, None, settings, policy).await
+    publish_bytes_with_handle(cx, store, text, None, settings, policy)
+        .await
+        .step
 }
 
 pub(crate) async fn publish_bytes_with_handle(
@@ -373,23 +375,23 @@ pub(crate) async fn publish_bytes_with_handle(
     handle: Option<&str>,
     settings: &leases::LeaseSettings,
     policy: &impl crate::authz::approvals::EffectPolicy,
-) -> crate::worker::StepResult {
+) -> crate::worker::DispatchStep {
     use crate::{
         authz::{
             approvals::{ReplayAction, ReplayEffect, check_operation},
             store::StoreError,
         },
-        worker::{StepResult, turns::lease_step},
+        worker::{DispatchStep, StepResult, turns::lease_step},
     };
     if *cx.step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
-        return StepResult::LeaseLost;
+        return DispatchStep::from_step(StepResult::LeaseLost);
     }
     let fail = StepResult::Failed(leases::FailReason::StepFailed);
     if cx.proposal.tool == mcp::READ_RANGE {
-        return fail;
+        return DispatchStep::from_step(fail);
     }
     let Ok(output) = Output::new(text) else {
-        return fail;
+        return DispatchStep::from_step(fail);
     };
     let recheck = async |action| {
         let mut c = cx
@@ -410,18 +412,19 @@ pub(crate) async fn publish_bytes_with_handle(
     };
     let observed = |r| match r {
         Ok(ReplayEffect::Observed {
+            succeeded,
             output: Some(output),
             ..
         }) => {
             if let Some(why) = *cx.step.stop.borrow() {
-                crate::worker::stopped_step(why)
+                DispatchStep::from_step(crate::worker::stopped_step(why))
             } else {
-                StepResult::ToolOutput(output)
+                DispatchStep::observed_output(output, succeeded)
             }
         }
-        Ok(ReplayEffect::Invalidated(s)) => StepResult::Invalidated(s),
-        Err(e) => lease_step(e),
-        _ => StepResult::LeaseLost,
+        Ok(ReplayEffect::Invalidated(s)) => DispatchStep::from_step(StepResult::Invalidated(s)),
+        Err(e) => DispatchStep::from_step(lease_step(e)),
+        _ => DispatchStep::from_step(StepResult::LeaseLost),
     };
     let mut fallback = output.inline();
     if fallback.is_none() {
@@ -438,7 +441,9 @@ pub(crate) async fn publish_bytes_with_handle(
                 None => Some("store_unconfigured"),
                 Some(store) => match try_publish(cx, store, &output, handle).await {
                     Ok(_) => None,
-                    Err(SpillError::LeaseLost) => return StepResult::LeaseLost,
+                    Err(SpillError::LeaseLost) => {
+                        return DispatchStep::from_step(StepResult::LeaseLost);
+                    }
                     Err(error) => Some(error.code()),
                 },
             },
@@ -447,7 +452,7 @@ pub(crate) async fn publish_bytes_with_handle(
         fallback = error.map(|code| output.preview(cx.proposal, cx.operation, Err(code)));
     }
     if *cx.step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
-        return StepResult::LeaseLost;
+        return DispatchStep::from_step(StepResult::LeaseLost);
     }
     if let Some(s) = fallback {
         // The spill commit may already have won. The single observation key and
@@ -475,13 +480,15 @@ pub(crate) async fn publish_bytes_with_handle(
                 // A prior commit can have a different envelope for the same operation.
                 return observed(recheck(ReplayAction::PrepareSpill).await);
             }
-            Ok(Err(LeaseError::Store(StoreError::Database(_)))) => return StepResult::LeaseLost,
-            Ok(Err(e)) => return lease_step(e),
-            Err(_) => return StepResult::LeaseLost,
+            Ok(Err(LeaseError::Store(StoreError::Database(_)))) => {
+                return DispatchStep::from_step(StepResult::LeaseLost);
+            }
+            Ok(Err(e)) => return DispatchStep::from_step(lease_step(e)),
+            Err(_) => return DispatchStep::from_step(StepResult::LeaseLost),
         }
     }
     if let Some(stop) = *cx.step.stop.borrow() {
-        return crate::worker::stopped_step(stop);
+        return DispatchStep::from_step(crate::worker::stopped_step(stop));
     }
     observed(recheck(ReplayAction::Inspect).await)
 }

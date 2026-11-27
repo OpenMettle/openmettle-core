@@ -19,13 +19,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
 import secrets
 import shutil
+import socket
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,6 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -93,9 +99,12 @@ CLUSTER_NAME = re.compile(r"openmettle-dev-telemetry-[0-9a-f]{8}")
 TELEMETRY_NAMESPACE = "openmettle-qualification-telemetry"
 ALLOY_HOST = f"alloy.{TELEMETRY_NAMESPACE}.svc.cluster.local"
 PROMETHEUS_HOST = f"prometheus.{TELEMETRY_NAMESPACE}.svc.cluster.local"
+RELAY_HOST = f"otlp-delay-relay.{TELEMETRY_NAMESPACE}.svc.cluster.local"
 ALLOY_OTLP_PORT = 4318
 ALLOY_ADMIN_PORT = 12345
 PROMETHEUS_PORT = 9090
+RELAY_PORT = 9091
+RELAY_DELAY_MS = 1500
 OTLP_CA_MOUNT_DIR = "/etc/openmettle/otlp-ca"
 OTLP_CA_FILE = f"{OTLP_CA_MOUNT_DIR}/ca.crt"
 OTLP_PRIVATE_RANGES = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
@@ -115,6 +124,8 @@ EXPECTED_ALERTS = (
     "OpenMettleDatabaseReadinessFailing",
     "OpenMettleTelemetryDropsDetected",
     "OpenMettleProviderTransportFailures",
+    "OpenMettleGatewayFailuresDetected",
+    "OpenMettleRunQueueHighAge",
     "OpenMettleStorageQuotaDriftDetected",
     "OpenMettleBackupFailedOrOverdue",
 )
@@ -201,10 +212,15 @@ def render_alloy_config() -> str:
         "\n"
         'otelcol.exporter.otlphttp "prometheus" {\n'
         "  client {\n"
-        f'    endpoint = "http://{PROMETHEUS_HOST}:{PROMETHEUS_PORT}/api/v1/otlp"\n'
+        f'    endpoint    = "http://{RELAY_HOST}:{RELAY_PORT}/api/v1/otlp"\n'
+        '    compression = "none"\n'
         "    tls {\n"
         "      insecure = true\n"
         "    }\n"
+        "  }\n"
+        "  sending_queue {\n"
+        "    enabled       = true\n"
+        "    num_consumers = 1\n"
         "  }\n"
         "}\n"
         "\n"
@@ -473,6 +489,61 @@ def render_manifests(
             "spec": {
                 "selector": {"app.kubernetes.io/name": "prometheus"},
                 "ports": [{"name": "http", "port": PROMETHEUS_PORT, "targetPort": "http"}],
+            },
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "otlp-delay-relay", "namespace": TELEMETRY_NAMESPACE},
+            "spec": {
+                "replicas": 1,
+                "strategy": {"type": "Recreate"},
+                "selector": {"matchLabels": {"app.kubernetes.io/name": "otlp-delay-relay"}},
+                "template": {
+                    "metadata": {"labels": {"app.kubernetes.io/name": "otlp-delay-relay"}},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "enableServiceLinks": False,
+                        "securityContext": {
+                            "runAsNonRoot": True,
+                            "runAsUser": 65532,
+                            "runAsGroup": 65532,
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        },
+                        "containers": [{
+                            "name": "relay",
+                            "image": images["relay"],
+                            "imagePullPolicy": "Never",
+                            "env": [
+                                {"name": "RELAY_BIND", "value": f"0.0.0.0:{RELAY_PORT}"},
+                                {
+                                    "name": "UPSTREAM_ADDR",
+                                    "value": f"{PROMETHEUS_HOST}:{PROMETHEUS_PORT}",
+                                },
+                            ],
+                            "ports": [{"name": "http", "containerPort": RELAY_PORT}],
+                            "readinessProbe": {
+                                "httpGet": {"path": "/healthz", "port": "http"},
+                                "periodSeconds": 2,
+                                "failureThreshold": 3,
+                            },
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "otlp-delay-relay", "namespace": TELEMETRY_NAMESPACE},
+            "spec": {
+                "selector": {"app.kubernetes.io/name": "otlp-delay-relay"},
+                "ports": [{"name": "http", "port": RELAY_PORT, "targetPort": "http"}],
             },
         },
         {
@@ -885,6 +956,176 @@ def parse_gateway_request_logs(logs: str) -> list[dict]:
     return matches
 
 
+def _pb_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("varint must be non-negative")
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _pb_len(field: int, payload: bytes) -> bytes:
+    return _pb_varint((field << 3) | 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_str(field: int, text: str) -> bytes:
+    return _pb_len(field, text.encode("utf-8"))
+
+
+def _pb_kv(key: str, value: str) -> bytes:
+    # KeyValue { 1: key (string), 2: AnyValue { 1: string_value (string) } }
+    any_val = _pb_str(1, value)
+    return _pb_str(1, key) + _pb_len(2, any_val)
+
+
+def encode_otlp_slow_exit_counter(
+    instance_id: str,
+    outcome: str,
+    start_time_unix_nano: int,
+    time_unix_nano: int,
+    value: int,
+    *,
+    service_name: str = "openmettle-worker",
+) -> bytes:
+    """Encode a valid OTLP ExportMetricsServiceRequest protobuf for `openmettle.runs.queue.slow_exits`."""
+    # NumberDataPoint: 7=attributes, 2=start_time_unix_nano (fixed64), 3=time_unix_nano (fixed64), 6=as_int (sfixed64)
+    dp = (
+        _pb_len(7, _pb_kv("outcome", outcome))
+        + _pb_varint((2 << 3) | 1)
+        + struct.pack("<Q", start_time_unix_nano)
+        + _pb_varint((3 << 3) | 1)
+        + struct.pack("<Q", time_unix_nano)
+        + _pb_varint((6 << 3) | 1)
+        + struct.pack("<q", value)
+    )
+    # Sum: 1=data_points, 2=aggregation_temporality (CUMULATIVE=2), 3=is_monotonic (true=1)
+    sum_msg = (
+        _pb_len(1, dp)
+        + _pb_varint((2 << 3) | 0)
+        + _pb_varint(2)
+        + _pb_varint((3 << 3) | 0)
+        + _pb_varint(1)
+    )
+    # Metric: 1=name, 3=unit, 7=sum
+    metric = (
+        _pb_str(1, "openmettle.runs.queue.slow_exits")
+        + _pb_str(3, "{run}")
+        + _pb_len(7, sum_msg)
+    )
+    # InstrumentationScope: 1=name, 2=version
+    scope = _pb_str(1, "openmettle_core::telemetry") + _pb_str(2, "1.0.0")
+    # ScopeMetrics: 1=scope, 2=metrics
+    scope_metrics = _pb_len(1, scope) + _pb_len(2, metric)
+    # Resource: 1=attributes
+    resource = _pb_len(1, _pb_kv("service.name", service_name)) + _pb_len(
+        1, _pb_kv("service.instance.id", instance_id)
+    )
+    # ResourceMetrics: 1=resource, 2=scope_metrics
+    resource_metrics = _pb_len(1, resource) + _pb_len(2, scope_metrics)
+    # ExportMetricsServiceRequest: 1=resource_metrics
+    return _pb_len(1, resource_metrics)
+
+
+def validate_delayed_baseline_samples(
+    range_rows: list[dict], increase_rows: list[dict], relay_stats: dict
+) -> dict:
+    """Validate that a delayed startup 0 baseline followed by +1ms live 1 was stored in order."""
+    if not range_rows:
+        raise QualificationFailure("delayed startup baseline series missing from Prometheus")
+    values = range_rows[0].get("values") or []
+    if len(values) < 2:
+        raise QualificationFailure(
+            f"expected both [0, 1] samples for delayed startup baseline, got {values!r}"
+        )
+    parsed = [(float(ts), float(val)) for ts, val in values]
+    if any(not (math.isfinite(ts) and math.isfinite(val)) for ts, val in parsed):
+        raise QualificationFailure(
+            f"non-finite sample timestamp or value in delayed baseline series: {parsed!r}"
+        )
+    if parsed[0][1] != 0.0 or parsed[-1][1] != 1.0:
+        raise QualificationFailure(
+            f"expected ordered [0.0, 1.0] samples after delayed baseline, got {parsed!r}"
+        )
+    if parsed[-1][0] <= parsed[0][0]:
+        raise QualificationFailure(
+            f"expected live sample timestamp > baseline timestamp, got {parsed!r}"
+        )
+    if not increase_rows:
+        raise QualificationFailure(
+            "increase(openmettle_runs_queue_slow_exits_total[10m]) returned no result"
+        )
+    increase_val = float(increase_rows[0]["value"][1])
+    if not math.isfinite(increase_val) or increase_val < 1.0:
+        raise QualificationFailure(
+            f"expected finite increase(...) >= 1.0 for delayed startup baseline, got {increase_val}"
+        )
+    if not isinstance(relay_stats, dict):
+        raise QualificationFailure(f"invalid otlp-delay-relay stats payload: {relay_stats!r}")
+    for key in ("delayed", "status_4xx"):
+        if key not in relay_stats or not isinstance(relay_stats[key], int) or isinstance(relay_stats[key], bool):
+            raise QualificationFailure(
+                f"otlp-delay-relay stats missing integer field {key!r}: {relay_stats!r}"
+            )
+    delayed = relay_stats["delayed"]
+    status_4xx = relay_stats["status_4xx"]
+    if delayed < 1:
+        raise QualificationFailure(
+            f"expected otlp-delay-relay to delay the baseline POST at least once, got {relay_stats!r}"
+        )
+    if status_4xx != 0:
+        raise QualificationFailure(
+            f"Prometheus returned {status_4xx} 4xx response(s) (out-of-order rejection): {relay_stats!r}"
+        )
+    return {
+        "samples": len(parsed),
+        "first_value": parsed[0][1],
+        "last_value": parsed[-1][1],
+        "increase_10m": increase_val,
+        "relay_delayed": delayed,
+        "relay_status_4xx": status_4xx,
+    }
+
+
+def https_post_otlp(
+    port: int,
+    path: str,
+    body: bytes,
+    *,
+    ca_crt: str,
+    server_hostname: str,
+    timeout: float = 10.0,
+) -> tuple[int | None, str]:
+    """POST OTLP/HTTP protobuf over TLS to a port-forwarded collector verified against `ca_crt`."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cadata=ca_crt)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    try:
+        raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        with ctx.wrap_socket(raw, server_hostname=server_hostname) as tls_sock:
+            tls_sock.settimeout(timeout)
+            head = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: {server_hostname}:{ALLOY_OTLP_PORT}\r\n"
+                "Content-Type: application/x-protobuf\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            tls_sock.sendall(head + body)
+            resp = http.client.HTTPResponse(tls_sock)
+            resp.begin()
+            payload = resp.read().decode("utf-8", errors="replace")
+            return resp.status, payload
+    except OSError as exc:
+        return None, str(exc)
+
+
 # --- Safety guards & HTTP/port-forward helpers -------------------------------------------
 
 def check_cluster_absent(run, name: str) -> None:
@@ -1006,7 +1247,11 @@ class TelemetryQualification:
             "kubectl", "--kubeconfig", str(self.kubeconfig),
             "--context", f"kind-{self.name}",
         ]
-        self.images = {role: f"openmettle-{role}:telemetry-qual-{self.run_id}" for role in ROLES}
+        self.images = {
+            **{role: f"openmettle-{role}:telemetry-qual-{self.run_id}" for role in ROLES},
+            "relay": f"openmettle-otlp-delay-relay:telemetry-qual-{self.run_id}",
+        }
+        self.ca_crt: str | None = None
         self.cluster_attempted = False
         self.built_images: list[str] = []
         self.report: dict = {
@@ -1090,6 +1335,14 @@ class TelemetryQualification:
                 "--tag", self.images[role],
                 str(ROOT),
             ], timeout=1800)
+        _log(f"building {self.images['relay']} (test-only OTLP delay relay; never pushed)")
+        self.built_images.append(self.images["relay"])
+        self.run([
+            "docker", "build", "--builder", "default",
+            "--file", str(ROOT / "tests" / "telemetry_kind" / "Dockerfile.relay"),
+            "--tag", self.images["relay"],
+            str(ROOT / "tests" / "telemetry_kind"),
+        ], timeout=600)
 
     def create_cluster(self):
         _log(f"creating kind cluster {self.name} (dev, temporary kubeconfig)")
@@ -1102,17 +1355,18 @@ class TelemetryQualification:
         ], timeout=900)
         self.verify_identity()
         self.passed("isolated cluster identity", context=f"kind-{self.name}")
-        for role in ROLES:
-            self.run(["kind", "load", "docker-image", self.images[role], "--name", self.name],
+        for key in (*ROLES, "relay"):
+            self.run(["kind", "load", "docker-image", self.images[key], "--name", self.name],
                      timeout=600)
 
     def deploy(self):
         passwords = {k: secrets.token_hex(16) for k in ("admin", *ROLES)}
         tls = generate_collector_tls(self.workdir)
+        self.ca_crt = tls["ca_crt"]
         manifests = render_manifests(
             self.process_contract, self.images, passwords, tls, self.alerts_yaml, self.run_id,
         )
-        # Apply namespaces, Postgres, Prometheus, and Alloy first so the collector is ready
+        # Apply namespaces, Postgres, Prometheus, relay, and Alloy first so the collector is ready
         # before openmettle-api/worker/gateway start and emit their initial zero-baseline drop series.
         infra_items = []
         app_items = []
@@ -1130,6 +1384,8 @@ class TelemetryQualification:
                   "--timeout=300s", timeout=330)
         self.kube("--namespace", TELEMETRY_NAMESPACE, "rollout", "status", "deployment/prometheus",
                   "--timeout=300s", timeout=330)
+        self.kube("--namespace", TELEMETRY_NAMESPACE, "rollout", "status",
+                  "deployment/otlp-delay-relay", "--timeout=180s", timeout=210)
         self.kube("--namespace", TELEMETRY_NAMESPACE, "rollout", "status", "deployment/alloy",
                   "--timeout=300s", timeout=330)
         self.verify_identity()
@@ -1475,6 +1731,94 @@ class TelemetryQualification:
                 **ingested,
                 **validation,
             )
+
+            # 4b. Verify Alloy `sending_queue { enabled = true, num_consumers = 1 }` serializes
+            # downstream OTLP delivery to Prometheus when the startup 0 baseline POST is delayed
+            # by 1.5s ahead of a +1ms cumulative 1 sample (preventing 400 out-of-order rejection).
+            assert self.ca_crt is not None
+            probe_instance = str(uuid.uuid4())
+            with (
+                PortForward(
+                    self.kubectl, self.env, TELEMETRY_NAMESPACE,
+                    "service/otlp-delay-relay", RELAY_PORT,
+                ) as relay_pf,
+                PortForward(
+                    self.kubectl, self.env, TELEMETRY_NAMESPACE,
+                    "service/alloy", ALLOY_OTLP_PORT,
+                ) as alloy_otlp_pf,
+            ):
+                arm_status, arm_body = http_request(
+                    relay_pf.port,
+                    f"/arm-delay?ms={RELAY_DELAY_MS}&match={probe_instance}",
+                    method="POST",
+                    data=b"",
+                )
+                self.expect(
+                    arm_status == 200,
+                    f"failed to arm otlp-delay-relay: status={arm_status} body={arm_body!r}",
+                )
+                start_ns = time.time_ns()
+                baseline_body = encode_otlp_slow_exit_counter(
+                    probe_instance, "claimed", start_ns, start_ns, 0
+                )
+                live_body = encode_otlp_slow_exit_counter(
+                    probe_instance, "claimed", start_ns, start_ns + 1_000_000, 1
+                )
+                st0, body0 = https_post_otlp(
+                    alloy_otlp_pf.port,
+                    "/v1/metrics",
+                    baseline_body,
+                    ca_crt=self.ca_crt,
+                    server_hostname=ALLOY_HOST,
+                )
+                st1, body1 = https_post_otlp(
+                    alloy_otlp_pf.port,
+                    "/v1/metrics",
+                    live_body,
+                    ca_crt=self.ca_crt,
+                    server_hostname=ALLOY_HOST,
+                )
+                self.expect(st0 == 200, f"Alloy rejected baseline POST: {st0} {body0!r}")
+                self.expect(st1 == 200, f"Alloy rejected live POST: {st1} {body1!r}")
+
+                range_expr = (
+                    'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",'
+                    f'instance="{probe_instance}",outcome="claimed"}}[10m]'
+                )
+                increase_expr = f"increase({range_expr})"
+
+                def delayed_samples_stored():
+                    r_rows = self.prom_query(prom_pf.port, range_expr, allow_transient=True)
+                    i_rows = self.prom_query(prom_pf.port, increase_expr, allow_transient=True)
+                    if (
+                        r_rows
+                        and len(r_rows[0].get("values") or []) >= 2
+                        and i_rows
+                    ):
+                        return (r_rows, i_rows)
+                    return None
+
+                range_rows, increase_rows = self.wait_for(
+                    "delayed startup baseline [0, 1] samples to land in Prometheus in order",
+                    delayed_samples_stored,
+                    timeout=30,
+                    interval=0.5,
+                )
+                stats_status, stats_body = http_request(relay_pf.port, "/stats")
+                self.expect(
+                    stats_status == 200,
+                    f"otlp-delay-relay /stats failed: status={stats_status} body={stats_body!r}",
+                )
+                relay_stats = json.loads(stats_body)
+                ordered = validate_delayed_baseline_samples(range_rows, increase_rows, relay_stats)
+                after_probe_series = self.prom_query(prom_pf.port, '{__name__=~"openmettle_.*"}')
+                validate_prometheus_series(after_probe_series, self.telemetry_contract)
+                self.passed(
+                    "serialized Alloy downstream delivery preserves delayed startup zero baseline",
+                    probe_instance=probe_instance,
+                    delay_ms=RELAY_DELAY_MS,
+                    **ordered,
+                )
 
             # 5. Single collector outage: verify API and gateway resilience and that
             # OpenMettleTelemetryDropsDetected transitions from zero baseline through pending

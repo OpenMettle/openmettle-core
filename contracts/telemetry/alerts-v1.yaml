@@ -49,15 +49,39 @@ groups:
 
       - alert: OpenMettleProviderTransportFailures
         expr: |
-          sum by (operation, outcome) (increase(openmettle_provider_http_requests_total{outcome!="ok"}[5m])) >= 3
+          sum by (operation, outcome) (increase(openmettle_provider_http_requests_total{outcome!~"ok|cancelled"}[5m])) >= 3
         for: 5m
         labels:
           severity: warning
-          service: openmettle-api
+          service: openmettle-core
           signal_contract: v1
         annotations:
-          summary: "OpenMettle identity provider transport failures"
-          description: "Repeated outbound OIDC provider HTTP requests failed over the ADR 0010 transport."
+          summary: "OpenMettle outbound provider transport failures"
+          description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
+
+      - alert: OpenMettleGatewayFailuresDetected
+        expr: |
+          sum by (step, cause) (increase(openmettle_gateway_failures_total[5m])) >= 3
+        for: 2m
+        labels:
+          severity: warning
+          service: openmettle-gateway
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle gateway failures detected"
+          description: "Repeated inference gateway failures were recorded by step and cause over the last 5 minutes."
+
+      - alert: OpenMettleRunQueueHighAge
+        expr: |
+          sum by (outcome) (increase(openmettle_runs_queue_slow_exits_total[10m])) >= 1
+        for: 5m
+        labels:
+          severity: warning
+          service: openmettle-worker
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle runs waiting over 60s in durable work queue"
+          description: "One or more runs waited longer than 60 seconds in the durable work queue before leaving the queue over the last 10 minutes."
 
       - alert: OpenMettleStorageQuotaDriftDetected
         expr: |

@@ -660,11 +660,23 @@ async fn connect_alternates_only_before_request_bytes() {
     );
 }
 
+const CANCEL_CHILD: &str = "OPENMETTLE_PROVIDER_HTTP_CANCEL_CHILD";
+
+/// Runs in an isolated child process so process-global OIDC provider metric assertions have zero
+/// contention with parallel `provider_http::tests::*` tests.
 #[tokio::test]
-async fn cancellation_closes_the_connection() {
+#[ignore = "child process of cancellation_closes_the_connection"]
+async fn cancellation_closes_the_connection_child() {
+    use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
+
+    if std::env::var(CANCEL_CHILD).as_deref() != Ok("1") {
+        return;
+    }
     let ca = Ca::new();
     let server = Server::start(ca.leaf(fixture::HOST, false), |_| Reply::Stall(Vec::new())).await;
     let t = fixture::transport(server.port, &ca);
+
+    // 1. Dropping an in-flight OIDC token request closes the socket and records `cancelled` (+1).
     let mut call = Box::pin(t.call(fixture::token_request(&fixture::url(server.port))));
     tokio::select! {
         _ = server.entered.notified() => (),
@@ -676,6 +688,89 @@ async fn cancellation_closes_the_connection() {
         .expect("dropping the request closes the socket");
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled),
+        1
+    );
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Transport),
+        0
+    );
+
+    // 2. Dropping in-flight OIDC discovery and JWKS fetches also records `cancelled` (+1 each).
+    let docs = ProviderDocuments::configured(
+        &t,
+        &format!(
+            "https://{}:{}/.well-known/openid-configuration",
+            fixture::HOST,
+            server.port
+        ),
+        &format!("https://{}:{}/jwks", fixture::HOST, server.port),
+    )
+    .unwrap();
+
+    let mut disc = Box::pin(docs.fetch_discovery());
+    tokio::select! {
+        _ = server.entered.notified() => (),
+        _ = &mut disc => panic!("stalled discovery completed"),
+    }
+    drop(disc);
+    tokio::time::timeout(Duration::from_secs(5), server.closed.notified())
+        .await
+        .expect("dropping discovery closes the socket");
+    assert_eq!(
+        metrics::global()
+            .provider_http_count(ProviderOperation::Discovery, ProviderOutcome::Cancelled),
+        1
+    );
+
+    let mut jwks = Box::pin(docs.fetch_jwks());
+    tokio::select! {
+        _ = server.entered.notified() => (),
+        _ = &mut jwks => panic!("stalled jwks completed"),
+    }
+    drop(jwks);
+    tokio::time::timeout(Duration::from_secs(5), server.closed.notified())
+        .await
+        .expect("dropping jwks closes the socket");
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Jwks, ProviderOutcome::Cancelled),
+        1
+    );
+
+    // 3. Admission refusal still records `refused` (+1) and does NOT record `cancelled`.
+    let wrong_dest = fixture::token_request("https://wrong.example.test/oauth/token");
+    assert_eq!(t.call(wrong_dest).await.unwrap_err(), Error::Destination);
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Refused),
+        1
+    );
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled),
+        1
+    );
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Transport),
+        0
+    );
+}
+
+#[test]
+fn cancellation_closes_the_connection() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "provider_http::tests::cancellation_closes_the_connection_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(CANCEL_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed"), "{stdout}\n{stderr}");
 }
 
 /// Blocks lookups until released; counts entries.

@@ -77,7 +77,7 @@ fn metrics_destination(port: u16, ca: &Ca, tuning: Tuning) -> otlp::Destination 
         .allow_loopback_fixture()
 }
 
-fn start_traces(
+pub(crate) fn start_traces(
     destination: otlp::Destination,
     role: Process,
 ) -> (opentelemetry_sdk::trace::SdkTracer, otlp::Exporter) {
@@ -165,7 +165,7 @@ pub(crate) async fn finish(exporter: Exporter) {
         .await;
 }
 
-fn text(value: &Option<AnyValue>) -> Option<&str> {
+pub(crate) fn text(value: &Option<AnyValue>) -> Option<&str> {
     match value.as_ref()?.value.as_ref()? {
         Value::StringValue(s) => Some(s),
         _ => None,
@@ -179,7 +179,7 @@ fn int(value: &Option<AnyValue>) -> Option<i64> {
     }
 }
 
-fn attributes(list: &[KeyValue]) -> BTreeMap<&str, &Option<AnyValue>> {
+pub(crate) fn attributes(list: &[KeyValue]) -> BTreeMap<&str, &Option<AnyValue>> {
     list.iter().map(|kv| (kv.key.as_str(), &kv.value)).collect()
 }
 
@@ -1001,10 +1001,10 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    while captured.lock().unwrap().is_empty() {
+    while captured.lock().unwrap().len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for metrics export"
+            "timed out waiting for baseline and live metrics exports"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1013,8 +1013,8 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
         .await;
 
     let requests = captured.lock().unwrap().clone();
-    assert!(!requests.is_empty());
-    let (head, body) = &requests[0];
+    assert!(requests.len() >= 2);
+    let (head, body) = &requests[1];
     assert!(
         head.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
         "unexpected request head: {head:?}"
@@ -1058,6 +1058,607 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
     };
     assert!(sum.is_monotonic);
     assert_eq!(sum.data_points.len(), 1);
+}
+
+fn find_counter_point(
+    req: &opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+    name: &str,
+    want_labels: &[(&str, &str)],
+) -> (i64, u64, u64) {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point::Value as NumVal};
+    let metric = req.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| panic!("missing metric {name}"));
+    let Some(metric::Data::Sum(sum)) = metric.data.as_ref() else {
+        panic!("expected Sum for {name}");
+    };
+    let dp = sum
+        .data_points
+        .iter()
+        .find(|dp| {
+            let map = attributes(&dp.attributes);
+            want_labels
+                .iter()
+                .all(|&(k, v)| map.get(k).and_then(|val| text(val)) == Some(v))
+        })
+        .unwrap_or_else(|| panic!("missing point {want_labels:?} in {name}"));
+    let Some(NumVal::AsInt(value)) = dp.value else {
+        panic!("expected AsInt in {name}");
+    };
+    (value, dp.start_time_unix_nano, dp.time_unix_nano)
+}
+
+#[tokio::test]
+async fn metrics_export_delivers_zero_baseline_before_immediate_startup_failures() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let ca = Ca::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        recorded.lock().unwrap().push(received.body.clone());
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    // Use a long periodic export interval (60s) so the live export does not run before shutdown,
+    // proving that the pre-captured zero baseline is delivered immediately on startup ahead of
+    // failures recorded right after `start_with_metrics` returns.
+    let tuning = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest = metrics_destination(server.port, &ca, tuning);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Worker, store.clone());
+
+    // Record 3 readiness failures, 3 MCP transport failures, and 1 slow queue exit immediately
+    // after exporter installation (before the 60s periodic export timer elapses).
+    for _ in 0..3 {
+        store.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(5));
+        store.record_provider_http(
+            metrics::ProviderOperation::Mcp,
+            metrics::ProviderOutcome::Transport,
+            Duration::from_millis(10),
+        );
+    }
+    store.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 75.0);
+
+    until(|| !captured.lock().unwrap().is_empty()).await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let bodies = captured.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "expected startup zero baseline + shutdown live flush"
+    );
+    let baseline = ExportMetricsServiceRequest::decode(bodies[0].as_slice()).unwrap();
+    let live = ExportMetricsServiceRequest::decode(bodies[1].as_slice()).unwrap();
+
+    for (name, labels, expected_live) in [
+        (
+            "openmettle.db.readiness.checks",
+            &[("outcome", "error")][..],
+            3i64,
+        ),
+        (
+            "openmettle.provider.http.requests",
+            &[("operation", "mcp"), ("outcome", "transport")][..],
+            3i64,
+        ),
+        (
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")][..],
+            1i64,
+        ),
+    ] {
+        let (base_val, base_start, base_time) = find_counter_point(&baseline, name, labels);
+        let (live_val, live_start, live_time) = find_counter_point(&live, name, labels);
+        assert_eq!(base_val, 0, "baseline for {name} must be 0");
+        assert_eq!(
+            base_time, base_start,
+            "baseline for {name} must carry time_unix_nano == start_time_unix_nano"
+        );
+        assert_eq!(live_start, base_start);
+        assert_eq!(live_val, expected_live, "live value mismatch for {name}");
+        assert!(
+            live_time > base_time,
+            "live timestamp ({live_time}) must strictly exceed baseline ({base_time}) for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_export_retains_zero_baseline_across_initial_collector_outage() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let ca = Ca::new();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let healthy_srv = healthy.clone();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        if !healthy_srv.load(AtomicOrdering::Acquire) {
+            return Reply::Bytes(response(503, &[], b""));
+        }
+        recorded.lock().unwrap().push(received.body.clone());
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Api, store.clone());
+
+    // Wait for the initial baseline attempt to fail against the 503 collector.
+    until(|| store.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+
+    // Record startup failures while the collector is still down.
+    for _ in 0..3 {
+        store.record_db_readiness(metrics::ReadinessOutcome::Timeout, Duration::from_millis(5));
+        store.record_provider_http(
+            metrics::ProviderOperation::Token,
+            metrics::ProviderOutcome::Timeout,
+            Duration::from_millis(10),
+        );
+    }
+
+    // Bring collector back up; pending_baseline MUST still arrive ahead of the live snapshot.
+    healthy.store(true, AtomicOrdering::Release);
+    until(|| captured.lock().unwrap().len() >= 2).await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let bodies = captured.lock().unwrap().clone();
+    assert!(bodies.len() >= 2);
+    let baseline = ExportMetricsServiceRequest::decode(bodies[0].as_slice()).unwrap();
+    let live = ExportMetricsServiceRequest::decode(bodies[1].as_slice()).unwrap();
+
+    for (name, labels, min_live) in [
+        (
+            "openmettle.db.readiness.checks",
+            &[("outcome", "timeout")][..],
+            3i64,
+        ),
+        (
+            "openmettle.provider.http.requests",
+            &[("operation", "token"), ("outcome", "timeout")][..],
+            3i64,
+        ),
+        (
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")][..],
+            1i64,
+        ),
+    ] {
+        let (base_val, base_start, base_time) = find_counter_point(&baseline, name, labels);
+        let (live_val, live_start, live_time) = find_counter_point(&live, name, labels);
+        assert_eq!(base_val, 0, "retained baseline for {name} must stay 0");
+        assert_eq!(base_time, base_start);
+        assert_eq!(live_start, base_start);
+        assert!(
+            live_val >= min_live,
+            "live snapshot for {name} expected >= {min_live}, got {live_val}"
+        );
+        assert!(live_time > base_time);
+    }
+}
+
+#[tokio::test]
+async fn metrics_export_discards_permanently_rejected_baseline_and_delivers_live_snapshot() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    // Case 1: Collector returns 503 at startup, then recovers with a timestamp cutoff that
+    // permanently rejects the stale zero baseline (`time == start_time`) with 400 while
+    // accepting live snapshots (`time > start_time`) with 200.
+    let ca = Ca::new();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_srv = recovered.clone();
+    let seen = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen_srv = seen.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")],
+        );
+        let is_baseline = ts == start;
+        let status = if !recovered_srv.load(AtomicOrdering::Acquire) {
+            503
+        } else if is_baseline {
+            400
+        } else {
+            200
+        };
+        seen_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Worker, store.clone());
+
+    // Wait for the initial 503 startup baseline failure.
+    until(|| {
+        let log = seen.lock().unwrap();
+        !log.is_empty() && log[0].0 == 503 && log[0].1
+    })
+    .await;
+
+    // Record a slow queue exit while the collector was unavailable, then recover collector
+    // with the 400 cutoff on the stale baseline timestamp.
+    store.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 90.0);
+    recovered.store(true, AtomicOrdering::Release);
+
+    // Wait for at least one live snapshot to succeed (200) after the 400 rejection.
+    until(|| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(code, is_base, _)| *code == 200 && !*is_base)
+    })
+    .await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let history = seen.lock().unwrap().clone();
+    let baseline_statuses: Vec<u16> = history
+        .iter()
+        .filter(|(_, is_base, _)| *is_base)
+        .map(|(code, _, _)| *code)
+        .collect();
+    assert_eq!(
+        baseline_statuses,
+        vec![503, 400],
+        "stale baseline must be attempted only on retryable 503 and discarded permanently after 400 (never retried, including on stop)"
+    );
+
+    let first_live_body = history
+        .iter()
+        .find(|(code, is_base, _)| *code == 200 && !*is_base)
+        .map(|(_, _, body)| body)
+        .expect("expected 200 live snapshot immediately after 400 baseline rejection");
+    let first_live = ExportMetricsServiceRequest::decode(first_live_body.as_slice()).unwrap();
+    let (slow_val, slow_start, slow_ts) = find_counter_point(
+        &first_live,
+        "openmettle.runs.queue.slow_exits",
+        &[("outcome", "claimed")],
+    );
+    assert_eq!(slow_val, 1);
+    assert!(slow_ts > slow_start);
+    let (drop_val, _, _) = find_counter_point(
+        &first_live,
+        "openmettle.telemetry.dropped",
+        &[("signal", "metric_exports")],
+    );
+    assert_eq!(
+        drop_val, 2,
+        "dropped metric_exports must count both the initial 503 and the permanent 400 rejection"
+    );
+
+    // Case 2: Collector returns 400 immediately on the initial t=0 startup baseline POST, then
+    // 200 for live snapshots; baseline must be sent only once, the first live snapshot must be
+    // exported immediately without waiting for `interval` (60s) or `stop()`, and shutdown flushes
+    // without retrying the rejected baseline.
+    let seen2 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen2_srv = seen2.clone();
+    let server2 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let status = if is_baseline { 400 } else { 200 };
+        seen2_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], b""))
+    })
+    .await;
+
+    let store2 = Arc::new(metrics::Metrics::new());
+    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(4));
+    let tuning2 = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest2 = metrics_destination(server2.port, &ca, tuning2);
+    let (_, exporter2) = otlp::start_with_metrics(dest2, Process::Api, store2.clone());
+
+    // Both the rejected 400 baseline AND the immediate fallback 200 live snapshot must arrive
+    // before `interval` (60s) elapses and before `stop()` is called.
+    until(|| seen2.lock().unwrap().len() >= 2).await;
+    {
+        let early = seen2.lock().unwrap().clone();
+        assert_eq!(early.len(), 2);
+        assert_eq!((early[0].0, early[0].1), (400, true));
+        assert_eq!((early[1].0, early[1].1), (200, false));
+        let live2 = ExportMetricsServiceRequest::decode(early[1].2.as_slice()).unwrap();
+        let (err_val, _, _) = find_counter_point(
+            &live2,
+            "openmettle.db.readiness.checks",
+            &[("outcome", "error")],
+        );
+        let (drop_val2, _, _) = find_counter_point(
+            &live2,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        assert_eq!(err_val, 1);
+        assert_eq!(drop_val2, 1);
+    }
+
+    exporter2
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let history2 = seen2.lock().unwrap().clone();
+    assert_eq!(
+        history2.len(),
+        3,
+        "expected single 400 baseline + immediate 200 live fallback + 200 shutdown flush"
+    );
+    assert_eq!((history2[0].0, history2[0].1), (400, true));
+    assert_eq!((history2[1].0, history2[1].1), (200, false));
+    assert_eq!((history2[2].0, history2[2].1), (200, false));
+}
+
+#[tokio::test]
+async fn metrics_export_classifies_oversized_response_bodies_by_parsed_status() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    const OVERSIZED_LEN: usize = otlp::MAX_RESPONSE_BYTES + 4; // 65,540 bytes > 64 KiB cap
+    let oversized_body = Arc::new(vec![b'x'; OVERSIZED_LEN]);
+    let ca = Ca::new();
+
+    // 1. After an initial 503, collector returns 400 with a 65,540-byte error body for the stale
+    //    baseline and 200 for live snapshots: baseline must still be classified PermanentRejection
+    //    (never retried after 400) and live snapshot must be delivered.
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovered_srv = recovered.clone();
+    let seen1 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen1_srv = seen1.clone();
+    let big1 = oversized_body.clone();
+    let server1 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if !recovered_srv.load(AtomicOrdering::Acquire) {
+            (503, b"")
+        } else if is_baseline {
+            (400, big1.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen1_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store1 = Arc::new(metrics::Metrics::new());
+    let dest1 = metrics_destination(server1.port, &ca, FAST);
+    let (_, exporter1) = otlp::start_with_metrics(dest1, Process::Worker, store1.clone());
+    until(|| {
+        let log = seen1.lock().unwrap();
+        !log.is_empty() && log[0].0 == 503 && log[0].1
+    })
+    .await;
+    store1.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 90.0);
+    recovered.store(true, AtomicOrdering::Release);
+    until(|| {
+        seen1
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(code, is_base, _)| *code == 200 && !*is_base)
+    })
+    .await;
+    exporter1
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let hist1 = seen1.lock().unwrap().clone();
+    let base_codes1: Vec<u16> = hist1
+        .iter()
+        .filter(|(_, is_base, _)| *is_base)
+        .map(|(code, _, _)| *code)
+        .collect();
+    assert_eq!(base_codes1, vec![503, 400]);
+    let live1_body = hist1
+        .iter()
+        .find(|(code, is_base, _)| *code == 200 && !*is_base)
+        .map(|(_, _, body)| body)
+        .expect("expected 200 live snapshot after oversized 400");
+    let live1 = ExportMetricsServiceRequest::decode(live1_body.as_slice()).unwrap();
+    assert_eq!(
+        find_counter_point(
+            &live1,
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")]
+        )
+        .0,
+        1
+    );
+    assert_eq!(
+        find_counter_point(
+            &live1,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")]
+        )
+        .0,
+        2
+    );
+
+    // 2. Immediate t=0 400 with a 65,540-byte body must discard baseline and immediately export
+    //    the live snapshot (before 60s interval or stop).
+    let seen2 = Arc::new(Mutex::new(Vec::<(u16, bool, Vec<u8>)>::new()));
+    let seen2_srv = seen2.clone();
+    let big2 = oversized_body.clone();
+    let server2 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if is_baseline {
+            (400, big2.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen2_srv
+            .lock()
+            .unwrap()
+            .push((status, is_baseline, received.body.clone()));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store2 = Arc::new(metrics::Metrics::new());
+    store2.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(3));
+    let tuning_long = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest2 = metrics_destination(server2.port, &ca, tuning_long);
+    let (_, exporter2) = otlp::start_with_metrics(dest2, Process::Api, store2.clone());
+    until(|| seen2.lock().unwrap().len() >= 2).await;
+    exporter2
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let hist2 = seen2.lock().unwrap().clone();
+    assert_eq!(hist2.len(), 3);
+    assert_eq!((hist2[0].0, hist2[0].1), (400, true));
+    assert_eq!((hist2[1].0, hist2[1].1), (200, false));
+    assert_eq!((hist2[2].0, hist2[2].1), (200, false));
+    assert_eq!(
+        store2.dropped_count(metrics::DroppedSignal::MetricExports),
+        1
+    );
+
+    // 3. 503 with a 65,540-byte body must remain RetryableFailure (retaining pending_baseline
+    //    until the collector recovers to 200).
+    let healthy3 = Arc::new(AtomicBool::new(false));
+    let healthy3_srv = healthy3.clone();
+    let seen3 = Arc::new(Mutex::new(Vec::<(u16, bool)>::new()));
+    let seen3_srv = seen3.clone();
+    let big3 = oversized_body.clone();
+    let server3 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let (status, payload): (u16, &[u8]) = if !healthy3_srv.load(AtomicOrdering::Acquire) {
+            (503, big3.as_slice())
+        } else {
+            (200, b"")
+        };
+        seen3_srv.lock().unwrap().push((status, is_baseline));
+        Reply::Bytes(response(status, &[], payload))
+    })
+    .await;
+
+    let store3 = Arc::new(metrics::Metrics::new());
+    let dest3 = metrics_destination(server3.port, &ca, FAST);
+    let (_, exporter3) = otlp::start_with_metrics(dest3, Process::Api, store3.clone());
+    until(|| store3.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+    healthy3.store(true, AtomicOrdering::Release);
+    until(|| seen3.lock().unwrap().iter().any(|&(c, b)| c == 200 && !b)).await;
+    exporter3
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let hist3 = seen3.lock().unwrap().clone();
+    let ok3: Vec<(u16, bool)> = hist3.into_iter().filter(|&(c, _)| c == 200).collect();
+    assert!(ok3.len() >= 2);
+    assert_eq!(
+        ok3[0],
+        (200, true),
+        "503 + oversized body must retain baseline"
+    );
+    assert_eq!(ok3[1], (200, false));
+
+    // 4. 200 with a 65,540-byte body must NEVER be treated as Delivered (must count a drop and
+    //    retain pending_baseline until a valid <=64 KiB 200 response arrives).
+    let healthy4 = Arc::new(AtomicBool::new(false));
+    let healthy4_srv = healthy4.clone();
+    let seen4 = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
+    let seen4_srv = seen4.clone();
+    let big4 = oversized_body.clone();
+    let server4 = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        let decoded = ExportMetricsServiceRequest::decode(received.body.as_slice()).unwrap();
+        let (_, start, ts) = find_counter_point(
+            &decoded,
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")],
+        );
+        let is_baseline = ts == start;
+        let is_small = healthy4_srv.load(AtomicOrdering::Acquire);
+        let payload: &[u8] = if is_small { b"" } else { big4.as_slice() };
+        seen4_srv.lock().unwrap().push((is_small, is_baseline));
+        Reply::Bytes(response(200, &[], payload))
+    })
+    .await;
+
+    let store4 = Arc::new(metrics::Metrics::new());
+    let dest4 = metrics_destination(server4.port, &ca, FAST);
+    let (_, exporter4) = otlp::start_with_metrics(dest4, Process::Api, store4.clone());
+    until(|| store4.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+    healthy4.store(true, AtomicOrdering::Release);
+    until(|| {
+        seen4
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(small, base)| small && !base)
+    })
+    .await;
+    exporter4
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(store4.dropped_count(metrics::DroppedSignal::MetricExports) >= 1);
+    let ok4: Vec<(bool, bool)> = seen4
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|&(small, _)| small)
+        .collect();
+    assert!(ok4.len() >= 2);
+    assert_eq!(
+        ok4[0],
+        (true, true),
+        "oversized 200 must not mark baseline delivered"
+    );
+    assert_eq!(ok4[1], (true, false));
 }
 
 #[tokio::test]
@@ -1214,4 +1815,364 @@ async fn traces_and_metrics_export_concurrently_and_stop_cleanly() {
     let metric_instance = text(metric_res["service.instance.id"]).unwrap();
     assert!(super::is_v4(trace_instance));
     assert_eq!(trace_instance, metric_instance);
+}
+
+#[tokio::test]
+async fn http_correlation_propagates_validated_ids_and_suppresses_on_401() {
+    use crate::telemetry::record_request_run_id;
+    use axum::http::{Extensions, StatusCode};
+
+    const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const UNAUTH_RUN_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    let app = observe(
+        Router::new()
+            .route(
+                "/v1/runs/{run_id}",
+                get(move |ext: Extensions| async move {
+                    record_request_run_id(&ext, RUN_ID);
+                    "ok\n"
+                }),
+            )
+            .route(
+                "/v1/recheck-401/{run_id}",
+                get(move |ext: Extensions| async move {
+                    // Simulates recording run_id after initial session validation, followed by
+                    // a post-auth DB principal/approval recheck returning 401 Unauthorized.
+                    record_request_run_id(&ext, UNAUTH_RUN_ID);
+                    StatusCode::UNAUTHORIZED
+                }),
+            )
+            .route(
+                "/v1/bad",
+                get(|ext: Extensions| async move {
+                    // Unvalidated canary strings must be silently ignored.
+                    record_request_run_id(&ext, CANARY);
+                    record_request_run_id(&ext, "not-a-uuid-canary");
+                    "ok\n"
+                }),
+            ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    assert_eq!(
+        exchange(
+            address,
+            get_request(&format!("/v1/runs/{RUN_ID}")).as_bytes()
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        exchange(
+            address,
+            get_request(&format!("/v1/recheck-401/{UNAUTH_RUN_ID}")).as_bytes()
+        )
+        .await,
+        401
+    );
+    assert_eq!(
+        exchange(address, get_request("/v1/bad").as_bytes()).await,
+        200
+    );
+    server.abort();
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 3, "{spans:#?}");
+
+    let run_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/runs/{run_id}"))
+        .expect("correlated /v1/runs/{run_id} span");
+    assert_eq!(run_span.name, "http.server.request");
+    assert_eq!(run_span.kind, SpanKind::Server as i32);
+    assert!(run_span.parent_span_id.is_empty());
+    assert_eq!(run_span.dropped_attributes_count, 0);
+    let run_attrs = attributes(&run_span.attributes);
+    let run_keys: BTreeSet<&str> = run_attrs.keys().copied().collect();
+    assert_eq!(
+        run_keys,
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "request_id",
+            "run_id",
+        ]
+        .into()
+    );
+    let run_req_id = text(run_attrs["request_id"]).unwrap();
+    assert_eq!(text(run_attrs["run_id"]), Some(RUN_ID));
+
+    // Post-auth 401 must centrally suppress `run_id` on both span and completion log.
+    let unauth_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/recheck-401/{run_id}"))
+        .expect("401 recheck span");
+    assert_eq!(unauth_span.dropped_attributes_count, 0);
+    let unauth_attrs = attributes(&unauth_span.attributes);
+    assert_eq!(
+        unauth_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "request_id",
+        ]
+        .into()
+    );
+    let unauth_req_id = text(unauth_attrs["request_id"]).unwrap();
+    assert_eq!(int(unauth_attrs["http.response.status_code"]), Some(401));
+
+    let bad_span = spans
+        .iter()
+        .find(|s| text(attributes(&s.attributes)["http.route"]) == Some("/v1/bad"))
+        .expect("/v1/bad span");
+    assert_eq!(bad_span.dropped_attributes_count, 0);
+    let bad_attrs = attributes(&bad_span.attributes);
+    assert_eq!(
+        bad_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        [
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "request_id",
+        ]
+        .into()
+    );
+
+    let completed = capture.events("http.request.completed");
+    assert_eq!(completed.len(), 3, "{}", capture.text());
+    let run_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/runs/{run_id}"))
+        .expect("correlated completion log");
+    assert_eq!(run_log["request_id"].as_str(), Some(run_req_id));
+    assert_eq!(run_log["run_id"].as_str(), Some(RUN_ID));
+
+    let unauth_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/recheck-401/{run_id}"))
+        .expect("401 recheck completion log");
+    assert_eq!(unauth_log["request_id"].as_str(), Some(unauth_req_id));
+    assert!(unauth_log.get("run_id").is_none());
+
+    let bad_log = completed
+        .iter()
+        .find(|e| e.get("http.route").and_then(|v| v.as_str()) == Some("/v1/bad"))
+        .expect("/v1/bad completion log");
+    assert!(bad_log.get("run_id").is_none());
+
+    collector.assert_absent(&[
+        CANARY.as_bytes(),
+        b"not-a-uuid-canary",
+        UNAUTH_RUN_ID.as_bytes(),
+    ]);
+    capture.assert_absent(&[
+        CANARY.as_bytes(),
+        b"not-a-uuid-canary",
+        UNAUTH_RUN_ID.as_bytes(),
+    ]);
+}
+
+#[tokio::test]
+async fn capacity_grant_lifecycle_emits_public_grant_id_as_lease_id_without_fence_secrets() {
+    use crate::telemetry::{
+        capacity_grant_completed, capacity_grant_span,
+        metrics::{CapacityOperation, CapacityOutcome},
+        record_capacity_span_grant_id,
+    };
+    use tracing::Instrument;
+
+    const RUN_ID: &str = "77777777-7777-4777-8777-777777777777";
+    const GRANT_ID: &str = "88888888-8888-4888-8888-888888888888";
+    const FENCE_SECRET_CANARY: &str = "CANARY-controller-fence-secret-9999";
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    // 1. Grant lifecycle: `grant_id` discovered mid-span and recorded as `lease_id`.
+    let grant_span = capacity_grant_span(Some(RUN_ID), None, CapacityOperation::Grant);
+    async {
+        record_capacity_span_grant_id(FENCE_SECRET_CANARY); // rejected (not a UUID)
+        record_capacity_span_grant_id(GRANT_ID);
+        tracing::Span::current().record("operation.outcome", CapacityOutcome::Granted.as_str());
+        capacity_grant_completed(
+            Some(RUN_ID),
+            Some(GRANT_ID),
+            CapacityOperation::Grant,
+            CapacityOutcome::Granted,
+            Duration::from_millis(8),
+        );
+    }
+    .instrument(grant_span)
+    .await;
+
+    // 2. Reconcile / release lifecycle with known `grant_id`.
+    let rel_span = capacity_grant_span(None, Some(GRANT_ID), CapacityOperation::Reconcile);
+    async {
+        tracing::Span::current().record("operation.outcome", CapacityOutcome::Released.as_str());
+        capacity_grant_completed(
+            None,
+            Some(GRANT_ID),
+            CapacityOperation::Reconcile,
+            CapacityOutcome::Released,
+            Duration::from_millis(4),
+        );
+    }
+    .instrument(rel_span)
+    .await;
+
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    for span in &spans {
+        assert_eq!(span.name, "capacity.grant");
+        assert_eq!(span.kind, SpanKind::Internal as i32);
+        assert_eq!(span.dropped_attributes_count, 0);
+        let attrs = attributes(&span.attributes);
+        assert_eq!(text(attrs["lease_id"]), Some(GRANT_ID));
+    }
+
+    let events = capture.events("capacity.grant.completed");
+    assert_eq!(events.len(), 2, "{}", capture.text());
+    assert_eq!(events[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(events[0]["lease_id"].as_str(), Some(GRANT_ID));
+    assert_eq!(events[0]["operation.kind"].as_str(), Some("grant"));
+    assert_eq!(events[0]["operation.outcome"].as_str(), Some("granted"));
+    assert_eq!(events[1]["lease_id"].as_str(), Some(GRANT_ID));
+    assert_eq!(events[1]["operation.kind"].as_str(), Some("reconcile"));
+    assert_eq!(events[1]["operation.outcome"].as_str(), Some("released"));
+
+    collector.assert_absent(&[FENCE_SECRET_CANARY.as_bytes()]);
+    capture.assert_absent(&[FENCE_SECRET_CANARY.as_bytes()]);
+}
+
+#[tokio::test]
+async fn worker_run_and_child_operation_spans_and_logs_correlate_without_exposing_claim_token() {
+    use crate::telemetry::{
+        WorkerOperationKind, WorkerOperationOutcome, WorkerRunOutcome, derive_run_lease_id,
+        worker_operation_completed, worker_operation_span, worker_run_claimed, worker_run_settled,
+        worker_run_span,
+    };
+    use tracing::Instrument;
+
+    const RUN_ID: &str = "44444444-4444-4444-8444-444444444444";
+    const OP_ID: &str = "55555555-5555-4555-8555-555555555555";
+    const RAW_CLAIM_TOKEN: &str = "66666666-6666-4666-8666-666666666666";
+
+    let lease_id = derive_run_lease_id(RUN_ID, RAW_CLAIM_TOKEN);
+
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+    let run_span = worker_run_span(RUN_ID, &lease_id);
+    async {
+        worker_run_claimed(RUN_ID, &lease_id);
+        let op_span =
+            worker_operation_span(RUN_ID, &lease_id, OP_ID, WorkerOperationKind::Inference);
+        async {
+            worker_operation_completed(
+                RUN_ID,
+                &lease_id,
+                OP_ID,
+                WorkerOperationKind::Inference,
+                WorkerOperationOutcome::Ok,
+                Duration::from_millis(12),
+            );
+            tracing::Span::current()
+                .record("operation.outcome", WorkerOperationOutcome::Ok.as_str());
+        }
+        .instrument(op_span)
+        .await;
+        worker_run_settled(
+            RUN_ID,
+            &lease_id,
+            WorkerRunOutcome::Succeeded,
+            Duration::from_millis(25),
+        );
+        tracing::Span::current().record("run.outcome", WorkerRunOutcome::Succeeded.as_str());
+    }
+    .instrument(run_span)
+    .await;
+
+    finish(exporter).await;
+
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    let run_s = spans
+        .iter()
+        .find(|s| s.name == "worker.run")
+        .expect("worker.run span");
+    let op_s = spans
+        .iter()
+        .find(|s| s.name == "worker.operation")
+        .expect("worker.operation span");
+
+    assert!(run_s.parent_span_id.is_empty());
+    assert_eq!(run_s.kind, SpanKind::Internal as i32);
+    assert_eq!(run_s.dropped_attributes_count, 0);
+    assert_eq!(op_s.trace_id, run_s.trace_id);
+    assert_eq!(op_s.parent_span_id, run_s.span_id);
+    assert_eq!(op_s.kind, SpanKind::Internal as i32);
+    assert_eq!(op_s.dropped_attributes_count, 0);
+
+    let run_attrs = attributes(&run_s.attributes);
+    assert_eq!(
+        run_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        ["lease_id", "run.outcome", "run_id"].into()
+    );
+    assert_eq!(text(run_attrs["run_id"]), Some(RUN_ID));
+    assert_eq!(text(run_attrs["lease_id"]), Some(lease_id.as_str()));
+    assert_eq!(text(run_attrs["run.outcome"]), Some("succeeded"));
+
+    let op_attrs = attributes(&op_s.attributes);
+    assert_eq!(
+        op_attrs.keys().copied().collect::<BTreeSet<_>>(),
+        [
+            "lease_id",
+            "operation.kind",
+            "operation.outcome",
+            "operation_id",
+            "run_id",
+        ]
+        .into()
+    );
+    assert_eq!(text(op_attrs["run_id"]), Some(RUN_ID));
+    assert_eq!(text(op_attrs["lease_id"]), Some(lease_id.as_str()));
+    assert_eq!(text(op_attrs["operation_id"]), Some(OP_ID));
+    assert_eq!(text(op_attrs["operation.kind"]), Some("inference"));
+    assert_eq!(text(op_attrs["operation.outcome"]), Some("ok"));
+
+    let claimed = capture.events("worker.run.claimed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(claimed[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+
+    let op_done = capture.events("worker.operation.completed");
+    assert_eq!(op_done.len(), 1);
+    assert_eq!(op_done[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(op_done[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+    assert_eq!(op_done[0]["operation_id"].as_str(), Some(OP_ID));
+    assert_eq!(op_done[0]["operation.kind"].as_str(), Some("inference"));
+    assert_eq!(op_done[0]["operation.outcome"].as_str(), Some("ok"));
+
+    let settled = capture.events("worker.run.settled");
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0]["run_id"].as_str(), Some(RUN_ID));
+    assert_eq!(settled[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+    assert_eq!(settled[0]["run.outcome"].as_str(), Some("succeeded"));
+
+    collector.assert_absent(&[RAW_CLAIM_TOKEN.as_bytes()]);
+    capture.assert_absent(&[RAW_CLAIM_TOKEN.as_bytes()]);
 }

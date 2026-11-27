@@ -1027,30 +1027,62 @@ const LOCK_DUE_WAITS: &str = "WITH locked AS MATERIALIZED (
                 WHERE id=r.approval_wait_id LIMIT 1) a ON true
             WHERE r.state='waiting' AND (r.approval_wait_id IS NULL OR r.wait_reason IS DISTINCT FROM 'approval'
                 OR a.approval_expires_at<=clock_timestamp()) ORDER BY r.id LIMIT $1 FOR NO KEY UPDATE OF r SKIP LOCKED)
-            SELECT scope_id::text,id::text,approval_wait_id IS NOT NULL AND wait_reason IS NOT DISTINCT FROM 'approval'
+            SELECT scope_id::text,id::text,approval_wait_id IS NOT NULL AND wait_reason IS NOT DISTINCT FROM 'approval',approval_wait_id::text
             FROM locked WHERE state='waiting' AND (approval_wait_id IS NULL OR wait_reason IS DISTINCT FROM 'approval'
                 OR approval_expires_at<=clock_timestamp()) ORDER BY locked.id";
+
+// Query approved decisions for already-locked due waits in a fresh `READ COMMITTED` snapshot so
+// runs that were approved (resumable in the worker queue) before expiry record `expired` queue
+// age from `decided_at`, while undecided human waits emit no queue-age sample.
+const APPROVED_EXPIRED_WAIT_AGES: &str =
+    "SELECT GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() - decided_at)), 0)::float8
+            FROM openmettle.run_approval_decisions
+            WHERE approval_id = ANY($1::text[]::uuid[]) AND decision = 'approve'";
 
 /// Fail at most the requested number of due or legacy waits in ascending run ID order.
 pub async fn expire_waits(c: &mut PgConnection, limit: u32) -> Result<Vec<String>, StoreError> {
     if !(1..=1000).contains(&limit) {
         return Err(StoreError::InvalidInput("limit"));
     }
-    runs::transaction(c, async |c| {
-        let rows: Vec<(String, String, bool)> = sqlx::query_as(LOCK_DUE_WAITS)
+    let (ids, approved_ages) = runs::transaction(c, async |c| {
+        let rows: Vec<(String, String, bool, Option<String>)> = sqlx::query_as(LOCK_DUE_WAITS)
             .bind(i64::from(limit))
             .fetch_all(&mut *c)
             .await?;
+        let bound_approvals: Vec<String> = rows
+            .iter()
+            .filter_map(
+                |(_, _, bound, approval_id)| {
+                    if *bound { approval_id.clone() } else { None }
+                },
+            )
+            .collect();
+        let approved_ages: Vec<f64> = if bound_approvals.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar(APPROVED_EXPIRED_WAIT_AGES)
+                .bind(&bound_approvals)
+                .fetch_all(&mut *c)
+                .await?
+        };
         let mut ids = Vec::with_capacity(rows.len());
-        for (scope, id, bound) in rows {
+        for (scope, id, bound, _) in rows {
             fail_without_release(c, &scope, &id, if bound { EXPIRED } else { INVALID_WAIT })
                 .await?;
             ids.push(id);
         }
         runs::release_terminal_runs(c, &ids).await?;
-        Ok(ids)
+        Ok((ids, approved_ages))
     })
-    .await
+    .await?;
+    let metrics = crate::telemetry::metrics::global();
+    for age_s in approved_ages {
+        metrics.record_run_queue_age(
+            crate::telemetry::metrics::RunQueueAgeOutcome::Expired,
+            age_s,
+        );
+    }
+    Ok(ids)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1095,13 +1127,14 @@ async fn invalidate_wait(
     scope: &str,
     run: &str,
     expires: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<f64>, StoreError> {
     if expires <= db_time(c).await? {
-        fail(c, scope, run, EXPIRED).await
+        fail(c, scope, run, EXPIRED).await?;
+        Ok(None)
     } else {
-        runs::cancel_one(c, scope, run, CancelReason::Revoked)
-            .await
-            .map(drop)
+        Ok(runs::cancel_one(c, scope, run, CancelReason::Revoked)
+            .await?
+            .and_then(|(_, age)| age))
     }
 }
 
@@ -1295,7 +1328,7 @@ pub async fn decide(
             i.idempotency_key.as_bytes(),
         ],
     )));
-    runs::transaction(c, async |c| {
+    let (receipt, cancelled_age_s) = runs::transaction(c, async |c| {
         let r = locked_actor_run(c, session, i.scope, i.run).await?;
         crate::restore::require_open_gate(c).await?;
         crate::backup::require_open_maintenance(c).await?;
@@ -1319,12 +1352,15 @@ pub async fn decide(
             {
                 return Err(StoreError::Conflict(store::KEY_REUSED));
             }
-            return Ok(Some(Receipt {
-                approval_id: i.approval.into(),
-                decision: i.decision,
-                binding_digest: i.binding_digest.into(),
-                decided_us: old.try_get("decided")?,
-            }));
+            return Ok((
+                Some(Receipt {
+                    approval_id: i.approval.into(),
+                    decision: i.decision,
+                    binding_digest: i.binding_digest.into(),
+                    decided_us: old.try_get("decided")?,
+                }),
+                None,
+            ));
         }
         if r.try_get::<&str, _>("state")? != "waiting"
             || r.try_get::<Option<&str>, _>("approval_wait_id")? != Some(i.approval)
@@ -1335,7 +1371,7 @@ pub async fn decide(
         let expires: i64 = a.try_get("expires")?;
         if db_time(c).await? >= expires {
             fail(c, i.scope, i.run, EXPIRED).await?;
-            return Ok(None);
+            return Ok((None, None));
         }
         let s = subject(&r, i.scope, i.run)?;
         if session.context.approval_id() != s.approval {
@@ -1370,8 +1406,8 @@ pub async fn decide(
             Ok(time) => time,
             Err(StoreError::Denied(_)) => {
                 session_proof(&reader).session_time(c).await?;
-                invalidate_wait(c, i.scope, i.run, expires).await?;
-                return Ok(None);
+                let age = invalidate_wait(c, i.scope, i.run, expires).await?;
+                return Ok((None, age));
             }
             Err(e) => return Err(e),
         };
@@ -1383,18 +1419,27 @@ pub async fn decide(
             event("openmettle.run-approval-decided", b"{}"),
         )
         .await?;
+        let mut cancelled_age = None;
         if i.decision == HumanDecision::Deny {
-            runs::cancel_one(c, i.scope, i.run, CancelReason::Requested).await?;
+            cancelled_age = runs::cancel_one(c, i.scope, i.run, CancelReason::Requested)
+                .await?
+                .and_then(|(_, age)| age);
         }
-        Ok(Some(Receipt {
-            approval_id: i.approval.into(),
-            decision: i.decision,
-            binding_digest: i.binding_digest.into(),
-            decided_us,
-        }))
+        Ok((
+            Some(Receipt {
+                approval_id: i.approval.into(),
+                decision: i.decision,
+                binding_digest: i.binding_digest.into(),
+                decided_us,
+            }),
+            cancelled_age,
+        ))
     })
-    .await?
-    .ok_or(CONFLICT)
+    .await?;
+    if let Some(age_s) = cancelled_age_s {
+        runs::record_cancelled_queue_ages(&[age_s]);
+    }
+    receipt.ok_or(CONFLICT)
 }
 
 /// Only an Applied result carries the exact committed outbound request and a one-use start check.

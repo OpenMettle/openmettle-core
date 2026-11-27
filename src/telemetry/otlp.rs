@@ -403,10 +403,18 @@ fn start_inner(
     };
     let metrics = metric_endpoint.map(|endpoint| {
         let stop = Arc::new(Notify::new());
+        // Synchronously pre-capture the zero-valued startup baseline before returning so any
+        // failures recorded during the first export interval (`t = 0..interval`) are preceded by
+        // an explicit `(start_time_unix_nano, 0)` sample in Prometheus.
+        let pending_baseline = metrics
+            .as_ref()
+            .encode_zero_baseline(role, instance_id.as_deref())
+            .map(|request| request.encode_to_vec());
         let task = tokio::spawn(export_metrics(
             metrics,
             role,
             instance_id,
+            pending_baseline,
             stop.clone(),
             transport,
             endpoint,
@@ -483,22 +491,97 @@ async fn export_traces(
     }
 }
 
+/// Outcome of one OTLP/HTTP POST per the OTLP/HTTP specification: only HTTP 429/502/503/504 and
+/// transport/timeout failures before a response are retryable; all other non-2xx responses (such
+/// as 400 Bad Request) are permanent rejections that must never be retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostOutcome {
+    Delivered,
+    RetryableFailure,
+    PermanentRejection,
+}
+
+fn classify_status(status: http::StatusCode) -> PostOutcome {
+    if status.is_success() {
+        PostOutcome::Delivered
+    } else if matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+        PostOutcome::RetryableFailure
+    } else {
+        PostOutcome::PermanentRejection
+    }
+}
+
 /// Periodic cumulative metrics export task: one snapshot in flight at a time.
 async fn export_metrics(
     metrics: MetricsSource,
     role: Process,
     instance_id: Option<String>,
+    mut pending_baseline: Option<Vec<u8>>,
     stop: Arc<Notify>,
     transport: Arc<SharedTransport>,
     endpoint: Endpoint,
 ) {
     let interval = transport.tuning.interval;
+    // Deliver the pre-captured zero baseline immediately at startup (before the first sleep).
+    // Retryable failures (429/502/503/504 or transport/timeout errors) retain `pending_baseline`
+    // ahead of the first live snapshot; permanent rejections (such as 400 Bad Request) discard it
+    // immediately and fall through to export the current live snapshot right away rather than
+    // waiting a full export interval.
+    if let Some(body) = pending_baseline.take() {
+        match post(&transport, &endpoint, body.clone()).await {
+            PostOutcome::Delivered => {}
+            PostOutcome::RetryableFailure => {
+                metrics
+                    .as_ref()
+                    .record_dropped(DroppedSignal::MetricExports, 1);
+                metric_exports_dropped(1);
+                pending_baseline = Some(body);
+            }
+            PostOutcome::PermanentRejection => {
+                metrics
+                    .as_ref()
+                    .record_dropped(DroppedSignal::MetricExports, 1);
+                metric_exports_dropped(1);
+                send_metrics(
+                    &transport,
+                    &endpoint,
+                    metrics.as_ref(),
+                    role,
+                    instance_id.as_deref(),
+                )
+                .await;
+            }
+        }
+    }
     loop {
         let stopping = tokio::select! {
             biased;
             () = stop.notified() => true,
             () = tokio::time::sleep(interval) => false,
         };
+        if let Some(body) = pending_baseline.take() {
+            match post(&transport, &endpoint, body.clone()).await {
+                PostOutcome::Delivered => {}
+                PostOutcome::RetryableFailure => {
+                    metrics
+                        .as_ref()
+                        .record_dropped(DroppedSignal::MetricExports, 1);
+                    metric_exports_dropped(1);
+                    pending_baseline = Some(body);
+                    if stopping {
+                        return;
+                    }
+                    continue;
+                }
+                PostOutcome::PermanentRejection => {
+                    metrics
+                        .as_ref()
+                        .record_dropped(DroppedSignal::MetricExports, 1);
+                    metric_exports_dropped(1);
+                    // Discard permanently rejected baseline and export the live snapshot now.
+                }
+            }
+        }
         send_metrics(
             &transport,
             &endpoint,
@@ -523,7 +606,7 @@ async fn send_metrics(
     let Some(request) = metrics.encode_otlp(role, instance_id) else {
         return;
     };
-    if !post(transport, endpoint, request.encode_to_vec()).await {
+    if post(transport, endpoint, request.encode_to_vec()).await != PostOutcome::Delivered {
         metrics.record_dropped(DroppedSignal::MetricExports, 1);
         metric_exports_dropped(1);
     }
@@ -552,14 +635,17 @@ async fn send_spans(
     let request = ExportTraceServiceRequest {
         resource_spans: group_spans_by_resource_and_scope(batch, resource),
     };
-    if !post(transport, endpoint, request.encode_to_vec()).await {
+    if post(transport, endpoint, request.encode_to_vec()).await != PostOutcome::Delivered {
         shared.dropped.fetch_add(count, Ordering::Relaxed);
     }
 }
 
 /// One POST over the shared transport core: no retry, redirect, proxy or extra header. Only
-/// a 2xx answer counts as delivered; a partial-success body is not decoded.
-async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -> bool {
+/// a complete 2xx response counts as delivered; a partial-success body is not decoded. When
+/// response headers already carried a non-2xx status before a body-read failure (such as an
+/// oversized `400`/`413` error payload), classify that status directly so permanent rejections
+/// are not misclassified as retryable.
+async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -> PostOutcome {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -582,8 +668,58 @@ async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -
         setup: transport.tuning.deadline,
         total: transport.tuning.deadline,
     };
-    matches!(
-        route.send(http::Method::POST, &headers, body, &limits).await,
-        Ok(response) if response.status().is_success()
-    )
+    match route
+        .send_with_status(http::Method::POST, &headers, body, &limits)
+        .await
+    {
+        Ok(response) => classify_status(response.status()),
+        Err((Some(status), _)) if !status.is_success() => classify_status(status),
+        Err(_) => PostOutcome::RetryableFailure,
+    }
+}
+
+#[cfg(test)]
+mod post_outcome_tests {
+    use super::{PostOutcome, classify_status};
+    use openidconnect::http::StatusCode;
+
+    #[test]
+    fn classifies_otlp_http_statuses_per_spec() {
+        for code in [
+            StatusCode::OK,
+            StatusCode::CREATED,
+            StatusCode::ACCEPTED,
+            StatusCode::NO_CONTENT,
+        ] {
+            assert_eq!(classify_status(code), PostOutcome::Delivered, "{code}");
+        }
+        for code in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                classify_status(code),
+                PostOutcome::RetryableFailure,
+                "{code}"
+            );
+        }
+        for code in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::NOT_IMPLEMENTED,
+        ] {
+            assert_eq!(
+                classify_status(code),
+                PostOutcome::PermanentRejection,
+                "{code}"
+            );
+        }
+    }
 }
