@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "AuthorizeConnectionRequestTypical--auto-missing-granted_scopes",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access_token": "synthetic-access-example-1",
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "reason": "Initial credential authorization",
+    "refresh_token": "synthetic-refresh-example-1"
+  },
+  "mutation": {
+    "name": "auto-missing-granted_scopes",
+    "op": "remove",
+    "path": "/granted_scopes"
+  },
+  "schema": "#/components/schemas/AuthorizeConnectionRequest",
+  "source": "#/components/examples/AuthorizeConnectionRequestTypical"
+}

@@ -338,6 +338,13 @@ enum Op {
     UpdateAdminRetentionPolicy,
     PreviewAdminRetentionDeadlines,
     ApplyAdminRetentionDeadlines,
+    CreateConnection,
+    ListConnections,
+    GetConnection,
+    AuthorizeConnection,
+    DisconnectConnection,
+    ShareConnection,
+    RevokeConnectionShare,
 }
 
 impl Op {
@@ -393,6 +400,13 @@ impl Op {
             Self::UpdateAdminRetentionPolicy => "updateAdminRetentionPolicy",
             Self::PreviewAdminRetentionDeadlines => "previewAdminRetentionDeadlines",
             Self::ApplyAdminRetentionDeadlines => "applyAdminRetentionDeadlines",
+            Self::CreateConnection => "createConnection",
+            Self::ListConnections => "listConnections",
+            Self::GetConnection => "getConnection",
+            Self::AuthorizeConnection => "authorizeConnection",
+            Self::DisconnectConnection => "disconnectConnection",
+            Self::ShareConnection => "shareConnection",
+            Self::RevokeConnectionShare => "revokeConnectionShare",
         }
     }
     fn reads(self) -> bool {
@@ -420,6 +434,8 @@ impl Op {
                 | Self::ListAdminCapacityGroups
                 | Self::GetAdminRetentionStatus
                 | Self::PreviewAdminRetentionDeadlines
+                | Self::ListConnections
+                | Self::GetConnection
         )
     }
     /// Streams a `multipart/form-data` artifact upload (ADR 0031).
@@ -446,6 +462,10 @@ impl Op {
                 | Self::UpdateAdminRetentionPolicy
                 | Self::PreviewAdminRetentionDeadlines
                 | Self::ApplyAdminRetentionDeadlines
+                | Self::CreateConnection
+                | Self::AuthorizeConnection
+                | Self::ShareConnection
+                | Self::RevokeConnectionShare
         )
     }
     /// Names its target by a UUID in the third path segment.
@@ -470,6 +490,8 @@ impl Op {
                 | Self::UpdateAdminRetentionPolicy
                 | Self::PreviewAdminRetentionDeadlines
                 | Self::ApplyAdminRetentionDeadlines
+                | Self::CreateConnection
+                | Self::ListConnections
         )
     }
 }
@@ -901,7 +923,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 42] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 48] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -1043,11 +1065,11 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 42] {
         ),
         (
             "/v1/admin/retention/status",
-            vec![(get, GetAdminRetentionStatus)],
+            vec![(get.clone(), GetAdminRetentionStatus)],
         ),
         (
             "/v1/admin/retention/policy",
-            vec![(put, UpdateAdminRetentionPolicy)],
+            vec![(put.clone(), UpdateAdminRetentionPolicy)],
         ),
         (
             "/v1/admin/retention/deadlines/preview",
@@ -1055,7 +1077,34 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 42] {
         ),
         (
             "/v1/admin/retention/deadlines/apply",
-            vec![(post, ApplyAdminRetentionDeadlines)],
+            vec![(post.clone(), ApplyAdminRetentionDeadlines)],
+        ),
+        (
+            "/v1/connections",
+            vec![
+                (get.clone(), ListConnections),
+                (post.clone(), CreateConnection),
+            ],
+        ),
+        (
+            "/v1/connections/{connection_id}",
+            vec![(get, GetConnection)],
+        ),
+        (
+            "/v1/connections/{connection_id}/authorize",
+            vec![(post.clone(), AuthorizeConnection)],
+        ),
+        (
+            "/v1/connections/{connection_id}/disconnect",
+            vec![(post.clone(), DisconnectConnection)],
+        ),
+        (
+            "/v1/connections/{connection_id}/shares",
+            vec![(put, ShareConnection)],
+        ),
+        (
+            "/v1/connections/{connection_id}/shares/revoke",
+            vec![(post, RevokeConnectionShare)],
         ),
     ]
 }
@@ -1155,6 +1204,20 @@ impl Api {
         ) {
             return self
                 .retention_operation(op, &parts, session, key.as_deref(), &body)
+                .await;
+        }
+        if matches!(
+            op,
+            Op::CreateConnection
+                | Op::ListConnections
+                | Op::GetConnection
+                | Op::AuthorizeConnection
+                | Op::DisconnectConnection
+                | Op::ShareConnection
+                | Op::RevokeConnectionShare
+        ) {
+            return self
+                .connection_operation(op, &parts, session, target, key.as_deref(), &body)
                 .await;
         }
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
@@ -1556,6 +1619,7 @@ pub use approvals::ApprovalDisplayPolicy;
 mod artifacts;
 mod capacity;
 mod catalog;
+mod connections;
 mod conversations;
 mod pagination;
 mod quotas;

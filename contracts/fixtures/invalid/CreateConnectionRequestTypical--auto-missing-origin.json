@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "CreateConnectionRequestTypical--auto-missing-origin",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "account_id": "acct-example-1",
+    "allowed_scopes": [
+      "issues.read",
+      "issues.write"
+    ],
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker"
+  },
+  "mutation": {
+    "name": "auto-missing-origin",
+    "op": "remove",
+    "path": "/origin"
+  },
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

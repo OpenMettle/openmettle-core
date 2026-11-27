@@ -176,7 +176,7 @@ type ExportRow = (
 );
 
 /// A checksummed export: installation origin, optional schema-42 lifecycle origin and upgrade
-/// baseline, every record from 1 in order, and watermark.
+/// baseline, optional schema-43 connection origin, every record from 1 in order, and watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Export {
     baseline: Vec<BaselineEntry>,
@@ -184,6 +184,7 @@ pub struct Export {
     pub origin_us: i64,
     pub lifecycle_origin_us: Option<i64>,
     pub lifecycle_baseline_digest: Option<String>,
+    pub connection_origin_us: Option<i64>,
     pub seq: i64,
     pub digest: String,
 }
@@ -215,6 +216,7 @@ pub struct GateLock {
     pub origin_us: i64,
     pub lifecycle_origin_us: Option<i64>,
     pub lifecycle_baseline_digest: Option<String>,
+    pub connection_origin_us: Option<i64>,
     pub snapshot_seq: i64,
     pub required_seq: i64,
     pub coverage_complete: bool,
@@ -376,6 +378,17 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
     )
     .fetch_one(&mut *tx)
     .await?;
+    let has_connection_origin: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM pg_catalog.pg_attribute
+              WHERE attrelid = to_regclass('openmettle.deletion_journal_head')
+                AND attname = 'connection_coverage_started_at'
+                AND NOT attisdropped
+         )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     let lifecycle_origin_expr = if has_lifecycle_origin {
         us("lifecycle_coverage_started_at")
     } else {
@@ -386,19 +399,34 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
     } else {
         "NULL::text".to_owned()
     };
-    let (seq, chain, origin_us, lifecycle_origin_us, lifecycle_baseline_digest, at): (
+    let connection_origin_expr = if has_connection_origin {
+        us("connection_coverage_started_at")
+    } else {
+        "NULL::bigint".to_owned()
+    };
+    let (
+        seq,
+        chain,
+        origin_us,
+        lifecycle_origin_us,
+        lifecycle_baseline_digest,
+        connection_origin_us,
+        at,
+    ): (
         i64,
         String,
         i64,
         Option<i64>,
         Option<String>,
+        Option<i64>,
         i64,
     ) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT journal_seq, encode(chain_digest, 'hex'), {}, {}, {}, {}
+        "SELECT journal_seq, encode(chain_digest, 'hex'), {}, {}, {}, {}, {}
            FROM openmettle.deletion_journal_head WHERE id",
         us("coverage_started_at"),
         lifecycle_origin_expr,
         lifecycle_baseline_expr,
+        connection_origin_expr,
         us("clock_timestamp()")
     )))
     .fetch_one(&mut *tx)
@@ -455,6 +483,9 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         if folded != baseline_digest {
             return Err(Error::Export("lifecycle baseline digest mismatch"));
         }
+    }
+    if let Some(connection_origin_us) = connection_origin_us {
+        let _ = writeln!(text, "connection_origin {connection_origin_us}");
     }
     for (i, r) in rows.iter().enumerate() {
         if r.0 != i as i64 + 1 {
@@ -627,6 +658,18 @@ impl Export {
         } else {
             None
         };
+        let connection_origin_us = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("connection_origin"))
+        {
+            let line = lines.next().unwrap_or_default();
+            match line.split(' ').collect::<Vec<_>>()[..] {
+                ["connection_origin", origin] => Some(number(origin)?),
+                _ => return Err(Error::Export("malformed connection origin")),
+            }
+        } else {
+            None
+        };
         let mut records: Vec<Record> = Vec::new();
         let mut watermark = None;
         for line in lines {
@@ -711,19 +754,31 @@ impl Export {
                     chain,
                     retained,
                 ] if watermark.is_none() => {
-                    if lifecycle_origin_us.is_none() {
+                    let is_connection_event = matches!(
+                        kind,
+                        "external_connection.disconnected"
+                            | "external_connection.credential_superseded"
+                            | "external_connection.share_revoked"
+                    );
+                    if is_connection_event {
+                        if connection_origin_us.is_none() {
+                            return Err(Error::Export("missing connection origin"));
+                        }
+                    } else if lifecycle_origin_us.is_none() {
                         return Err(Error::Export("missing lifecycle origin"));
                     }
                     let seq = number(seq)?;
                     if seq != records.len() as i64 + 1 {
                         return Err(Error::Export("records out of sequence"));
                     }
-                    if !matches!(
-                        kind,
-                        "artifact_revision.retained"
-                            | "artifact_revision.deadline_adjusted"
-                            | "artifact_revision.restored"
-                    ) {
+                    if !is_connection_event
+                        && !matches!(
+                            kind,
+                            "artifact_revision.retained"
+                                | "artifact_revision.deadline_adjusted"
+                                | "artifact_revision.restored"
+                        )
+                    {
                         return Err(Error::Export("unknown event kind"));
                     }
                     if !runs::is_canonical_uuid(entity) || !runs::is_canonical_uuid(scope) {
@@ -764,6 +819,17 @@ impl Export {
                                 return Err(Error::Export("malformed line"));
                             }
                         }
+                        "external_connection.disconnected"
+                        | "external_connection.credential_superseded"
+                        | "external_connection.share_revoked" => {
+                            if original_purge_after_us.is_some()
+                                || purged_us.is_some()
+                                || retained_us.is_some()
+                                || policy.is_none()
+                            {
+                                return Err(Error::Export("malformed line"));
+                            }
+                        }
                         _ => return Err(Error::Export("unknown event kind")),
                     }
                     records.push(Record {
@@ -797,15 +863,25 @@ impl Export {
             origin_us,
             lifecycle_origin_us,
             lifecycle_baseline_digest,
+            connection_origin_us,
             seq,
             digest,
         })
     }
 }
 
-/// Closes or updates the gate after a restore (migration 41/42's `restore_gate_lock`), including
-/// optional `lifecycle_origin_us` and `lifecycle_baseline_digest`.
+/// Closes or updates the gate after a restore (migration 41/42/43's `restore_gate_lock`),
+/// including optional `lifecycle_origin_us` and `lifecycle_baseline_digest`.
 pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateLock, Error> {
+    lock_gate_with_connection_origin(pool, req, None).await
+}
+
+/// Like [`lock_gate`], additionally pinning schema-43 `connection_origin_us`.
+pub async fn lock_gate_with_connection_origin(
+    pool: &PgPool,
+    req: &GateLockRequest<'_>,
+    connection_origin_us: Option<i64>,
+) -> Result<GateLock, Error> {
     if req.required_seq < 0 {
         return Err(Error::Invalid("invalid sequence"));
     }
@@ -827,20 +903,32 @@ pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateL
     {
         return Err(Error::Invalid("invalid restore run id"));
     }
+    type GateLockRow = (
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+        bool,
+    );
     let mut tx = read_committed(pool).await?;
     let (
         restore_run_id,
         required_origin_us,
         required_lifecycle_origin_us,
         required_lifecycle_baseline_digest,
+        required_connection_origin_us,
         snapshot_seq,
         required_seq,
         coverage_complete,
-    ): (String, i64, Option<i64>, Option<String>, i64, i64, bool) = sqlx::query_as(
+    ): GateLockRow = sqlx::query_as(
         "SELECT restore_run_id::text, required_origin_us, required_lifecycle_origin_us,
                 encode(required_lifecycle_baseline_digest, 'hex'),
+                required_connection_origin_us,
                 snapshot_journal_seq, required_journal_seq, coverage_complete
-           FROM openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), $4, $5::uuid, $6, $7, decode($8, 'hex'))",
+           FROM openmettle.restore_gate_lock($1, $2, decode($3, 'hex'), $4, $5::uuid, $6, $7, decode($8, 'hex'), $9)",
     )
     .bind(req.origin_us)
     .bind(req.required_seq)
@@ -850,6 +938,7 @@ pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateL
     .bind(req.new_restore)
     .bind(req.lifecycle_origin_us)
     .bind(req.lifecycle_baseline_digest)
+    .bind(connection_origin_us)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -858,6 +947,7 @@ pub async fn lock_gate(pool: &PgPool, req: &GateLockRequest<'_>) -> Result<GateL
         origin_us: required_origin_us,
         lifecycle_origin_us: required_lifecycle_origin_us,
         lifecycle_baseline_digest: required_lifecycle_baseline_digest,
+        connection_origin_us: required_connection_origin_us,
         snapshot_seq,
         required_seq,
         coverage_complete,
@@ -963,7 +1053,7 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
 
     let mut tx = read_committed(pool).await?;
     sqlx::query(
-        "SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'), $6::uuid[])",
+        "SELECT openmettle.restore_verify_export($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'), $6::uuid[], $7)",
     )
     .bind(export.origin_us)
     .bind(export.seq)
@@ -971,6 +1061,7 @@ pub async fn apply(pool: &PgPool, export: &Export) -> Result<u64, Error> {
     .bind(export.lifecycle_origin_us)
     .bind(export.lifecycle_baseline_digest.as_deref())
     .bind(&lock_entity_ids)
+    .bind(export.connection_origin_us)
     .execute(&mut *tx)
     .await?;
     if let (Some(lc_origin), Some(lc_baseline)) = (
@@ -1075,13 +1166,14 @@ async fn claim_volume_phase(pool: &PgPool, export: &Export) -> Result<(String, S
     let mut tx = read_committed(pool).await?;
     let lease: (String, String) = sqlx::query_as(
         "SELECT restore_run_id::text, volume_claim_token::text
-           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'))",
+           FROM openmettle.restore_claim_volume_phase($1, $2, decode($3, 'hex'), $4, decode($5, 'hex'), $6)",
     )
     .bind(export.origin_us)
     .bind(export.seq)
     .bind(&export.digest)
     .bind(export.lifecycle_origin_us)
     .bind(export.lifecycle_baseline_digest.as_deref())
+    .bind(export.connection_origin_us)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1361,7 +1453,7 @@ async fn finish_claimed(
         }
     };
     if let Err(err) = sqlx::query(
-        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid, $7, decode($8, 'hex'))",
+        "SELECT openmettle.restore_gate_open($1::uuid, $2::uuid, $3, $4, decode($5, 'hex'), $6::uuid, $7, decode($8, 'hex'), $9)",
     )
     .bind(restore_run_id)
     .bind(claim_token)
@@ -1371,6 +1463,7 @@ async fn finish_claimed(
     .bind(expected_volume_id.as_deref())
     .bind(export.lifecycle_origin_us)
     .bind(export.lifecycle_baseline_digest.as_deref())
+    .bind(export.connection_origin_us)
     .execute(&mut *open_tx)
     .await
     {
@@ -1659,6 +1752,44 @@ mod tests {
         ));
         assert!(matches!(
             Export::parse(&bad_restored),
+            Err(Error::Export("malformed line"))
+        ));
+
+        // Schema-43 connection_origin header and external_connection.* records parse cleanly
+        // and reject missing connection_origin or missing generation (`policy_revision`).
+        let valid_conn = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\nconnection_origin 3\n\
+             1 10 external_connection.disconnected {entity} {scope} - - {d} 1 {d} -\n\
+             2 11 external_connection.credential_superseded {entity} {scope} - - {d} 2 {d} -\n\
+             3 12 external_connection.share_revoked {entity2} {scope} - - {d} 1 {d} -\n\
+             watermark 1 3 {d} 13\n"
+        ));
+        let parsed_conn = Export::parse(&valid_conn).unwrap();
+        assert_eq!(parsed_conn.connection_origin_us, Some(3));
+        assert_eq!(parsed_conn.records.len(), 3);
+        assert_eq!(
+            parsed_conn.records[0].event_kind,
+            "external_connection.disconnected"
+        );
+        assert_eq!(parsed_conn.records[1].policy_revision, Some(2));
+
+        let missing_conn_origin = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\n\
+             1 10 external_connection.disconnected {entity} {scope} - - {d} 1 {d} -\n\
+             watermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&missing_conn_origin),
+            Err(Error::Export("missing connection origin"))
+        ));
+
+        let missing_conn_gen = seal(&format!(
+            "{HEADER}\norigin 1\nlifecycle_origin 2\nlifecycle_baseline {GENESIS}\nconnection_origin 3\n\
+             1 10 external_connection.disconnected {entity} {scope} - - {d} - {d} -\n\
+             watermark 1 1 {d} 11\n"
+        ));
+        assert!(matches!(
+            Export::parse(&missing_conn_gen),
             Err(Error::Export("malformed line"))
         ));
     }

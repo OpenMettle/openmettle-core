@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 48);
+    assert_eq!(served.len(), 55);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -704,4 +704,19 @@ fn quota_override_bodies_and_problem_extensions_are_validated_and_closed() {
             scope_kind: "personal",
         })
     );
+}
+
+#[test]
+fn connection_request_keys_are_isolated_per_operation_and_target() {
+    let c1 = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    let c2 = "1f0e0d0c-0b0a-4908-8706-050403020100";
+    let k_create = request_key(Op::CreateConnection, c1, "same-key");
+    let k_auth = request_key(Op::AuthorizeConnection, c1, "same-key");
+    let k_disc = request_key(Op::DisconnectConnection, c1, "same-key");
+    let k_share = request_key(Op::ShareConnection, c1, "same-key");
+    let k_revoke = request_key(Op::RevokeConnectionShare, c1, "same-key");
+    let k_other = request_key(Op::AuthorizeConnection, c2, "same-key");
+    let all = [k_create, k_auth, k_disc, k_share, k_revoke, k_other];
+    let unique: BTreeSet<&String> = all.iter().collect();
+    assert_eq!(unique.len(), all.len());
 }

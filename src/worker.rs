@@ -262,6 +262,17 @@ pub trait ApprovedAdapter: Send + Sync {
         request: Vec<u8>,
         step: StepContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = StepResult> + Send + 'a>>;
+
+    /// Destination-authorized read-only reconciliation for unresolved operations during
+    /// `Executor::reconcile`. Defaults to returning `None` (fail closed without replaying).
+    fn reconcile_operation<'a>(
+        &'a self,
+        _run: &'a ActiveRun,
+        _operation: &'a UnresolvedOperation,
+        _step: StepContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<OwnedObservation>> + Send + 'a>> {
+        Box::pin(async { None })
+    }
 }
 
 pub struct ApprovedEffects {

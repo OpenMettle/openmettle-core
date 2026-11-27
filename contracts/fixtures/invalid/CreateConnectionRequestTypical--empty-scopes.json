@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/allowed_scopes",
+    "keyword": "minItems",
+    "valid": false
+  },
+  "fixture": "CreateConnectionRequestTypical--empty-scopes",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "account_id": "acct-example-1",
+    "allowed_scopes": [],
+    "origin": "https://api.example.test",
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker"
+  },
+  "mutation": {
+    "name": "empty-scopes",
+    "op": "set",
+    "path": "/allowed_scopes",
+    "value": []
+  },
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

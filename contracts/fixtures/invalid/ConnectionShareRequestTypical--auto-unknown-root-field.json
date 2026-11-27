@@ -1,0 +1,29 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "ConnectionShareRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "use",
+    "grantee": {
+      "grantee_id": "3c4d5e6f-7081-49ab-c2d3-e4f506172839",
+      "kind": "user"
+    },
+    "reason": "Allow collaborator to run scoped tools",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ConnectionShareRequest",
+  "source": "#/components/examples/ConnectionShareRequestTypical"
+}

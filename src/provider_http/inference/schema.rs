@@ -10,7 +10,7 @@ pub enum SchemaSubset {
     Nested,
 }
 
-pub(super) fn declared(s: &V, subset: SchemaSubset) -> bool {
+pub(crate) fn declared(s: &V, subset: SchemaSubset) -> bool {
     s["type"] == "object" && node(s, 0, subset)
 }
 fn node(s: &V, depth: usize, subset: SchemaSubset) -> bool {

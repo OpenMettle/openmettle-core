@@ -5,7 +5,7 @@ mod decode;
 pub(crate) mod json;
 mod request;
 mod responses;
-mod schema;
+pub(crate) mod schema;
 pub(crate) mod stream;
 mod turn;
 
@@ -234,6 +234,18 @@ pub struct Gateway {
     loopback: bool,
 }
 impl Gateway {
+    pub fn qualification(&self) -> &Qualification {
+        &self.qualification
+    }
+
+    pub fn accepts_tool(&self, tool: &Tool) -> bool {
+        turn::identifier(&tool.name)
+            && self
+                .qualification
+                .functions
+                .is_some_and(|subset| schema::declared(&tool.parameters, subset))
+    }
+
     /// A canonical `https://` route with the given trust anchors.
     pub fn new(
         endpoint: &str,

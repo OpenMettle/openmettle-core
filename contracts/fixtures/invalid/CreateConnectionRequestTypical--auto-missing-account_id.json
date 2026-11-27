@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "CreateConnectionRequestTypical--auto-missing-account_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "allowed_scopes": [
+      "issues.read",
+      "issues.write"
+    ],
+    "origin": "https://api.example.test",
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker"
+  },
+  "mutation": {
+    "name": "auto-missing-account_id",
+    "op": "remove",
+    "path": "/account_id"
+  },
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

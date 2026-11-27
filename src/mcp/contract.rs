@@ -71,6 +71,8 @@ pub struct IdempotencyWindow {
 pub struct ReconcileSpec {
     /// Remote MCP tool name for the read-only lookup (on the same pinned transport).
     pub lookup_tool: String,
+    /// Canonical lowercase ASCII scope token required for this read-only reconciliation lookup.
+    pub lookup_scope: String,
     /// Argument name populated with `operations.downstream_handle` when present.
     pub handle_argument: Option<String>,
     /// Argument name populated with the deterministic key (`endpoint_key` or `logical_key`)
@@ -156,6 +158,15 @@ impl ExternalToolContract {
                 }
                 _ => {}
             }
+        }
+        if let Some(reconcile) = &self.reconcile
+            && (reconcile.lookup_tool.is_empty()
+                || reconcile.lookup_tool.len() > 256
+                || reconcile.status_field.is_empty()
+                || reconcile.status_field.len() > 128
+                || !crate::vault::is_valid_scope_token(&reconcile.lookup_scope))
+        {
+            return Err(ToolFault::TerminalRefusal);
         }
         self.input_schema = sorted;
         self.schema_digest = canonical_schema_digest(&self.input_schema);
@@ -295,6 +306,10 @@ impl ExternalRegistry {
             .values()
             .filter(|c| c.tool_id == tool_id)
             .collect()
+    }
+
+    pub fn contracts(&self) -> impl Iterator<Item = &ExternalToolContract> {
+        self.contracts.values()
     }
 
     pub fn proposal(

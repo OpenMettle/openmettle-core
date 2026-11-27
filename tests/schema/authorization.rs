@@ -1240,6 +1240,11 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
                             .unwrap()
                             .is_string()
                     );
+                    assert!(
+                        obj.remove("connection_coverage_started_at")
+                            .unwrap()
+                            .is_string()
+                    );
                 }
                 value.to_string()
             })

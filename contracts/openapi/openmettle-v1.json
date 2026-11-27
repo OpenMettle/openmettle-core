@@ -3511,6 +3511,544 @@
           }
         }
       }
+    },
+    "/v1/connections": {
+      "get": {
+        "operationId": "listConnections",
+        "summary": "List visible external connections in a personal or project scope",
+        "description": "Returns keyset-paginated non-secret external connection metadata visible to the caller in scope_id (defaults to the caller's personal scope). Private connections owned by other users or unshared project connections are omitted and never consume page slots. Raw credentials, ciphertexts and key identifiers are never returned (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionScope"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of visible external connections.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPage"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/ConnectionPageTypical"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createConnection",
+        "summary": "Register an external connection in pending_auth state",
+        "description": "Creates a personal or project external connection pinning provider_kind, account_id, canonical HTTPS origin and allowed_scopes (ADR 0045). No credentials are stored on creation. Personal connections require the personal scope owner; project connections require a project owner and fail with conflict in an archived project.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConnectionRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/CreateConnectionRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay of the connection registration.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                },
+                "examples": {
+                  "pending": {
+                    "$ref": "#/components/examples/ConnectionPendingAuth"
+                  }
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The newly registered external connection in pending_auth state.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                },
+                "examples": {
+                  "pending": {
+                    "$ref": "#/components/examples/ConnectionPendingAuth"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/connections/{connection_id}": {
+      "get": {
+        "operationId": "getConnection",
+        "summary": "Read non-secret metadata for one external connection",
+        "description": "Returns connection state, destination origin, allowed/granted scopes and lifecycle counters. Conceals unauthorized, missing or deleted-project connections with not_found. Never returns credentials, ciphertexts or key identifiers (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The external connection metadata.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                },
+                "examples": {
+                  "authorized": {
+                    "$ref": "#/components/examples/ConnectionAuthorized"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/connections/{connection_id}/authorize": {
+      "post": {
+        "operationId": "authorizeConnection",
+        "summary": "Store encrypted credentials on an external connection (write-only)",
+        "description": "Encrypts and stores access and optional refresh credentials under the active vault key, transitioning pending_auth, reauth_required or authorized to authorized. Enforces granted_scopes subset of allowed_scopes (refusing widening with validation), refuses disconnected connections and archived projects with conflict, and fails with 503 provisioning when no vault keyring is mounted. Never returns stored credentials (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizeConnectionRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/AuthorizeConnectionRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated non-secret connection metadata after authorization.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                },
+                "examples": {
+                  "authorized": {
+                    "$ref": "#/components/examples/ConnectionAuthorized"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/connections/{connection_id}/disconnect": {
+      "post": {
+        "operationId": "disconnectConnection",
+        "summary": "Disconnect an external connection and wipe stored credentials",
+        "description": "Atomically transitions the connection to terminal disconnected state, wipes all stored ciphertexts and key identifiers to NULL, and advances revocation_generation to fence any in-flight refresh. Allowed in archived projects (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disconnected external connection metadata.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                },
+                "examples": {
+                  "disconnected": {
+                    "$ref": "#/components/examples/ConnectionDisconnected"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/connections/{connection_id}/shares": {
+      "put": {
+        "operationId": "shareConnection",
+        "summary": "Explicitly share execution use of an external connection",
+        "description": "Grants execution-only use access to a user, local_group, oidc_group or (for project-scoped connections only) the whole project without exposing stored credentials. Inside a project the grantee must hold active project membership; refused in archived projects or disconnected connections (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionShareRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ConnectionShareRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The granted execution-use share.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionShare"
+                },
+                "examples": {
+                  "use": {
+                    "$ref": "#/components/examples/ConnectionShareUse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/connections/{connection_id}/shares/revoke": {
+      "post": {
+        "operationId": "revokeConnectionShare",
+        "summary": "Revoke an explicit share on an external connection",
+        "description": "Immediately revokes execution and read access for the specified grantee and advances share_revision and revocation_generation. Allowed in archived projects and for stale grantees (ADR 0045).",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConnectionId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRevokeRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ShareRevokeRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The connection share is revoked.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3743,6 +4281,23 @@
         "in": "path",
         "required": true,
         "description": "The target personal or project scope identifier. A malformed identifier fails with validation; a missing scope fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ConnectionId": {
+        "name": "connection_id",
+        "in": "path",
+        "required": true,
+        "description": "The external connection's canonical UUID. A malformed identifier fails with validation; a missing or unauthorized connection fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ConnectionScope": {
+        "name": "scope_id",
+        "in": "query",
+        "description": "Return visible external connections in this scope. Defaults to the caller's personal scope.",
         "schema": {
           "$ref": "#/components/schemas/Uuid"
         }
@@ -8287,6 +8842,343 @@
             "$ref": "#/components/schemas/NonNegativeDecimal"
           }
         }
+      },
+      "ConnectionScopeToken": {
+        "description": "Canonical lowercase ASCII external connection scope token.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9][a-z0-9._:/-]{0,127}$"
+      },
+      "ConnectionState": {
+        "description": "External connection lifecycle state (ADR 0045).",
+        "type": "string",
+        "enum": [
+          "pending_auth",
+          "authorized",
+          "reauth_required",
+          "disconnected"
+        ]
+      },
+      "Connection": {
+        "description": "Non-secret metadata of a personal or project external connection (ADR 0045). Never contains credentials, ciphertexts or key identifiers.",
+        "type": "object",
+        "required": [
+          "connection_id",
+          "scope_kind",
+          "scope_id",
+          "project_id",
+          "provider_kind",
+          "account_id",
+          "origin",
+          "allowed_scopes",
+          "granted_scopes",
+          "state",
+          "expires_at",
+          "has_refresh",
+          "generation",
+          "revocation_generation",
+          "share_revision",
+          "created_at",
+          "updated_at",
+          "disconnected_at",
+          "can_manage"
+        ],
+        "properties": {
+          "connection_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_kind": {
+            "type": "string",
+            "enum": [
+              "personal",
+              "project"
+            ]
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+          },
+          "account_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 9,
+            "maxLength": 256,
+            "pattern": "^https://[a-z0-9-]+(\\.[a-z0-9-]+)+(:[1-9][0-9]{0,4})?$"
+          },
+          "allowed_scopes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ConnectionScopeToken"
+            }
+          },
+          "granted_scopes": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ConnectionScopeToken"
+            }
+          },
+          "state": {
+            "$ref": "#/components/schemas/ConnectionState"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "has_refresh": {
+            "type": "boolean"
+          },
+          "generation": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "revocation_generation": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "share_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "disconnected_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "can_manage": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ConnectionPage": {
+        "description": "A keyset-paginated list of visible external connections.",
+        "type": "object",
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/Connection"
+            }
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "CreateConnectionRequest": {
+        "description": "Register a personal or project external connection in pending_auth state (ADR 0045).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider_kind",
+          "account_id",
+          "origin",
+          "allowed_scopes"
+        ],
+        "properties": {
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+          },
+          "account_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 9,
+            "maxLength": 256,
+            "pattern": "^https://[a-z0-9-]+(\\.[a-z0-9-]+)+(:[1-9][0-9]{0,4})?$"
+          },
+          "allowed_scopes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ConnectionScopeToken"
+            }
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "AuthorizeConnectionRequest": {
+        "description": "Write-only request body storing encrypted access and optional refresh credentials on an external connection (ADR 0045). Never returned in any response.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "access_token",
+          "granted_scopes"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "writeOnly": true
+          },
+          "refresh_token": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "granted_scopes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ConnectionScopeToken"
+            }
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ConnectionShareRequest": {
+        "description": "Explicitly grant execution use of an external connection to a grantee (ADR 0045).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grantee",
+          "access"
+        ],
+        "properties": {
+          "grantee": {
+            "$ref": "#/components/schemas/ShareGrantee"
+          },
+          "access": {
+            "const": "use"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ConnectionShare": {
+        "description": "Active execution-use share recorded on an external connection.",
+        "type": "object",
+        "required": [
+          "connection_id",
+          "grantee",
+          "access"
+        ],
+        "properties": {
+          "connection_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "grantee": {
+            "$ref": "#/components/schemas/ShareGrantee"
+          },
+          "access": {
+            "const": "use"
+          }
+        }
       }
     },
     "examples": {
@@ -11828,6 +12720,339 @@
               "expect": {
                 "instancePath": "/affected_revisions",
                 "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "CreateConnectionRequestTypical": {
+        "summary": "Register a personal external connection in pending_auth state",
+        "dataValue": {
+          "provider_kind": "github",
+          "account_id": "acct-example-1",
+          "origin": "https://api.example.test",
+          "allowed_scopes": [
+            "issues.read",
+            "issues.write"
+          ],
+          "reason": "Connect personal issue tracker"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/CreateConnectionRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "http-origin",
+              "class": "invalid",
+              "op": "set",
+              "path": "/origin",
+              "value": "http://api.example.test",
+              "expect": {
+                "instancePath": "/origin",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "empty-scopes",
+              "class": "invalid",
+              "op": "set",
+              "path": "/allowed_scopes",
+              "value": [],
+              "expect": {
+                "instancePath": "/allowed_scopes",
+                "keyword": "minItems"
+              }
+            },
+            {
+              "name": "unknown-field",
+              "class": "invalid",
+              "op": "set",
+              "path": "/extra",
+              "value": true,
+              "expect": {
+                "instancePath": "",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "AuthorizeConnectionRequestTypical": {
+        "summary": "Write-only authorization storing synthetic access and refresh tokens",
+        "dataValue": {
+          "access_token": "synthetic-access-example-1",
+          "refresh_token": "synthetic-refresh-example-1",
+          "granted_scopes": [
+            "issues.read"
+          ],
+          "expires_at": "2026-12-31T23:59:59.000000Z",
+          "reason": "Initial credential authorization"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/AuthorizeConnectionRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "missing-access",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/access_token",
+              "expect": {
+                "instancePath": "",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "unknown-field",
+              "class": "invalid",
+              "op": "set",
+              "path": "/extra",
+              "value": 1,
+              "expect": {
+                "instancePath": "",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionPendingAuth": {
+        "summary": "Newly registered personal connection awaiting authorization",
+        "dataValue": {
+          "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "provider_kind": "github",
+          "account_id": "acct-example-1",
+          "origin": "https://api.example.test",
+          "allowed_scopes": [
+            "issues.read",
+            "issues.write"
+          ],
+          "granted_scopes": [],
+          "state": "pending_auth",
+          "expires_at": null,
+          "has_refresh": false,
+          "generation": "0",
+          "revocation_generation": "0",
+          "share_revision": "0",
+          "created_at": "2026-11-26T09:00:00.000000Z",
+          "updated_at": "2026-11-26T09:00:00.000000Z",
+          "disconnected_at": null,
+          "can_manage": true
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Connection",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-state",
+              "class": "invalid",
+              "op": "set",
+              "path": "/state",
+              "value": "active",
+              "expect": {
+                "instancePath": "/state",
+                "keyword": "enum"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionAuthorized": {
+        "summary": "Authorized external connection metadata with zero secret fields",
+        "dataValue": {
+          "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "provider_kind": "github",
+          "account_id": "acct-example-1",
+          "origin": "https://api.example.test",
+          "allowed_scopes": [
+            "issues.read",
+            "issues.write"
+          ],
+          "granted_scopes": [
+            "issues.read"
+          ],
+          "state": "authorized",
+          "expires_at": "2026-12-31T23:59:59.000000Z",
+          "has_refresh": true,
+          "generation": "1",
+          "revocation_generation": "0",
+          "share_revision": "0",
+          "created_at": "2026-11-26T09:00:00.000000Z",
+          "updated_at": "2026-11-26T09:05:00.000000Z",
+          "disconnected_at": null,
+          "can_manage": true
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Connection",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-generation",
+              "class": "invalid",
+              "op": "set",
+              "path": "/generation",
+              "value": "01",
+              "expect": {
+                "instancePath": "/generation",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionDisconnected": {
+        "summary": "Disconnected external connection after immediate credential wipe",
+        "dataValue": {
+          "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "provider_kind": "github",
+          "account_id": "acct-example-1",
+          "origin": "https://api.example.test",
+          "allowed_scopes": [
+            "issues.read",
+            "issues.write"
+          ],
+          "granted_scopes": [],
+          "state": "disconnected",
+          "expires_at": null,
+          "has_refresh": false,
+          "generation": "1",
+          "revocation_generation": "1",
+          "share_revision": "0",
+          "created_at": "2026-11-26T09:00:00.000000Z",
+          "updated_at": "2026-11-26T09:10:00.000000Z",
+          "disconnected_at": "2026-11-26T09:10:00.000000Z",
+          "can_manage": true
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Connection",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "bad-disconnected-at",
+              "class": "invalid",
+              "op": "set",
+              "path": "/disconnected_at",
+              "value": "2026-11-26T09:10:00Z",
+              "expect": {
+                "instancePath": "/disconnected_at",
+                "keyword": "anyOf"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionPageTypical": {
+        "summary": "Keyset-paginated list of visible external connections",
+        "dataValue": {
+          "items": [
+            {
+              "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+              "scope_kind": "personal",
+              "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+              "project_id": null,
+              "provider_kind": "github",
+              "account_id": "acct-example-1",
+              "origin": "https://api.example.test",
+              "allowed_scopes": [
+                "issues.read",
+                "issues.write"
+              ],
+              "granted_scopes": [
+                "issues.read"
+              ],
+              "state": "authorized",
+              "expires_at": "2026-12-31T23:59:59.000000Z",
+              "has_refresh": true,
+              "generation": "1",
+              "revocation_generation": "0",
+              "share_revision": "0",
+              "created_at": "2026-11-26T09:00:00.000000Z",
+              "updated_at": "2026-11-26T09:05:00.000000Z",
+              "disconnected_at": null,
+              "can_manage": true
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConnectionPage",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "missing-page-info",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/page_info",
+              "expect": {
+                "instancePath": "",
+                "keyword": "required"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionShareRequestTypical": {
+        "summary": "Grant execution use of a connection to a user",
+        "dataValue": {
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "3c4d5e6f-7081-49ab-c2d3-e4f506172839"
+          },
+          "access": "use",
+          "reason": "Allow collaborator to run scoped tools"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConnectionShareRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "wrong-access",
+              "class": "invalid",
+              "op": "set",
+              "path": "/access",
+              "value": "write",
+              "expect": {
+                "instancePath": "/access",
+                "keyword": "const"
+              }
+            }
+          ]
+        }
+      },
+      "ConnectionShareUse": {
+        "summary": "Recorded execution-use share on a connection",
+        "dataValue": {
+          "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "3c4d5e6f-7081-49ab-c2d3-e4f506172839"
+          },
+          "access": "use"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConnectionShare",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "wrong-access",
+              "class": "invalid",
+              "op": "set",
+              "path": "/access",
+              "value": "read",
+              "expect": {
+                "instancePath": "/access",
+                "keyword": "const"
               }
             }
           ]

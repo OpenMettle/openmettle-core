@@ -49,8 +49,8 @@ pub struct Call {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolError {
     pub call_id: String,
-    pub(super) name: String,
-    pub(super) arguments: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 impl ToolError {
     pub fn model_output(&self) -> Value {

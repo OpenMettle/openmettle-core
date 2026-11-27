@@ -1,0 +1,22 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CreateConnectionRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "account_id": "acct-example-1",
+    "allowed_scopes": [
+      "issues.read",
+      "issues.write"
+    ],
+    "origin": "https://api.example.test",
+    "provider_kind": "github",
+    "reason": "Connect personal issue tracker"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/CreateConnectionRequest",
+  "source": "#/components/examples/CreateConnectionRequestTypical"
+}

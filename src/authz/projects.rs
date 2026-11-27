@@ -46,7 +46,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const CONCEALED: StoreError = StoreError::Denied(DenialReason::NotFound);
+pub(crate) const CONCEALED: StoreError = StoreError::Denied(DenialReason::NotFound);
 
 /// Settings, role grants and new shares in an archived project, refused after authorization.
 pub const ARCHIVED: StoreError = StoreError::Conflict("project is archived");
@@ -247,7 +247,7 @@ fn narrow<P, E>(
         .collect()
 }
 
-async fn project_in(
+pub(crate) async fn project_in(
     c: &mut PgConnection,
     project_id: &str,
     scope_id: &str,
@@ -390,10 +390,10 @@ pub async fn hydrate_resource(
 // --- shared write steps ------------------------------------------------------------------------
 
 /// A locked project row: its scope and its lifecycle as read under the lock.
-struct Locked {
-    scope: String,
-    archived: bool,
-    deleted: bool,
+pub(crate) struct Locked {
+    pub(crate) scope: String,
+    pub(crate) archived: bool,
+    pub(crate) deleted: bool,
 }
 
 /// Lock the project row FOR NO KEY UPDATE through its inert guard column (migration 16).
@@ -402,7 +402,7 @@ struct Locked {
 /// statement, whose READ COMMITTED snapshot is taken after the lock is granted, so a change
 /// committed by the writer this one waited for is seen. Returns `None` when the project is
 /// missing so callers can verify the actor is active before concealing it.
-async fn lock_project(
+pub(crate) async fn lock_project(
     c: &mut PgConnection,
     project_id: &str,
 ) -> Result<Option<Locked>, StoreError> {
@@ -430,7 +430,7 @@ async fn lock_project(
     }))
 }
 
-fn grantee_input(grantee: &Grantee) -> Result<(), StoreError> {
+pub(crate) fn grantee_input(grantee: &Grantee) -> Result<(), StoreError> {
     match grantee {
         Grantee::User(id) | Grantee::LocalGroup(id) => uuid(id, "grantee"),
         Grantee::OidcGroup(id) if !bounded(id, 1024) || id.chars().any(char::is_control) => {
@@ -441,7 +441,7 @@ fn grantee_input(grantee: &Grantee) -> Result<(), StoreError> {
 }
 
 /// Audit details: the grantee's kind and identifier and the requested role or access.
-fn grantee_details(grantee: &Grantee, field: &str, value: Option<&str>) -> Value {
+pub(crate) fn grantee_details(grantee: &Grantee, field: &str, value: Option<&str>) -> Value {
     let (kind, user, local_group, oidc_group) = grants::Grantee::from(grantee).columns();
     let mut details = json!({ "grantee_kind": kind });
     if let Some(id) = user.or(local_group).or(oidc_group) {
@@ -1005,7 +1005,10 @@ async fn member_change(
 }
 
 /// A user or local group recipient must exist and be enabled; it stays locked FOR SHARE.
-async fn recipient_enabled(c: &mut PgConnection, grantee: &Grantee) -> Result<(), StoreError> {
+pub(crate) async fn recipient_enabled(
+    c: &mut PgConnection,
+    grantee: &Grantee,
+) -> Result<(), StoreError> {
     let (enabled, what) = match grantee {
         Grantee::User(id) => (
             store::lock_user(c, id, false).await?,
@@ -1205,7 +1208,7 @@ async fn share_change(
 /// recipient is inactive, which the policy refuses. An unknown user is `NotFound`. The user row
 /// is not locked: a personal share already locks its owner's row, and locking a second user
 /// could deadlock two owners sharing with each other. A later disablement grants nothing.
-async fn recipient_principal(
+pub(crate) async fn recipient_principal(
     c: &mut PgConnection,
     user_id: &str,
     project: Option<&Project>,

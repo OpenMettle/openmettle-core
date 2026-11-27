@@ -1773,3 +1773,173 @@ pub fn decode_retention_deadlines_apply_result(
         affected_bytes: parse_decimal(&wire.affected_bytes, true)?,
     })
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    PendingAuth,
+    Authorized,
+    ReauthRequired,
+    Disconnected,
+    Unrecognized(String),
+}
+
+impl ConnectionState {
+    fn from_wire(raw: String) -> Self {
+        match raw.as_str() {
+            "pending_auth" => Self::PendingAuth,
+            "authorized" => Self::Authorized,
+            "reauth_required" => Self::ReauthRequired,
+            "disconnected" => Self::Disconnected,
+            _ => Self::Unrecognized(raw),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExternalConnection {
+    pub connection_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub project_id: Option<String>,
+    pub provider_kind: String,
+    pub account_id: String,
+    pub origin: String,
+    pub allowed_scopes: Vec<String>,
+    pub granted_scopes: Vec<String>,
+    pub state: ConnectionState,
+    pub expires_at: Option<String>,
+    pub has_refresh: bool,
+    pub generation: i64,
+    pub revocation_generation: i64,
+    pub share_revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub disconnected_at: Option<String>,
+    pub can_manage: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConnectionPage {
+    pub items: Vec<ExternalConnection>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConnectionShare {
+    pub connection_id: String,
+    pub grantee_kind: String,
+    pub grantee_id: Option<String>,
+    pub access: String,
+}
+
+#[derive(Deserialize)]
+struct WireExternalConnection {
+    connection_id: String,
+    scope_kind: String,
+    scope_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    project_id: Option<String>,
+    provider_kind: String,
+    account_id: String,
+    origin: String,
+    allowed_scopes: Vec<String>,
+    granted_scopes: Vec<String>,
+    state: String,
+    #[serde(deserialize_with = "required_nullable")]
+    expires_at: Option<String>,
+    has_refresh: bool,
+    generation: String,
+    revocation_generation: String,
+    share_revision: String,
+    created_at: String,
+    updated_at: String,
+    #[serde(deserialize_with = "required_nullable")]
+    disconnected_at: Option<String>,
+    can_manage: bool,
+}
+
+#[derive(Deserialize)]
+struct WireConnectionPage {
+    items: Vec<Value>,
+    page_info: WireConnectionPageInfo,
+}
+
+#[derive(Deserialize)]
+struct WireConnectionPageInfo {
+    #[serde(deserialize_with = "required_nullable")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireConnectionShare {
+    connection_id: String,
+    grantee: WireConnectionGrantee,
+    access: String,
+}
+
+#[derive(Deserialize)]
+struct WireConnectionGrantee {
+    kind: String,
+    #[serde(default)]
+    grantee_id: Option<String>,
+}
+
+pub fn decode_connection(value: &Value) -> Result<ExternalConnection, String> {
+    let wire: WireExternalConnection =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if !matches!(wire.scope_kind.as_str(), "personal" | "project") {
+        return Err(format!("invalid scope_kind {}", wire.scope_kind));
+    }
+    Ok(ExternalConnection {
+        connection_id: wire.connection_id,
+        scope_kind: wire.scope_kind,
+        scope_id: wire.scope_id,
+        project_id: wire.project_id,
+        provider_kind: wire.provider_kind,
+        account_id: wire.account_id,
+        origin: wire.origin,
+        allowed_scopes: wire.allowed_scopes,
+        granted_scopes: wire.granted_scopes,
+        state: ConnectionState::from_wire(wire.state),
+        expires_at: wire.expires_at,
+        has_refresh: wire.has_refresh,
+        generation: parse_decimal(&wire.generation, true)?,
+        revocation_generation: parse_decimal(&wire.revocation_generation, true)?,
+        share_revision: parse_decimal(&wire.share_revision, true)?,
+        created_at: wire.created_at,
+        updated_at: wire.updated_at,
+        disconnected_at: wire.disconnected_at,
+        can_manage: wire.can_manage,
+    })
+}
+
+pub fn decode_connection_page(value: &Value) -> Result<ConnectionPage, String> {
+    let wire: WireConnectionPage =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let items = wire
+        .items
+        .iter()
+        .map(decode_connection)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConnectionPage {
+        items,
+        next_cursor: wire.page_info.next_cursor,
+    })
+}
+
+pub fn decode_connection_share(value: &Value) -> Result<ConnectionShare, String> {
+    let wire: WireConnectionShare =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.access != "use" {
+        return Err(format!(
+            "unexpected connection share access {}",
+            wire.access
+        ));
+    }
+    Ok(ConnectionShare {
+        connection_id: wire.connection_id,
+        grantee_kind: wire.grantee.kind,
+        grantee_id: wire.grantee.grantee_id,
+        access: wire.access,
+    })
+}

@@ -593,6 +593,14 @@ fn schema_problems(document: &Value) -> Vec<String> {
                     {
                         continue;
                     }
+                    // ADR 0045: AuthorizeConnectionRequest is strictly a write-only input body
+                    // accepting access_token and optional refresh_token; it is never returned in
+                    // any response schema (verified below).
+                    if path == "#/components/schemas/AuthorizeConnectionRequest"
+                        && matches!(name.as_str(), "access_token" | "refresh_token")
+                    {
+                        continue;
+                    }
                     if SENSITIVE_NAMES.iter().any(|s| name.contains(s)) {
                         problems.push(format!("{path}: sensitive property name {name}"));
                     }
@@ -614,6 +622,15 @@ fn schema_problems(document: &Value) -> Vec<String> {
             {
                 problems.push(format!("{at}: request object must reject unknown fields"));
             }
+        }
+    });
+    walk(&document["paths"], "#/paths".into(), &mut |path, node| {
+        if path.contains("/responses/")
+            && node.as_str() == Some("#/components/schemas/AuthorizeConnectionRequest")
+        {
+            problems.push(format!(
+                "{path}: write-only AuthorizeConnectionRequest referenced in response"
+            ));
         }
     });
     problems
@@ -2020,4 +2037,36 @@ fn consumer_reads_retention_status_policy_and_deadlines() {
     ))
     .unwrap();
     assert_eq!(applied, preview);
+}
+
+#[test]
+fn consumer_reads_external_connections_pages_and_shares() {
+    let pending = consumer::decode_connection(&fixture("ConnectionPendingAuth")).unwrap();
+    assert_eq!(pending.state, consumer::ConnectionState::PendingAuth);
+    assert!(!pending.has_refresh);
+    assert_eq!(pending.generation, 0);
+    assert!(pending.granted_scopes.is_empty());
+
+    let authorized = consumer::decode_connection(&fixture("ConnectionAuthorized")).unwrap();
+    assert_eq!(authorized.state, consumer::ConnectionState::Authorized);
+    assert!(authorized.has_refresh);
+    assert_eq!(authorized.generation, 1);
+    assert_eq!(authorized.granted_scopes, vec!["issues.read"]);
+    assert_eq!(authorized.origin, "https://api.example.test");
+
+    let disconnected = consumer::decode_connection(&fixture("ConnectionDisconnected")).unwrap();
+    assert_eq!(disconnected.state, consumer::ConnectionState::Disconnected);
+    assert!(!disconnected.has_refresh);
+    assert_eq!(disconnected.revocation_generation, 1);
+    assert!(disconnected.disconnected_at.is_some());
+
+    let page = consumer::decode_connection_page(&fixture("ConnectionPageTypical")).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0], authorized);
+    assert!(page.next_cursor.is_none());
+
+    let share = consumer::decode_connection_share(&fixture("ConnectionShareUse")).unwrap();
+    assert_eq!(share.access, "use");
+    assert_eq!(share.grantee_kind, "user");
+    assert!(share.grantee_id.is_some());
 }

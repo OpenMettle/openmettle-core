@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/access",
+    "keyword": "const",
+    "valid": false
+  },
+  "fixture": "ConnectionShareUse--wrong-access",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "connection_id": "2c3d4e5f-6071-489a-b1c2-d3e4f5061728",
+    "grantee": {
+      "grantee_id": "3c4d5e6f-7081-49ab-c2d3-e4f506172839",
+      "kind": "user"
+    }
+  },
+  "mutation": {
+    "name": "wrong-access",
+    "op": "set",
+    "path": "/access",
+    "value": "read"
+  },
+  "schema": "#/components/schemas/ConnectionShare",
+  "source": "#/components/examples/ConnectionShareUse"
+}
