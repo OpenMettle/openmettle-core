@@ -21,6 +21,15 @@ use archive::{
 use chrono::{DateTime, Utc};
 use crypto::{BackupKeyRing, CryptoError, EncryptedStats, StreamEncryptor};
 use ring::rand::{SecureRandom, SystemRandom};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
+    SignatureScheme,
+    client::{
+        WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -41,19 +50,24 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::net::TcpStream;
 
 pub const MANIFEST_FORMAT: &str = "openmettle-backup-manifest/v1";
 pub const META_FORMAT: &str = "openmettle-backup-meta/v1";
 pub const GATEWAY_CONSISTENCY_MODE: &str = "postgresql_authoritative_adr_0044";
-pub const REBUILDABLE_INDEXES: [&str; 3] = [
+pub const BASE_REBUILDABLE_INDEXES: [&str; 2] = [
     "postgresql_secondary_indexes",
-    "chroma_vector_embeddings",
     "derived_search_and_fulltext_indexes",
 ];
+pub const CHROMA_REBUILDABLE_INDEX: &str = "chroma_vector_embeddings";
+pub const REBUILDABLE_INDEXES: [&str; 2] = BASE_REBUILDABLE_INDEXES;
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_LEASE_SECONDS: i32 = 300;
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SNAPSHOT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const TLS_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TLS_PEM_BYTES: usize = 1024 * 1024;
+const PG_SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 const REQUIRED_COMPONENTS: [&str; 5] = [
     "artifacts.bin.enc",
     "config.json.enc",
@@ -359,6 +373,35 @@ impl ValidatedPgConfig {
         {
             return Err(BackupError::PgDump(
                 "sslrootcert=system is not supported; pass an explicit CA file path",
+            ));
+        }
+        if self.sslcert.is_some() != self.sslkey.is_some() {
+            return Err(BackupError::PgDump(
+                "sslcert and sslkey must be supplied together",
+            ));
+        }
+        for path in [
+            self.sslrootcert.as_deref(),
+            self.sslcert.as_deref(),
+            self.sslkey.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.is_empty() || !Path::new(path).is_absolute() {
+                return Err(BackupError::PgDump(
+                    "TLS certificate paths in database URL must be non-empty absolute paths",
+                ));
+            }
+        }
+        if self.host.starts_with('/')
+            && matches!(
+                self.sslmode.as_str(),
+                "require" | "verify-ca" | "verify-full"
+            )
+        {
+            return Err(BackupError::PgDump(
+                "TLS-required sslmode cannot be used with a Unix domain socket host",
             ));
         }
         let has_any_cert =
@@ -761,6 +804,212 @@ pub fn parse_validated_pg_uri(url: &str) -> Result<ValidatedPgConfig, BackupErro
     Ok(cfg)
 }
 
+#[derive(Debug)]
+struct VerifyCaOnlyVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for VerifyCaOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(TlsError::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn parse_pem_certs(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, BackupError> {
+    let mut out = Vec::new();
+    for item in CertificateDer::pem_slice_iter(bytes) {
+        let cert = item.map_err(|_| BackupError::PgDump("invalid PEM certificate file"))?;
+        out.push(cert);
+    }
+    if out.is_empty() {
+        return Err(BackupError::PgDump(
+            "PEM certificate file contains no certificates",
+        ));
+    }
+    Ok(out)
+}
+
+async fn write_all_tcp(stream: &TcpStream, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "unexpected EOF writing PostgreSQL SSLRequest",
+                ));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+async fn read_exact_tcp(stream: &TcpStream, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        stream.readable().await?;
+        match stream.try_read(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF reading PostgreSQL SSLRequest reply",
+                ));
+            }
+            Ok(n) => buf = &mut buf[n..],
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Strictly verify PostgreSQL server TLS trust against ONLY `cfg.sslrootcert` (zero system or
+/// WebPKI fallback roots) before opening any SQLx pool or closing admission.
+///
+/// `sqlx-postgres` 0.9.0 appends `ssl_root_cert` to its built-in/native root store rather than
+/// replacing it; this preflight closes that trust-store gap so `sslmode=verify-ca` and
+/// `sslmode=verify-full` behave identically across SQLx and `libpq` (`pg_dump`).
+pub async fn verify_pg_tls_preflight(cfg: &ValidatedPgConfig) -> Result<(), BackupError> {
+    cfg.validate_tls_parity()?;
+    if !matches!(cfg.sslmode.as_str(), "verify-ca" | "verify-full") {
+        return Ok(());
+    }
+    let ca_path = cfg.sslrootcert.as_deref().ok_or(BackupError::PgDump(
+        "sslmode=verify-ca and verify-full require an explicit sslrootcert CA file path",
+    ))?;
+    let ca_bytes = read_regular_bounded_nofollow(Path::new(ca_path), MAX_TLS_PEM_BYTES)
+        .map_err(|_| BackupError::PgDump("failed to read sslrootcert CA PEM file"))?;
+    let ca_certs = parse_pem_certs(&ca_bytes)?;
+    let mut root_store = RootCertStore::empty();
+    for cert in ca_certs {
+        root_store
+            .add(cert)
+            .map_err(|_| BackupError::PgDump("invalid CA certificate in sslrootcert"))?;
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| BackupError::PgDump("failed to initialize TLS client configuration"))?;
+    let webpki_verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider)
+            .build()
+            .map_err(|_| BackupError::PgDump("failed to build strict sslrootcert verifier"))?;
+    let with_verifier = match cfg.sslmode.as_str() {
+        "verify-full" => builder
+            .dangerous()
+            .with_custom_certificate_verifier(webpki_verifier),
+        "verify-ca" => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(VerifyCaOnlyVerifier {
+                inner: webpki_verifier,
+            })),
+        _ => unreachable!(),
+    };
+    let tls_config = match (cfg.sslcert.as_deref(), cfg.sslkey.as_deref()) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_bytes = read_regular_bounded_nofollow(Path::new(cert_path), MAX_TLS_PEM_BYTES)
+                .map_err(|_| BackupError::PgDump("failed to read sslcert PEM file"))?;
+            let certs = parse_pem_certs(&cert_bytes)?;
+            let key_bytes = read_regular_bounded_nofollow(Path::new(key_path), MAX_TLS_PEM_BYTES)
+                .map_err(|_| BackupError::PgDump("failed to read sslkey PEM file"))?;
+            let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+                .map_err(|_| BackupError::PgDump("invalid sslkey PEM file"))?;
+            with_verifier
+                .with_client_auth_cert(certs, key)
+                .map_err(|_| BackupError::PgDump("invalid sslcert/sslkey pair"))?
+        }
+        (None, None) => with_verifier.with_no_client_auth(),
+        _ => {
+            return Err(BackupError::PgDump(
+                "sslcert and sslkey must be supplied together",
+            ));
+        }
+    };
+
+    let server_name = match cfg.sslmode.as_str() {
+        "verify-full" => ServerName::try_from(cfg.host.clone()).map_err(|_| {
+            BackupError::PgDump("invalid database host for sslmode=verify-full verification")
+        })?,
+        _ => ServerName::try_from(cfg.host.clone()).unwrap_or_else(|_| {
+            ServerName::try_from("postgres.invalid".to_owned()).expect("valid static DNS name")
+        }),
+    };
+
+    let host = cfg.host.clone();
+    let port = cfg.port;
+    tokio::time::timeout(TLS_PREFLIGHT_TIMEOUT, async move {
+        let tcp = TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight connection failed"))?;
+        write_all_tcp(&tcp, &PG_SSL_REQUEST)
+            .await
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight SSLRequest failed"))?;
+        let mut reply = [0u8; 1];
+        read_exact_tcp(&tcp, &mut reply)
+            .await
+            .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight SSLRequest reply failed"))?;
+        if reply[0] != b'S' {
+            return Err(BackupError::PgDump(
+                "PostgreSQL server declined TLS during sslrootcert preflight",
+            ));
+        }
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let tls_stream = connector.connect(server_name, tcp).await.map_err(|_| {
+            BackupError::PgDump(
+                "PostgreSQL TLS server certificate failed strict sslrootcert verification",
+            )
+        })?;
+        drop(tls_stream);
+        Ok(())
+    })
+    .await
+    .map_err(|_| BackupError::PgDump("PostgreSQL TLS preflight timed out"))?
+}
+
 /// Cooperative cancellation handle shared between the async capture supervisor and blocking
 /// `pg_dump` or streaming tasks. Calling [`DumpCancel::cancel`] marks the token cancelled and
 /// sends `SIGKILL` to any registered child process so a stalled `pg_dump` exits and is reaped
@@ -878,40 +1127,46 @@ fn valid_snapshot_id(snap: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-struct EphemeralPgPass {
+struct EphemeralPgEnv {
     dir: PathBuf,
-    file: PathBuf,
+    pgpass_file: PathBuf,
 }
 
-impl EphemeralPgPass {
+impl EphemeralPgEnv {
     fn create(parsed: &ValidatedPgConfig) -> Result<Self, BackupError> {
         let mut rnd = [0u8; 16];
         SystemRandom::new()
             .fill(&mut rnd)
             .map_err(|_| BackupError::Crypto(CryptoError::Random))?;
-        let dir = std::env::temp_dir().join(format!("om-pgpass-{}", hex(&rnd)));
+        let dir = std::env::temp_dir().join(format!("om-pgenv-{}", hex(&rnd)));
         create_dir_0700(&dir)?;
-        let file = dir.join("pgpass");
-        let host = escape_pgpass(&parsed.host);
-        let port = parsed.port.to_string();
-        let db = escape_pgpass(&parsed.database);
-        let user = escape_pgpass(&parsed.username);
-        let pass = parsed
-            .password
-            .as_deref()
-            .map_or_else(String::new, escape_pgpass);
-        let content = format!("{host}:{port}:{db}:{user}:{pass}\n");
-        if let Err(err) = write_file_0600(&file, content.as_bytes()) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(err.into());
-        }
-        Ok(Self { dir, file })
+        let pgpass_file = if let Some(password) = parsed.password.as_deref() {
+            let file = dir.join("pgpass");
+            let host = escape_pgpass(&parsed.host);
+            let port = parsed.port.to_string();
+            let db = escape_pgpass(&parsed.database);
+            let user = escape_pgpass(&parsed.username);
+            let pass = escape_pgpass(password);
+            let content = format!("{host}:{port}:{db}:{user}:{pass}\n");
+            if let Err(err) = write_file_0600(&file, content.as_bytes()) {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(err.into());
+            }
+            file
+        } else {
+            dir.join("nonexistent-pgpass")
+        };
+        Ok(Self { dir, pgpass_file })
+    }
+
+    fn nonexistent_path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
     }
 }
 
-impl Drop for EphemeralPgPass {
+impl Drop for EphemeralPgEnv {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.file);
+        let _ = fs::remove_file(&self.pgpass_file);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -933,11 +1188,7 @@ impl PgDumpRunner for CliPgDumpRunner {
         {
             return Err(BackupError::PgDump("invalid PostgreSQL snapshot ID"));
         }
-        let pgpass = if parsed.password.is_some() {
-            Some(EphemeralPgPass::create(&parsed)?)
-        } else {
-            None
-        };
+        let pg_env = EphemeralPgEnv::create(&parsed)?;
 
         let mut cmd = Command::new(&self.program);
         // Scrub every inherited libpq PG* variable so only explicitly validated URL settings
@@ -957,18 +1208,37 @@ impl PgDumpRunner for CliPgDumpRunner {
         cmd.arg(format!("--username={}", parsed.username));
         cmd.arg(format!("--dbname={}", parsed.database));
         cmd.env("PGSSLMODE", &parsed.sslmode);
-        if let Some(pass) = &pgpass {
-            cmd.env("PGPASSFILE", &pass.file);
-        }
-        if let Some(ca) = &parsed.sslrootcert {
-            cmd.env("PGSSLROOTCERT", ca);
-        }
-        if let Some(cert) = &parsed.sslcert {
-            cmd.env("PGSSLCERT", cert);
-        }
-        if let Some(key) = &parsed.sslkey {
-            cmd.env("PGSSLKEY", key);
-        }
+        // Pin every libpq home-directory fallback path into the ephemeral 0700 directory so
+        // libpq never consults $HOME/.postgresql/{root.crt,postgresql.crt,postgresql.key,root.crl},
+        // $HOME/.pgpass, or $HOME/.pg_service.conf.
+        cmd.env("PGPASSFILE", &pg_env.pgpass_file);
+        match parsed.sslrootcert.as_deref() {
+            Some(ca) => cmd.env("PGSSLROOTCERT", ca),
+            None => cmd.env(
+                "PGSSLROOTCERT",
+                pg_env.nonexistent_path("nonexistent-root.crt"),
+            ),
+        };
+        match parsed.sslcert.as_deref() {
+            Some(cert) => cmd.env("PGSSLCERT", cert),
+            None => cmd.env(
+                "PGSSLCERT",
+                pg_env.nonexistent_path("nonexistent-client.crt"),
+            ),
+        };
+        match parsed.sslkey.as_deref() {
+            Some(key) => cmd.env("PGSSLKEY", key),
+            None => cmd.env(
+                "PGSSLKEY",
+                pg_env.nonexistent_path("nonexistent-client.key"),
+            ),
+        };
+        cmd.env("PGSSLCRL", pg_env.nonexistent_path("nonexistent-root.crl"));
+        cmd.env("PGSSLCRLDIR", pg_env.nonexistent_path("nonexistent-crldir"));
+        cmd.env(
+            "PGSERVICEFILE",
+            pg_env.nonexistent_path("nonexistent-pg_service.conf"),
+        );
         if let Some(app) = &parsed.application_name {
             cmd.env("PGAPPNAME", app);
         }
@@ -1026,11 +1296,11 @@ impl PgDumpRunner for CliPgDumpRunner {
         };
 
         // Always close the stdout read pipe, keep the child reachable in `cancel` while reaping
-        // (killing immediately on error or cancellation), then join stderr and unlink PGPASSFILE.
+        // (killing immediately on error or cancellation), then join stderr and unlink pg_env.
         drop(stdout);
         let status = cancel.wait_and_reap(copy_result.is_err() || cancel.is_cancelled());
         let _ = stderr_handle.join();
-        drop(pgpass);
+        drop(pg_env);
 
         copy_result?;
         if cancel.is_cancelled() {
@@ -1071,7 +1341,7 @@ impl<W: Write> Write for CancelCheckingWriter<'_, W> {
     }
 }
 
-// --- Graphiti / Neo4j & manifest structures ---------------------------------------------------
+// --- Graphiti / Neo4j, Chroma, and manifest structures ----------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GraphitiMode {
@@ -1079,28 +1349,59 @@ pub enum GraphitiMode {
     OfflineDump(PathBuf),
 }
 
-struct OpenedNeo4jDump {
+/// Explicit backup disposition for Chroma vector embeddings. Chroma is never assumed rebuildable
+/// without an operator-supplied qualification reference (`QualifiedRebuild`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ChromaMode {
+    #[default]
+    NotProvisioned,
+    Archive(PathBuf),
+    QualifiedRebuild {
+        qualification_ref: String,
+    },
+}
+
+struct ExternalFileErrors {
+    not_absolute: &'static str,
+    unreadable: &'static str,
+    empty: &'static str,
+    changed: &'static str,
+}
+
+const NEO4J_DUMP_ERRORS: ExternalFileErrors = ExternalFileErrors {
+    not_absolute: "--neo4j-dump path must be absolute",
+    unreadable: "--neo4j-dump must be a readable non-symlink regular file",
+    empty: "--neo4j-dump must be a non-empty regular file",
+    changed: "--neo4j-dump changed or was truncated during backup capture",
+};
+
+const CHROMA_ARCHIVE_ERRORS: ExternalFileErrors = ExternalFileErrors {
+    not_absolute: "--chroma-archive path must be absolute",
+    unreadable: "--chroma-archive must be a readable non-symlink regular file",
+    empty: "--chroma-archive must be a non-empty regular file",
+    changed: "--chroma-archive changed or was truncated during backup capture",
+};
+
+struct OpenedExternalFile {
     file: fs::File,
     dev: u64,
     ino: u64,
     len: u64,
     mtime: i64,
     mtime_nsec: i64,
+    errors: &'static ExternalFileErrors,
 }
 
-impl OpenedNeo4jDump {
-    fn open(path: &Path) -> Result<Self, BackupError> {
+impl OpenedExternalFile {
+    fn open(path: &Path, errors: &'static ExternalFileErrors) -> Result<Self, BackupError> {
         if !path.is_absolute() {
-            return Err(BackupError::Invalid("--neo4j-dump path must be absolute"));
+            return Err(BackupError::Invalid(errors.not_absolute));
         }
-        let file = open_regular_nofollow(path).map_err(|_| {
-            BackupError::Invalid("--neo4j-dump must be a readable non-symlink regular file")
-        })?;
+        let file =
+            open_regular_nofollow(path).map_err(|_| BackupError::Invalid(errors.unreadable))?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() == 0 {
-            return Err(BackupError::Invalid(
-                "--neo4j-dump must be a non-empty regular file",
-            ));
+            return Err(BackupError::Invalid(errors.empty));
         }
         Ok(Self {
             file,
@@ -1109,6 +1410,7 @@ impl OpenedNeo4jDump {
             len: meta.len(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            errors,
         })
     }
 
@@ -1123,12 +1425,49 @@ impl OpenedNeo4jDump {
             || meta.mtime() != self.mtime
             || meta.mtime_nsec() != self.mtime_nsec
         {
-            return Err(BackupError::Integrity(
-                "--neo4j-dump changed or was truncated during backup capture",
-            ));
+            return Err(BackupError::Integrity(self.errors.changed));
         }
         Ok(())
     }
+}
+
+pub fn validate_chroma_qualification_ref(reference: &str) -> Result<(), BackupError> {
+    if reference.is_empty()
+        || reference.len() > 256
+        || reference.trim() != reference
+        || !reference.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    {
+        return Err(BackupError::Invalid("invalid --chroma-qualification-ref"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ChromaManifest {
+    NotProvisioned,
+    Archive {
+        component: String,
+        plaintext_bytes: u64,
+        plaintext_sha256: String,
+    },
+    QualifiedRebuild {
+        qualification_ref: String,
+    },
+}
+
+/// Canonical rebuildable-index inventory for a backup manifest. `chroma_vector_embeddings` is
+/// listed ONLY when Chroma rebuildability has been explicitly qualified via
+/// [`ChromaManifest::QualifiedRebuild`].
+pub fn rebuildable_indexes_for(chroma: &ChromaManifest) -> Vec<String> {
+    let mut indexes: Vec<String> = BASE_REBUILDABLE_INDEXES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    if matches!(chroma, ChromaManifest::QualifiedRebuild { .. }) {
+        indexes.push(CHROMA_REBUILDABLE_INDEX.to_owned());
+    }
+    indexes
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1188,6 +1527,7 @@ pub struct BackupManifest {
     pub vault_required_key_ids: Vec<String>,
     pub gateway_consistency_mode: String,
     pub graphiti_neo4j: GraphitiManifest,
+    pub chroma: ChromaManifest,
     pub rebuildable_indexes: Vec<String>,
 }
 
@@ -1429,14 +1769,16 @@ async fn renew_lease(pool: &PgPool, run_id: &str, lease_seconds: i32) -> Result<
 async fn mark_quiesced(
     pool: &PgPool,
     run_id: &str,
+    snapshot_quiesced_at: &str,
     lease_seconds: i32,
 ) -> Result<String, BackupError> {
     let mut tx = read_committed(pool).await?;
     let quiesced_at: String = sqlx::query_scalar(
         "SELECT to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
-           FROM openmettle.backup_mark_quiesced($1::uuid, $2)",
+           FROM openmettle.backup_mark_quiesced($1::uuid, $2::timestamptz, $3)",
     )
     .bind(run_id)
+    .bind(snapshot_quiesced_at)
     .bind(lease_seconds)
     .fetch_one(&mut *tx)
     .await?;
@@ -1944,6 +2286,7 @@ pub struct CaptureOptions {
     pub lease_seconds: i32,
     pub require_separate_device: bool,
     pub graphiti_mode: GraphitiMode,
+    pub chroma_mode: ChromaMode,
     pub config_files: Vec<(String, PathBuf)>,
     pub prune_policy: Option<GfsPolicy>,
     pub release_on_success: bool,
@@ -2341,13 +2684,17 @@ pub async fn capture_with_runner(
     opts: &CaptureOptions,
     pg_dump: Arc<dyn PgDumpRunner>,
 ) -> Result<CaptureReport, BackupError> {
-    // 1. Validate arguments, database URL allow-list + SQLx parity, and destination isolation
+    // 1. Validate arguments, database URL allow-list + SQLx/TLS parity, and destination isolation
     //    BEFORE touching the database maintenance window or external source files.
     runs::uuid(&opts.operator_id)
         .map_err(|_| BackupError::Invalid("invalid --operator-id UUID"))?;
     validate_destination_domain(&opts.destination_domain)?;
+    if let ChromaMode::QualifiedRebuild { qualification_ref } = &opts.chroma_mode {
+        validate_chroma_qualification_ref(qualification_ref)?;
+    }
     let validated_pg = parse_validated_pg_uri(&opts.database_url)?;
     let _ = validated_pg.to_sqlx_options()?;
+    verify_pg_tls_preflight(&validated_pg).await?;
     if !(30..=3600).contains(&opts.lease_seconds) {
         return Err(BackupError::Invalid(
             "lease seconds must be between 30 and 3600",
@@ -2365,19 +2712,29 @@ pub async fn capture_with_runner(
     )?;
 
     // 2. Check for an existing `publishing` or `succeeded` run for this exact request_key BEFORE
-    //    opening `--neo4j-dump` or reading `--config-file`, so retrying an interrupted publication
-    //    works even after source files have moved or changed.
+    //    opening `--neo4j-dump`, `--chroma-archive`, or `--config-file`, so retrying an
+    //    interrupted publication works even after source files have moved or changed.
     if let Some(report) =
         try_finalize_staged_or_succeeded_retry(pool, keyring, opts, &dest_root).await?
     {
         return Ok(report);
     }
 
-    // 3. Validate non-secret config files and optional Neo4j dump BEFORE entering maintenance.
+    // 3. Validate non-secret config files and optional external archives BEFORE entering
+    //    maintenance.
     let bundled_configs = load_non_secret_config_files(&opts.config_files, keyring.paths())?;
     let opened_neo4j = match &opts.graphiti_mode {
         GraphitiMode::NotProvisioned => None,
-        GraphitiMode::OfflineDump(neo4j_path) => Some(OpenedNeo4jDump::open(neo4j_path)?),
+        GraphitiMode::OfflineDump(neo4j_path) => {
+            Some(OpenedExternalFile::open(neo4j_path, &NEO4J_DUMP_ERRORS)?)
+        }
+    };
+    let opened_chroma = match &opts.chroma_mode {
+        ChromaMode::Archive(chroma_path) => Some(OpenedExternalFile::open(
+            chroma_path,
+            &CHROMA_ARCHIVE_ERRORS,
+        )?),
+        ChromaMode::NotProvisioned | ChromaMode::QualifiedRebuild { .. } => None,
     };
 
     // 4. Enter maintenance (or inherit an existing maintenance window) and allocate a leased
@@ -2403,6 +2760,7 @@ pub async fn capture_with_runner(
         &started,
         bundled_configs,
         opened_neo4j,
+        opened_chroma,
     )
     .await;
 
@@ -2440,6 +2798,43 @@ fn is_statement_timeout(err: &sqlx::Error) -> bool {
     )
 }
 
+async fn encrypt_external_file(
+    mut opened: OpenedExternalFile,
+    out_path: PathBuf,
+    role: &'static str,
+    keyring: &BackupKeyRing,
+    run_id: &str,
+    lease_lost: &AtomicBool,
+) -> Result<EncryptedStats, CaptureFailure> {
+    let keyring_bg = keyring.clone();
+    let run_id_bg = run_id.to_owned();
+    run_blocking_with_lease_check(lease_lost, move |cancel| {
+        opened.file.seek(SeekFrom::Start(0))?;
+        let mut out = open_new_file_0600(&out_path)?;
+        let mut enc = StreamEncryptor::start(&keyring_bg, &run_id_bg, role, &mut out)?;
+        let mut buf = vec![0u8; crypto::CHUNK_SIZE];
+        {
+            let mut guarded = CancelCheckingWriter {
+                inner: &mut enc,
+                cancel,
+            };
+            loop {
+                let n = opened.file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                guarded.write_all(&buf[..n])?;
+            }
+        }
+        let stats = enc.finish()?;
+        out.sync_all()?;
+        opened.verify_unchanged(stats.plaintext_bytes)?;
+        Ok(stats)
+    })
+    .await
+    .map_err(CaptureFailure::BeforeCommit)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn capture_body(
     pool: &PgPool,
@@ -2450,7 +2845,8 @@ async fn capture_body(
     staging_dir: &Path,
     started: &StartedCapture,
     bundled_configs: Vec<BundledConfigFile>,
-    opened_neo4j: Option<OpenedNeo4jDump>,
+    opened_neo4j: Option<OpenedExternalFile>,
+    opened_chroma: Option<OpenedExternalFile>,
 ) -> Result<CaptureReport, CaptureFailure> {
     let run_id = &started.run_id;
     let installation_id = &started.installation_id;
@@ -2464,7 +2860,7 @@ async fn capture_body(
     let deadline = Instant::now() + opts.drain_timeout;
     let tokio_deadline = tokio::time::Instant::from_std(deadline);
     let mut last_counts = DrainCounts::default();
-    let (mut snap_tx, snapshot_id, pinned_volume_id) = loop {
+    let (mut snap_tx, snapshot_id, snapshot_ts, pinned_volume_id) = loop {
         if heartbeat.is_lost() {
             return Err(CaptureFailure::BeforeCommit(BackupError::GateNotReady(
                 "backup capture lease lost during drain",
@@ -2495,7 +2891,7 @@ async fn capture_body(
             .max(1);
         let timeout_arg = format!("{remaining_ms}ms");
 
-        let (mut tx, snap_id) = match tokio::time::timeout_at(tokio_deadline, async {
+        let (mut tx, snap_id, snap_ts) = match tokio::time::timeout_at(tokio_deadline, async {
             let mut tx = pool.begin().await?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *tx)
@@ -2513,10 +2909,16 @@ async fn capture_body(
                 .bind(&timeout_arg)
                 .execute(&mut *tx)
                 .await?;
-            let snap_id: String = sqlx::query_scalar("SELECT pg_catalog.pg_export_snapshot()")
-                .fetch_one(&mut *tx)
-                .await?;
-            Ok::<_, sqlx::Error>((tx, snap_id))
+            let (snap_id, snap_ts): (String, String) = sqlx::query_as(
+                "SELECT pg_catalog.pg_export_snapshot(),
+                        to_char(
+                            pg_catalog.transaction_timestamp() AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                        )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            Ok::<_, sqlx::Error>((tx, snap_id, snap_ts))
         })
         .await
         {
@@ -2731,7 +3133,7 @@ async fn capture_body(
             .await
             .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
 
-        break (tx, snap_id, vol_id);
+        break (tx, snap_id, snap_ts, vol_id);
     };
 
     // 6. Verify accounting and filesystem drift inside the exact exported snapshot BEFORE marking
@@ -2797,7 +3199,7 @@ async fn capture_body(
         .await
         .map_err(CaptureFailure::BeforeCommit)?;
 
-    let quiesced_at = mark_quiesced(pool, run_id, opts.lease_seconds)
+    let quiesced_at = mark_quiesced(pool, run_id, &snapshot_ts, opts.lease_seconds)
         .await
         .map_err(CaptureFailure::BeforeCommit)?;
 
@@ -2950,40 +3352,21 @@ async fn capture_body(
         .await
         .map_err(|e| CaptureFailure::BeforeCommit(e.into()))?;
 
-    // 7e. Optional Graphiti / Neo4j offline dump (`neo4j.dump.enc`) from the preflight-opened
-    //     descriptor, verified unchanged across encryption.
+    // 7e. Optional Graphiti / Neo4j offline dump (`neo4j.dump.enc`) and optional Chroma archive
+    //     (`chroma.archive.enc`) from preflight-opened descriptors, verified unchanged across
+    //     encryption.
     let graphiti_manifest = match opened_neo4j {
         None => GraphitiManifest::NotProvisioned,
-        Some(mut neo4j) => {
-            let neo4j_out_path = staging_dir.join("neo4j.dump.enc");
-            let keyring_bg = keyring.clone();
-            let run_id_bg = run_id.clone();
-            let stats = run_blocking_with_lease_check(&lease_lost, move |cancel| {
-                neo4j.file.seek(SeekFrom::Start(0))?;
-                let mut out = open_new_file_0600(&neo4j_out_path)?;
-                let mut enc =
-                    StreamEncryptor::start(&keyring_bg, &run_id_bg, "neo4j_dump", &mut out)?;
-                let mut buf = vec![0u8; crypto::CHUNK_SIZE];
-                {
-                    let mut guarded = CancelCheckingWriter {
-                        inner: &mut enc,
-                        cancel,
-                    };
-                    loop {
-                        let n = neo4j.file.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        guarded.write_all(&buf[..n])?;
-                    }
-                }
-                let stats = enc.finish()?;
-                out.sync_all()?;
-                neo4j.verify_unchanged(stats.plaintext_bytes)?;
-                Ok(stats)
-            })
-            .await
-            .map_err(CaptureFailure::BeforeCommit)?;
+        Some(neo4j) => {
+            let stats = encrypt_external_file(
+                neo4j,
+                staging_dir.join("neo4j.dump.enc"),
+                "neo4j_dump",
+                keyring,
+                run_id,
+                &lease_lost,
+            )
+            .await?;
             let comp = component_manifest("neo4j_dump", &stats);
             let gm = GraphitiManifest::OfflineDump {
                 component: "neo4j.dump.enc".to_owned(),
@@ -2994,6 +3377,39 @@ async fn capture_body(
             gm
         }
     };
+    let chroma_manifest = match (&opts.chroma_mode, opened_chroma) {
+        (ChromaMode::NotProvisioned, None) => ChromaManifest::NotProvisioned,
+        (ChromaMode::Archive(_), Some(chroma)) => {
+            let stats = encrypt_external_file(
+                chroma,
+                staging_dir.join("chroma.archive.enc"),
+                "chroma_archive",
+                keyring,
+                run_id,
+                &lease_lost,
+            )
+            .await?;
+            let comp = component_manifest("chroma_archive", &stats);
+            let cm = ChromaManifest::Archive {
+                component: "chroma.archive.enc".to_owned(),
+                plaintext_bytes: comp.plaintext_bytes,
+                plaintext_sha256: comp.plaintext_sha256.clone(),
+            };
+            components.insert("chroma.archive.enc".to_owned(), comp);
+            cm
+        }
+        (ChromaMode::QualifiedRebuild { qualification_ref }, None) => {
+            ChromaManifest::QualifiedRebuild {
+                qualification_ref: qualification_ref.clone(),
+            }
+        }
+        _ => {
+            return Err(CaptureFailure::BeforeCommit(BackupError::Invalid(
+                "inconsistent chroma backup mode state",
+            )));
+        }
+    };
+    let rebuildable_indexes = rebuildable_indexes_for(&chroma_manifest);
 
     // 7f. Non-secret config files + required vault key-ID inventory (`config.json.enc`).
     let config_bundle = ConfigBundle {
@@ -3071,10 +3487,8 @@ async fn capture_body(
         vault_required_key_ids: vault_required_key_ids.clone(),
         gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
         graphiti_neo4j: graphiti_manifest,
-        rebuildable_indexes: REBUILDABLE_INDEXES
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect(),
+        chroma: chroma_manifest,
+        rebuildable_indexes: rebuildable_indexes.clone(),
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|_| {
         CaptureFailure::BeforeCommit(BackupError::Integrity("manifest serialization failed"))
@@ -3141,7 +3555,7 @@ async fn capture_body(
         "artifact_revision_count": artifact_summary.revision_count,
         "artifact_payload_bytes": artifact_summary.payload_bytes,
         "vault_required_key_ids": vault_required_key_ids,
-        "rebuildable_indexes": REBUILDABLE_INDEXES,
+        "rebuildable_indexes": rebuildable_indexes,
         "backup_dir_name": final_dir_name,
     });
     let summary_text = summary_json.to_string();
@@ -3344,6 +3758,7 @@ pub struct UnpackReport {
     pub artifact_summary: ArtifactArchiveSummary,
     pub config_files_written: usize,
     pub has_neo4j_dump: bool,
+    pub has_chroma_archive: bool,
 }
 
 /// Decrypt, verify, and unpack a backup set into a new `0700` `output_dir` (`0600` files),
@@ -3481,6 +3896,12 @@ pub fn unpack_backup(
         } else {
             false
         };
+        let has_chroma_archive = if manifest.components.contains_key("chroma.archive.enc") {
+            decrypt_to_file("chroma.archive.enc", "chroma.archive")?;
+            true
+        } else {
+            false
+        };
 
         let manifest_json = serde_json::to_vec_pretty(&manifest)
             .map_err(|_| BackupError::Integrity("manifest JSON encode failed"))?;
@@ -3494,6 +3915,7 @@ pub fn unpack_backup(
             artifact_summary,
             config_files_written: config_bundle.files.len(),
             has_neo4j_dump,
+            has_chroma_archive,
         })
     })();
 
@@ -3563,6 +3985,78 @@ fn decrypt_and_validate_manifest_file(
                 "manifest missing required backup component",
             ));
         }
+    }
+    match &manifest.graphiti_neo4j {
+        GraphitiManifest::NotProvisioned => {
+            if manifest.components.contains_key("neo4j.dump.enc") {
+                return Err(BackupError::Integrity(
+                    "manifest declares graphiti_neo4j not_provisioned but includes neo4j.dump.enc",
+                ));
+            }
+        }
+        GraphitiManifest::OfflineDump {
+            component,
+            plaintext_bytes,
+            plaintext_sha256,
+        } => {
+            let Some(comp) = manifest.components.get("neo4j.dump.enc") else {
+                return Err(BackupError::Integrity(
+                    "manifest declares graphiti offline_dump without neo4j.dump.enc component",
+                ));
+            };
+            if component != "neo4j.dump.enc"
+                || comp.role != "neo4j_dump"
+                || comp.plaintext_bytes != *plaintext_bytes
+                || &comp.plaintext_sha256 != plaintext_sha256
+            {
+                return Err(BackupError::Integrity(
+                    "manifest graphiti_neo4j metadata disagrees with neo4j.dump.enc component",
+                ));
+            }
+        }
+    }
+    match &manifest.chroma {
+        ChromaManifest::NotProvisioned => {
+            if manifest.components.contains_key("chroma.archive.enc") {
+                return Err(BackupError::Integrity(
+                    "manifest declares chroma not_provisioned but includes chroma.archive.enc",
+                ));
+            }
+        }
+        ChromaManifest::Archive {
+            component,
+            plaintext_bytes,
+            plaintext_sha256,
+        } => {
+            let Some(comp) = manifest.components.get("chroma.archive.enc") else {
+                return Err(BackupError::Integrity(
+                    "manifest declares chroma archive without chroma.archive.enc component",
+                ));
+            };
+            if component != "chroma.archive.enc"
+                || comp.role != "chroma_archive"
+                || comp.plaintext_bytes != *plaintext_bytes
+                || &comp.plaintext_sha256 != plaintext_sha256
+            {
+                return Err(BackupError::Integrity(
+                    "manifest chroma metadata disagrees with chroma.archive.enc component",
+                ));
+            }
+        }
+        ChromaManifest::QualifiedRebuild { qualification_ref } => {
+            if manifest.components.contains_key("chroma.archive.enc")
+                || validate_chroma_qualification_ref(qualification_ref).is_err()
+            {
+                return Err(BackupError::Integrity(
+                    "manifest chroma qualified_rebuild metadata is invalid",
+                ));
+            }
+        }
+    }
+    if manifest.rebuildable_indexes != rebuildable_indexes_for(&manifest.chroma) {
+        return Err(BackupError::Integrity(
+            "manifest rebuildable_indexes disagrees with chroma disposition",
+        ));
     }
     let expected_pre_bundle = hex(&compute_bundle_digest(&manifest.components, ""));
     if manifest.bundle_digest != expected_pre_bundle {
@@ -3761,6 +4255,14 @@ mod tests {
             "postgres://u:p@127.0.0.1:5432/db?sslmode=require&sslrootcert=/etc/ca.pem",
             "postgres://u:p@127.0.0.1:5432/db?sslmode=verify-ca",
             "postgres://u:p@127.0.0.1:5432/db?sslmode=verify-full",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=verify-full&sslrootcert=relative/ca.pem",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=verify-full&sslrootcert=/etc/ca.pem&sslcert=/etc/c.pem",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=verify-full&sslrootcert=/etc/ca.pem&sslkey=/etc/c.key",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=require&sslcert=/etc/c.pem",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=require&sslcert=rel.pem&sslkey=/etc/c.key",
+            "postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?sslmode=require",
+            "postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?sslmode=verify-ca&sslrootcert=/etc/ca.pem",
+            "postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db?sslmode=verify-full&sslrootcert=/etc/ca.pem",
             "postgres://u:p@127.0.0.1:5432/db?channel_binding=require",
             "postgres://u:p@127.0.0.1:5432/db?options=-c%20search_path=public",
             "postgres://u:p@host1:5432,host2:5432/db",
@@ -4277,10 +4779,8 @@ mod tests {
             vault_required_key_ids: Vec::new(),
             gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
             graphiti_neo4j: GraphitiManifest::NotProvisioned,
-            rebuildable_indexes: REBUILDABLE_INDEXES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
+            chroma: ChromaManifest::NotProvisioned,
+            rebuildable_indexes: rebuildable_indexes_for(&ChromaManifest::NotProvisioned),
         };
         let manifest_stats = encrypt_bytes_to_file(
             &keyring,
@@ -4333,6 +4833,389 @@ mod tests {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             assert!(!name.ends_with(".tmp"), "stray tmp in final_dir: {name}");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_pg_dump_runner_isolates_home_libpq_defaults_when_optional_fields_omitted() {
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-pgenv-home-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-pg-dump.sh");
+        let observed = dir.join("observed.txt");
+        let body = format!(
+            "#!/bin/sh\nset -eu\n\
+             printf 'PGPASSFILE=%s\\n' \"${{PGPASSFILE:-}}\" > \"{}\"\n\
+             printf 'PGSSLROOTCERT=%s\\n' \"${{PGSSLROOTCERT:-}}\" >> \"{}\"\n\
+             printf 'PGSSLCERT=%s\\n' \"${{PGSSLCERT:-}}\" >> \"{}\"\n\
+             printf 'PGSSLKEY=%s\\n' \"${{PGSSLKEY:-}}\" >> \"{}\"\n\
+             printf 'PGSSLCRL=%s\\n' \"${{PGSSLCRL:-}}\" >> \"{}\"\n\
+             printf 'PGSSLCRLDIR=%s\\n' \"${{PGSSLCRLDIR:-}}\" >> \"{}\"\n\
+             printf 'PGSERVICEFILE=%s\\n' \"${{PGSERVICEFILE:-}}\" >> \"{}\"\n\
+             printf 'OK'\n",
+            observed.display(),
+            observed.display(),
+            observed.display(),
+            observed.display(),
+            observed.display(),
+            observed.display(),
+            observed.display(),
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runner = CliPgDumpRunner::with_program(&script);
+        let mut out = Vec::new();
+        runner
+            .dump(
+                "postgres://openmettle_owner@db.example.test:5432/openmettle?sslmode=require",
+                None,
+                &DumpCancel::new(),
+                &mut out,
+            )
+            .unwrap();
+        let obs = fs::read_to_string(&observed).unwrap();
+        let mut parent_dirs = BTreeSet::new();
+        for key in [
+            "PGPASSFILE",
+            "PGSSLROOTCERT",
+            "PGSSLCERT",
+            "PGSSLKEY",
+            "PGSSLCRL",
+            "PGSSLCRLDIR",
+            "PGSERVICEFILE",
+        ] {
+            let val = obs
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .unwrap_or("");
+            assert!(
+                !val.is_empty(),
+                "{key} must be explicitly pinned to isolate libpq from $HOME defaults: {obs}"
+            );
+            assert!(
+                !Path::new(val).exists(),
+                "{key} path must not exist after dump: {val}"
+            );
+            parent_dirs.insert(Path::new(val).parent().unwrap().to_path_buf());
+        }
+        assert_eq!(parent_dirs.len(), 1);
+        assert!(
+            !parent_dirs.into_iter().next().unwrap().exists(),
+            "ephemeral pg env directory must be removed on drop"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chroma_qualification_ref_and_rebuildable_indexes_enforce_gate() {
+        assert!(validate_chroma_qualification_ref("ADR-0046-chroma-rebuild-2026-11").is_ok());
+        assert!(validate_chroma_qualification_ref("").is_err());
+        assert!(validate_chroma_qualification_ref(" leading").is_err());
+        assert!(validate_chroma_qualification_ref("bad\nref").is_err());
+        assert!(validate_chroma_qualification_ref(&"a".repeat(257)).is_err());
+
+        let not_prov = rebuildable_indexes_for(&ChromaManifest::NotProvisioned);
+        assert!(!not_prov.iter().any(|s| s == CHROMA_REBUILDABLE_INDEX));
+        let archived = rebuildable_indexes_for(&ChromaManifest::Archive {
+            component: "chroma.archive.enc".to_owned(),
+            plaintext_bytes: 12,
+            plaintext_sha256: "a".repeat(64),
+        });
+        assert!(!archived.iter().any(|s| s == CHROMA_REBUILDABLE_INDEX));
+        let qualified = rebuildable_indexes_for(&ChromaManifest::QualifiedRebuild {
+            qualification_ref: "qual-ref-1".to_owned(),
+        });
+        assert!(qualified.iter().any(|s| s == CHROMA_REBUILDABLE_INDEX));
+    }
+
+    #[tokio::test]
+    async fn verify_pg_tls_preflight_enforces_strict_sslrootcert_hostname_expiry_and_mtls() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use tokio::net::TcpListener;
+
+        fn pem_block(label: &str, der: &[u8]) -> Vec<u8> {
+            let body = STANDARD.encode(der);
+            let mut out = format!("-----BEGIN {label}-----\n");
+            for line in body.as_bytes().chunks(64) {
+                out.push_str(std::str::from_utf8(line).unwrap());
+                out.push('\n');
+            }
+            out.push_str(&format!("-----END {label}-----\n"));
+            out.into_bytes()
+        }
+
+        fn make_ca(
+            cn: &str,
+        ) -> (
+            rcgen::Issuer<'static, rcgen::KeyPair>,
+            CertificateDer<'static>,
+        ) {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, cn);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::DigitalSignature,
+            ];
+            let der = params.self_signed(&key).unwrap().der().clone();
+            (rcgen::Issuer::new(params, key), der)
+        }
+
+        fn make_leaf(
+            issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+            ca_der: &CertificateDer<'static>,
+            san: &str,
+            eku: rcgen::ExtendedKeyUsagePurpose,
+            expired: bool,
+        ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![san.to_owned()]).unwrap();
+            params.extended_key_usages = vec![eku];
+            if expired {
+                params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+                params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+            }
+            let cert = params.signed_by(&key, issuer).unwrap();
+            (
+                vec![cert.der().clone(), ca_der.clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+        }
+
+        async fn spawn_pg_tls_stub(
+            server_config: Option<Arc<rustls::ServerConfig>>,
+        ) -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = tokio::spawn(async move {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = [0u8; 8];
+                if read_exact_tcp(&tcp, &mut req).await.is_err() || req != PG_SSL_REQUEST {
+                    return;
+                }
+                match server_config {
+                    None => {
+                        let _ = write_all_tcp(&tcp, b"N").await;
+                    }
+                    Some(cfg) => {
+                        if write_all_tcp(&tcp, b"S").await.is_err() {
+                            return;
+                        }
+                        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                        let _ = acceptor.accept(tcp).await;
+                    }
+                }
+            });
+            (port, handle)
+        }
+
+        let mut rnd = [0u8; 4];
+        SystemRandom::new().fill(&mut rnd).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "om-tls-preflight-{}-{:02x}{:02x}{:02x}{:02x}",
+            std::process::id(),
+            rnd[0],
+            rnd[1],
+            rnd[2],
+            rnd[3],
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        create_dir_0700(&dir).unwrap();
+
+        let (ca_server, ca_server_der) = make_ca("OpenMettle Test PG Server CA");
+        let (ca_other, ca_other_der) = make_ca("OpenMettle Test Unrelated CA");
+        let ca_server_path = dir.join("ca-server.pem");
+        let ca_other_path = dir.join("ca-other.pem");
+        write_file_0600(
+            &ca_server_path,
+            &pem_block("CERTIFICATE", ca_server_der.as_ref()),
+        )
+        .unwrap();
+        write_file_0600(
+            &ca_other_path,
+            &pem_block("CERTIFICATE", ca_other_der.as_ref()),
+        )
+        .unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let build_server =
+            |chain: Vec<CertificateDer<'static>>,
+             key: PrivateKeyDer<'static>,
+             require_client_ca: Option<CertificateDer<'static>>| {
+                let b = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                    .with_safe_default_protocol_versions()
+                    .unwrap();
+                let cfg = match require_client_ca {
+                    None => b
+                        .with_no_client_auth()
+                        .with_single_cert(chain, key)
+                        .unwrap(),
+                    Some(client_ca) => {
+                        let mut roots = RootCertStore::empty();
+                        roots.add(client_ca).unwrap();
+                        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                            Arc::new(roots),
+                            Arc::clone(&provider),
+                        )
+                        .build()
+                        .unwrap();
+                        b.with_client_cert_verifier(verifier)
+                            .with_single_cert(chain, key)
+                            .unwrap()
+                    }
+                };
+                Arc::new(cfg)
+            };
+
+        // 1. verify-full succeeds with matching 127.0.0.1 IP SAN and ca_server.
+        let (chain_ip, key_ip) = make_leaf(
+            &ca_server,
+            &ca_server_der,
+            "127.0.0.1",
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            false,
+        );
+        let (port, h) = spawn_pg_tls_stub(Some(build_server(chain_ip, key_ip, None))).await;
+        let cfg = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-full&sslrootcert={}",
+            ca_server_path.display()
+        ))
+        .unwrap();
+        verify_pg_tls_preflight(&cfg).await.unwrap();
+        let _ = h.await;
+
+        // 2. verify-full rejects mismatched SAN (`other.example.test`), while verify-ca accepts it.
+        let (chain_other_san, key_other_san) = make_leaf(
+            &ca_server,
+            &ca_server_der,
+            "other.example.test",
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            false,
+        );
+        let srv_other_san = build_server(chain_other_san, key_other_san, None);
+        let (port, h) = spawn_pg_tls_stub(Some(Arc::clone(&srv_other_san))).await;
+        let cfg_full = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-full&sslrootcert={}",
+            ca_server_path.display()
+        ))
+        .unwrap();
+        assert!(verify_pg_tls_preflight(&cfg_full).await.is_err());
+        let _ = h.await;
+
+        let (port, h) = spawn_pg_tls_stub(Some(srv_other_san)).await;
+        let cfg_ca = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-ca&sslrootcert={}",
+            ca_server_path.display()
+        ))
+        .unwrap();
+        verify_pg_tls_preflight(&cfg_ca).await.unwrap();
+        let _ = h.await;
+
+        // 3. verify-ca still rejects expired certificates even from the trusted CA.
+        let (chain_exp, key_exp) = make_leaf(
+            &ca_server,
+            &ca_server_der,
+            "other.example.test",
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            true,
+        );
+        let (port, h) = spawn_pg_tls_stub(Some(build_server(chain_exp, key_exp, None))).await;
+        let cfg_exp = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-ca&sslrootcert={}",
+            ca_server_path.display()
+        ))
+        .unwrap();
+        assert!(verify_pg_tls_preflight(&cfg_exp).await.is_err());
+        let _ = h.await;
+
+        // 4. Both verify-ca and verify-full reject a server signed by ca_server when sslrootcert
+        //    only trusts ca_other.
+        let (chain_ip2, key_ip2) = make_leaf(
+            &ca_server,
+            &ca_server_der,
+            "127.0.0.1",
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            false,
+        );
+        let (port, h) = spawn_pg_tls_stub(Some(build_server(chain_ip2, key_ip2, None))).await;
+        let cfg_wrong_ca = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-ca&sslrootcert={}",
+            ca_other_path.display()
+        ))
+        .unwrap();
+        assert!(verify_pg_tls_preflight(&cfg_wrong_ca).await.is_err());
+        let _ = h.await;
+
+        // 5. Server declining SSL (`N`) fails preflight.
+        let (port, h) = spawn_pg_tls_stub(None).await;
+        let cfg_decline = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-ca&sslrootcert={}",
+            ca_server_path.display()
+        ))
+        .unwrap();
+        assert!(verify_pg_tls_preflight(&cfg_decline).await.is_err());
+        let _ = h.await;
+
+        // 6. Mutual TLS (`sslcert` + `sslkey`) succeeds against a server requiring a client cert.
+        let (chain_mtls, key_mtls) = make_leaf(
+            &ca_server,
+            &ca_server_der,
+            "127.0.0.1",
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            false,
+        );
+        let (client_chain, client_key) = make_leaf(
+            &ca_other,
+            &ca_other_der,
+            "openmettle_owner",
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            false,
+        );
+        let client_cert_path = dir.join("client.pem");
+        let client_key_path = dir.join("client.key");
+        let mut client_pem = Vec::new();
+        for c in &client_chain {
+            client_pem.extend_from_slice(&pem_block("CERTIFICATE", c.as_ref()));
+        }
+        write_file_0600(&client_cert_path, &client_pem).unwrap();
+        write_file_0600(
+            &client_key_path,
+            &pem_block("PRIVATE KEY", client_key.secret_der()),
+        )
+        .unwrap();
+        let (port, h) = spawn_pg_tls_stub(Some(build_server(
+            chain_mtls,
+            key_mtls,
+            Some(ca_other_der.clone()),
+        )))
+        .await;
+        let cfg_mtls = parse_validated_pg_uri(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=verify-full&sslrootcert={}&sslcert={}&sslkey={}",
+            ca_server_path.display(),
+            client_cert_path.display(),
+            client_key_path.display(),
+        ))
+        .unwrap();
+        verify_pg_tls_preflight(&cfg_mtls).await.unwrap();
+        let _ = h.await;
 
         let _ = fs::remove_dir_all(&dir);
     }

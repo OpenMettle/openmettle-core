@@ -50,6 +50,7 @@ openmettle-admin backup capture \
   --drain-timeout-secs 300 \
   --require-separate-device \
   --graphiti-mode not-provisioned \
+  --chroma-mode not-provisioned \
   --config-file catalog.json=/etc/openmettle/catalog/catalog.json \
   --config-file inference.json=/etc/openmettle/worker/inference.json \
   --keep-daily 7 \
@@ -60,13 +61,13 @@ openmettle-admin backup capture \
 
 What happens during capture:
 
-1. **Pre-flight validation:** Validates destination isolation, non-secret config files (refusing PEM private keys, secret JSON keys, or keyring/vault paths), and optional `--neo4j-dump` before closing admission.
+1. **Pre-flight validation:** Validates database URI allow-list + strict `sslrootcert`-only TLS preflight (for `verify-ca` / `verify-full`, isolating `pg_dump` from ambient `$HOME/.postgresql/*` defaults), destination isolation, non-secret config files (refusing PEM private keys, secret JSON keys, or keyring/vault paths), optional `--neo4j-dump`, and Chroma disposition (`--chroma-mode`) before closing admission.
 2. **Admission closes (`maintenance_active = true`):** `openmettle-api` answers `503 unavailable` on mutating `/v1` routes and session issuance while keeping `/healthz`, `/readyz`, `/v1` reads, and settlement of already-started uploads/runs/gateway reports open. `openmettle-worker` stops claiming runs and skips `purge_due`.
-3. **Drain & drift verification:** Polls until active runs, open reservations, active purges, unsettled gateway requests, active external-connection refreshes, and unconfirmed capacity grants all hit `0`, confirms `restore_reconciliation_gate.open = true` and zero adoption/rebind barrier, and runs `verify_accounting_drift()`.
-4. **Encrypted capture, staged publication & atomic publish:** Streams `pg.dump.enc`, `gateway-entitlements.json.enc`, `deletion-journal.bin.enc`, `artifacts.bin.enc` (POSIX `OMART01` archive verified live by SHA-256), optional `neo4j.dump.enc`, `config.json.enc`, and `manifest.json.enc` (AEAD `OMBKUP01`) into `.staging.<run_id>`, `fsync`s both `.staging.<run_id>` and the destination root, stages publication in PostgreSQL (`backup_runs.state = 'publishing'`), atomically writes non-secret `backup-meta.json` (via `backup-meta.json.tmp` + `fsync` + rename), renames `.staging.<run_id>` to `backup-<YYYYMMDDTHHMMSSZ>-<run_id>`, `fsync`s the destination root, and confirms `backup_runs.state = 'succeeded'`. Only `succeeded` runs increment the `succeeded` metric and reset the 24h RPO clock.
+3. **Drain & drift verification:** Polls until active runs, open reservations, active purges, unsettled gateway requests, active external-connection refreshes, and unconfirmed capacity grants all hit `0`, opens a single exported `REPEATABLE READ` snapshot (recording its `transaction_timestamp()` as `quiesced_at`), confirms `restore_reconciliation_gate.open = true` and zero adoption/rebind barrier, and runs `verify_accounting_drift()`.
+4. **Encrypted capture, staged publication & atomic publish:** Streams `pg.dump.enc`, `gateway-entitlements.json.enc`, `deletion-journal.bin.enc`, `artifacts.bin.enc` (POSIX `OMART01` archive verified live by SHA-256), optional `neo4j.dump.enc`, optional `chroma.archive.enc`, `config.json.enc`, and `manifest.json.enc` (AEAD `OMBKUP01`) into `.staging.<run_id>`, `fsync`s both `.staging.<run_id>` and the destination root, stages publication in PostgreSQL (`backup_runs.state = 'publishing'`), atomically publishes non-secret `backup-meta.json` (via a CSPRNG-unique exclusive `0600` temp file in the destination root + `sync_all()` + rename into `.staging.<run_id>/backup-meta.json`), renames `.staging.<run_id>` to `backup-<YYYYMMDDTHHMMSSZ>-<run_id>`, verifies and `fsync`s `backup-meta.json`, the published directory, and the destination root, and confirms `backup_runs.state = 'succeeded'`. Only `succeeded` runs increment the `succeeded` metric and reset the 24h RPO clock (anchored to `quiesced_at`).
 5. **GFS pruning & release:** Applies `7 daily, 4 weekly, 3 monthly` pruning (always keeping the newest completed set and ignoring foreign/incomplete directories), then releases `maintenance_active` when `--release-on-success` is set.
 
-### Optional Graphiti / Neo4j offline dump
+### Optional Graphiti / Neo4j and Chroma dispositions
 
 When Graphiti/Neo4j is provisioned, stop Neo4j during the maintenance window, produce a consistent offline dump (`neo4j-admin database dump`), and pass:
 
@@ -74,7 +75,25 @@ When Graphiti/Neo4j is provisioned, stop Neo4j during the maintenance window, pr
 --graphiti-mode offline-dump --neo4j-dump /var/backups/neo4j/graphiti.dump
 ```
 
-When Graphiti/Neo4j is not provisioned, keep `--graphiti-mode not-provisioned` (the default). The manifest records the mode explicitly.
+When Graphiti/Neo4j is not provisioned, keep `--graphiti-mode not-provisioned` (the default).
+
+Chroma vector embeddings are **never** assumed rebuildable without explicit qualification. Choose one of three explicit modes:
+
+- **Not provisioned (default):** `--chroma-mode not-provisioned` (records `chroma.mode = "not_provisioned"` and excludes `chroma_vector_embeddings` from `rebuildable_indexes`).
+- **Offline archive included in backup:** Stop Chroma during the maintenance window, archive its persistent directory into a regular file, and pass:
+
+  ```sh
+  --chroma-mode archive --chroma-archive /var/backups/chroma/chroma.tar
+  ```
+
+  This encrypts the archive as `chroma.archive.enc` and unpacks it to `chroma.archive`.
+- **Qualified post-restore rebuild:** Only after qualifying a complete, deterministic re-embedding/rebuild procedure against PostgreSQL + artifact storage, pass:
+
+  ```sh
+  --chroma-mode qualified-rebuild --chroma-qualification-ref "<QUALIFICATION_TICKET_OR_REPORT_ID>"
+  ```
+
+  This records the qualification reference in `manifest.json` and adds `chroma_vector_embeddings` to `rebuildable_indexes`.
 
 ### Verifying and pruning backups offline
 
@@ -149,13 +168,19 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
      --backup-keys-config /etc/openmettle/backup-keys/keyring.json
    ```
 
-   This verifies every AEAD tag and digest and writes `pg.dump`, `gateway-entitlements.json`, `deletion-journal.bin`, `artifacts/` (with `revisions/`, `staging/`, and `.openmettle-volume-id` sentinels), `config/` (including `vault-key-inventory.json`), optional `neo4j.dump`, and plaintext `manifest.json`.
+   This verifies every AEAD tag and digest and writes `pg.dump`, `gateway-entitlements.json`, `deletion-journal.bin`, `artifacts/` (with `revisions/`, `staging/`, and `.openmettle-volume-id` sentinels), `config/` (including `vault-key-inventory.json`), optional `neo4j.dump`, optional `chroma.archive`, and plaintext `manifest.json`.
 
-2. **Restore PostgreSQL 18 into a freshly provisioned `openmettle_owner` database** (with `REVOKE ALL ON SCHEMA public FROM PUBLIC`, `REVOKE ALL ON DATABASE <db> FROM PUBLIC`, and `GRANT CONNECT` to the bounded runtime roles matching [Schema migrations](../../README.md#schema-migrations)):
+2. **Restore PostgreSQL 18 into a freshly provisioned `openmettle_owner` database** (with `REVOKE ALL ON SCHEMA public FROM PUBLIC`, `REVOKE ALL ON DATABASE <db> FROM PUBLIC`, and `GRANT CONNECT` to the bounded runtime roles matching [Schema migrations](../../README.md#schema-migrations)). Never pass a password-bearing database URL on the `pg_restore` command line (process arguments are visible via `ps` / `/proc/<pid>/cmdline`); supply credentials through an owner-only `0600` `PGPASSFILE` and explicit password-free connection flags:
 
    ```sh
+   PGPASSFILE=/run/secrets/openmettle-owner.pgpass \
+   PGSSLMODE=verify-full \
+   PGSSLROOTCERT=/etc/openmettle/pg-ca.pem \
    pg_restore --no-owner --exit-on-error \
-     --dbname="$OPENMETTLE_ADMIN_DATABASE_URL" \
+     --host="$PGHOST" \
+     --port="${PGPORT:-5432}" \
+     --username=openmettle_owner \
+     --dbname="$PGDATABASE" \
      /var/restore/openmettle-recovery/pg.dump
    openmettle-migrate
    ```
@@ -192,7 +217,8 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
    - Complete the [Database backup restore checklist](../../README.md#database-backup-restore-pre-worker-checklist) (session/provider invalidation, login/cursor key rotation, identity/grant reconciliation, parked `waiting` runs).
    - Verify external-connection vault key coverage against `config/vault-key-inventory.json` using `openmettle-admin vault status` ([Credential vault and key recovery](credential-vault-and-key-recovery.md)).
    - If `neo4j.dump` is present in the unpacked directory, restore Graphiti/Neo4j offline (`neo4j-admin database load`) before starting dependent services.
-   - Rebuild declared rebuildable indexes (`postgresql_secondary_indexes` via `REINDEX` if needed, `chroma_vector_embeddings`, and `derived_search_and_fulltext_indexes`) as listed in `manifest.json`.
+   - If `chroma.archive` is present in the unpacked directory, restore the Chroma persistent directory from `chroma.archive` before starting dependent services.
+   - Rebuild declared rebuildable indexes listed in `manifest.json` (`postgresql_secondary_indexes` via `REINDEX` if needed, `derived_search_and_fulltext_indexes`, and `chroma_vector_embeddings` only when `manifest.json` records `chroma.mode = "qualified_rebuild"`).
 
 7. **Release the restored maintenance gate and start services:**
 

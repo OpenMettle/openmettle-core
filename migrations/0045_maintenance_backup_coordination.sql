@@ -329,9 +329,9 @@ ALTER TABLE openmettle.authorization_audit
         'connection.refreshed', 'connection.reauth_required',
         'connection.disconnected', 'vault.rotated',
         'storage.declare_payload_lost',
-        'backup.maintenance_entered', 'backup.capture_succeeded',
-        'backup.capture_failed', 'backup.maintenance_released',
-        'backup.rpo_armed')),
+        'backup.maintenance_entered', 'backup.capture_started',
+        'backup.capture_succeeded', 'backup.capture_failed',
+        'backup.maintenance_released', 'backup.rpo_armed')),
     DROP CONSTRAINT authorization_audit_target_kind_check,
     ADD CONSTRAINT authorization_audit_target_kind_check CHECK (target_kind IN (
         'user', 'project', 'conversation', 'artifact', 'local_group', 'capability',
@@ -352,7 +352,11 @@ ALTER TABLE openmettle.authorization_audit
             AND operator_id IS NOT NULL
         )
         OR (
-            action IN ('backup.capture_succeeded', 'backup.capture_failed')
+            action IN (
+                'backup.capture_started',
+                'backup.capture_succeeded',
+                'backup.capture_failed'
+            )
             AND target_kind = 'backup_run'
             AND actor_kind = 'operator'
             AND actor_user_id IS NULL
@@ -585,6 +589,9 @@ BEGIN
         END IF;
         RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
     END IF;
+    IF EXISTS (SELECT 1 FROM openmettle.backup_runs br WHERE br.request_key = p_request_key) THEN
+        RAISE EXCEPTION 'request key already used by a backup capture run' USING ERRCODE = '23505';
+    END IF;
 
     v_now := pg_catalog.clock_timestamp();
     IF g.maintenance_active THEN
@@ -676,6 +683,9 @@ BEGIN
             RETURN;
         END IF;
         RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
+    END IF;
+    IF EXISTS (SELECT 1 FROM openmettle.backup_runs br WHERE br.request_key = p_request_key) THEN
+        RAISE EXCEPTION 'request key already used by a backup capture run' USING ERRCODE = '23505';
     END IF;
 
     v_now := pg_catalog.clock_timestamp();
@@ -819,6 +829,9 @@ BEGIN
         END IF;
         RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
     END IF;
+    IF EXISTS (SELECT 1 FROM openmettle.backup_runs br WHERE br.request_key = p_request_key) THEN
+        RAISE EXCEPTION 'request key already used by a backup capture run' USING ERRCODE = '23505';
+    END IF;
 
     IF NOT g.maintenance_active
        OR g.backup_run_id IS DISTINCT FROM p_backup_run_id
@@ -921,6 +934,9 @@ BEGIN
             RETURN;
         END IF;
         RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
+    END IF;
+    IF EXISTS (SELECT 1 FROM openmettle.backup_runs br WHERE br.request_key = p_request_key) THEN
+        RAISE EXCEPTION 'request key already used by a backup capture run' USING ERRCODE = '23505';
     END IF;
 
     v_now := pg_catalog.clock_timestamp();
@@ -1091,6 +1107,17 @@ BEGIN
          WHERE id;
     END IF;
 
+    INSERT INTO openmettle.authorization_audit
+        (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
+         request_key, reason, details)
+    VALUES
+        ('operator', NULL, p_operator_id, 'backup.capture_started', 'backup_run',
+         v_run_id::text, p_request_key, p_reason,
+         jsonb_build_object(
+             'destination_domain', p_destination_domain,
+             'opened_maintenance', v_opened
+         ));
+
     RETURN QUERY SELECT
         v_run_id, v_entered_at, v_lease_until, g.rpo_target_seconds, g.installation_id, v_opened;
 END
@@ -1150,9 +1177,11 @@ END
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_renew_lease(uuid, integer) FROM PUBLIC;
 
--- Owner only: transition a draining backup run to capturing once all quiesce checks pass.
+-- Owner only: transition a draining backup run to capturing once all quiesce checks pass,
+-- anchoring quiesced_at to the exported REPEATABLE READ snapshot's transaction_timestamp().
 CREATE FUNCTION openmettle.backup_mark_quiesced(
     p_backup_run_id uuid,
+    p_quiesced_at timestamptz,
     p_lease_seconds integer DEFAULT 300)
 RETURNS TABLE(
     quiesced_at timestamptz,
@@ -1162,6 +1191,7 @@ DECLARE
     g openmettle.backup_maintenance_gate%ROWTYPE;
     r openmettle.backup_runs%ROWTYPE;
     v_now timestamptz;
+    v_quiesced timestamptz;
     v_new_lease timestamptz;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
@@ -1174,6 +1204,7 @@ BEGIN
         RAISE EXCEPTION 'only openmettle_owner may mark backup quiesced' USING ERRCODE = '42501';
     END IF;
     IF p_backup_run_id IS NULL
+       OR p_quiesced_at IS NULL
        OR p_lease_seconds IS NULL
        OR p_lease_seconds NOT BETWEEN 30 AND 3600 THEN
         RAISE EXCEPTION 'invalid backup quiesce parameters' USING ERRCODE = '22023';
@@ -1195,24 +1226,30 @@ BEGIN
             USING ERRCODE = 'OMB02';
     END IF;
 
-    v_now := greatest(v_now, g.entered_at);
+    IF p_quiesced_at > v_now + interval '5 seconds'
+       OR p_quiesced_at < g.entered_at - interval '5 seconds' THEN
+        RAISE EXCEPTION 'backup quiesce timestamp is out of bounds' USING ERRCODE = '22023';
+    END IF;
+
+    v_now := greatest(v_now, g.entered_at, r.started_at);
+    v_quiesced := least(greatest(p_quiesced_at, g.entered_at, r.started_at), v_now);
     v_new_lease := greatest(r.lease_until, v_now + pg_catalog.make_interval(secs => p_lease_seconds));
 
     UPDATE openmettle.backup_runs
        SET state = 'capturing',
-           quiesced_at = v_now,
+           quiesced_at = v_quiesced,
            lease_until = v_new_lease
      WHERE id = p_backup_run_id;
 
     UPDATE openmettle.backup_maintenance_gate
-       SET quiesced_at = v_now,
+       SET quiesced_at = v_quiesced,
            updated_at = v_now
      WHERE id;
 
-    RETURN QUERY SELECT v_now, v_new_lease;
+    RETURN QUERY SELECT v_quiesced, v_new_lease;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.backup_mark_quiesced(uuid, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.backup_mark_quiesced(uuid, timestamptz, integer) FROM PUBLIC;
 
 -- Owner only: stage verified backup bundle digests and watermarks (`capturing -> publishing`)
 -- before writing `backup-meta.json` and renaming `.staging.<run_id>` on disk. Does NOT count as
@@ -1357,6 +1394,7 @@ BEGIN
      WHERE id;
 
     v_details := jsonb_build_object(
+        'capture_request_key', r.request_key,
         'destination_domain', r.destination_domain,
         'encryption_key_id', r.encryption_key_id,
         'bundle_digest', encode(r.bundle_digest, 'hex'),
@@ -1369,7 +1407,8 @@ BEGIN
          request_key, reason, details)
     VALUES
         ('operator', NULL, r.operator_id, 'backup.capture_succeeded', 'backup_run',
-         p_backup_run_id::text, r.request_key, p_reason, v_details);
+         p_backup_run_id::text, 'backup.capture_succeeded:' || p_backup_run_id::text,
+         p_reason, v_details);
 
     RETURN v_now;
 END
@@ -1438,8 +1477,9 @@ BEGIN
          request_key, reason, details)
     VALUES
         ('operator', NULL, r.operator_id, 'backup.capture_failed', 'backup_run',
-         p_backup_run_id::text, r.request_key, p_reason,
+         p_backup_run_id::text, 'backup.capture_failed:' || p_backup_run_id::text, p_reason,
          jsonb_build_object(
+             'capture_request_key', r.request_key,
              'failure_code', p_failure_code,
              'destination_domain', r.destination_domain
          ));

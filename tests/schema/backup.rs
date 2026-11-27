@@ -16,10 +16,11 @@ use openmettle_core::{
         store::WriteOutcome,
     },
     backup::{
-        self, ArtifactVolumeManifest, BackupError, BackupManifest, CaptureOptions, CliPgDumpRunner,
-        ComponentManifest, DEFAULT_LEASE_SECONDS, DumpCancel, GATEWAY_CONSISTENCY_MODE,
-        GraphitiManifest, GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT,
-        PgDumpRunner, REBUILDABLE_INDEXES,
+        self, ArtifactVolumeManifest, BackupError, BackupManifest, CHROMA_REBUILDABLE_INDEX,
+        CaptureOptions, ChromaManifest, ChromaMode, CliPgDumpRunner, ComponentManifest,
+        DEFAULT_LEASE_SECONDS, DumpCancel, GATEWAY_CONSISTENCY_MODE, GraphitiManifest,
+        GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT, PgDumpRunner,
+        REBUILDABLE_INDEXES,
         archive::{BackupMeta, GfsPolicy},
         crypto::{BackupKeyRing, StreamEncryptor},
     },
@@ -427,6 +428,7 @@ fn write_verified_backup_set(
         vault_required_key_ids: Vec::new(),
         gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
         graphiti_neo4j: GraphitiManifest::NotProvisioned,
+        chroma: ChromaManifest::NotProvisioned,
         rebuildable_indexes: REBUILDABLE_INDEXES
             .iter()
             .map(|s| (*s).to_owned())
@@ -958,6 +960,7 @@ async fn drain_timeout_fails_closed_and_requires_explicit_maintenance_recovery()
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: Some(GfsPolicy::default()),
             release_on_success: true,
@@ -1242,6 +1245,7 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::OfflineDump(neo4j_path.clone()),
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: vec![("catalog.json".to_owned(), cfg_path.clone())],
             prune_policy: Some(GfsPolicy::default()),
             release_on_success: true,
@@ -1687,6 +1691,7 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
@@ -2069,6 +2074,7 @@ async fn released_gateway_requests_do_not_block_drain_and_superseded_final_repor
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
@@ -2123,6 +2129,7 @@ async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflig
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: vec![("vault-key-inventory.json".to_owned(), dummy_cfg)],
             prune_policy: None,
             release_on_success: true,
@@ -2175,6 +2182,7 @@ async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflig
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::OfflineDump(neo4j_path.clone()),
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
@@ -2210,6 +2218,7 @@ async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflig
         lease_seconds: DEFAULT_LEASE_SECONDS,
         require_separate_device: false,
         graphiti_mode: GraphitiMode::NotProvisioned,
+        chroma_mode: ChromaMode::NotProvisioned,
         config_files: Vec::new(),
         prune_policy: None,
         release_on_success: true,
@@ -2302,6 +2311,7 @@ async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflig
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
@@ -2642,7 +2652,7 @@ async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_
 
         let quiesced_at: String = sqlx::query_scalar(
             "SELECT to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
-               FROM openmettle.backup_mark_quiesced($1::uuid, 300)",
+               FROM openmettle.backup_mark_quiesced($1::uuid, clock_timestamp(), 300)",
         )
         .bind(&run_id)
         .fetch_one(owner_pool)
@@ -2728,6 +2738,7 @@ async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_
             vault_required_key_ids: Vec::new(),
             gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
             graphiti_neo4j: GraphitiManifest::NotProvisioned,
+            chroma: ChromaManifest::NotProvisioned,
             rebuildable_indexes: REBUILDABLE_INDEXES
                 .iter()
                 .map(|s| (*s).to_owned())
@@ -2877,6 +2888,7 @@ async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::OfflineDump(PathBuf::from(dir.path("deleted-neo4j.dump"))),
+            chroma_mode: ChromaMode::Archive(PathBuf::from(dir.path("deleted-chroma.tar"))),
             config_files: vec![(
                 "missing.json".to_owned(),
                 PathBuf::from(dir.path("deleted-config.json")),
@@ -3000,6 +3012,7 @@ async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_
             lease_seconds: DEFAULT_LEASE_SECONDS,
             require_separate_device: false,
             graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
@@ -3182,4 +3195,1178 @@ async fn worker_restart_with_historical_failure_never_emits_zero_before_seeding(
         }
         other => panic!("expected Sum metric for openmettle.backup.runs, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn audit_request_key_collision_blocked_during_inflight_capture() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+
+    // Start capture 1 and confirm `backup.capture_started` immediately reserves `(operator, key)`
+    // in `authorization_audit`.
+    let (run1,): (String,) = sqlx::query_as(
+        "SELECT backup_run_id::text
+           FROM openmettle.backup_start_capture(
+               $1::uuid, 'inflight-shared-key', 'capture collision check', 'offhost-audit', 300
+           )",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+
+    let started_row: (String, String, String) = sqlx::query_as(
+        "SELECT action, target_kind, target_id
+           FROM openmettle.authorization_audit
+          WHERE actor_kind = 'operator'
+            AND operator_id = $1::uuid
+            AND request_key = 'inflight-shared-key'",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        started_row,
+        (
+            "backup.capture_started".to_owned(),
+            "backup_run".to_owned(),
+            run1.clone()
+        )
+    );
+
+    // While run 1 is still draining/capturing, reusing the exact same `(operator, request_key)`
+    // across `arm_rpo`, `enter_maintenance`, or `release_maintenance` MUST be rejected (`23505`).
+    for err in [
+        backup::arm_rpo(
+            &owner_pool,
+            OPERATOR_1,
+            "inflight-shared-key",
+            "collide arm-rpo",
+            86_400,
+        )
+        .await
+        .unwrap_err(),
+        backup::enter_maintenance(
+            &owner_pool,
+            OPERATOR_1,
+            "inflight-shared-key",
+            "collide enter",
+        )
+        .await
+        .unwrap_err(),
+        backup::release_maintenance(
+            &owner_pool,
+            OPERATOR_1,
+            "inflight-shared-key",
+            "collide release",
+            false,
+        )
+        .await
+        .unwrap_err(),
+    ] {
+        match err {
+            BackupError::Database(sqlx::Error::Database(db_err)) => {
+                assert_eq!(db_err.code().as_deref(), Some("23505"), "{db_err}");
+            }
+            other => panic!("expected SQLSTATE 23505 collision rejection, got {other:?}"),
+        }
+    }
+
+    // Also verify another operator cannot collide with `backup_runs.request_key` via `arm_rpo`.
+    let other_op_err = backup::arm_rpo(
+        &owner_pool,
+        OPERATOR_2,
+        "inflight-shared-key",
+        "cross-operator arm-rpo collision",
+        86_400,
+    )
+    .await
+    .unwrap_err();
+    match other_op_err {
+        BackupError::Database(sqlx::Error::Database(db_err)) => {
+            assert_eq!(db_err.code().as_deref(), Some("23505"), "{db_err}");
+        }
+        other => panic!("expected SQLSTATE 23505 for cross-operator collision, got {other:?}"),
+    }
+
+    // Complete run 1 through quiesce -> stage -> confirm; confirmation MUST succeed and write a
+    // distinct `backup.capture_succeeded:<run_id>` audit key preserving `capture_request_key`.
+    sqlx::query("SELECT * FROM openmettle.backup_mark_quiesced($1::uuid, clock_timestamp(), 300)")
+        .bind(&run1)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT openmettle.backup_stage_publication(
+            $1::uuid, 'k1', $2, $2, 1, 0, $2, NULL, NULL, NULL, '{}'::jsonb
+        )",
+    )
+    .bind(&run1)
+    .bind([0x44u8; 32].as_slice())
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT openmettle.backup_confirm_publication($1::uuid, 'confirmed cleanly')")
+        .bind(&run1)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+
+    let succeeded_details: String = sqlx::query_scalar(
+        "SELECT details::text
+           FROM openmettle.authorization_audit
+          WHERE actor_kind = 'operator'
+            AND operator_id = $1::uuid
+            AND action = 'backup.capture_succeeded'
+            AND request_key = $2",
+    )
+    .bind(OPERATOR_1)
+    .bind(format!("backup.capture_succeeded:{run1}"))
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    let succeeded_json: Value = serde_json::from_str(&succeeded_details).unwrap();
+    assert_eq!(succeeded_json["capture_request_key"], "inflight-shared-key");
+
+    // Start a second run and fail it; verify distinct `backup.capture_failed:<run_id>` audit key.
+    let (run2,): (String,) = sqlx::query_as(
+        "SELECT backup_run_id::text
+           FROM openmettle.backup_start_capture(
+               $1::uuid, 'inflight-fail-key', 'fail audit key check', 'offhost-audit', 300
+           )",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT openmettle.backup_fail_capture($1::uuid, 'io_error', 'synthetic fail')")
+        .bind(&run2)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let failed_details: String = sqlx::query_scalar(
+        "SELECT details::text
+           FROM openmettle.authorization_audit
+          WHERE actor_kind = 'operator'
+            AND operator_id = $1::uuid
+            AND action = 'backup.capture_failed'
+            AND request_key = $2",
+    )
+    .bind(OPERATOR_1)
+    .bind(format!("backup.capture_failed:{run2}"))
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    let failed_json: Value = serde_json::from_str(&failed_details).unwrap();
+    assert_eq!(failed_json["capture_request_key"], "inflight-fail-key");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn quiesced_at_anchors_to_exported_snapshot_timestamp_and_rejects_out_of_bounds() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+
+    let (run1,): (String,) = sqlx::query_as(
+        "SELECT backup_run_id::text
+           FROM openmettle.backup_start_capture(
+               $1::uuid, 'snap-ts-bounds-1', 'quiesce bounds test', 'offhost-ts', 300
+           )",
+    )
+    .bind(OPERATOR_1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+
+    // Future (> now + 5s) and far-past (< entered_at - 5s) timestamps are rejected with 22023.
+    for q in [
+        "SELECT * FROM openmettle.backup_mark_quiesced($1::uuid, clock_timestamp() + interval '30 seconds', 300)",
+        "SELECT * FROM openmettle.backup_mark_quiesced($1::uuid, clock_timestamp() - interval '30 seconds', 300)",
+    ] {
+        let err = sqlx::query(q)
+            .bind(&run1)
+            .execute(&owner_pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_database_error().unwrap().code().as_deref(),
+            Some("22023"),
+            "out-of-bounds snapshot timestamp must raise 22023: {err}"
+        );
+    }
+
+    // Valid snapshot timestamp strictly between started_at and now() is preserved accurately.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let snap_ts: String = sqlx::query_scalar(
+        "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let returned_ts: String = sqlx::query_scalar(
+        "SELECT to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+           FROM openmettle.backup_mark_quiesced($1::uuid, $2::timestamptz, 300)",
+    )
+    .bind(&run1)
+    .bind(&snap_ts)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        returned_ts, snap_ts,
+        "backup_mark_quiesced must record the exact exported snapshot timestamp"
+    );
+
+    let (run_q, gate_q): (String, String) = sqlx::query_as(
+        "SELECT to_char(r.quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                to_char(g.quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+           FROM openmettle.backup_runs r
+           JOIN openmettle.backup_maintenance_gate g ON g.id
+          WHERE r.id = $1::uuid",
+    )
+    .bind(&run1)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(run_q, snap_ts);
+    assert_eq!(gate_q, snap_ts);
+
+    // End-to-end capture: verify manifest.quiesced_at matches backup_runs.quiesced_at and precedes
+    // completed_at when pg_dump takes measurable time.
+    backup::release_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "snap-ts-release-1",
+        "clear bounds test",
+        true,
+    )
+    .await
+    .unwrap();
+
+    struct SlowSyntheticPgDump;
+    impl PgDumpRunner for SlowSyntheticPgDump {
+        fn dump(
+            &self,
+            _database_url: &str,
+            _snapshot_id: Option<&str>,
+            _cancel: &DumpCancel,
+            writer: &mut dyn IoWrite,
+        ) -> Result<u64, BackupError> {
+            std::thread::sleep(Duration::from_millis(120));
+            let payload = b"PGDMP-SLOW-SYNTHETIC";
+            writer.write_all(payload)?;
+            Ok(payload.len() as u64)
+        }
+    }
+
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-ts"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-ts", &[("bk-ts", [0x88; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let rep = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest,
+            destination_domain: "offhost-ts".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "snap-ts-e2e-1".to_owned(),
+            reason: "snapshot timestamp capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SlowSyntheticPgDump),
+    )
+    .await
+    .unwrap();
+
+    let manifest = backup::verify_backup(&rep.backup_dir, &keyring).unwrap();
+    let (db_quiesced, db_order_ok): (String, bool) = sqlx::query_as(
+        "SELECT to_char(quiesced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                (started_at <= quiesced_at AND quiesced_at < completed_at)
+           FROM openmettle.backup_runs
+          WHERE id = $1::uuid",
+    )
+    .bind(&rep.backup_run_id)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(manifest.quiesced_at, db_quiesced);
+    assert!(
+        db_order_ok,
+        "expected started_at <= quiesced_at < completed_at"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn chroma_modes_not_provisioned_archive_and_qualified_rebuild_and_retry_with_prune() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-chroma"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-ch", &[("bk-ch", [0x99; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    // 1. Invalid qualification_ref fails preflight BEFORE entering maintenance.
+    let bad_qual = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-chroma".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "chroma-bad-qual".to_owned(),
+            reason: "invalid qual ref".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::QualifiedRebuild {
+                qualification_ref: "bad\nref".to_owned(),
+            },
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(bad_qual, BackupError::Invalid(_)));
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // 2. ChromaMode::NotProvisioned excludes `chroma_vector_embeddings` from rebuildable_indexes.
+    let rep_np = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-chroma".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "chroma-np-1".to_owned(),
+            reason: "chroma not provisioned".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    let unpack_np = PathBuf::from(dir.path("unpack-np"));
+    let u_np = backup::unpack_backup(&rep_np.backup_dir, &unpack_np, &keyring).unwrap();
+    assert_eq!(u_np.manifest.chroma, ChromaManifest::NotProvisioned);
+    assert!(
+        !u_np
+            .manifest
+            .rebuildable_indexes
+            .iter()
+            .any(|s| s == CHROMA_REBUILDABLE_INDEX)
+    );
+    assert!(!u_np.has_chroma_archive);
+    assert!(!unpack_np.join("chroma.archive").exists());
+
+    // 3. ChromaMode::Archive encrypts `chroma.archive.enc`, unpacks `chroma.archive`, detects
+    //    tamper, and still excludes `chroma_vector_embeddings` from rebuildable_indexes.
+    let chroma_bytes = b"SYNTHETIC-CHROMA-TAR-ARCHIVE-BYTES-0123456789";
+    let chroma_path = PathBuf::from(dir.write("chroma.tar", chroma_bytes));
+    let rep_arch = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-chroma".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "chroma-arch-1".to_owned(),
+            reason: "chroma archive mode".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::Archive(chroma_path),
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    let unpack_arch = PathBuf::from(dir.path("unpack-arch"));
+    let u_arch = backup::unpack_backup(&rep_arch.backup_dir, &unpack_arch, &keyring).unwrap();
+    assert!(matches!(
+        u_arch.manifest.chroma,
+        ChromaManifest::Archive {
+            ref component,
+            plaintext_bytes,
+            ..
+        } if component == "chroma.archive.enc" && plaintext_bytes == chroma_bytes.len() as u64
+    ));
+    assert!(
+        !u_arch
+            .manifest
+            .rebuildable_indexes
+            .iter()
+            .any(|s| s == CHROMA_REBUILDABLE_INDEX)
+    );
+    assert!(u_arch.has_chroma_archive);
+    assert_eq!(
+        fs::read(unpack_arch.join("chroma.archive")).unwrap(),
+        chroma_bytes
+    );
+
+    // Tampering `chroma.archive.enc` must fail `verify_backup`.
+    let tamper_dir = PathBuf::from(dir.path("tamper-chroma"));
+    fs::create_dir(&tamper_dir).unwrap();
+    for entry in fs::read_dir(&rep_arch.backup_dir).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), tamper_dir.join(entry.file_name())).unwrap();
+    }
+    let mut enc = fs::read(tamper_dir.join("chroma.archive.enc")).unwrap();
+    let idx = enc.len() - 4;
+    enc[idx] ^= 0x01;
+    fs::write(tamper_dir.join("chroma.archive.enc"), &enc).unwrap();
+    assert!(backup::verify_backup(&tamper_dir, &keyring).is_err());
+
+    // 4. ChromaMode::QualifiedRebuild records qualification_ref and includes
+    //    `chroma_vector_embeddings` in rebuildable_indexes.
+    let rep_qual = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-chroma".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "chroma-qual-1".to_owned(),
+            reason: "chroma qualified rebuild".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::QualifiedRebuild {
+                qualification_ref: "V1-30-CHROMA-QUAL-2026-11".to_owned(),
+            },
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    let m_qual = backup::verify_backup(&rep_qual.backup_dir, &keyring).unwrap();
+    assert_eq!(
+        m_qual.chroma,
+        ChromaManifest::QualifiedRebuild {
+            qualification_ref: "V1-30-CHROMA-QUAL-2026-11".to_owned(),
+        }
+    );
+    assert!(
+        m_qual
+            .rebuildable_indexes
+            .iter()
+            .any(|s| s == CHROMA_REBUILDABLE_INDEX)
+    );
+    assert!(!m_qual.components.contains_key("chroma.archive.enc"));
+
+    // 5. Exact-key retry of `rep_qual` with `prune_policy: Some(1,1,1)` and
+    //    `release_on_success: true` prunes the two older same-day sets (`rep_np` and `rep_arch`).
+    let retry_with_prune = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-chroma".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "chroma-qual-1".to_owned(),
+            reason: "chroma qualified rebuild".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::QualifiedRebuild {
+                qualification_ref: "V1-30-CHROMA-QUAL-2026-11".to_owned(),
+            },
+            config_files: Vec::new(),
+            prune_policy: Some(GfsPolicy {
+                keep_daily: 1,
+                keep_weekly: 1,
+                keep_monthly: 1,
+            }),
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    let pruned = retry_with_prune
+        .pruned
+        .expect("exact-key retry must execute prune_policy when provided");
+    assert_eq!(pruned.kept.len(), 1);
+    assert_eq!(pruned.pruned.len(), 2, "pruned={pruned:?}");
+    assert!(rep_qual.backup_dir.is_dir());
+    assert!(!rep_np.backup_dir.exists());
+    assert!(!rep_arch.backup_dir.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn tls_strict_sslrootcert_preflight_and_home_isolation_with_real_pg_dump() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const PG_SSL_REQ: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
+
+    fn pem_cert(der: &[u8]) -> Vec<u8> {
+        let body = STANDARD.encode(der);
+        let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+        for line in body.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str("-----END CERTIFICATE-----\n");
+        out.into_bytes()
+    }
+
+    fn make_ca(
+        cn: &str,
+    ) -> (
+        rcgen::Issuer<'static, rcgen::KeyPair>,
+        CertificateDer<'static>,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let der = params.self_signed(&key).unwrap().der().clone();
+        (rcgen::Issuer::new(params, key), der)
+    }
+
+    fn make_server_config(
+        issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+        ca_der: &CertificateDer<'static>,
+        san: &str,
+    ) -> Arc<rustls::ServerConfig> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![san.to_owned()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.signed_by(&key, issuer).unwrap();
+        let chain = vec![cert.der().clone(), ca_der.clone()];
+        let priv_key: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, priv_key)
+                .unwrap(),
+        )
+    }
+
+    async fn read_exact_tcp(stream: &TcpStream, mut buf: &mut [u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            stream.readable().await?;
+            match stream.try_read(buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "eof",
+                    ));
+                }
+                Ok(n) => buf = &mut buf[n..],
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn write_all_tcp(stream: &TcpStream, mut buf: &[u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            stream.writable().await?;
+            match stream.try_write(buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero",
+                    ));
+                }
+                Ok(n) => buf = &buf[n..],
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn forward_duplex<A, B>(mut a: A, mut b: B)
+    where
+        A: AsyncRead + AsyncWrite + Unpin,
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut a_to_b = vec![0u8; 16 * 1024];
+        let mut a_pos = 0usize;
+        let mut a_len = 0usize;
+        let mut a_eof = false;
+        let mut b_needs_flush = false;
+        let mut b_shutdown = false;
+
+        let mut b_to_a = vec![0u8; 16 * 1024];
+        let mut b_pos = 0usize;
+        let mut b_len = 0usize;
+        let mut b_eof = false;
+        let mut a_needs_flush = false;
+        let mut a_shutdown = false;
+
+        let _ = std::future::poll_fn(|cx| {
+            loop {
+                let mut progressed = false;
+
+                if a_pos < a_len {
+                    match Pin::new(&mut b).poll_write(cx, &a_to_b[a_pos..a_len]) {
+                        Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                        Poll::Ready(Ok(n)) => {
+                            a_pos += n;
+                            b_needs_flush = true;
+                            if a_pos == a_len {
+                                a_pos = 0;
+                                a_len = 0;
+                            }
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if b_needs_flush {
+                    match Pin::new(&mut b).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            b_needs_flush = false;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if !a_eof {
+                    let mut rb = ReadBuf::new(&mut a_to_b);
+                    match Pin::new(&mut a).poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => {
+                            let n = rb.filled().len();
+                            if n == 0 {
+                                a_eof = true;
+                            } else {
+                                a_len = n;
+                                a_pos = 0;
+                            }
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if !b_shutdown {
+                    match Pin::new(&mut b).poll_shutdown(cx) {
+                        Poll::Ready(Ok(())) => {
+                            b_shutdown = true;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                }
+
+                if b_pos < b_len {
+                    match Pin::new(&mut a).poll_write(cx, &b_to_a[b_pos..b_len]) {
+                        Poll::Ready(Ok(0)) => return Poll::Ready(()),
+                        Poll::Ready(Ok(n)) => {
+                            b_pos += n;
+                            a_needs_flush = true;
+                            if b_pos == b_len {
+                                b_pos = 0;
+                                b_len = 0;
+                            }
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if a_needs_flush {
+                    match Pin::new(&mut a).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            a_needs_flush = false;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if !b_eof {
+                    let mut rb = ReadBuf::new(&mut b_to_a);
+                    match Pin::new(&mut b).poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => {
+                            let n = rb.filled().len();
+                            if n == 0 {
+                                b_eof = true;
+                            } else {
+                                b_len = n;
+                                b_pos = 0;
+                            }
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                } else if !a_shutdown {
+                    match Pin::new(&mut a).poll_shutdown(cx) {
+                        Poll::Ready(Ok(())) => {
+                            a_shutdown = true;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(_)) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                }
+
+                if a_shutdown && b_shutdown {
+                    return Poll::Ready(());
+                }
+                if !progressed {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await;
+    }
+
+    async fn spawn_pg_tls_proxy(
+        upstream_host: String,
+        upstream_port: u16,
+        server_cfg: Arc<rustls::ServerConfig>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let handle = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let acc = acceptor.clone();
+                let up_host = upstream_host.clone();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 8];
+                    if read_exact_tcp(&client, &mut req).await.is_err() || req != PG_SSL_REQ {
+                        return;
+                    }
+                    if write_all_tcp(&client, b"S").await.is_err() {
+                        return;
+                    }
+                    let Ok(tls_stream) = acc.accept(client).await else {
+                        return;
+                    };
+                    let Ok(upstream) = TcpStream::connect((up_host.as_str(), upstream_port)).await
+                    else {
+                        return;
+                    };
+                    forward_duplex(tls_stream, upstream).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    let db = TestDb::migrated().await;
+    let base_url = db.url(OWNER);
+    let base_cfg = backup::parse_validated_pg_uri(&base_url).unwrap();
+    if base_cfg.host.starts_with('/') {
+        // TCP proxy requires a TCP PostgreSQL upstream.
+        return;
+    }
+
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest-tls"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-tls", &[("bk-tls", [0xaa; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let (ca_server, ca_server_der) = make_ca("OpenMettle PG18 Test CA");
+    let (_ca_other, ca_other_der) = make_ca("OpenMettle Unrelated CA");
+    let ca_server_path =
+        PathBuf::from(dir.write("ca-server.pem", &pem_cert(ca_server_der.as_ref())));
+    let ca_other_path = PathBuf::from(dir.write("ca-other.pem", &pem_cert(ca_other_der.as_ref())));
+    fs::set_permissions(&ca_server_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&ca_other_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (proxy_ip_port, proxy_ip_handle) = spawn_pg_tls_proxy(
+        base_cfg.host.clone(),
+        base_cfg.port,
+        make_server_config(&ca_server, &ca_server_der, "127.0.0.1"),
+    )
+    .await;
+    let (proxy_dns_port, proxy_dns_handle) = spawn_pg_tls_proxy(
+        base_cfg.host.clone(),
+        base_cfg.port,
+        make_server_config(&ca_server, &ca_server_der, "other.example.test"),
+    )
+    .await;
+
+    let build_proxy_url = |port: u16, query: &str| -> String {
+        match base_cfg.password.as_deref() {
+            Some(pw) => format!(
+                "postgres://{}:{}@127.0.0.1:{port}/{}?{query}",
+                base_cfg.username, pw, base_cfg.database
+            ),
+            None => format!(
+                "postgres://{}@127.0.0.1:{port}/{}?{query}",
+                base_cfg.username, base_cfg.database
+            ),
+        }
+    };
+
+    let owner_pool = pool(&db, OWNER).await;
+    let has_local_pg18 = pg_tool_major_version("pg_dump").is_some_and(|v| v >= 18);
+    let make_runner = || -> Arc<dyn PgDumpRunner> {
+        if has_local_pg18 {
+            Arc::new(CliPgDumpRunner::default())
+        } else {
+            Arc::new(SyntheticPgDumpRunner)
+        }
+    };
+
+    // 1. Wrong `sslrootcert` (`ca_other`) fails preflight BEFORE entering maintenance.
+    let bad_ca_url = build_proxy_url(
+        proxy_ip_port,
+        &format!("sslmode=verify-ca&sslrootcert={}", ca_other_path.display()),
+    );
+    let err = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: bad_ca_url,
+            destination_root: dest.clone(),
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-wrong-ca-1".to_owned(),
+            reason: "wrong ca preflight test".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        make_runner(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BackupError::PgDump(_)), "{err:?}");
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // 2. `verify-full` against mismatched SAN (`other.example.test`) fails preflight BEFORE
+    //    entering maintenance.
+    let mismatch_full_url = build_proxy_url(
+        proxy_dns_port,
+        &format!(
+            "sslmode=verify-full&sslrootcert={}",
+            ca_server_path.display()
+        ),
+    );
+    let err = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: mismatch_full_url,
+            destination_root: dest.clone(),
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-mismatch-full-1".to_owned(),
+            reason: "verify-full san mismatch test".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        make_runner(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BackupError::PgDump(_)), "{err:?}");
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // 3. `verify-ca` against mismatched SAN with matching `ca_server` succeeds over real TLS
+    //    (both SQLx pool and real `pg_dump` 18 when available).
+    let verify_ca_url = build_proxy_url(
+        proxy_dns_port,
+        &format!("sslmode=verify-ca&sslrootcert={}", ca_server_path.display()),
+    );
+    let verify_ca_cfg = backup::parse_validated_pg_uri(&verify_ca_url).unwrap();
+    backup::verify_pg_tls_preflight(&verify_ca_cfg)
+        .await
+        .unwrap();
+    let tls_pool_ca = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(verify_ca_cfg.to_sqlx_options().unwrap())
+        .await
+        .unwrap();
+    let rep_ca = backup::capture_with_runner(
+        &tls_pool_ca,
+        &keyring,
+        &CaptureOptions {
+            database_url: verify_ca_url,
+            destination_root: dest.clone(),
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-verify-ca-ok-1".to_owned(),
+            reason: "verify-ca tls capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        make_runner(),
+    )
+    .await
+    .unwrap();
+    backup::verify_backup(&rep_ca.backup_dir, &keyring).unwrap();
+    tls_pool_ca.close().await;
+
+    // 4. `verify-full` against matching `127.0.0.1` IP SAN + `ca_server` succeeds over real TLS.
+    let verify_full_url = build_proxy_url(
+        proxy_ip_port,
+        &format!(
+            "sslmode=verify-full&sslrootcert={}",
+            ca_server_path.display()
+        ),
+    );
+    let verify_full_cfg = backup::parse_validated_pg_uri(&verify_full_url).unwrap();
+    backup::verify_pg_tls_preflight(&verify_full_cfg)
+        .await
+        .unwrap();
+    let tls_pool_full = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(verify_full_cfg.to_sqlx_options().unwrap())
+        .await
+        .unwrap();
+    let rep_full = backup::capture_with_runner(
+        &tls_pool_full,
+        &keyring,
+        &CaptureOptions {
+            database_url: verify_full_url,
+            destination_root: dest.clone(),
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-verify-full-ok-1".to_owned(),
+            reason: "verify-full tls capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        make_runner(),
+    )
+    .await
+    .unwrap();
+    backup::verify_backup(&rep_full.backup_dir, &keyring).unwrap();
+    tls_pool_full.close().await;
+
+    // 5. Poisoned `$HOME/.postgresql/root.crt` (holding `ca_other`) + `sslmode=require`:
+    //    Both SQLx AND real `pg_dump` 18 (isolated by `CliPgDumpRunner`'s ephemeral PG env)
+    //    succeed over TLS even though unisolated `pg_dump` with that `HOME` fails!
+    let poisoned_home = PathBuf::from(dir.path("poisoned-home"));
+    let dot_pg = poisoned_home.join(".postgresql");
+    fs::create_dir_all(&dot_pg).unwrap();
+    fs::set_permissions(&dot_pg, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::copy(&ca_other_path, dot_pg.join("root.crt")).unwrap();
+    fs::set_permissions(dot_pg.join("root.crt"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(dot_pg.join("postgresql.crt"), b"INVALID-CLIENT-CERT").unwrap();
+    fs::set_permissions(
+        dot_pg.join("postgresql.crt"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let require_url = build_proxy_url(proxy_ip_port, "sslmode=require");
+    let require_cfg = backup::parse_validated_pg_uri(&require_url).unwrap();
+    let tls_pool_req = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(require_cfg.to_sqlx_options().unwrap())
+        .await
+        .unwrap();
+
+    let require_runner: Arc<dyn PgDumpRunner> = if has_local_pg18 {
+        // Negative control: unisolated `pg_dump` with `HOME=poisoned_home` and `PGSSLMODE=require`
+        // MUST fail because libpq loads `$HOME/.postgresql/root.crt` (`ca_other`)!
+        let mut raw_cmd = Command::new("pg_dump");
+        raw_cmd
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", &poisoned_home)
+            .env("PGSSLMODE", "require")
+            .args([
+                "--format=custom",
+                "--schema=openmettle",
+                "--no-owner",
+                "--host=127.0.0.1",
+                &format!("--port={proxy_ip_port}"),
+                &format!("--username={}", base_cfg.username),
+                &format!("--dbname={}", base_cfg.database),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Ok(ld) = std::env::var("LD_LIBRARY_PATH") {
+            raw_cmd.env("LD_LIBRARY_PATH", ld);
+        }
+        if let Some(pw) = base_cfg.password.as_deref() {
+            raw_cmd.env("PGPASSWORD", pw);
+        }
+        let raw_out = tokio::task::spawn_blocking(move || raw_cmd.output().unwrap())
+            .await
+            .unwrap();
+        let raw_stderr = String::from_utf8_lossy(&raw_out.stderr);
+        assert!(
+            !raw_out.status.success(),
+            "negative control failed: unisolated pg_dump with poisoned $HOME/.postgresql/root.crt unexpectedly succeeded"
+        );
+        assert!(
+            raw_stderr.to_ascii_lowercase().contains("ssl")
+                || raw_stderr.to_ascii_lowercase().contains("cert"),
+            "negative control failed for unexpected non-TLS reason: {raw_stderr}"
+        );
+
+        let home_wrapper = PathBuf::from(dir.path("pg_dump_poisoned_home.sh"));
+        fs::write(
+            &home_wrapper,
+            format!(
+                "#!/bin/sh\nset -eu\nexport HOME='{}'\nexec pg_dump \"$@\"\n",
+                poisoned_home.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&home_wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        Arc::new(CliPgDumpRunner::with_program(home_wrapper))
+    } else {
+        Arc::new(SyntheticPgDumpRunner)
+    };
+
+    let rep_req = backup::capture_with_runner(
+        &tls_pool_req,
+        &keyring,
+        &CaptureOptions {
+            database_url: require_url,
+            destination_root: dest,
+            destination_domain: "offhost-tls".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "tls-require-home-isolated-1".to_owned(),
+            reason: "sslmode=require ignores poisoned HOME".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            chroma_mode: ChromaMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        require_runner,
+    )
+    .await
+    .unwrap();
+    backup::verify_backup(&rep_req.backup_dir, &keyring).unwrap();
+    tls_pool_req.close().await;
+
+    proxy_ip_handle.abort();
+    proxy_dns_handle.abort();
 }

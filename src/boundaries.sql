@@ -426,7 +426,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.backup_arm_rpo(uuid,text,text,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_start_capture(uuid,text,text,text,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_renew_lease(uuid,integer)',false,ARRAY[]::text[]),
-        ('openmettle.backup_mark_quiesced(uuid,integer)',false,ARRAY[]::text[]),
+        ('openmettle.backup_mark_quiesced(uuid,timestamptz,integer)',false,ARRAY[]::text[]),
         ('openmettle.backup_stage_publication(uuid,text,bytea,bytea,bigint,bigint,bytea,bigint,bytea,bigint,jsonb)',false,ARRAY[]::text[]),
         ('openmettle.backup_confirm_publication(uuid,text)',false,ARRAY[]::text[]),
         ('openmettle.backup_fail_capture(uuid,text,text)',false,ARRAY[]::text[])) AS f WHERE $1 >= 45

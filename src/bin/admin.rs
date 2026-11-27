@@ -9,8 +9,8 @@ use openmettle_core::{
         store::{StoreError, WriteOutcome},
     },
     backup::{
-        self, CaptureOptions, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_LEASE_SECONDS, GraphitiMode,
-        archive::GfsPolicy, crypto::BackupKeyRing,
+        self, CaptureOptions, ChromaMode, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_LEASE_SECONDS,
+        GraphitiMode, archive::GfsPolicy, crypto::BackupKeyRing,
     },
     restore, vault,
 };
@@ -56,6 +56,12 @@ async fn validated_backup_pool(connections: u32) -> Result<(String, PgPool), &'s
         eprintln!("backup capture: {err}");
         "OPENMETTLE_ADMIN_DATABASE_URL is invalid or contains unsupported parameters"
     })?;
+    backup::verify_pg_tls_preflight(&pg_cfg)
+        .await
+        .map_err(|err| {
+            eprintln!("backup capture: {err}");
+            "PostgreSQL TLS preflight failed"
+        })?;
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(connections)
         .connect_with(opts)
@@ -1120,6 +1126,7 @@ struct BackupCaptureArgs {
     drain_timeout_secs: u64,
     require_separate_device: bool,
     graphiti_mode: GraphitiMode,
+    chroma_mode: ChromaMode,
     config_files: Vec<(String, PathBuf)>,
     keep_daily: usize,
     keep_weekly: usize,
@@ -1130,7 +1137,7 @@ struct BackupCaptureArgs {
 }
 
 fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'static str> {
-    let usage = "usage: openmettle-admin backup capture --destination-root PATH --destination-domain DOMAIN [--backup-keys-config PATH] [--artifact-root PATH] --operator-id UUID --request-key KEY --reason REASON [--drain-timeout-secs N] [--require-separate-device] [--graphiti-mode not-provisioned|offline-dump] [--neo4j-dump PATH] [--config-file NAME=PATH]... [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--no-prune] [--release-on-success] [--pg-dump-bin PATH]";
+    let usage = "usage: openmettle-admin backup capture --destination-root PATH --destination-domain DOMAIN [--backup-keys-config PATH] [--artifact-root PATH] --operator-id UUID --request-key KEY --reason REASON [--drain-timeout-secs N] [--require-separate-device] [--graphiti-mode not-provisioned|offline-dump] [--neo4j-dump PATH] [--chroma-mode not-provisioned|archive|qualified-rebuild] [--chroma-archive PATH] [--chroma-qualification-ref REF] [--config-file NAME=PATH]... [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--no-prune] [--release-on-success] [--pg-dump-bin PATH]";
     let defaults = GfsPolicy::default();
     let mut destination_root = None;
     let mut destination_domain = None;
@@ -1143,6 +1150,9 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
     let mut require_separate_device = false;
     let mut graphiti_mode_raw: Option<String> = None;
     let mut neo4j_dump: Option<PathBuf> = None;
+    let mut chroma_mode_raw: Option<String> = None;
+    let mut chroma_archive: Option<PathBuf> = None;
+    let mut chroma_qualification_ref: Option<String> = None;
     let mut config_files: Vec<(String, PathBuf)> = Vec::new();
     let mut keep_daily = None;
     let mut keep_weekly = None;
@@ -1248,6 +1258,33 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
                     args.get(i).ok_or("missing --neo4j-dump value")?,
                 ));
             }
+            "--chroma-mode" => {
+                if chroma_mode_raw.is_some() {
+                    return Err("duplicate --chroma-mode");
+                }
+                i += 1;
+                chroma_mode_raw = Some(args.get(i).ok_or("missing --chroma-mode value")?.clone());
+            }
+            "--chroma-archive" => {
+                if chroma_archive.is_some() {
+                    return Err("duplicate --chroma-archive");
+                }
+                i += 1;
+                chroma_archive = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --chroma-archive value")?,
+                ));
+            }
+            "--chroma-qualification-ref" => {
+                if chroma_qualification_ref.is_some() {
+                    return Err("duplicate --chroma-qualification-ref");
+                }
+                i += 1;
+                chroma_qualification_ref = Some(
+                    args.get(i)
+                        .ok_or("missing --chroma-qualification-ref value")?
+                        .clone(),
+                );
+            }
             "--config-file" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing --config-file value")?;
@@ -1338,6 +1375,37 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
         _ => return Err("--graphiti-mode must be not-provisioned or offline-dump"),
     };
 
+    let chroma_mode = match chroma_mode_raw.as_deref().unwrap_or("not-provisioned") {
+        "not-provisioned" => {
+            if chroma_archive.is_some() {
+                return Err("--chroma-archive requires --chroma-mode archive");
+            }
+            if chroma_qualification_ref.is_some() {
+                return Err("--chroma-qualification-ref requires --chroma-mode qualified-rebuild");
+            }
+            ChromaMode::NotProvisioned
+        }
+        "archive" => {
+            if chroma_qualification_ref.is_some() {
+                return Err("--chroma-qualification-ref requires --chroma-mode qualified-rebuild");
+            }
+            let path =
+                chroma_archive.ok_or("--chroma-mode archive requires --chroma-archive PATH")?;
+            ChromaMode::Archive(path)
+        }
+        "qualified-rebuild" => {
+            if chroma_archive.is_some() {
+                return Err("--chroma-archive requires --chroma-mode archive");
+            }
+            let qualification_ref = chroma_qualification_ref
+                .ok_or("--chroma-mode qualified-rebuild requires --chroma-qualification-ref REF")?;
+            backup::validate_chroma_qualification_ref(&qualification_ref)
+                .map_err(|_| "invalid --chroma-qualification-ref")?;
+            ChromaMode::QualifiedRebuild { qualification_ref }
+        }
+        _ => return Err("--chroma-mode must be not-provisioned, archive, or qualified-rebuild"),
+    };
+
     Ok(BackupCaptureArgs {
         destination_root: destination_root.ok_or(usage)?,
         destination_domain: destination_domain.ok_or(usage)?,
@@ -1349,6 +1417,7 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
         drain_timeout_secs: drain_timeout_secs.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS),
         require_separate_device,
         graphiti_mode,
+        chroma_mode,
         config_files,
         keep_daily: keep_daily.unwrap_or(defaults.keep_daily),
         keep_weekly: keep_weekly.unwrap_or(defaults.keep_weekly),
@@ -1666,6 +1735,7 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                     lease_seconds: DEFAULT_LEASE_SECONDS,
                     require_separate_device: parsed.require_separate_device,
                     graphiti_mode: parsed.graphiti_mode,
+                    chroma_mode: parsed.chroma_mode,
                     config_files: parsed.config_files,
                     prune_policy,
                     release_on_success: parsed.release_on_success,
@@ -1717,12 +1787,13 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
             )
             .map_err(report_backup_error("backup unpack"))?;
             println!(
-                "backup.unpacked run_id={} output={} artifact_revisions={} config_files={} neo4j_dump={}",
+                "backup.unpacked run_id={} output={} artifact_revisions={} config_files={} neo4j_dump={} chroma_archive={}",
                 report.manifest.backup_run_id,
                 report.output_dir.display(),
                 report.artifact_summary.revision_count,
                 report.config_files_written,
-                report.has_neo4j_dump
+                report.has_neo4j_dump,
+                report.has_chroma_archive
             );
             Ok(())
         }
@@ -1754,9 +1825,9 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphitiMode, parse_backup_audit_args, parse_backup_capture_args, parse_backup_prune_args,
-        parse_backup_verify_unpack_args, parse_declare_lost_args, parse_restore_lock_args,
-        parse_restore_replay_args,
+        ChromaMode, GraphitiMode, parse_backup_audit_args, parse_backup_capture_args,
+        parse_backup_prune_args, parse_backup_verify_unpack_args, parse_declare_lost_args,
+        parse_restore_lock_args, parse_restore_replay_args,
     };
     use openmettle_core::restore::GENESIS;
     use std::path::PathBuf;
@@ -1939,6 +2010,113 @@ mod tests {
             parsed.pg_dump_bin,
             Some(PathBuf::from("/usr/lib/postgresql/18/bin/pg_dump"))
         );
+        assert_eq!(parsed.chroma_mode, ChromaMode::NotProvisioned);
+
+        let chroma_archived = parse_backup_capture_args(&vecs(&[
+            "--destination-root",
+            "/mnt/backups",
+            "--destination-domain",
+            "offhost",
+            "--operator-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--request-key",
+            "k1",
+            "--reason",
+            "r1",
+            "--chroma-mode",
+            "archive",
+            "--chroma-archive",
+            "/var/backups/chroma/chroma.tar",
+        ]))
+        .unwrap();
+        assert_eq!(
+            chroma_archived.chroma_mode,
+            ChromaMode::Archive(PathBuf::from("/var/backups/chroma/chroma.tar"))
+        );
+
+        let chroma_qualified = parse_backup_capture_args(&vecs(&[
+            "--destination-root",
+            "/mnt/backups",
+            "--destination-domain",
+            "offhost",
+            "--operator-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--request-key",
+            "k1",
+            "--reason",
+            "r1",
+            "--chroma-mode",
+            "qualified-rebuild",
+            "--chroma-qualification-ref",
+            "QUAL-CHROMA-2026-11",
+        ]))
+        .unwrap();
+        assert_eq!(
+            chroma_qualified.chroma_mode,
+            ChromaMode::QualifiedRebuild {
+                qualification_ref: "QUAL-CHROMA-2026-11".to_owned(),
+            }
+        );
+
+        for (extra, expected_err) in [
+            (
+                vec!["--chroma-mode", "archive"],
+                "--chroma-mode archive requires --chroma-archive PATH",
+            ),
+            (
+                vec!["--chroma-archive", "/var/backups/chroma.tar"],
+                "--chroma-archive requires --chroma-mode archive",
+            ),
+            (
+                vec!["--chroma-mode", "qualified-rebuild"],
+                "--chroma-mode qualified-rebuild requires --chroma-qualification-ref REF",
+            ),
+            (
+                vec!["--chroma-qualification-ref", "QUAL-1"],
+                "--chroma-qualification-ref requires --chroma-mode qualified-rebuild",
+            ),
+            (
+                vec![
+                    "--chroma-mode",
+                    "archive",
+                    "--chroma-archive",
+                    "/var/backups/chroma.tar",
+                    "--chroma-qualification-ref",
+                    "QUAL-1",
+                ],
+                "--chroma-qualification-ref requires --chroma-mode qualified-rebuild",
+            ),
+            (
+                vec![
+                    "--chroma-mode",
+                    "qualified-rebuild",
+                    "--chroma-qualification-ref",
+                    "QUAL-1",
+                    "--chroma-archive",
+                    "/var/backups/chroma.tar",
+                ],
+                "--chroma-archive requires --chroma-mode archive",
+            ),
+            (
+                vec!["--chroma-mode", "bogus"],
+                "--chroma-mode must be not-provisioned, archive, or qualified-rebuild",
+            ),
+        ] {
+            let mut argv = vecs(&[
+                "--destination-root",
+                "/mnt/backups",
+                "--destination-domain",
+                "offhost",
+                "--operator-id",
+                "11111111-1111-4111-8111-111111111111",
+                "--request-key",
+                "k1",
+                "--reason",
+                "r1",
+            ]);
+            argv.extend(vecs(&extra));
+            assert_eq!(parse_backup_capture_args(&argv).err(), Some(expected_err));
+        }
 
         // offline-dump without --neo4j-dump is refused.
         assert_eq!(

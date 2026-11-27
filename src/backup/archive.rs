@@ -11,7 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -505,7 +505,7 @@ fn read_u16_str(reader: &mut dyn Read, max_len: usize) -> Result<String, Archive
 }
 
 pub(crate) fn create_dir_0700(path: &Path) -> Result<(), ArchiveError> {
-    fs::create_dir(path)?;
+    fs::DirBuilder::new().mode(0o700).create(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
@@ -1021,8 +1021,16 @@ pub fn prune_destination_with_verifier(
     let mut candidates = Vec::new();
     let mut skipped_unverified = Vec::new();
     for entry in fs::read_dir(dest_root)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
@@ -1036,6 +1044,12 @@ pub fn prune_destination_with_verifier(
         let meta_path = dir_path.join("backup-meta.json");
         let Ok(meta_bytes) = read_regular_bounded_nofollow(&meta_path, MAX_BACKUP_META_BYTES)
         else {
+            if matches!(
+                fs::symlink_metadata(&dir_path),
+                Err(ref err) if err.kind() == io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
             skipped_unverified.push(name);
             continue;
         };
@@ -1064,6 +1078,12 @@ pub fn prune_destination_with_verifier(
             continue;
         }
         if !verify_dir(&dir_path, &meta) {
+            if matches!(
+                fs::symlink_metadata(&dir_path),
+                Err(ref err) if err.kind() == io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
             skipped_unverified.push(name);
             continue;
         }
@@ -1080,7 +1100,20 @@ pub fn prune_destination_with_verifier(
     if !dry_run {
         for dir_name in &pruned {
             let target = dest_root.join(dir_name);
-            fs::remove_dir_all(&target)?;
+            for attempt in 0..8 {
+                match fs::remove_dir_all(&target) {
+                    Ok(()) => break,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        if !target.exists() {
+                            break;
+                        }
+                        if attempt == 7 {
+                            return Err(err.into());
+                        }
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
         }
         if !pruned.is_empty() {
             fsync_dir(dest_root)?;
@@ -1298,6 +1331,92 @@ mod tests {
             protected_inodes,
         };
         assert!(validate_destination_root(&dir, None, &same_dev_ring, true, true).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_dir_0700_sets_owner_only_permissions() {
+        let base = std::env::temp_dir().join(format!("om-backup-mkdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let target = base.join("restricted");
+        create_dir_0700(&target).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected mode 0700, got {:o}", mode);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prune_tolerates_concurrent_removal_of_expired_backup_directory() {
+        let dir = std::env::temp_dir().join(format!("om-backup-prune-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let make_set = |name: &str, run_id: &str, completed_at: &str| {
+            let bdir = dir.join(name);
+            create_dir_0700(&bdir).unwrap();
+            let meta = BackupMeta {
+                format: "openmettle-backup-meta/v1".to_owned(),
+                installation_id: INST_A.to_owned(),
+                backup_run_id: run_id.to_owned(),
+                completed_at: completed_at.to_owned(),
+                destination_domain: "offhost-race".to_owned(),
+                encryption_key_id: "k1".to_owned(),
+                manifest_ciphertext_sha256: "a".repeat(64),
+                bundle_digest: "b".repeat(64),
+                state: "complete".to_owned(),
+            };
+            write_file_0600(
+                &bdir.join("backup-meta.json"),
+                &serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            bdir
+        };
+
+        let expired_1 = make_set(
+            "backup-20261126T010000Z-11111111-1111-4111-8111-111111111111",
+            "11111111-1111-4111-8111-111111111111",
+            "2026-11-26T01:00:00Z",
+        );
+        let expired_2 = make_set(
+            "backup-20261126T020000Z-22222222-2222-4222-8222-222222222222",
+            "22222222-2222-4222-8222-222222222222",
+            "2026-11-26T02:00:00Z",
+        );
+        let kept_newest = make_set(
+            "backup-20261126T030000Z-33333333-3333-4333-8333-333333333333",
+            "33333333-3333-4333-8333-333333333333",
+            "2026-11-26T03:00:00Z",
+        );
+
+        // Simulate a concurrent pruner deleting `expired_1` after it was verified and selected,
+        // before `prune_destination_with_verifier` runs `remove_dir_all` on it.
+        let expired_1_clone = expired_1.clone();
+        let report = prune_destination_with_verifier(
+            &dir,
+            GfsPolicy {
+                keep_daily: 1,
+                keep_weekly: 1,
+                keep_monthly: 1,
+            },
+            None,
+            false,
+            move |path, _| {
+                if path == expired_1_clone {
+                    let _ = fs::remove_dir_all(&expired_1_clone);
+                }
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.pruned.len(), 2);
+        assert!(kept_newest.is_dir());
+        assert!(!expired_1.exists());
+        assert!(!expired_2.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
