@@ -426,17 +426,22 @@ pub(crate) async fn maintenance(
             if !spills || !uploads {
                 sweep_failed(Sweep::Uploads);
             }
-            // ADR 0041 & ADR 0046: no purge sweep while restore gate is closed or maintenance is active.
-            let open = timeout(Duration::from_secs(15), async {
+            // ADR 0041 & ADR 0046: when restore gate is closed, run no purge work; when
+            // maintenance is active (and restore gate is open), finish already-claimed `purging`
+            // revisions and `.purge.<id>` anchors so drain completes without claiming new purges.
+            let gate_state = timeout(Duration::from_secs(15), async {
                 let mut conn = pool.acquire().await?;
                 let restore_open = crate::restore::gate_open(&mut conn).await?;
                 let maint_active = crate::backup::maintenance_active(&mut conn).await?;
-                Ok::<bool, sqlx::Error>(restore_open && !maint_active)
+                Ok::<(bool, bool), sqlx::Error>((restore_open, maint_active))
             })
             .await;
-            let purged = match open {
-                Ok(Ok(true)) => sweep(artifact_fs::purge_due(pool, store, 100)).await,
-                Ok(Ok(false)) => true,
+            let purged = match gate_state {
+                Ok(Ok((true, false))) => sweep(artifact_fs::purge_due(pool, store, 100)).await,
+                Ok(Ok((true, true))) => {
+                    sweep(artifact_fs::finish_inflight_purges(pool, store, 100)).await
+                }
+                Ok(Ok((false, _))) => true,
                 _ => false,
             };
             if !purged {

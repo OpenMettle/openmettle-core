@@ -114,7 +114,7 @@ CREATE TABLE openmettle.backup_runs (
                 AND failure_code COLLATE "C" ~ '^[a-z0-9_]+$'
             )
         ),
-    telemetry_observed boolean NOT NULL DEFAULT false,
+    opened_maintenance boolean NOT NULL DEFAULT false,
     manifest_summary jsonb NOT NULL DEFAULT '{}'::jsonb
         CHECK (
             jsonb_typeof(manifest_summary) = 'object'
@@ -129,7 +129,6 @@ CREATE TABLE openmettle.backup_runs (
             AND failure_code IS NULL
             AND bundle_digest IS NULL
             AND manifest_digest IS NULL
-            AND NOT telemetry_observed
         )
         OR (
             state = 'capturing'
@@ -139,7 +138,6 @@ CREATE TABLE openmettle.backup_runs (
             AND failure_code IS NULL
             AND bundle_digest IS NULL
             AND manifest_digest IS NULL
-            AND NOT telemetry_observed
         )
         OR (
             state = 'succeeded'
@@ -169,15 +167,11 @@ CREATE INDEX backup_runs_active_lease_idx
     ON openmettle.backup_runs (lease_until)
     WHERE state IN ('draining', 'capturing');
 
-CREATE INDEX backup_runs_unobserved_terminal_idx
-    ON openmettle.backup_runs (completed_at)
-    WHERE state IN ('succeeded', 'failed', 'incomplete') AND NOT telemetry_observed;
-
 CREATE INDEX backup_runs_succeeded_completed_idx
     ON openmettle.backup_runs (completed_at DESC)
     WHERE state = 'succeeded';
 
--- Enforce monotonic state transitions and terminal immutability on backup_runs.
+-- Enforce monotonic state transitions and strict terminal immutability on backup_runs.
 CREATE FUNCTION openmettle.enforce_backup_runs_transitions()
 RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 BEGIN
@@ -189,12 +183,9 @@ BEGIN
        OR NEW.request_key IS DISTINCT FROM OLD.request_key
        OR NEW.operator_id IS DISTINCT FROM OLD.operator_id
        OR NEW.started_at IS DISTINCT FROM OLD.started_at
-       OR NEW.destination_domain IS DISTINCT FROM OLD.destination_domain THEN
+       OR NEW.destination_domain IS DISTINCT FROM OLD.destination_domain
+       OR NEW.opened_maintenance IS DISTINCT FROM OLD.opened_maintenance THEN
         RAISE EXCEPTION 'backup_runs identity fields are immutable' USING ERRCODE = '22023';
-    END IF;
-
-    IF OLD.telemetry_observed AND NOT NEW.telemetry_observed THEN
-        RAISE EXCEPTION 'telemetry_observed cannot revert to false' USING ERRCODE = 'OMB01';
     END IF;
 
     IF OLD.quiesced_at IS NOT NULL AND NEW.quiesced_at IS DISTINCT FROM OLD.quiesced_at THEN
@@ -202,29 +193,7 @@ BEGIN
     END IF;
 
     IF OLD.state IN ('succeeded', 'failed', 'incomplete') THEN
-        IF NOT (
-            NOT OLD.telemetry_observed
-            AND NEW.telemetry_observed
-            AND NEW.state IS NOT DISTINCT FROM OLD.state
-            AND NEW.lease_until IS NOT DISTINCT FROM OLD.lease_until
-            AND NEW.quiesced_at IS NOT DISTINCT FROM OLD.quiesced_at
-            AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
-            AND NEW.encryption_key_id IS NOT DISTINCT FROM OLD.encryption_key_id
-            AND NEW.bundle_digest IS NOT DISTINCT FROM OLD.bundle_digest
-            AND NEW.manifest_digest IS NOT DISTINCT FROM OLD.manifest_digest
-            AND NEW.journal_origin_us IS NOT DISTINCT FROM OLD.journal_origin_us
-            AND NEW.journal_seq IS NOT DISTINCT FROM OLD.journal_seq
-            AND NEW.journal_chain_digest IS NOT DISTINCT FROM OLD.journal_chain_digest
-            AND NEW.lifecycle_origin_us IS NOT DISTINCT FROM OLD.lifecycle_origin_us
-            AND NEW.lifecycle_baseline_digest IS NOT DISTINCT FROM OLD.lifecycle_baseline_digest
-            AND NEW.connection_origin_us IS NOT DISTINCT FROM OLD.connection_origin_us
-            AND NEW.failure_code IS NOT DISTINCT FROM OLD.failure_code
-            AND NEW.manifest_summary IS NOT DISTINCT FROM OLD.manifest_summary
-        ) THEN
-            RAISE EXCEPTION 'terminal backup_runs rows are immutable except telemetry_observed'
-                USING ERRCODE = 'OMB01';
-        END IF;
-        RETURN NEW;
+        RAISE EXCEPTION 'terminal backup_runs rows are immutable' USING ERRCODE = 'OMB01';
     END IF;
 
     IF OLD.state = 'draining'
@@ -250,9 +219,10 @@ CREATE TRIGGER backup_runs_enforce_transitions
     FOR EACH ROW
     EXECUTE FUNCTION openmettle.enforce_backup_runs_transitions();
 
--- Singleton maintenance-window gate and RPO tracking state.
+-- Singleton maintenance-window gate, stable installation_id, and durable RPO tracking state.
 CREATE TABLE openmettle.backup_maintenance_gate (
     id boolean PRIMARY KEY DEFAULT true CHECK (id),
+    installation_id uuid NOT NULL DEFAULT gen_random_uuid(),
     maintenance_active boolean NOT NULL DEFAULT false,
     backup_run_id uuid REFERENCES openmettle.backup_runs (id),
     entered_at timestamptz,
@@ -263,6 +233,7 @@ CREATE TABLE openmettle.backup_maintenance_gate (
         CHECK (rpo_target_seconds BETWEEN 3600 AND 604800),
     rpo_tracking_armed_at timestamptz,
     last_overdue_observed_at timestamptz,
+    overdue_count bigint NOT NULL DEFAULT 0 CHECK (overdue_count >= 0),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT backup_maintenance_gate_state_check CHECK (
         (
@@ -391,6 +362,8 @@ GRANT EXECUTE ON FUNCTION openmettle.backup_maintenance_lock_open()
 
 -- Worker telemetry observer for openmettle.backup.runs (ADR 0028 / ADR 0046).
 -- Canonical lock order: backup_maintenance_gate (FOR UPDATE SKIP LOCKED) -> backup_runs.
+-- Returns durable cumulative outcome totals so worker restarts before an OTLP flush never lose
+-- failure, incomplete, or overdue counts (monotonically synchronized via fetch_max).
 CREATE FUNCTION openmettle.backup_observe_telemetry()
 RETURNS TABLE(
     succeeded_count bigint,
@@ -413,7 +386,20 @@ BEGIN
      WHERE id
        FOR UPDATE SKIP LOCKED;
     IF NOT FOUND THEN
-        RETURN QUERY SELECT 0::bigint, 0::bigint, 0::bigint, 0::bigint;
+        SELECT count(*) FILTER (WHERE r.state = 'succeeded'),
+               count(*) FILTER (WHERE r.state = 'failed'),
+               count(*) FILTER (WHERE r.state = 'incomplete')
+          INTO v_succeeded, v_failed, v_incomplete
+          FROM openmettle.backup_runs r;
+        SELECT coalesce(gm.overdue_count, 0::bigint)
+          INTO v_overdue
+          FROM openmettle.backup_maintenance_gate gm
+         WHERE gm.id;
+        RETURN QUERY SELECT
+            coalesce(v_succeeded, 0::bigint),
+            coalesce(v_failed, 0::bigint),
+            coalesce(v_incomplete, 0::bigint),
+            coalesce(v_overdue, 0::bigint);
         RETURN;
     END IF;
 
@@ -437,29 +423,8 @@ BEGIN
       FROM expired e
      WHERE r.id = e.id;
 
-    -- 2. Atomically claim unobserved terminal runs for worker counter emission.
-    WITH due AS (
-        SELECT r.id
-          FROM openmettle.backup_runs r
-         WHERE r.state IN ('succeeded', 'failed', 'incomplete')
-           AND NOT r.telemetry_observed
-         ORDER BY r.id
-           FOR UPDATE SKIP LOCKED
-    ),
-    marked AS (
-        UPDATE openmettle.backup_runs r
-           SET telemetry_observed = true
-          FROM due d
-         WHERE r.id = d.id
-     RETURNING r.state
-    )
-    SELECT count(*) FILTER (WHERE state = 'succeeded'),
-           count(*) FILTER (WHERE state = 'failed'),
-           count(*) FILTER (WHERE state = 'incomplete')
-      INTO v_succeeded, v_failed, v_incomplete
-      FROM marked;
-
-    -- 3. Evaluate RPO overdue state once tracking has been armed.
+    -- 2. Evaluate RPO overdue state once tracking has been armed and persist durable count.
+    v_overdue := g.overdue_count;
     IF g.rpo_tracking_armed_at IS NOT NULL THEN
         SELECT coalesce(max(r.completed_at), g.rpo_tracking_armed_at)
           INTO v_anchor
@@ -472,13 +437,21 @@ BEGIN
                OR g.last_overdue_observed_at < v_anchor
                OR v_now - g.last_overdue_observed_at >= interval '1 hour'
            ) THEN
+            v_overdue := g.overdue_count + 1;
             UPDATE openmettle.backup_maintenance_gate
                SET last_overdue_observed_at = v_now,
+                   overdue_count = v_overdue,
                    updated_at = v_now
              WHERE id;
-            v_overdue := 1;
         END IF;
     END IF;
+
+    -- 3. Return durable cumulative counts across backup_runs and backup_maintenance_gate.
+    SELECT count(*) FILTER (WHERE r.state = 'succeeded'),
+           count(*) FILTER (WHERE r.state = 'failed'),
+           count(*) FILTER (WHERE r.state = 'incomplete')
+      INTO v_succeeded, v_failed, v_incomplete
+      FROM openmettle.backup_runs r;
 
     RETURN QUERY SELECT
         coalesce(v_succeeded, 0::bigint),
@@ -702,6 +675,111 @@ END
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_release_maintenance(uuid, text, text, boolean) FROM PUBLIC;
 
+-- Owner only: release maintenance strictly if opened by the named completed capture run.
+-- Refuses to release an inherited maintenance window (opened_maintenance = false) or a window
+-- taken over by a later run, returning false so explicit backup_release_maintenance is required.
+CREATE FUNCTION openmettle.backup_release_capture_maintenance(
+    p_backup_run_id uuid,
+    p_operator_id uuid,
+    p_request_key text,
+    p_reason text)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
+DECLARE
+    g openmettle.backup_maintenance_gate%ROWTYPE;
+    r openmettle.backup_runs%ROWTYPE;
+    v_existing record;
+    v_now timestamptz;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'backup capture maintenance release requires READ COMMITTED'
+            USING ERRCODE = '25000';
+    END IF;
+    IF NOT (
+        pg_catalog.pg_has_role(session_user, 'openmettle_owner', 'USAGE')
+        AND pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')
+    ) THEN
+        RAISE EXCEPTION 'only openmettle_owner may release backup maintenance' USING ERRCODE = '42501';
+    END IF;
+    IF p_backup_run_id IS NULL
+       OR p_operator_id IS NULL
+       OR p_request_key IS NULL
+       OR octet_length(p_request_key) NOT BETWEEN 1 AND 128
+       OR btrim(p_request_key) <> p_request_key
+       OR p_request_key COLLATE "C" ~ '[[:cntrl:]]'
+       OR NOT openmettle.capacity_valid_name(p_reason, 512) THEN
+        RAISE EXCEPTION 'invalid backup capture maintenance release parameters'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT * INTO STRICT g FROM openmettle.backup_maintenance_gate WHERE id FOR UPDATE;
+    SELECT * INTO r FROM openmettle.backup_runs WHERE id = p_backup_run_id FOR SHARE;
+    IF NOT FOUND OR NOT r.opened_maintenance OR r.state <> 'succeeded' THEN
+        RETURN false;
+    END IF;
+
+    SELECT a.operator_id, a.action, a.target_kind, a.target_id, a.reason
+      INTO v_existing
+      FROM openmettle.authorization_audit a
+     WHERE a.actor_kind = 'operator'
+       AND a.operator_id = p_operator_id
+       AND a.request_key = p_request_key
+     LIMIT 1;
+    IF FOUND THEN
+        IF v_existing.action = 'backup.maintenance_released'
+           AND v_existing.target_kind = 'backup_maintenance'
+           AND v_existing.target_id = 'singleton'
+           AND v_existing.reason = p_reason THEN
+            RETURN false;
+        END IF;
+        RAISE EXCEPTION 'request key already used with different parameters' USING ERRCODE = '23505';
+    END IF;
+
+    IF NOT g.maintenance_active
+       OR g.backup_run_id IS DISTINCT FROM p_backup_run_id
+       OR g.entered_at IS DISTINCT FROM r.started_at THEN
+        RETURN false;
+    END IF;
+
+    v_now := pg_catalog.clock_timestamp();
+    IF EXISTS (
+        SELECT 1
+          FROM openmettle.backup_runs br
+         WHERE br.state IN ('draining', 'capturing')
+           AND br.lease_until > v_now
+    ) THEN
+        RAISE EXCEPTION 'another active backup run holds a live lease' USING ERRCODE = 'OMB02';
+    END IF;
+
+    UPDATE openmettle.backup_maintenance_gate
+       SET maintenance_active = false,
+           backup_run_id = NULL,
+           entered_at = NULL,
+           entered_by_operator_id = NULL,
+           reason = NULL,
+           quiesced_at = NULL,
+           updated_at = v_now
+     WHERE id;
+
+    INSERT INTO openmettle.authorization_audit
+        (actor_kind, actor_user_id, operator_id, action, target_kind, target_id,
+         request_key, reason, details)
+    VALUES
+        ('operator', NULL, p_operator_id, 'backup.maintenance_released', 'backup_maintenance',
+         'singleton', p_request_key, p_reason,
+         jsonb_build_object(
+             'was_active', true,
+             'abort_active_run', false,
+             'aborted_run_id', NULL,
+             'aborted_live_leases', 0,
+             'backup_run_id', p_backup_run_id
+         ));
+
+    RETURN true;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.backup_release_capture_maintenance(uuid, uuid, text, text) FROM PUBLIC;
+
 -- Owner only: arm RPO overdue tracking and optionally configure rpo_target_seconds.
 CREATE FUNCTION openmettle.backup_arm_rpo(
     p_operator_id uuid,
@@ -796,7 +874,9 @@ RETURNS TABLE(
     backup_run_id uuid,
     entered_at timestamptz,
     lease_until timestamptz,
-    rpo_target_seconds integer)
+    rpo_target_seconds integer,
+    installation_id uuid,
+    opened_maintenance boolean)
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 DECLARE
     g openmettle.backup_maintenance_gate%ROWTYPE;
@@ -805,6 +885,7 @@ DECLARE
     v_run_id uuid;
     v_entered_at timestamptz;
     v_lease_until timestamptz;
+    v_opened boolean;
     v_enter_key text;
     v_enter_bytes bytea;
 BEGIN
@@ -868,16 +949,18 @@ BEGIN
 
     v_run_id := pg_catalog.gen_random_uuid();
     v_lease_until := v_now + pg_catalog.make_interval(secs => p_lease_seconds);
+    v_opened := NOT g.maintenance_active;
 
     INSERT INTO openmettle.backup_runs (
-        id, request_key, operator_id, state, started_at, lease_until, destination_domain
+        id, request_key, operator_id, state, started_at, lease_until, destination_domain,
+        opened_maintenance
     )
     VALUES (
         v_run_id, p_request_key, p_operator_id, 'draining', v_now, v_lease_until,
-        p_destination_domain
+        p_destination_domain, v_opened
     );
 
-    IF NOT g.maintenance_active THEN
+    IF v_opened THEN
         v_entered_at := v_now;
         UPDATE openmettle.backup_maintenance_gate
            SET maintenance_active = true,
@@ -918,7 +1001,8 @@ BEGIN
          WHERE id;
     END IF;
 
-    RETURN QUERY SELECT v_run_id, v_entered_at, v_lease_until, g.rpo_target_seconds;
+    RETURN QUERY SELECT
+        v_run_id, v_entered_at, v_lease_until, g.rpo_target_seconds, g.installation_id, v_opened;
 END
 $$;
 REVOKE ALL ON FUNCTION openmettle.backup_start_capture(uuid, text, text, text, integer) FROM PUBLIC;

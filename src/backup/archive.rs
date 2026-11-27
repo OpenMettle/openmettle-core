@@ -72,6 +72,26 @@ pub struct ArtifactArchiveSummary {
     pub payload_bytes: u64,
 }
 
+/// Open a regular file without following symlinks and with `O_CLOEXEC | O_NONBLOCK`.
+pub fn open_regular_nofollow(path: &Path) -> Result<fs::File, ArchiveError> {
+    if !path.is_absolute() {
+        return Err(ArchiveError::Invalid("path must be absolute"));
+    }
+    let fd = at::openat(
+        at::CWD,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| ArchiveError::Invalid("regular file unreadable or symlink refused"))?;
+    let file = fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(ArchiveError::Invalid("expected a regular file"));
+    }
+    Ok(file)
+}
+
 /// Open a directory descriptor without following symlinks and with `O_CLOEXEC`.
 fn open_dir_nofollow(
     parent: impl std::os::fd::AsFd,
@@ -586,9 +606,17 @@ pub fn validate_destination_root(
                 "--destination-root must reside on a separate storage device from --artifact-root",
             ));
         }
+    } else if require_separate_device {
+        let root_meta = fs::metadata("/")?;
+        if dest_meta.dev() == root_meta.dev() {
+            return Err(ArchiveError::Invalid(
+                "--destination-root must reside on a separate storage device from /",
+            ));
+        }
     }
 
-    // Refuse overlap with backup keyring config or key files.
+    // Refuse overlap with backup keyring config or key files (and enforce separate device when
+    // requested so DB-only captures also catch unmounted local mountpoints).
     for key_path in keyring_paths
         .config_path
         .iter()
@@ -596,11 +624,20 @@ pub fn validate_destination_root(
     {
         if let Ok(kc) = fs::canonicalize(key_path)
             && let Some(kdir) = kc.parent()
-            && paths_overlap(&dest_canon, kdir)
         {
-            return Err(ArchiveError::Invalid(
-                "--destination-root must not overlap backup key custody directory",
-            ));
+            if paths_overlap(&dest_canon, kdir) {
+                return Err(ArchiveError::Invalid(
+                    "--destination-root must not overlap backup key custody directory",
+                ));
+            }
+            if require_separate_device
+                && let Ok(kmeta) = fs::metadata(kdir)
+                && dest_meta.dev() == kmeta.dev()
+            {
+                return Err(ArchiveError::Invalid(
+                    "--destination-root must reside on a separate storage device from backup key custody directory",
+                ));
+            }
         }
     }
 
@@ -621,6 +658,7 @@ fn valid_config_name(name: &str) -> bool {
         && name.len() <= 128
         && name != "."
         && name != ".."
+        && !name.eq_ignore_ascii_case("vault-key-inventory.json")
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -673,8 +711,10 @@ fn json_looks_like_secret_material(val: &serde_json::Value) -> bool {
     }
 }
 
-/// Load and validate non-secret `--config-file NAME=PATH` entries, refusing backup/vault key
-/// files, private keys, and JSON objects holding vault/backup key material.
+/// Load and validate non-secret `--config-file NAME=PATH` entries using `O_NOFOLLOW` descriptor
+/// reads, refusing backup/vault key files, reserved generated names, private keys, and JSON
+/// objects holding vault/backup key material. Fails closed whenever a configured vault keyring
+/// environment variable cannot be read or parsed.
 pub fn load_non_secret_config_files(
     specs: &[(String, PathBuf)],
     keyring_paths: &KeyRingPaths,
@@ -686,41 +726,61 @@ pub fn load_non_secret_config_files(
         "OPENMETTLE_ADMIN_VAULT_KEYS_CONFIG",
         "VAULT_KEYS_CONFIG",
     ] {
-        if let Ok(raw) = std::env::var(var)
-            && !raw.is_empty()
-        {
-            let p = Path::new(&raw);
-            if let Some(ino) = file_dev_ino(p) {
-                vault_inodes.insert(ino);
-            }
-            if let Ok(bytes) = fs::read(p)
-                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                && let Some(keys) = val.get("keys").and_then(serde_json::Value::as_array)
-            {
-                for item in keys {
-                    if let Some(file) = item.get("file").and_then(serde_json::Value::as_str)
-                        && let Some(ino) = file_dev_ino(Path::new(file))
-                    {
-                        vault_inodes.insert(ino);
-                    }
-                }
-            }
+        let Ok(raw) = std::env::var(var) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let p = Path::new(&raw);
+        let ino = file_dev_ino(p).ok_or(ArchiveError::Invalid(
+            "configured vault keyring is unreadable; refusing to bundle config files",
+        ))?;
+        vault_inodes.insert(ino);
+        let bytes = fs::read(p).map_err(|_| {
+            ArchiveError::Invalid(
+                "configured vault keyring is unreadable; refusing to bundle config files",
+            )
+        })?;
+        let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            ArchiveError::Invalid(
+                "configured vault keyring is malformed; refusing to bundle config files",
+            )
+        })?;
+        let keys = val
+            .get("keys")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(ArchiveError::Invalid(
+                "configured vault keyring is malformed; refusing to bundle config files",
+            ))?;
+        for item in keys {
+            let file = item.get("file").and_then(serde_json::Value::as_str).ok_or(
+                ArchiveError::Invalid(
+                    "configured vault keyring entry is malformed; refusing to bundle config files",
+                ),
+            )?;
+            let key_ino = file_dev_ino(Path::new(file)).ok_or(ArchiveError::Invalid(
+                "configured vault key file is unreadable; refusing to bundle config files",
+            ))?;
+            vault_inodes.insert(key_ino);
         }
     }
 
     let mut seen_names = BTreeSet::new();
     let mut out = Vec::with_capacity(specs.len());
     for (name, path) in specs {
-        if !valid_config_name(name) || !seen_names.insert(name.as_str()) {
+        if !valid_config_name(name) || !seen_names.insert(name.to_ascii_lowercase()) {
             return Err(ArchiveError::Invalid(
-                "invalid or duplicate --config-file name",
+                "invalid, reserved, or duplicate --config-file name",
             ));
         }
         if !path.is_absolute() {
             return Err(ArchiveError::Invalid("--config-file path must be absolute"));
         }
-        let meta = fs::metadata(path)
-            .map_err(|_| ArchiveError::Invalid("--config-file path unreadable"))?;
+        let file = open_regular_nofollow(path).map_err(|_| {
+            ArchiveError::Invalid("--config-file must be an existing non-symlink regular file")
+        })?;
+        let meta = file.metadata()?;
         if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES as u64 {
             return Err(ArchiveError::Invalid(
                 "--config-file must be a regular file <= 1 MiB",
@@ -733,7 +793,9 @@ pub fn load_non_secret_config_files(
             ));
         }
         let perm = meta.permissions().mode() & 0o777;
-        let bytes = fs::read(path)?;
+        let mut bytes = Vec::with_capacity((meta.len() as usize).min(MAX_CONFIG_FILE_BYTES) + 1);
+        file.take(MAX_CONFIG_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_CONFIG_FILE_BYTES {
             return Err(ArchiveError::Invalid("--config-file exceeds 1 MiB"));
         }
@@ -765,12 +827,14 @@ pub fn load_non_secret_config_files(
 
 // --- Unencrypted non-secret routing header (`backup-meta.json`) & GFS retention ---------------
 
-/// Unencrypted non-secret routing header stored beside encrypted `.enc` files so `backup prune`
-/// and `backup status` never require decrypting archives.
+/// Unencrypted non-secret routing header stored beside encrypted `.enc` files.
+/// `backup prune` still cryptographically verifies `manifest.json.enc` and component `.enc`
+/// digests before trusting any set to supersede older retained backups.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackupMeta {
     pub format: String,
+    pub installation_id: String,
     pub backup_run_id: String,
     pub completed_at: String,
     pub destination_domain: String,
@@ -812,6 +876,8 @@ impl GfsPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackupSetCandidate {
     pub dir_name: String,
+    pub installation_id: String,
+    pub destination_domain: String,
     pub backup_run_id: String,
     pub completed_at: DateTime<Utc>,
 }
@@ -820,66 +886,86 @@ pub struct BackupSetCandidate {
 pub struct PruneReport {
     pub kept: Vec<String>,
     pub pruned: Vec<String>,
+    pub skipped_unverified: Vec<String>,
 }
 
-/// Deterministic GFS selector over verified complete backup sets.
-/// Always keeps the newest set unconditionally, plus the newest set from each of the most
-/// recent `keep_daily` distinct UTC dates, `keep_weekly` distinct ISO weeks, and `keep_monthly`
-/// distinct calendar months.
+/// Deterministic GFS selector over verified complete backup sets, scoped independently per
+/// `(installation_id, destination_domain)` so installations sharing a destination root never
+/// prune each other's backups. Within each scope, always keeps the newest set unconditionally,
+/// plus the newest set from each of the most recent `keep_daily` distinct UTC dates,
+/// `keep_weekly` distinct ISO weeks, and `keep_monthly` distinct calendar months.
 pub fn select_gfs_retention(
     candidates: &[BackupSetCandidate],
     policy: GfsPolicy,
 ) -> Result<(BTreeSet<String>, Vec<String>), ArchiveError> {
     policy.validate()?;
-    let mut sorted: Vec<&BackupSetCandidate> = candidates.iter().collect();
-    sorted.sort_by(|a, b| {
-        b.completed_at
-            .cmp(&a.completed_at)
-            .then_with(|| b.backup_run_id.cmp(&a.backup_run_id))
-            .then_with(|| b.dir_name.cmp(&a.dir_name))
-    });
-
-    let mut kept = BTreeSet::new();
-    let mut daily: BTreeMap<NaiveDate, &str> = BTreeMap::new();
-    let mut weekly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
-    let mut monthly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
-
-    for (idx, c) in sorted.iter().enumerate() {
-        if idx == 0 {
-            kept.insert(c.dir_name.clone());
-        }
-        let date = c.completed_at.date_naive();
-        if daily.len() < policy.keep_daily && !daily.contains_key(&date) {
-            daily.insert(date, &c.dir_name);
-            kept.insert(c.dir_name.clone());
-        }
-        let iso = date.iso_week();
-        let wk = (iso.year(), iso.week());
-        if weekly.len() < policy.keep_weekly && !weekly.contains_key(&wk) {
-            weekly.insert(wk, &c.dir_name);
-            kept.insert(c.dir_name.clone());
-        }
-        let mo = (date.year(), date.month());
-        if monthly.len() < policy.keep_monthly && !monthly.contains_key(&mo) {
-            monthly.insert(mo, &c.dir_name);
-            kept.insert(c.dir_name.clone());
-        }
+    let mut by_scope: BTreeMap<(&str, &str), Vec<&BackupSetCandidate>> = BTreeMap::new();
+    for c in candidates {
+        by_scope
+            .entry((c.installation_id.as_str(), c.destination_domain.as_str()))
+            .or_default()
+            .push(c);
     }
 
-    let pruned: Vec<String> = sorted
-        .iter()
-        .filter(|c| !kept.contains(&c.dir_name))
-        .map(|c| c.dir_name.clone())
-        .collect();
+    let mut kept = BTreeSet::new();
+    let mut pruned = Vec::new();
+    for mut group in by_scope.into_values() {
+        group.sort_by(|a, b| {
+            b.completed_at
+                .cmp(&a.completed_at)
+                .then_with(|| b.backup_run_id.cmp(&a.backup_run_id))
+                .then_with(|| b.dir_name.cmp(&a.dir_name))
+        });
+
+        let mut daily: BTreeMap<NaiveDate, &str> = BTreeMap::new();
+        let mut weekly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
+        let mut monthly: BTreeMap<(i32, u32), &str> = BTreeMap::new();
+        let mut group_kept = BTreeSet::new();
+
+        for (idx, c) in group.iter().enumerate() {
+            if idx == 0 {
+                group_kept.insert(c.dir_name.clone());
+            }
+            let date = c.completed_at.date_naive();
+            if daily.len() < policy.keep_daily && !daily.contains_key(&date) {
+                daily.insert(date, &c.dir_name);
+                group_kept.insert(c.dir_name.clone());
+            }
+            let iso = date.iso_week();
+            let wk = (iso.year(), iso.week());
+            if weekly.len() < policy.keep_weekly && !weekly.contains_key(&wk) {
+                weekly.insert(wk, &c.dir_name);
+                group_kept.insert(c.dir_name.clone());
+            }
+            let mo = (date.year(), date.month());
+            if monthly.len() < policy.keep_monthly && !monthly.contains_key(&mo) {
+                monthly.insert(mo, &c.dir_name);
+                group_kept.insert(c.dir_name.clone());
+            }
+        }
+
+        for c in &group {
+            if !group_kept.contains(&c.dir_name) {
+                pruned.push(c.dir_name.clone());
+            }
+        }
+        kept.extend(group_kept);
+    }
+    pruned.sort();
     Ok((kept, pruned))
 }
 
-/// Scan `dest_root` for verified complete `backup-*` sets (`backup-meta.json` with
-/// `state == "complete"`), compute GFS retention, and remove expired sets unless `dry_run`.
-pub fn prune_destination(
+/// Scan `dest_root` for `backup-*` sets, require cryptographic & structural verification via
+/// `verify_dir` before any set can enter GFS bucket selection, scope optionally to one
+/// `(installation_id, destination_domain)`, and remove only verified expired sets unless
+/// `dry_run`. Any `backup-*` directory failing verification is excluded from GFS selection,
+/// reported in `skipped_unverified`, and never deleted.
+pub fn prune_destination_with_verifier(
     dest_root: &Path,
     policy: GfsPolicy,
+    scope_filter: Option<(&str, &str)>,
     dry_run: bool,
+    verify_dir: impl Fn(&Path, &BackupMeta) -> bool,
 ) -> Result<PruneReport, ArchiveError> {
     policy.validate()?;
     if !dest_root.is_absolute() || !dest_root.is_dir() {
@@ -889,6 +975,7 @@ pub fn prune_destination(
     }
 
     let mut candidates = Vec::new();
+    let mut skipped_unverified = Vec::new();
     for entry in fs::read_dir(dest_root)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -901,24 +988,44 @@ pub fn prune_destination(
         if !name.starts_with("backup-") {
             continue;
         }
-        let meta_path = entry.path().join("backup-meta.json");
+        let dir_path = entry.path();
+        let meta_path = dir_path.join("backup-meta.json");
         let Ok(meta_bytes) = fs::read(&meta_path) else {
+            skipped_unverified.push(name);
             continue;
         };
         let Ok(meta) = serde_json::from_slice::<BackupMeta>(&meta_bytes) else {
+            skipped_unverified.push(name);
             continue;
         };
-        if meta.state != "complete" || runs::uuid(&meta.backup_run_id).is_err() {
-            continue;
-        }
-        if !name.ends_with(&format!("-{}", meta.backup_run_id)) {
+        if meta.state != "complete"
+            || runs::uuid(&meta.backup_run_id).is_err()
+            || runs::uuid(&meta.installation_id).is_err()
+            || !name.ends_with(&format!("-{}", meta.backup_run_id))
+        {
+            skipped_unverified.push(name);
             continue;
         }
         let Ok(completed_at) = DateTime::parse_from_rfc3339(&meta.completed_at) else {
+            skipped_unverified.push(name);
             continue;
         };
+        if let Some((want_inst, want_dom)) = scope_filter
+            && (
+                meta.installation_id.as_str(),
+                meta.destination_domain.as_str(),
+            ) != (want_inst, want_dom)
+        {
+            continue;
+        }
+        if !verify_dir(&dir_path, &meta) {
+            skipped_unverified.push(name);
+            continue;
+        }
         candidates.push(BackupSetCandidate {
             dir_name: name,
+            installation_id: meta.installation_id,
+            destination_domain: meta.destination_domain,
             backup_run_id: meta.backup_run_id,
             completed_at: completed_at.with_timezone(&Utc),
         });
@@ -937,7 +1044,12 @@ pub fn prune_destination(
 
     let mut kept: Vec<String> = kept_set.into_iter().collect();
     kept.sort();
-    Ok(PruneReport { kept, pruned })
+    skipped_unverified.sort();
+    Ok(PruneReport {
+        kept,
+        pruned,
+        skipped_unverified,
+    })
 }
 
 #[cfg(test)]
@@ -945,9 +1057,14 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn cand(name: &str, y: i32, m: u32, d: u32, h: u32) -> BackupSetCandidate {
+    const INST_A: &str = "11111111-1111-4111-8111-111111111111";
+    const INST_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn cand_for(inst: &str, name: &str, y: i32, m: u32, d: u32, h: u32) -> BackupSetCandidate {
         BackupSetCandidate {
             dir_name: name.to_owned(),
+            installation_id: inst.to_owned(),
+            destination_domain: "offhost-test".to_owned(),
             backup_run_id: format!(
                 "00000000-0000-4000-8000-{:012}",
                 y as u64 * 10000 + m as u64 * 100 + d as u64 + h as u64 * 1000000
@@ -956,8 +1073,12 @@ mod tests {
         }
     }
 
+    fn cand(name: &str, y: i32, m: u32, d: u32, h: u32) -> BackupSetCandidate {
+        cand_for(INST_A, name, y, m, d, h)
+    }
+
     #[test]
-    fn gfs_retention_keeps_7_daily_4_weekly_3_monthly_and_newest_always() {
+    fn gfs_retention_keeps_7_daily_4_weekly_3_monthly_and_isolates_installations() {
         // Build 120 consecutive daily backups from 2026-08-01 through 2026-11-28.
         let start = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
         let mut all = Vec::new();
@@ -980,18 +1101,17 @@ mod tests {
             latest.day(),
             14,
         ));
+        // Add an older backup from a DIFFERENT installation_id: must be retained independently.
+        all.push(cand_for(INST_B, "backup-inst-b-20260701", 2026, 7, 1, 2));
 
         let (kept, pruned) = select_gfs_retention(&all, GfsPolicy::default()).unwrap();
         assert!(kept.contains(&format!("backup-{}-later", latest.format("%Y%m%d"))));
         assert!(!kept.contains(&format!("backup-{}", latest.format("%Y%m%d"))));
-        // 7 distinct daily dates, 4 distinct ISO weeks (some overlapping), 3 distinct months
-        // (Nov, Oct, Sep -> 2 extra beyond weekly): total kept must be strictly bounded and > 7.
-        assert!(kept.len() >= 10 && kept.len() <= 14, "kept={kept:?}");
+        assert!(kept.contains("backup-inst-b-20260701"));
+        assert!(kept.len() >= 11 && kept.len() <= 15, "kept={kept:?}");
         assert_eq!(kept.len() + pruned.len(), all.len());
-        // Verify newest of September (2026-09-30) and October (2026-10-31) are retained.
         assert!(kept.contains("backup-20261031"), "kept={kept:?}");
         assert!(kept.contains("backup-20260930"), "kept={kept:?}");
-        // August (4th month back) must be pruned.
         assert!(!kept.contains("backup-20260831"), "kept={kept:?}");
     }
 
@@ -1008,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn config_loader_refuses_secret_json_and_private_keys() {
+    fn config_loader_refuses_secret_json_reserved_name_and_private_keys() {
         let dir = std::env::temp_dir().join(format!("om-backup-cfg-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1021,6 +1141,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.len(), 1);
+
+        // Reserved generated unpack filename must be rejected at preflight (case-insensitively).
+        assert!(
+            load_non_secret_config_files(
+                &[("Vault-Key-Inventory.json".into(), good.clone())],
+                &KeyRingPaths::default(),
+            )
+            .is_err()
+        );
 
         let bad_ring = dir.join("keys.json");
         fs::write(
@@ -1039,7 +1168,11 @@ mod tests {
         let bad_pem = dir.join("priv.txt");
         fs::write(
             &bad_pem,
-            "-----BEGIN EC PRIVATE KEY-----\nfake\n-----END EC PRIVATE KEY-----\n",
+            concat!(
+                "-----BEGIN EC ",
+                "PRIVATE KEY-----\nfake\n-----END EC ",
+                "PRIVATE KEY-----\n"
+            ),
         )
         .unwrap();
         assert!(

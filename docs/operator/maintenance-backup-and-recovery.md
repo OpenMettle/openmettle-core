@@ -4,7 +4,7 @@ Use this runbook to operate nightly coordinated backups (`V1-30`, [ADR 0046](../
 
 ## Preconditions
 
-1. **Owner login and tooling:** Run `openmettle-admin` with `OPENMETTLE_ADMIN_DATABASE_URL` set to the `openmettle_owner` database login and `pg_dump` (PostgreSQL 18 client) on `PATH`. Never grant `openmettle_owner` credentials to API, worker, issuance, or gateway workloads.
+1. **Owner login and tooling:** Run `openmettle-admin` with `OPENMETTLE_ADMIN_DATABASE_URL` set to the `openmettle_owner` database login and `pg_dump` (PostgreSQL 18 client) on `PATH` (or override the executable path via `--pg-dump-bin PATH` / `OPENMETTLE_PG_DUMP_BIN` when multiple PostgreSQL client versions are installed). Never grant `openmettle_owner` credentials to API, worker, issuance, or gateway workloads.
 2. **Off-workstation destination mount:** Mount a destination directory in a failure domain separate from the primary workstation/cluster storage (for example, an NFS/SMB/object-mounted NAS backup directory). `openmettle-admin backup capture` refuses temporary directories (`/tmp`, `/var/tmp`, `$TMPDIR`), git workspaces, and any path overlapping `ARTIFACTS_DIR` or keyring directories. Pass `--require-separate-device` in production to enforce that the backup destination resides on a distinct filesystem device from the artifact volume.
 3. **Separate backup encryption keyring (`BACKUP_KEYS_CONFIG`):** Provision a dedicated version-1 backup keyring manifest (`0400` or `0600`, owner-only) referencing 32-byte key files (`0400` or `0600`):
 
@@ -86,11 +86,12 @@ openmettle-admin backup verify \
   --backup-keys-config /etc/openmettle/backup-keys/keyring.json
 ```
 
-Preview or run standalone GFS pruning:
+Preview or run standalone GFS pruning (requires `--backup-keys-config` or `OPENMETTLE_ADMIN_BACKUP_KEYS_CONFIG` so every candidate's `manifest.json.enc` and component `.enc` digests are cryptographically verified before older sets can be pruned; sets are scoped per `(installation_id, destination_domain)` and unverified directories are never deleted):
 
 ```sh
 openmettle-admin backup prune \
   --destination-root /mnt/offhost-backups/openmettle \
+  --backup-keys-config /etc/openmettle/backup-keys/keyring.json \
   --keep-daily 7 --keep-weekly 4 --keep-monthly 3 --dry-run
 ```
 
@@ -156,11 +157,16 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
    openmettle-migrate
    ```
 
-   Running `openmettle-migrate` immediately after `pg_restore` verifies every schema ownership and bounded-role boundary (`src/boundaries.sql`) without modifying data. Because `pg.dump` was captured inside the maintenance window, the restored database boots with `backup_maintenance_gate.maintenance_active = true` (extra defense-in-depth keeping admission closed until step 7).
+   Running `openmettle-migrate` immediately after `pg_restore` reapplies `openmettle_owner`'s global and `openmettle`-schema `ALTER DEFAULT PRIVILEGES ... REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` (which `pg_dump --schema=openmettle` omits) and verifies every schema ownership and bounded-role boundary (`src/boundaries.sql`) without modifying data. Because `pg.dump` was captured inside the maintenance window, the restored database boots with `backup_maintenance_gate.maintenance_active = true` (extra defense-in-depth keeping admission closed until step 7).
 
-3. **Close `restore_reconciliation_gate` with the watermark from `manifest.json` (or a newer post-backup `journal export`):**
+3. **Select ONE authoritative deletion journal export (`SELECTED_JOURNAL`) and close `restore_reconciliation_gate`:**
 
-   Read `deletion_journal` fields from `/var/restore/openmettle-recovery/manifest.json` (or from a newer external `openmettle-admin journal export` file if one exists) and run `openmettle-admin restore lock` as documented in [Restore the deletion journal](storage-adoption-and-quota-upgrade.md#restore-the-deletion-journal-after-a-database-restore).
+   Choose a single verified journal export file and carry that exact `"$SELECTED_JOURNAL"` through both `restore lock` (this step) and `restore replay` (step 5):
+
+   - **Preferred (zero post-backup gap):** If a newer post-backup `openmettle-admin journal export` file exists from before primary loss, set `SELECTED_JOURNAL=/path/to/latest-journal-export.txt` and pass `--export-complete` to `restore lock`.
+   - **Fallback (backup-time journal only):** Otherwise set `SELECTED_JOURNAL=/var/restore/openmettle-recovery/deletion-journal.bin`. If writes or purges may have occurred after the backup was captured, omit `--export-complete` on `restore lock` and run audited `openmettle-admin restore accept-coverage-gap` before `restore replay` (see [Restore the deletion journal](storage-adoption-and-quota-upgrade.md#restore-the-deletion-journal-after-a-database-restore)).
+
+   Extract the watermark headers (`origin`, `lifecycle_origin`, `lifecycle_baseline`, `connection_origin`, and `watermark <origin> <seq> <digest> <ts>`) directly from `"$SELECTED_JOURNAL"` and run `openmettle-admin restore lock` with those exact values.
 
 4. **Copy/mount the restored artifact tree and run `storage rebind`:**
 
@@ -172,10 +178,10 @@ Keep `openmettle-api`, `openmettle-worker`, and `openmettle-gateway` stopped unt
 
    If a payload is unrecoverable across all backup copies, follow [Declaring an unrecoverable payload lost](restore-artifact-volume.md#declaring-an-unrecoverable-payload-lost).
 
-5. **Replay the deletion journal and verify zero drift:**
+5. **Replay the same `"$SELECTED_JOURNAL"` and verify zero drift:**
 
    ```sh
-   openmettle-admin restore replay /var/restore/openmettle-recovery/deletion-journal.bin "$ARTIFACT_ROOT"
+   openmettle-admin restore replay "$SELECTED_JOURNAL" "$ARTIFACT_ROOT"
    openmettle-admin quota verify "$ARTIFACT_ROOT"
    ```
 

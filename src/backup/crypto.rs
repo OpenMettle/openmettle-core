@@ -18,6 +18,7 @@ use std::{
     fmt, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use subtle::ConstantTimeEq;
 
@@ -110,18 +111,24 @@ pub struct KeyRingPaths {
     pub protected_inodes: BTreeSet<(u64, u64)>,
 }
 
-/// Versioned backup master keyring stored separately from PostgreSQL and `VAULT_KEYS_CONFIG`.
-pub struct BackupKeyRing {
+struct BackupKeyRingInner {
     active_key_id: String,
     keys: Vec<(String, SharedSecret)>,
     paths: KeyRingPaths,
 }
 
+/// Versioned backup master keyring stored separately from PostgreSQL and `VAULT_KEYS_CONFIG`.
+/// Cheaply cloneable via shared `Arc` without copying key material.
+#[derive(Clone)]
+pub struct BackupKeyRing {
+    inner: Arc<BackupKeyRingInner>,
+}
+
 impl fmt::Debug for BackupKeyRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ids: Vec<&str> = self.keys.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = self.inner.keys.iter().map(|(id, _)| id.as_str()).collect();
         f.debug_struct("BackupKeyRing")
-            .field("active_key_id", &self.active_key_id)
+            .field("active_key_id", &self.inner.active_key_id)
             .field("key_ids", &ids)
             .finish()
     }
@@ -168,9 +175,11 @@ impl BackupKeyRing {
             return Err(CryptoError::Configuration("active backup key missing"));
         }
         Ok(Self {
-            active_key_id,
-            keys,
-            paths,
+            inner: Arc::new(BackupKeyRingInner {
+                active_key_id,
+                keys,
+                paths,
+            }),
         })
     }
 
@@ -240,48 +249,80 @@ impl BackupKeyRing {
     }
 
     /// Verify that neither the keyring config nor any key file or key bytes match an ADR 0045
-    /// vault keyring configuration.
+    /// vault keyring configuration. Fails closed whenever a configured vault keyring or any key
+    /// file it names cannot be read or parsed.
     pub fn verify_distinct_from_vault_config(
         &self,
         vault_config: &Path,
     ) -> Result<(), CryptoError> {
-        if let Some(vault_ino) = file_dev_ino(vault_config)
-            && self.paths.protected_inodes.contains(&vault_ino)
-        {
+        if !vault_config.is_absolute() {
+            return Err(CryptoError::Configuration(
+                "vault keyring path must be absolute to verify backup key separation",
+            ));
+        }
+        let vault_ino = file_dev_ino(vault_config).ok_or(CryptoError::Configuration(
+            "vault keyring unreadable; cannot verify backup key separation",
+        ))?;
+        if self.inner.paths.protected_inodes.contains(&vault_ino) {
             return Err(CryptoError::Configuration(
                 "backup keyring must be distinct from VAULT_KEYS_CONFIG",
             ));
         }
-        // If the vault config is readable on this host, also verify none of its key files or raw
-        // 32-byte key values match the backup keyring.
-        if let Ok(vault_bytes) = fs::read(vault_config)
-            && vault_bytes.len() <= MAX_CONFIG_BYTES
-            && let Ok(doc) = serde_json::from_slice::<KeyRingDocument>(&vault_bytes)
-        {
-            for entry in &doc.keys {
-                let key_path = Path::new(&entry.file);
-                if let Some(ino) = file_dev_ino(key_path)
-                    && self.paths.protected_inodes.contains(&ino)
-                {
+        let vault_bytes = fs::read(vault_config).map_err(|_| {
+            CryptoError::Configuration(
+                "vault keyring unreadable; cannot verify backup key separation",
+            )
+        })?;
+        if vault_bytes.len() > MAX_CONFIG_BYTES {
+            return Err(CryptoError::Configuration(
+                "vault keyring oversized; cannot verify backup key separation",
+            ));
+        }
+        let doc: KeyRingDocument = serde_json::from_slice(&vault_bytes).map_err(|_| {
+            CryptoError::Configuration(
+                "vault keyring malformed; cannot verify backup key separation",
+            )
+        })?;
+        if doc.version != 1 || doc.keys.is_empty() || doc.keys.len() > MAX_KEYS {
+            return Err(CryptoError::Configuration(
+                "vault keyring invalid; cannot verify backup key separation",
+            ));
+        }
+        for entry in &doc.keys {
+            let key_path = Path::new(&entry.file);
+            if !key_path.is_absolute() {
+                return Err(CryptoError::Configuration(
+                    "vault key file path must be absolute to verify backup key separation",
+                ));
+            }
+            let ino = file_dev_ino(key_path).ok_or(CryptoError::Configuration(
+                "vault key file unreadable; cannot verify backup key separation",
+            ))?;
+            if self.inner.paths.protected_inodes.contains(&ino) {
+                return Err(CryptoError::Configuration(
+                    "backup key file must be distinct from vault key files",
+                ));
+            }
+            let raw = fs::read(key_path).map_err(|_| {
+                CryptoError::Configuration(
+                    "vault key file unreadable; cannot verify backup key separation",
+                )
+            })?;
+            if raw.len() != KEY_BYTES {
+                return Err(CryptoError::Configuration(
+                    "vault key file invalid; cannot verify backup key separation",
+                ));
+            }
+            let vault_secret = SharedSecret::from(raw);
+            for (_, backup_secret) in &self.inner.keys {
+                if bool::from(
+                    backup_secret
+                        .secret_bytes()
+                        .ct_eq(vault_secret.secret_bytes()),
+                ) {
                     return Err(CryptoError::Configuration(
-                        "backup key file must be distinct from vault key files",
+                        "backup key material must be distinct from vault keys",
                     ));
-                }
-                if let Ok(raw) = fs::read(key_path)
-                    && raw.len() == KEY_BYTES
-                {
-                    let vault_secret = SharedSecret::from(raw);
-                    for (_, backup_secret) in &self.keys {
-                        if bool::from(
-                            backup_secret
-                                .secret_bytes()
-                                .ct_eq(vault_secret.secret_bytes()),
-                        ) {
-                            return Err(CryptoError::Configuration(
-                                "backup key material must be distinct from vault keys",
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -289,19 +330,20 @@ impl BackupKeyRing {
     }
 
     pub fn active_key_id(&self) -> &str {
-        &self.active_key_id
+        &self.inner.active_key_id
     }
 
     pub fn key_ids(&self) -> Vec<&str> {
-        self.keys.iter().map(|(id, _)| id.as_str()).collect()
+        self.inner.keys.iter().map(|(id, _)| id.as_str()).collect()
     }
 
     pub fn paths(&self) -> &KeyRingPaths {
-        &self.paths
+        &self.inner.paths
     }
 
     fn key_bytes(&self, key_id: &str) -> Result<&[u8], CryptoError> {
-        self.keys
+        self.inner
+            .keys
             .iter()
             .find(|(id, _)| id == key_id)
             .map(|(_, secret)| secret.secret_bytes())

@@ -45,6 +45,25 @@ async fn pool(connections: u32) -> Result<PgPool, &'static str> {
         .map_err(|_| "database connection failed")
 }
 
+async fn validated_backup_pool(connections: u32) -> Result<(String, PgPool), &'static str> {
+    let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+        .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+    let pg_cfg = backup::parse_validated_pg_uri(&url).map_err(|err| {
+        eprintln!("backup capture: {err}");
+        "OPENMETTLE_ADMIN_DATABASE_URL is invalid or contains unsupported parameters"
+    })?;
+    let opts = pg_cfg.to_sqlx_options().map_err(|err| {
+        eprintln!("backup capture: {err}");
+        "OPENMETTLE_ADMIN_DATABASE_URL is invalid or contains unsupported parameters"
+    })?;
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(connections)
+        .connect_with(opts)
+        .await
+        .map_err(|_| "database connection failed")?;
+    Ok((url, db))
+}
+
 /// Reports a journal or restore step's failure by kind and SQLSTATE only, never record contents
 /// or digests, and returns the step's own message.
 fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
@@ -1107,10 +1126,11 @@ struct BackupCaptureArgs {
     keep_monthly: usize,
     no_prune: bool,
     release_on_success: bool,
+    pg_dump_bin: Option<PathBuf>,
 }
 
 fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'static str> {
-    let usage = "usage: openmettle-admin backup capture --destination-root PATH --destination-domain DOMAIN [--backup-keys-config PATH] [--artifact-root PATH] --operator-id UUID --request-key KEY --reason REASON [--drain-timeout-secs N] [--require-separate-device] [--graphiti-mode not-provisioned|offline-dump] [--neo4j-dump PATH] [--config-file NAME=PATH]... [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--no-prune] [--release-on-success]";
+    let usage = "usage: openmettle-admin backup capture --destination-root PATH --destination-domain DOMAIN [--backup-keys-config PATH] [--artifact-root PATH] --operator-id UUID --request-key KEY --reason REASON [--drain-timeout-secs N] [--require-separate-device] [--graphiti-mode not-provisioned|offline-dump] [--neo4j-dump PATH] [--config-file NAME=PATH]... [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--no-prune] [--release-on-success] [--pg-dump-bin PATH]";
     let defaults = GfsPolicy::default();
     let mut destination_root = None;
     let mut destination_domain = None;
@@ -1129,6 +1149,7 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
     let mut keep_monthly = None;
     let mut no_prune = false;
     let mut release_on_success = false;
+    let mut pg_dump_bin: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -1286,6 +1307,17 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
                 }
                 release_on_success = true;
             }
+            "--pg-dump-bin" => {
+                if pg_dump_bin.is_some() {
+                    return Err("duplicate --pg-dump-bin");
+                }
+                i += 1;
+                let raw = args.get(i).ok_or("missing --pg-dump-bin value")?;
+                if raw.is_empty() {
+                    return Err("--pg-dump-bin must not be empty");
+                }
+                pg_dump_bin = Some(PathBuf::from(raw));
+            }
             _ => return Err("unknown backup capture option"),
         }
         i += 1;
@@ -1323,6 +1355,7 @@ fn parse_backup_capture_args(args: &[String]) -> Result<BackupCaptureArgs, &'sta
         keep_monthly: keep_monthly.unwrap_or(defaults.keep_monthly),
         no_prune,
         release_on_success,
+        pg_dump_bin,
     })
 }
 
@@ -1391,14 +1424,16 @@ fn parse_backup_verify_unpack_args(
 
 struct BackupPruneArgs {
     destination_root: PathBuf,
+    backup_keys_config: Option<PathBuf>,
     policy: GfsPolicy,
     dry_run: bool,
 }
 
 fn parse_backup_prune_args(args: &[String]) -> Result<BackupPruneArgs, &'static str> {
-    let usage = "usage: openmettle-admin backup prune --destination-root PATH [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--dry-run]";
+    let usage = "usage: openmettle-admin backup prune --destination-root PATH [--backup-keys-config PATH] [--keep-daily N] [--keep-weekly N] [--keep-monthly N] [--dry-run]";
     let defaults = GfsPolicy::default();
     let mut destination_root = None;
+    let mut backup_keys_config = None;
     let mut keep_daily = None;
     let mut keep_weekly = None;
     let mut keep_monthly = None;
@@ -1413,6 +1448,15 @@ fn parse_backup_prune_args(args: &[String]) -> Result<BackupPruneArgs, &'static 
                 i += 1;
                 destination_root = Some(PathBuf::from(
                     args.get(i).ok_or("missing --destination-root value")?,
+                ));
+            }
+            "--backup-keys-config" => {
+                if backup_keys_config.is_some() {
+                    return Err("duplicate --backup-keys-config");
+                }
+                i += 1;
+                backup_keys_config = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --backup-keys-config value")?,
                 ));
             }
             "--keep-daily" => {
@@ -1471,6 +1515,7 @@ fn parse_backup_prune_args(args: &[String]) -> Result<BackupPruneArgs, &'static 
         .map_err(|_| "invalid GFS retention policy")?;
     Ok(BackupPruneArgs {
         destination_root: destination_root.ok_or(usage)?,
+        backup_keys_config,
         policy,
         dry_run,
     })
@@ -1588,9 +1633,7 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
         Some("capture") => {
             let parsed = parse_backup_capture_args(args)?;
             let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
-            let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
-                .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
-            let db = pool(2).await?;
+            let (url, db) = validated_backup_pool(3).await?;
             let prune_policy = if parsed.no_prune {
                 None
             } else {
@@ -1599,6 +1642,14 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                     keep_weekly: parsed.keep_weekly,
                     keep_monthly: parsed.keep_monthly,
                 })
+            };
+            let pg_dump_bin = match parsed.pg_dump_bin {
+                Some(path) => Some(path),
+                None => match env::var("OPENMETTLE_PG_DUMP_BIN") {
+                    Ok(raw) if !raw.is_empty() => Some(PathBuf::from(raw)),
+                    Ok(_) => return Err("OPENMETTLE_PG_DUMP_BIN must not be empty"),
+                    Err(_) => None,
+                },
             };
             let report = backup::capture(
                 &db,
@@ -1618,19 +1669,24 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
                     config_files: parsed.config_files,
                     prune_policy,
                     release_on_success: parsed.release_on_success,
+                    pg_dump_bin,
                     allow_local_test_paths: false,
                 },
             )
             .await
             .map_err(report_backup_error("backup capture"))?;
             println!(
-                "backup.capture_succeeded run_id={} dir={} key_id={} bundle_digest={} journal_seq={} pruned={} maintenance_released={}",
+                "backup.capture_succeeded run_id={} dir={} key_id={} bundle_digest={} journal_seq={} pruned={} skipped_unverified={} maintenance_released={}",
                 report.backup_run_id,
                 report.backup_dir.display(),
                 report.encryption_key_id,
                 report.bundle_digest,
                 report.journal_seq,
                 report.pruned.as_ref().map_or(0, |p| p.pruned.len()),
+                report
+                    .pruned
+                    .as_ref()
+                    .map_or(0, |p| p.skipped_unverified.len()),
                 report.released_maintenance
             );
             Ok(())
@@ -1672,13 +1728,20 @@ async fn backup_command(sub: Option<&str>, args: &[String]) -> Result<(), &'stat
         }
         Some("prune") => {
             let parsed = parse_backup_prune_args(args)?;
-            let report = backup::prune(&parsed.destination_root, parsed.policy, parsed.dry_run)
-                .map_err(report_backup_error("backup prune"))?;
+            let keyring = load_backup_keyring(parsed.backup_keys_config.as_deref())?;
+            let report = backup::prune(
+                &parsed.destination_root,
+                &keyring,
+                parsed.policy,
+                parsed.dry_run,
+            )
+            .map_err(report_backup_error("backup prune"))?;
             println!(
-                "backup.pruned dry_run={} kept={} pruned={}",
+                "backup.pruned dry_run={} kept={} pruned={} skipped_unverified={}",
                 parsed.dry_run,
                 report.kept.len(),
-                report.pruned.len()
+                report.pruned.len(),
+                report.skipped_unverified.len()
             );
             Ok(())
         }
@@ -1854,6 +1917,8 @@ mod tests {
             "--keep-monthly",
             "3",
             "--release-on-success",
+            "--pg-dump-bin",
+            "/usr/lib/postgresql/18/bin/pg_dump",
         ]))
         .unwrap();
         assert_eq!(
@@ -1870,6 +1935,10 @@ mod tests {
         assert_eq!(parsed.config_files.len(), 2);
         assert!(parsed.release_on_success);
         assert!(!parsed.no_prune);
+        assert_eq!(
+            parsed.pg_dump_bin,
+            Some(PathBuf::from("/usr/lib/postgresql/18/bin/pg_dump"))
+        );
 
         // offline-dump without --neo4j-dump is refused.
         assert_eq!(
@@ -1993,6 +2062,8 @@ mod tests {
         let prune = parse_backup_prune_args(&vecs(&[
             "--destination-root",
             "/mnt/backups",
+            "--backup-keys-config",
+            "/etc/openmettle/backup-keys.json",
             "--keep-daily",
             "7",
             "--keep-weekly",
@@ -2003,6 +2074,10 @@ mod tests {
         ]))
         .unwrap();
         assert!(prune.dry_run);
+        assert_eq!(
+            prune.backup_keys_config,
+            Some(PathBuf::from("/etc/openmettle/backup-keys.json"))
+        );
         assert_eq!(prune.policy.keep_daily, 7);
         assert_eq!(prune.policy.keep_weekly, 4);
         assert_eq!(prune.policy.keep_monthly, 3);

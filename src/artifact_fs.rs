@@ -1198,8 +1198,8 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
 }
 
 pub use reclaim::{
-    cleanup_lost_on_restore, purge_due, purge_journaled, reconcile_expired, reconcile_run_spills,
-    scrub_unsettled_on_restore,
+    cleanup_lost_on_restore, finish_inflight_purges, purge_due, purge_journaled, reconcile_expired,
+    reconcile_run_spills, scrub_unsettled_on_restore,
 };
 #[cfg(test)]
 mod tests;

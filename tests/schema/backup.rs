@@ -5,7 +5,7 @@
 //! telemetry observation. Every value is synthetic.
 
 use super::authz_http::{Api, As, browser, file_part, form, metadata_part};
-use super::authz_runs::personal_of;
+use super::authz_runs::{framed_digest, personal_of};
 use super::authz_store::{Account, FUTURE, PROVIDER, account, ctx, make_admin, providers};
 use super::*;
 use openmettle_core::{
@@ -16,11 +16,12 @@ use openmettle_core::{
         store::WriteOutcome,
     },
     backup::{
-        self, BackupError, BackupManifest, CaptureOptions, CliPgDumpRunner, DEFAULT_LEASE_SECONDS,
-        GATEWAY_CONSISTENCY_MODE, GraphitiManifest, GraphitiMode, PgDumpRunner,
+        self, ArtifactVolumeManifest, BackupError, BackupManifest, CaptureOptions, CliPgDumpRunner,
+        ComponentManifest, DEFAULT_LEASE_SECONDS, GATEWAY_CONSISTENCY_MODE, GraphitiManifest,
+        GraphitiMode, JournalWatermarkManifest, MANIFEST_FORMAT, META_FORMAT, PgDumpRunner,
         REBUILDABLE_INDEXES,
         archive::{BackupMeta, GfsPolicy},
-        crypto::BackupKeyRing,
+        crypto::{BackupKeyRing, StreamEncryptor},
     },
     runs::{self, RunInput, WriteTransaction},
     storage::{self, ReservationInput, Settlement},
@@ -31,11 +32,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write as IoWrite,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -151,22 +154,276 @@ fn write_keyring_json(
     cfg_path
 }
 
-fn tool_available(name: &str) -> bool {
-    Command::new(name)
+fn pg_tool_major_version(name: &str) -> Option<u32> {
+    let out = Command::new(name)
         .arg("--version")
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for token in text.split_whitespace() {
+        let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty()
+            && let Ok(major) = digits.parse::<u32>()
+        {
+            return Some(major);
+        }
+    }
+    None
+}
+
+enum PgRestoreMode {
+    Local,
+    Docker { container: String },
+}
+
+/// Resolve PostgreSQL >= 18 `pg_dump` and `pg_restore`:
+/// 1. Prefer host `pg_dump`/`pg_restore` when both report major version >= 18.
+/// 2. Otherwise, when `POSTGRES_CONTAINER` is set (as in GitHub Actions `Rust runtime`, where the
+///    Ubuntu runner carries `pg_dump` 16.x alongside a `postgres:18.1` service container), generate
+///    a `0700` `docker exec` wrapper script so tests exercise real PG 18.1 `pg_dump --snapshot`
+///    and `pg_restore`.
+fn resolve_pg18_tools(
+    dir: &auth_config_support::Dir,
+) -> Option<(Arc<dyn PgDumpRunner>, PgRestoreMode)> {
+    let local_dump = pg_tool_major_version("pg_dump").is_some_and(|v| v >= 18);
+    let local_restore = pg_tool_major_version("pg_restore").is_some_and(|v| v >= 18);
+    if local_dump && local_restore {
+        return Some((Arc::new(CliPgDumpRunner::default()), PgRestoreMode::Local));
+    }
+    let container = std::env::var("POSTGRES_CONTAINER").ok()?;
+    if container.is_empty() {
+        return None;
+    }
+    let wrapper = PathBuf::from(dir.path("pg_dump_18.sh"));
+    // Rewrite `--port <mapped>` -> `--port 5432` and `--host localhost` -> `--host 127.0.0.1`
+    // inside the container, and feed the host PGPASSFILE (with host:port rewritten to *:*) over
+    // stdin into a 0600 temp file inside the container so zero passwords appear in argv or env.
+    let posix_script = format!(
+        "#!/bin/sh\nset -eu\n\
+         CONTAINER='{container}'\n\
+         COUNT=$#\n\
+         I=0\n\
+         while [ \"$I\" -lt \"$COUNT\" ]; do\n\
+             ARG=\"$1\"\n\
+             shift\n\
+             I=$((I + 1))\n\
+             if [ \"$ARG\" = \"--port\" ] && [ \"$I\" -lt \"$COUNT\" ]; then\n\
+                 shift\n\
+                 I=$((I + 1))\n\
+                 set -- \"$@\" --port 5432\n\
+             elif [ \"$ARG\" = \"--host\" ] && [ \"$I\" -lt \"$COUNT\" ]; then\n\
+                 shift\n\
+                 I=$((I + 1))\n\
+                 set -- \"$@\" --host 127.0.0.1\n\
+             else\n\
+                 set -- \"$@\" \"$ARG\"\n\
+             fi\n\
+         done\n\
+         if [ -n \"${{PGPASSFILE:-}}\" ] && [ -f \"$PGPASSFILE\" ]; then\n\
+             sed -E 's/^[^:]*:[^:]*:/\\*:\\*:/' \"$PGPASSFILE\" | docker exec -i \\\n\
+                 -e \"PGSSLMODE=${{PGSSLMODE:-disable}}\" \\\n\
+                 \"$CONTAINER\" sh -eu -c \\\n\
+                 'f=$(mktemp); chmod 600 \"$f\"; trap \"rm -f \\\"$f\\\"\" EXIT; cat > \"$f\"; PGPASSFILE=\"$f\" pg_dump \"$@\" </dev/null' \\\n\
+                 _ \"$@\"\n\
+         else\n\
+             docker exec -e \"PGSSLMODE=${{PGSSLMODE:-disable}}\" \"$CONTAINER\" pg_dump \"$@\"\n\
+         fi\n"
+    );
+    fs::write(&wrapper, posix_script).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    Some((
+        Arc::new(CliPgDumpRunner::with_program(wrapper)),
+        PgRestoreMode::Docker { container },
+    ))
+}
+
+fn run_pg_restore(mode: &PgRestoreMode, restored: &TestDb, dump_path: &Path) -> Output {
+    match mode {
+        PgRestoreMode::Local => run_cli(
+            Command::new("pg_restore")
+                .args(["--no-owner", "--exit-on-error", "--dbname"])
+                .arg(restored.url(OWNER))
+                .arg(dump_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            "pg_restore into fresh database",
+        ),
+        PgRestoreMode::Docker { container } => {
+            let parsed = backup::parse_validated_pg_uri(&restored.url(OWNER)).unwrap();
+            let dump_file = fs::File::open(dump_path).unwrap();
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", "-i", "-e", "PGSSLMODE=disable"]);
+            if let Some(pw) = parsed.password.as_deref() {
+                cmd.arg("-e").arg(format!("PGPASSWORD={pw}"));
+            }
+            cmd.arg(container).args([
+                "pg_restore",
+                "--no-owner",
+                "--exit-on-error",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5432",
+                "--username",
+                OWNER,
+                "--dbname",
+                &restored.0,
+            ]);
+            cmd.stdin(Stdio::from(dump_file))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            run_cli(&mut cmd, "docker exec pg_restore into fresh database")
+        }
+    }
 }
 
 struct SyntheticPgDumpRunner;
 impl PgDumpRunner for SyntheticPgDumpRunner {
-    fn dump(&self, _database_url: &str, writer: &mut dyn IoWrite) -> Result<u64, BackupError> {
+    fn dump(
+        &self,
+        _database_url: &str,
+        snapshot_id: Option<&str>,
+        writer: &mut dyn IoWrite,
+    ) -> Result<u64, BackupError> {
+        assert!(
+            snapshot_id.is_some_and(|s| !s.is_empty()),
+            "coordinated backup capture must export and supply a PostgreSQL snapshot ID"
+        );
         let payload = b"PGDMP-SYNTHETIC-TEST-ARCHIVE-V1";
         writer.write_all(payload)?;
         Ok(payload.len() as u64)
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Create a genuine cryptographically verifiable backup directory on disk (with `OMBKUP01`
+/// component `.enc` files, `manifest.json.enc`, and `backup-meta.json`) for GFS pruning tests.
+fn write_verified_backup_set(
+    dest: &Path,
+    keyring: &BackupKeyRing,
+    installation_id: &str,
+    destination_domain: &str,
+    completed_at: &str,
+    idx: usize,
+) -> PathBuf {
+    let run_id = format!("00000000-0000-4000-8000-{idx:012}");
+    let dir_name = format!("backup-{idx:02}-{run_id}");
+    let bdir = dest.join(&dir_name);
+    fs::create_dir(&bdir).unwrap();
+    fs::set_permissions(&bdir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut components = BTreeMap::new();
+    for (file_name, role, body) in [
+        ("pg.dump.enc", "pg_dump", b"PGDMP-SYNTH".as_slice()),
+        (
+            "gateway-entitlements.json.enc",
+            "gateway_entitlements",
+            b"{}".as_slice(),
+        ),
+        (
+            "deletion-journal.bin.enc",
+            "deletion_journal",
+            b"journal".as_slice(),
+        ),
+        (
+            "artifacts.bin.enc",
+            "artifacts",
+            b"OMART01\0\0\0".as_slice(),
+        ),
+        ("config.json.enc", "config", b"{}".as_slice()),
+    ] {
+        let mut f = fs::File::create(bdir.join(file_name)).unwrap();
+        let mut enc = StreamEncryptor::start(keyring, &run_id, role, &mut f).unwrap();
+        enc.write_all(body).unwrap();
+        let stats = enc.finish().unwrap();
+        components.insert(
+            file_name.to_owned(),
+            ComponentManifest {
+                role: role.to_owned(),
+                plaintext_bytes: stats.plaintext_bytes,
+                plaintext_sha256: hex_encode(&stats.plaintext_sha256),
+                ciphertext_bytes: stats.ciphertext_bytes,
+                ciphertext_sha256: hex_encode(&stats.ciphertext_sha256),
+            },
+        );
+    }
+
+    let bundle_digest_for = |manifest_ct: &str| -> String {
+        let mut parts: Vec<&[u8]> = Vec::new();
+        for (name, comp) in &components {
+            parts.push(name.as_bytes());
+            parts.push(comp.ciphertext_sha256.as_bytes());
+        }
+        parts.push(manifest_ct.as_bytes());
+        hex_encode(&framed_digest(b"openmettle.backup.bundle/1\0", &parts))
+    };
+
+    let manifest = BackupManifest {
+        format: MANIFEST_FORMAT.to_owned(),
+        installation_id: installation_id.to_owned(),
+        backup_run_id: run_id.clone(),
+        quiesced_at: completed_at.to_owned(),
+        completed_at: completed_at.to_owned(),
+        schema_version: 45,
+        crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+        destination_domain: destination_domain.to_owned(),
+        rpo_target_seconds: 86_400,
+        encryption_key_id: keyring.active_key_id().to_owned(),
+        bundle_digest: bundle_digest_for(""),
+        components: components.clone(),
+        deletion_journal: JournalWatermarkManifest {
+            origin_us: 1,
+            journal_seq: 0,
+            chain_digest: openmettle_core::restore::GENESIS.to_owned(),
+            lifecycle_origin_us: None,
+            lifecycle_baseline_digest: None,
+            connection_origin_us: None,
+        },
+        artifact_volume: ArtifactVolumeManifest {
+            volume_id: None,
+            revision_count: 0,
+            payload_bytes: 0,
+        },
+        vault_required_key_ids: Vec::new(),
+        gateway_consistency_mode: GATEWAY_CONSISTENCY_MODE.to_owned(),
+        graphiti_neo4j: GraphitiManifest::NotProvisioned,
+        rebuildable_indexes: REBUILDABLE_INDEXES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let mut mf = fs::File::create(bdir.join("manifest.json.enc")).unwrap();
+    let mut menc = StreamEncryptor::start(keyring, &run_id, "manifest", &mut mf).unwrap();
+    menc.write_all(&manifest_bytes).unwrap();
+    let mstats = menc.finish().unwrap();
+    let manifest_ct_hex = hex_encode(&mstats.ciphertext_sha256);
+
+    let meta = BackupMeta {
+        format: META_FORMAT.to_owned(),
+        installation_id: installation_id.to_owned(),
+        backup_run_id: run_id,
+        completed_at: completed_at.to_owned(),
+        destination_domain: destination_domain.to_owned(),
+        encryption_key_id: keyring.active_key_id().to_owned(),
+        manifest_ciphertext_sha256: manifest_ct_hex.clone(),
+        bundle_digest: bundle_digest_for(&manifest_ct_hex),
+        state: "complete".to_owned(),
+    };
+    fs::write(
+        bdir.join("backup-meta.json"),
+        serde_json::to_vec_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    bdir
 }
 
 async fn seed_user(db: &TestDb) -> (Account, String, String) {
@@ -206,10 +463,10 @@ async fn seed_queued_personal_run(db: &TestDb, scope: &str, user: &Account, key:
             branch: &branch,
             message: &msg,
             key,
-            format: "openmettle.synthetic-run",
+            format: "openmettle.conversation",
             version: 1,
             input: b"synthetic input",
-            config: b"{}",
+            config: br#"{"effective":{"model":"synthetic-model"}}"#,
         },
     )
     .await
@@ -635,9 +892,10 @@ async fn drain_timeout_fails_closed_and_requires_explicit_maintenance_recovery()
             config_files: Vec::new(),
             prune_policy: Some(GfsPolicy::default()),
             release_on_success: true,
+            pg_dump_bin: None,
             allow_local_test_paths: true,
         },
-        &SyntheticPgDumpRunner,
+        Arc::new(SyntheticPgDumpRunner),
     )
     .await
     .unwrap_err();
@@ -888,14 +1146,16 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
     let dest_root = PathBuf::from(dir.path("backups"));
     fs::create_dir(&dest_root).unwrap();
 
-    let has_pg_dump = tool_available("pg_dump");
-    let has_pg_restore = tool_available("pg_restore");
-    let cli_runner = CliPgDumpRunner::default();
-    let synth_runner = SyntheticPgDumpRunner;
-    let runner: &dyn PgDumpRunner = if has_pg_dump {
-        &cli_runner
-    } else {
-        &synth_runner
+    let pg18_tools = resolve_pg18_tools(&dir);
+    if std::env::var("POSTGRES_CONTAINER").is_ok() {
+        assert!(
+            pg18_tools.is_some(),
+            "POSTGRES_CONTAINER is set; real PG 18.1 pg_dump/pg_restore wrapper must be active"
+        );
+    }
+    let runner: Arc<dyn PgDumpRunner> = match &pg18_tools {
+        Some((r, _)) => Arc::clone(r),
+        None => Arc::new(SyntheticPgDumpRunner),
     };
 
     let capture_report = backup::capture_with_runner(
@@ -916,6 +1176,7 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
             config_files: vec![("catalog.json".to_owned(), cfg_path.clone())],
             prune_policy: Some(GfsPolicy::default()),
             release_on_success: true,
+            pg_dump_bin: None,
             allow_local_test_paths: true,
         },
         runner,
@@ -1018,9 +1279,9 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
             .unwrap();
     assert_eq!(gw_doc["consistency_mode"], GATEWAY_CONSISTENCY_MODE);
 
-    // End-to-end pg_restore -> openmettle-migrate boundary verify -> restore lock ->
-    // storage rebind -> restore replay -> quota verify -> backup release-maintenance.
-    if has_pg_dump && has_pg_restore {
+    // End-to-end pg_restore -> openmettle-migrate boundary & global default ACL verify ->
+    // restore lock -> storage rebind -> restore replay -> quota verify -> backup release-maintenance.
+    if let Some((_, restore_mode)) = &pg18_tools {
         let restored = TestDb::with_options(false, "").await;
         for sql in [
             "REVOKE ALL ON SCHEMA public FROM PUBLIC".to_owned(),
@@ -1038,22 +1299,15 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
                 .unwrap();
         }
 
-        let restore_out = run_cli(
-            Command::new("pg_restore")
-                .args(["--no-owner", "--exit-on-error", "--dbname"])
-                .arg(restored.url(OWNER))
-                .arg(unpack_dir.join("pg.dump"))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-            "pg_restore into fresh database",
-        );
+        let restore_out = run_pg_restore(restore_mode, &restored, &unpack_dir.join("pg.dump"));
         assert!(
             restore_out.status.success(),
             "pg_restore failed: {}",
             stderr(&restore_out)
         );
 
-        // openmettle-migrate verifies role boundaries & ownership on the restored schema.
+        // openmettle-migrate verifies role boundaries & ownership and reapplies global owner
+        // default function ACLs (`defaclnamespace = 0`, P2 #6).
         let mig_out = run_cli(
             &mut migrate_command(&restored.url(OWNER), &[]),
             "migrate verify",
@@ -1064,8 +1318,37 @@ async fn full_coordinated_capture_verify_tamper_unpack_and_pg_restore_round_trip
             stderr(&mig_out)
         );
 
-        // Because pg.dump was taken inside maintenance, restored DB starts with maintenance active.
         let restored_pool = pool(&restored, OWNER).await;
+        // Verify global (defaclnamespace = 0) default function ACL exists for openmettle_owner
+        // with PUBLIC EXECUTE revoked (restored by openmettle-migrate after pg_restore).
+        let (has_global_fn_acl, public_granted): (bool, bool) = sqlx::query_as(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM pg_default_acl d
+                    JOIN pg_roles r ON r.oid = d.defaclrole
+                    WHERE r.rolname = 'openmettle_owner'
+                      AND d.defaclnamespace = 0
+                      AND d.defaclobjtype = 'f'
+                ),
+                EXISTS (
+                    SELECT 1 FROM pg_default_acl d
+                    JOIN pg_roles r ON r.oid = d.defaclrole,
+                         aclexplode(d.defaclacl) a
+                    WHERE r.rolname = 'openmettle_owner'
+                      AND d.defaclnamespace = 0
+                      AND d.defaclobjtype = 'f'
+                      AND a.grantee = 0
+                )",
+        )
+        .fetch_one(&restored_pool)
+        .await
+        .unwrap();
+        assert!(
+            has_global_fn_acl && !public_granted,
+            "post-restore openmettle-migrate must restore global owner default function ACL without PUBLIC execute"
+        );
+
+        // Because pg.dump was taken inside maintenance, restored DB starts with maintenance active.
         let restored_status = backup::status(&restored_pool).await.unwrap();
         assert!(restored_status.maintenance_active);
 
@@ -1176,8 +1459,12 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
     let dir = auth_config_support::Dir::new();
     let dest = PathBuf::from(dir.path("gfs-dest"));
     fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-1", &[("bk-1", [0x51; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+    let inst_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-    // Create 19 completed sets spanning 5 calendar months, 7 ISO weeks, and 10 consecutive days.
+    // Create 19 cryptographically verified completed sets spanning 5 calendar months, 7 ISO weeks,
+    // and 10 consecutive days.
     let timestamps = [
         "2026-07-15T02:00:00Z", // old month 1 -> prune
         "2026-08-15T02:00:00Z", // old month 2 -> prune
@@ -1201,25 +1488,7 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
     ];
     let mut created_dirs = Vec::new();
     for (idx, ts) in timestamps.iter().enumerate() {
-        let run_id = format!("00000000-0000-4000-8000-{idx:012}");
-        let name = format!("backup-{idx:02}-{run_id}");
-        let bdir = dest.join(&name);
-        fs::create_dir(&bdir).unwrap();
-        let meta = BackupMeta {
-            format: backup::META_FORMAT.to_owned(),
-            backup_run_id: run_id,
-            completed_at: (*ts).to_owned(),
-            destination_domain: "offhost-gfs".to_owned(),
-            encryption_key_id: "bk-1".to_owned(),
-            manifest_ciphertext_sha256: "a".repeat(64),
-            bundle_digest: "b".repeat(64),
-            state: "complete".to_owned(),
-        };
-        fs::write(
-            bdir.join("backup-meta.json"),
-            serde_json::to_vec(&meta).unwrap(),
-        )
-        .unwrap();
+        let bdir = write_verified_backup_set(&dest, &keyring, inst_id, "offhost-gfs", ts, idx);
         created_dirs.push(((*ts).to_owned(), bdir));
     }
 
@@ -1244,6 +1513,8 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
             "prune",
             "--destination-root",
             dest.to_str().unwrap(),
+            "--backup-keys-config",
+            keyring_path.to_str().unwrap(),
             "--keep-daily",
             "7",
             "--keep-weekly",
@@ -1257,6 +1528,7 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
     assert!(out.contains("dry_run=true"), "{out}");
     assert!(out.contains("kept=11"), "{out}");
     assert!(out.contains("pruned=8"), "{out}");
+    assert!(out.contains("skipped_unverified=1"), "{out}");
     assert!(created_dirs.iter().all(|(_, p)| p.exists()));
 
     // Actual prune removes only the 8 expired completed backups.
@@ -1267,6 +1539,8 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
             "prune",
             "--destination-root",
             dest.to_str().unwrap(),
+            "--backup-keys-config",
+            keyring_path.to_str().unwrap(),
             "--keep-daily",
             "7",
             "--keep-weekly",
@@ -1279,11 +1553,12 @@ async fn gfs_retention_prunes_7_daily_4_weekly_3_monthly_and_preserves_incomplet
     assert!(out.contains("dry_run=false"), "{out}");
     assert!(out.contains("kept=11"), "{out}");
     assert!(out.contains("pruned=8"), "{out}");
+    assert!(out.contains("skipped_unverified=1"), "{out}");
 
     assert!(staging.exists());
     assert!(incomplete.exists());
     assert!(foreign.exists());
-    let expected_kept: std::collections::BTreeSet<&str> = [
+    let expected_kept: BTreeSet<&str> = [
         "2026-09-28T02:00:00Z",
         "2026-10-26T02:00:00Z",
         "2026-11-08T02:00:00Z",
@@ -1321,7 +1596,7 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
         .unwrap();
     assert_eq!(obs0, backup::ObservedTelemetry::default());
 
-    // 2. Run one succeeded capture and one failed capture, then observe exactly once.
+    // 2. Run one succeeded capture and one failed capture, then observe durable cumulative totals.
     let dir = auth_config_support::Dir::new();
     let dest = PathBuf::from(dir.path("dest"));
     fs::create_dir(&dest).unwrap();
@@ -1346,9 +1621,10 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
             config_files: Vec::new(),
             prune_policy: None,
             release_on_success: true,
+            pg_dump_bin: None,
             allow_local_test_paths: true,
         },
-        &SyntheticPgDumpRunner,
+        Arc::new(SyntheticPgDumpRunner),
     )
     .await
     .unwrap();
@@ -1390,11 +1666,13 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
     assert_eq!(metrics.backup_run_count(BackupRunOutcome::Succeeded), 1);
     assert_eq!(metrics.backup_run_count(BackupRunOutcome::Failed), 1);
 
-    // Exact-once observation: second sweep returns all zeros.
+    // Second sweep returns the same durable cumulative totals without double-counting `metrics`.
     let obs2 = backup::observe_telemetry_into(&worker_pool, &metrics)
         .await
         .unwrap();
-    assert_eq!(obs2, backup::ObservedTelemetry::default());
+    assert_eq!(obs2, obs1);
+    assert_eq!(metrics.backup_run_count(BackupRunOutcome::Succeeded), 1);
+    assert_eq!(metrics.backup_run_count(BackupRunOutcome::Failed), 1);
 
     // 3. Simulate a crashed backup run whose lease expired -> worker marks it `incomplete` and
     //    KEEPS maintenance_active = true!
@@ -1437,6 +1715,25 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
             .unwrap();
     assert_eq!(abandoned_state, "incomplete");
 
+    // P2 #9: Simulated worker restart (brand-new Metrics registry) immediately recovers all
+    // durable cumulative counts via fetch_max without losing failures or incompletes.
+    let restarted_metrics = Metrics::new();
+    backup::observe_telemetry_into(&worker_pool, &restarted_metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted_metrics.backup_run_count(BackupRunOutcome::Succeeded),
+        1
+    );
+    assert_eq!(
+        restarted_metrics.backup_run_count(BackupRunOutcome::Failed),
+        1
+    );
+    assert_eq!(
+        restarted_metrics.backup_run_count(BackupRunOutcome::Incomplete),
+        1
+    );
+
     backup::release_maintenance(
         &owner_pool,
         OPERATOR_1,
@@ -1448,10 +1745,15 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
     .unwrap();
 
     // 4. Arm 3600s RPO on a fresh DB and backdate armed timestamp past RPO ->
-    //    emits overdue=1 once, throttles hourly, then emits overdue=1 again after 61 minutes.
+    //    emits overdue=1 once, throttles hourly, then advances to 2 after 61 minutes (durable
+    //    across worker restarts).
+    drop(owner_pool);
+    drop(worker_pool);
+    drop(db);
     let db_overdue = TestDb::migrated().await;
     let overdue_owner = pool(&db_overdue, OWNER).await;
     let overdue_worker = pool(&db_overdue, WORKER).await;
+    let overdue_metrics = Metrics::new();
     backup::arm_rpo(
         &overdue_owner,
         OPERATOR_1,
@@ -1470,19 +1772,26 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
     .await
     .unwrap();
 
-    let obs4 = backup::observe_telemetry_into(&overdue_worker, &metrics)
+    let obs4 = backup::observe_telemetry_into(&overdue_worker, &overdue_metrics)
         .await
         .unwrap();
     assert_eq!(obs4.overdue, 1);
-    assert_eq!(metrics.backup_run_count(BackupRunOutcome::Overdue), 1);
+    assert_eq!(
+        overdue_metrics.backup_run_count(BackupRunOutcome::Overdue),
+        1
+    );
 
-    // Throttled within 1 hour.
-    let obs5 = backup::observe_telemetry_into(&overdue_worker, &metrics)
+    // Throttled within 1 hour: cumulative total remains 1.
+    let obs5 = backup::observe_telemetry_into(&overdue_worker, &overdue_metrics)
         .await
         .unwrap();
-    assert_eq!(obs5.overdue, 0);
+    assert_eq!(obs5.overdue, 1);
+    assert_eq!(
+        overdue_metrics.backup_run_count(BackupRunOutcome::Overdue),
+        1
+    );
 
-    // Fires again once 1 hour passes.
+    // Advances to 2 once 1 hour passes.
     sqlx::query(
         "UPDATE openmettle.backup_maintenance_gate
             SET last_overdue_observed_at = clock_timestamp() - interval '61 minutes'
@@ -1491,9 +1800,740 @@ async fn worker_observe_telemetry_records_succeeded_failed_expired_incomplete_an
     .execute(&overdue_owner)
     .await
     .unwrap();
-    let obs6 = backup::observe_telemetry_into(&overdue_worker, &metrics)
+    let obs6 = backup::observe_telemetry_into(&overdue_worker, &overdue_metrics)
         .await
         .unwrap();
-    assert_eq!(obs6.overdue, 1);
-    assert_eq!(metrics.backup_run_count(BackupRunOutcome::Overdue), 2);
+    assert_eq!(obs6.overdue, 2);
+    assert_eq!(
+        overdue_metrics.backup_run_count(BackupRunOutcome::Overdue),
+        2
+    );
+
+    // Fresh worker after restart observes durable overdue=2 immediately.
+    let restarted_overdue = Metrics::new();
+    backup::observe_telemetry_into(&overdue_worker, &restarted_overdue)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted_overdue.backup_run_count(BackupRunOutcome::Overdue),
+        2
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn released_gateway_requests_do_not_block_drain_and_superseded_final_reports_do_not_double_count()
+ {
+    // Upgrade from schema 23 so `quota_enforcement.metering_enforced` stays false while testing
+    // gateway request drain & superseded final usage report aggregation directly.
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    let mut owner_cn = connect(&db.0, OWNER).await;
+    providers(&mut owner_cn).await;
+    let user = account(&mut owner_cn, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner_cn, &user).await;
+    let personal_scope = personal_of(&db, &user).await;
+    drop(owner_cn);
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let owner_pool = pool(&db, OWNER).await;
+
+    // Seed a run-owned gateway_reservation + one released gateway_requests row (`state='released'`,
+    // `settled_final=false`) via `openmettle.gateway_release(...)`, AND one handed_off row settled
+    // via two final usage reports (revision 0 superseded by final revision 1).
+    let run_id = seed_queued_personal_run(&db, &personal_scope, &user, "gw-drain-test-run").await;
+    let gw_res = new_uuid(&db).await;
+    let req_released = new_uuid(&db).await;
+    let req_settled = new_uuid(&db).await;
+    let installation = new_uuid(&db).await;
+    let report_source = installation.clone();
+    let dispatch_secret = [0x42u8; 32];
+
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_reservations
+            (id, scope_id, actor_user_id, approval_id, run_id, units)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1000)",
+    )
+    .bind(&gw_res)
+    .bind(&personal_scope)
+    .bind(&user.user)
+    .bind(&user.approval)
+    .bind(&run_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Reserve round 1 as `openmettle_worker` (per gateway_allocate trigger) and release it via the
+    // real worker `gateway_release` path -> leaves `state = 'released', settled_final = false`.
+    // Must NOT block drain!
+    let mut worker_cn = connect(&db.0, WORKER).await;
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_requests
+            (id, reservation_id, scope_id, actor_user_id, approval_id, run_id, round,
+             installation, model, units, dispatch_hash)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, 1,
+                 $7::uuid, 'synthetic-model', 100, sha256($8))",
+    )
+    .bind(&req_released)
+    .bind(&gw_res)
+    .bind(&personal_scope)
+    .bind(&user.user)
+    .bind(&user.approval)
+    .bind(&run_id)
+    .bind(&installation)
+    .bind(dispatch_secret.as_slice())
+    .execute(&mut worker_cn)
+    .await
+    .unwrap();
+    let released_ok: bool = sqlx::query_scalar("SELECT openmettle.gateway_release($1::uuid, $2)")
+        .bind(&req_released)
+        .bind(dispatch_secret.as_slice())
+        .fetch_one(&mut worker_cn)
+        .await
+        .unwrap();
+    assert!(released_ok);
+
+    // Settled request (round 2): insert as `openmettle_worker`, mark handed_off as owner, then
+    // settle with revision 0 final report superseded by revision 1 final report.
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_requests
+            (id, reservation_id, scope_id, actor_user_id, approval_id, run_id, round,
+             installation, model, units, dispatch_hash)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, 2,
+                 $7::uuid, 'synthetic-model', 500, sha256('settled'))",
+    )
+    .bind(&req_settled)
+    .bind(&gw_res)
+    .bind(&personal_scope)
+    .bind(&user.user)
+    .bind(&user.approval)
+    .bind(&run_id)
+    .bind(&installation)
+    .execute(&mut worker_cn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_requests
+            SET state = 'handed_off',
+                report_source = $2::uuid,
+                bearer_hash = sha256('bearer'),
+                claim_hash = sha256('claim'),
+                dispatched_at = clock_timestamp()
+          WHERE id = $1::uuid",
+    )
+    .bind(&req_settled)
+    .bind(&report_source)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    let report_id = new_uuid(&db).await;
+    // Revision 0 (initial final report: 100 prompt, 50 completion, 10 separate reasoning -> 160).
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_usage_reports
+            (request_id, source, report_id, revision, final,
+             prompt_tokens, completion_tokens, reasoning_tokens, reasoning_included)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, 0, true, 100, 50, 10, false)",
+    )
+    .bind(&req_settled)
+    .bind(&report_source)
+    .bind(&report_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_settlements
+            (request_id, revision, final, measured, outstanding)
+         VALUES ($1::uuid, 0, true, 160, 0)",
+    )
+    .bind(&req_settled)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Revision 1 (correcting final report: 120 prompt, 60 completion, 15 separate reasoning -> 195).
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_usage_reports
+            (request_id, source, report_id, revision, final,
+             prompt_tokens, completion_tokens, reasoning_tokens, reasoning_included)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, 1, true, 120, 60, 15, false)",
+    )
+    .bind(&req_settled)
+    .bind(&report_source)
+    .bind(&report_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_settlements
+            SET revision = 1, measured = 195
+          WHERE request_id = $1::uuid",
+    )
+    .bind(&req_settled)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Drain counts MUST report zero unsettled gateway requests.
+    let counts = backup::poll_drain_counts(&owner_pool).await.unwrap();
+    assert_eq!(counts.unsettled_gateway_requests, 0);
+    assert!(counts.is_quiesced(), "{counts:?}");
+
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("gw-dest"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-gw", &[("bk-gw", [0x61; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let report = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest,
+            destination_domain: "offhost-gw".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "gw-capture-1".to_owned(),
+            reason: "gateway drain and summary regression".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+
+    let unpack_dir = PathBuf::from(dir.path("gw-unpacked"));
+    backup::unpack_backup(&report.backup_dir, &unpack_dir, &keyring).unwrap();
+    let gw: Value =
+        serde_json::from_slice(&fs::read(unpack_dir.join("gateway-entitlements.json")).unwrap())
+            .unwrap();
+    let summary = &gw["gateway_usage_summary"];
+    assert_eq!(summary["settled_requests"], 1);
+    assert_eq!(summary["unsettled_requests"], 0);
+    assert_eq!(summary["total_measured_units"], "195");
+    assert_eq!(summary["total_prompt_tokens"], "120");
+    assert_eq!(summary["total_completion_tokens"], "60");
+    assert_eq!(summary["total_reasoning_tokens"], "15");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn commit_before_marker_idempotent_retry_inherited_maintenance_and_preflight_guards() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("dest"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-own", &[("bk-own", [0x71; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    // P1 #7: Reserved config filename (`vault-key-inventory.json`) fails preflight BEFORE entering
+    // maintenance.
+    let dummy_cfg = PathBuf::from(dir.write("ok.json", br#"{"ok":true}"#));
+    let reserved_err = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-own".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "reserved-cfg-fail".to_owned(),
+            reason: "should fail preflight".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            config_files: vec![("vault-key-inventory.json".to_owned(), dummy_cfg)],
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(reserved_err, BackupError::Archive(_)));
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // P1 #7: Neo4j dump mutated/truncated mid-capture fails closed and publishes nothing.
+    let neo4j_path = PathBuf::from(dir.write("graphiti-live.dump", b"INITIAL-NEO4J-DUMP-BYTES"));
+    struct MutatingNeo4jRunner(PathBuf);
+    impl PgDumpRunner for MutatingNeo4jRunner {
+        fn dump(
+            &self,
+            _database_url: &str,
+            _snapshot_id: Option<&str>,
+            writer: &mut dyn IoWrite,
+        ) -> Result<u64, BackupError> {
+            // Mutate/truncate the held Neo4j dump file in-place before step 6e reads it.
+            let f = fs::OpenOptions::new().write(true).open(&self.0)?;
+            f.set_len(4)?;
+            let payload = b"PGDMP-SYNTH";
+            writer.write_all(payload)?;
+            Ok(payload.len() as u64)
+        }
+    }
+    let mutated_err = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-own".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "mutated-neo4j-fail".to_owned(),
+            reason: "neo4j mutated during capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::OfflineDump(neo4j_path.clone()),
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(MutatingNeo4jRunner(neo4j_path)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(mutated_err, BackupError::Integrity(_)));
+    assert!(fs::read_dir(&dest).unwrap().next().is_none());
+    // Failure kept maintenance active!
+    assert!(
+        backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // P1 #6: Subsequent capture with `--release-on-success` on an INHERITED maintenance window
+    // (still active from the failed capture above) succeeds on its backup set while keeping
+    // `maintenance_active = true` (`released_maintenance == false`).
+    let inherited_opts = CaptureOptions {
+        database_url: db.url(OWNER),
+        destination_root: dest.clone(),
+        destination_domain: "offhost-own".to_owned(),
+        artifact_root: None,
+        operator_id: OPERATOR_1.to_owned(),
+        request_key: "inherited-maint-capture".to_owned(),
+        reason: "retry capture inside existing maintenance".to_owned(),
+        drain_timeout: Duration::from_secs(5),
+        lease_seconds: DEFAULT_LEASE_SECONDS,
+        require_separate_device: false,
+        graphiti_mode: GraphitiMode::NotProvisioned,
+        config_files: Vec::new(),
+        prune_policy: None,
+        release_on_success: true,
+        pg_dump_bin: None,
+        allow_local_test_paths: true,
+    };
+    let rep1 = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &inherited_opts,
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !rep1.released_maintenance,
+        "capture must not release an inherited maintenance window"
+    );
+    assert!(
+        backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // P1 #3: Simulate a crash right after PostgreSQL committed `backup_complete_capture` and
+    // before `backup-meta.json` + atomic rename: move `final_dir` back to `.staging.<run_id>` and
+    // delete `backup-meta.json`. Re-running with the EXACT same `request_key` must idempotently
+    // restore `backup-meta.json`, rename into `final_dir`, and pass verification.
+    let staging_dir = dest.join(format!(".staging.{}", rep1.backup_run_id));
+    fs::rename(&rep1.backup_dir, &staging_dir).unwrap();
+    fs::remove_file(staging_dir.join("backup-meta.json")).unwrap();
+    assert!(!rep1.backup_dir.exists());
+
+    let rep1_retry = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &inherited_opts,
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep1_retry.backup_run_id, rep1.backup_run_id);
+    assert_eq!(rep1_retry.bundle_digest, rep1.bundle_digest);
+    assert_eq!(rep1_retry.backup_dir, rep1.backup_dir);
+    assert!(!staging_dir.exists());
+    assert!(rep1.backup_dir.is_dir());
+    backup::verify_backup(&rep1.backup_dir, &keyring).unwrap();
+    assert!(
+        !rep1_retry.released_maintenance,
+        "idempotent retry of inherited-window capture still preserves operator maintenance"
+    );
+    assert!(
+        backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    // Explicit release clears maintenance, and a fresh capture that OPENS maintenance DOES release
+    // when `--release-on-success` is set.
+    backup::release_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "explicit-release-after-inherited",
+        "operator verified recovery",
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+
+    let rep2 = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest,
+            destination_domain: "offhost-own".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "owned-maint-capture".to_owned(),
+            reason: "fresh self-owned capture".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(SyntheticPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert!(rep2.released_maintenance);
+    assert!(
+        !backup::status(&owner_pool)
+            .await
+            .unwrap()
+            .maintenance_active
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn verified_gfs_pruning_ignores_corrupt_newer_sets_and_isolates_installations() {
+    let dir = auth_config_support::Dir::new();
+    let dest = PathBuf::from(dir.path("verified-gfs"));
+    fs::create_dir(&dest).unwrap();
+    let keyring_path = write_keyring_json(&dir, "bk", "bk-vgfs", &[("bk-vgfs", [0x81; 32])]);
+    let keyring = BackupKeyRing::load_from_config(&keyring_path).unwrap();
+
+    let inst_a = "11111111-1111-4111-8111-111111111111";
+    let inst_b = "22222222-2222-4222-8222-222222222222";
+
+    let valid_old =
+        write_verified_backup_set(&dest, &keyring, inst_a, "nas", "2026-11-25T02:00:00Z", 1);
+    let valid_today =
+        write_verified_backup_set(&dest, &keyring, inst_a, "nas", "2026-11-26T02:00:00Z", 2);
+    let corrupt_missing_pg =
+        write_verified_backup_set(&dest, &keyring, inst_a, "nas", "2026-11-26T14:00:00Z", 3);
+    fs::remove_file(corrupt_missing_pg.join("pg.dump.enc")).unwrap();
+
+    let corrupt_manifest =
+        write_verified_backup_set(&dest, &keyring, inst_a, "nas", "2026-11-26T18:00:00Z", 4);
+    let mut mf = fs::read(corrupt_manifest.join("manifest.json.enc")).unwrap();
+    let last = mf.len() - 1;
+    mf[last] ^= 0xff;
+    fs::write(corrupt_manifest.join("manifest.json.enc"), mf).unwrap();
+
+    // Much older backup from a SECOND installation in the same destination root.
+    let inst_b_old =
+        write_verified_backup_set(&dest, &keyring, inst_b, "nas", "2026-06-01T02:00:00Z", 5);
+
+    let report = backup::prune(
+        &dest,
+        &keyring,
+        GfsPolicy {
+            keep_daily: 1,
+            keep_weekly: 1,
+            keep_monthly: 1,
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(report.skipped_unverified.len(), 2, "{report:?}");
+    assert!(
+        corrupt_missing_pg.exists(),
+        "unverified set must never be deleted by prune"
+    );
+    assert!(
+        corrupt_manifest.exists(),
+        "corrupt manifest set must never be deleted by prune"
+    );
+    assert!(
+        valid_today.exists(),
+        "corrupt newer same-day sets must NOT cause older valid backup to be pruned"
+    );
+    assert!(
+        !valid_old.exists(),
+        "older superseded valid backup in same week/month should be pruned"
+    );
+    assert!(
+        inst_b_old.exists(),
+        "second installation's backup must never be pruned by first installation's sets"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn maintenance_finishes_inflight_purges_without_claiming_new_ones_and_fences_native_token() {
+    let db = TestDb::migrated().await;
+    configure_limits(&db, Some(100_000), Some(100_000), Some(100_000)).await;
+    retention_grace(&db, 0).await;
+
+    let (user, _, personal_scope) = seed_user(&db).await;
+    let owner_pool = pool(&db, OWNER).await;
+    let api_pool = pool(&db, API).await;
+    let worker_pool = pool(&db, WORKER).await;
+
+    let dir = auth_config_support::Dir::new();
+    let artifact_root = PathBuf::from(dir.path("artifacts"));
+    fs::create_dir(&artifact_root).unwrap();
+    let store = Store::open(&artifact_root).unwrap();
+    store.initialize_api(&api_pool).await.unwrap();
+    let (ok, _, err) = admin_cli(
+        &db,
+        &[
+            "storage",
+            "adopt",
+            artifact_root.to_str().unwrap(),
+            "--confirm-no-on-disk-payloads",
+        ],
+    );
+    assert!(ok, "storage adopt failed: {err}");
+
+    // Seed two retained revisions both past purge_after:
+    // - rev 0: already in-flight `state = 'purging'` (simulated mid-purge when maintenance entered)
+    // - rev 1: still `state = 'retained'` due for purge (must NOT be claimed during maintenance!)
+    let mut revs = Vec::new();
+    for (idx, payload) in [
+        (0, b"inflight-purge-bytes-0".as_slice()),
+        (1, b"retained-unclaimed-bytes-1".as_slice()),
+    ] {
+        let art_id = new_uuid(&db).await;
+        let res_id = {
+            let mut cn = connect(&db.0, API).await;
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+            let r = storage::reserve(
+                &mut tx,
+                &ReservationInput {
+                    scope: &personal_scope,
+                    actor: &user.user,
+                    key: &format!("purge-maint-{idx}"),
+                    artifact: &art_id,
+                    max_bytes: 512,
+                    run: None,
+                    operation: None,
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            r.id
+        };
+        let path = artifact_root.join("revisions").join(&res_id);
+        fs::write(&path, payload).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&path).unwrap());
+        sqlx::query(
+            "UPDATE openmettle.storage_reservations
+                SET stage_claimed = true, publish_pending = true, payload_ino = $1
+              WHERE id = $2::uuid",
+        )
+        .bind(ino as i64)
+        .bind(&res_id)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        let rev_id = {
+            let mut cn = connect(&db.0, API).await;
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+            let rev = storage::settle(
+                &mut tx,
+                &Settlement {
+                    scope: &personal_scope,
+                    reservation: &res_id,
+                    size_bytes: payload.len() as i64,
+                    content_digest: &digest,
+                    media_type: "text/plain",
+                    display_name: Some("purge.txt"),
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            rev
+        };
+        retain_revision(&db, &personal_scope, &rev_id).await;
+        revs.push((rev_id, res_id));
+    }
+
+    // Advance rev 0 into `state = 'purging'` (simulating an in-flight worker purge when
+    // maintenance enters).
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET state = 'purging',
+                purging_at = greatest(clock_timestamp(), purge_after)
+          WHERE id = $1::uuid",
+    )
+    .bind(&revs[0].0)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Start API binary to verify `/auth/native/token` fencing (P2 #4).
+    let api = Api::start_in(&db, dir);
+
+    // Seed a pending `native_handoffs` row with `sealed IS NOT NULL` to prove maintenance does not
+    // consume it.
+    let native_bearer = super::authz_http::native(&db, &user, 7).await;
+    let native_session_id = native_bearer.split('.').next().unwrap().to_owned();
+    sqlx::query(
+        "UPDATE openmettle.native_handoffs
+            SET sealed = $2
+          WHERE session_id = $1",
+    )
+    .bind(&native_session_id)
+    .bind([0xabu8; 103].as_slice())
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Enter maintenance.
+    backup::enter_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "maint-p2-3-4",
+        "test p2-3 and p2-4",
+    )
+    .await
+    .unwrap();
+
+    // P2 #3: Drain sees 1 active purge; finish_inflight_purges drains rev 0 -> 'purged' while
+    // leaving rev 1 untouched in 'retained'.
+    assert_eq!(
+        backup::poll_drain_counts(&owner_pool)
+            .await
+            .unwrap()
+            .active_purges,
+        1
+    );
+    let finished = artifact_fs::finish_inflight_purges(&worker_pool, &store, 10)
+        .await
+        .unwrap();
+    assert_eq!(finished, 1);
+    assert_eq!(
+        backup::poll_drain_counts(&owner_pool)
+            .await
+            .unwrap()
+            .active_purges,
+        0
+    );
+    let state0: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id = $1::uuid")
+            .bind(&revs[0].0)
+            .fetch_one(&owner_pool)
+            .await
+            .unwrap();
+    let state1: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id = $1::uuid")
+            .bind(&revs[1].0)
+            .fetch_one(&owner_pool)
+            .await
+            .unwrap();
+    assert_eq!(state0, "purged");
+    assert_eq!(state1, "retained");
+
+    // P2 #4: POST /auth/native/token returns 503 during maintenance without consuming handoff.
+    // Use canonical base64url (URL_SAFE_NO_PAD of [0xbb; 32]) so request parsing reaches
+    // `sessions::native::claim()` rather than failing token syntax validation.
+    let token_body = json!({
+        "grant_type": "authorization_code",
+        "iss": "https://app.example.test",
+        "client_id": "openmettle-desktop",
+        "redirect_uri": "https://app.example.test/native/complete",
+        "code": "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s",
+        "code_verifier": "ccccccccccccccccccccccccccccccccccccccccccc",
+    })
+    .to_string();
+    let raw_req = format!(
+        "POST /auth/native/token HTTP/1.1\r\nhost: app.example.test\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        token_body.len(),
+        token_body
+    );
+    let (status_maint, _, _) = api.raw(&raw_req);
+    assert_eq!(
+        status_maint, 503,
+        "POST /auth/native/token must fail closed with 503 during maintenance"
+    );
+    let still_sealed: bool = sqlx::query_scalar(
+        "SELECT sealed IS NOT NULL FROM openmettle.native_handoffs WHERE session_id = $1",
+    )
+    .bind(native_session_id)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert!(
+        still_sealed,
+        "maintenance refusal must not consume native_handoffs.sealed"
+    );
+
+    // Release maintenance: POST /auth/native/token passes the maintenance fence (reaches normal
+    // code lookup -> 403 for unknown code, NOT 503).
+    backup::release_maintenance(
+        &owner_pool,
+        OPERATOR_1,
+        "rel-p2-3-4",
+        "done p2-3 and p2-4",
+        false,
+    )
+    .await
+    .unwrap();
+    let (status_open, _, _) = api.raw(&raw_req);
+    assert_eq!(status_open, 403);
 }

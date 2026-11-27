@@ -1133,6 +1133,13 @@ impl Metrics {
         }
     }
 
+    /// Monotonically synchronize `openmettle.backup.runs` with PostgreSQL's durable cumulative
+    /// outcome total (`fetch_max`) so worker restarts before an OTLP flush never lose failure or
+    /// overdue counts.
+    pub fn observe_backup_run_total(&self, outcome: BackupRunOutcome, durable_total: u64) {
+        self.backup_runs[outcome.index()].fetch_max(durable_total, Ordering::Relaxed);
+    }
+
     pub fn backup_run_count(&self, outcome: BackupRunOutcome) -> u64 {
         self.backup_runs[outcome.index()].load(Ordering::Relaxed)
     }

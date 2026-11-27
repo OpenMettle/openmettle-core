@@ -328,6 +328,15 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await?;
+    let text = export_conn(&mut tx).await?;
+    tx.commit().await?;
+    Ok(text)
+}
+
+/// Same as [`export`], reading from an existing caller-managed `REPEATABLE READ` snapshot
+/// connection/transaction (used by ADR 0046 coordinated backup capture so `pg_dump`, artifact
+/// metadata, gateway entitlements, and deletion-journal export share one MVCC snapshot).
+pub(crate) async fn export_conn(c: &mut PgConnection) -> Result<String, Error> {
     let us = |column: &str| format!("(extract(epoch FROM {column}) * 1000000)::bigint");
     let has_retained: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -338,7 +347,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
                 AND NOT attisdropped
          )",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *c)
     .await?;
     let retained_expr = if has_retained {
         us("retained_at")
@@ -354,7 +363,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         us("purged_at"),
         retained_expr,
     )))
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *c)
     .await?;
     let has_lifecycle_origin: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -365,7 +374,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
                 AND NOT attisdropped
          )",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *c)
     .await?;
     let has_lifecycle_baseline: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -376,7 +385,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
                 AND NOT attisdropped
          )",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *c)
     .await?;
     let has_connection_origin: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -387,7 +396,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
                 AND NOT attisdropped
          )",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *c)
     .await?;
     let lifecycle_origin_expr = if has_lifecycle_origin {
         us("lifecycle_coverage_started_at")
@@ -429,7 +438,7 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
         connection_origin_expr,
         us("clock_timestamp()")
     )))
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *c)
     .await?;
     let baseline_rows: Vec<BaselineRow> = if has_lifecycle_baseline {
         sqlx::query_as(
@@ -445,12 +454,11 @@ pub async fn export(pool: &PgPool) -> Result<String, Error> {
                FROM openmettle.retention_upgrade_baseline
               ORDER BY artifact_revision_id ASC",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *c)
         .await?
     } else {
         Vec::new()
     };
-    tx.commit().await?;
     let fmt_opt = |v: Option<i64>| v.map_or_else(|| "-".to_owned(), |n| n.to_string());
     let mut text = format!("{HEADER}\norigin {origin_us}\n");
     if let Some(lifecycle_origin_us) = lifecycle_origin_us {

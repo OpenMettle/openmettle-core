@@ -1223,7 +1223,7 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
             .iter()
             .map(|row| {
                 let mut value: serde_json::Value = serde_json::from_str(row).unwrap();
-                if entry.table == "quota_defaults" || entry.table == "backup_maintenance_gate" {
+                if entry.table == "quota_defaults" {
                     assert!(
                         value
                             .as_object_mut()
@@ -1231,6 +1231,23 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
                             .remove("updated_at")
                             .unwrap()
                             .is_string()
+                    );
+                } else if entry.table == "backup_maintenance_gate" {
+                    let obj = value.as_object_mut().unwrap();
+                    assert!(obj.remove("updated_at").unwrap().is_string());
+                    let inst = obj.remove("installation_id").unwrap();
+                    assert!(
+                        inst.as_str().is_some_and(|s| {
+                            s.len() == 36
+                                && s.bytes().enumerate().all(|(i, b)| {
+                                    if matches!(i, 8 | 13 | 18 | 23) {
+                                        b == b'-'
+                                    } else {
+                                        matches!(b, b'0'..=b'9' | b'a'..=b'f')
+                                    }
+                                })
+                        }),
+                        "expected canonical UUID installation_id, got {inst}"
                     );
                 } else if entry.table == "deletion_journal_head" {
                     let obj = value.as_object_mut().unwrap();

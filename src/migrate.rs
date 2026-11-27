@@ -653,6 +653,17 @@ async fn migrate_within_boundaries(
         .await
         .map_err(Failure::Check)?;
     let applied = applied_version(connection).await.map_err(Failure::Check)?;
+    // Reapply migration 1's global and schema-scoped owner default function ACLs (pg_dump
+    // --schema=openmettle omits global defaclnamespace = 0 entries; ADR 0046 / ADR 0003).
+    if applied >= 1 {
+        connection
+            .execute(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+                 ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA openmettle REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+            )
+            .await
+            .map_err(Failure::Check)?;
+    }
     let violations = boundary_violations(connection, applied)
         .await
         .map_err(Failure::Check)?;
