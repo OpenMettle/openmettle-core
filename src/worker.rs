@@ -1021,6 +1021,53 @@ fn handoff_run_outcome(result: &Result<leases::Handoff, LeaseError>) -> WorkerRu
     }
 }
 
+struct WorkerRunGuard {
+    span: tracing::Span,
+    run_id: String,
+    lease_id: String,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl WorkerRunGuard {
+    fn new(span: tracing::Span, run_id: &str, lease_id: &str) -> Self {
+        Self {
+            span,
+            run_id: run_id.to_owned(),
+            lease_id: lease_id.to_owned(),
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, outcome: WorkerRunOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: WorkerRunOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.span.record("run.outcome", outcome.as_str());
+        worker_run_settled(
+            &self.run_id,
+            &self.lease_id,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for WorkerRunGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let span = self.span.clone();
+            span.in_scope(|| self.record(WorkerRunOutcome::Aborted));
+        }
+    }
+}
+
 async fn run_one<E: Executor>(
     pool: &PgPool,
     adapters: Adapters<'_, E>,
@@ -1030,18 +1077,18 @@ async fn run_one<E: Executor>(
     settings: LeaseSettings,
     shutdown: watch::Receiver<Option<Instant>>,
 ) {
-    let started = std::time::Instant::now();
     let run_id = run.claim.run_id.clone();
     let lease_id = derive_run_lease_id(&run_id, &run.claim.claim_token);
     let span = worker_run_span(&run_id, &lease_id);
+    let guard_span = span.clone();
     async {
         worker_run_claimed(&run_id, &lease_id);
+        let guard = WorkerRunGuard::new(guard_span, &run_id, &lease_id);
         let outcome = run_one_inner(
             pool, adapters, run, sent, recovered, settings, shutdown, &lease_id,
         )
         .await;
-        tracing::Span::current().record("run.outcome", outcome.as_str());
-        worker_run_settled(&run_id, &lease_id, outcome, started.elapsed());
+        guard.finish(outcome);
     }
     .instrument(span)
     .await;
@@ -1910,6 +1957,129 @@ mod tests {
             assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
             assert!(ev["duration_us"].as_u64().is_some());
         }
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn run_one_records_aborted_outcome_and_settled_event_when_dropped_while_pending() {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use tokio::{net::TcpListener, sync::Notify};
+
+        struct PendingStepExecutor;
+        impl Executor for PendingStepExecutor {
+            async fn step(&self, _: &ActiveRun, _: StepContext) -> StepResult {
+                std::future::pending().await
+            }
+            async fn reconcile(
+                &self,
+                _: &ActiveRun,
+                _: &UnresolvedOperation,
+                _: StepContext,
+            ) -> Option<OwnedObservation> {
+                None
+            }
+        }
+
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_listener.local_addr().unwrap().port();
+        let accepted = Arc::new(Notify::new());
+        let accepted_tx = accepted.clone();
+        let stalled_server = tokio::spawn(async move {
+            let (_sock, _) = stalled_listener.accept().await.unwrap();
+            accepted_tx.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let db_url = format!("postgres://unused@127.0.0.1:{stalled_port}/unused?sslmode=disable");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(db_url.parse().unwrap());
+
+        const RUN_ID: &str = "11111111-1111-4111-8111-111111111119";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-333333333339";
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-444444444449".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-555555555559".to_owned(),
+                round_limit: 5,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        {
+            let exec = PendingStepExecutor;
+            let (_shutdown_tx, shutdown_rx) = watch::channel(None);
+            let adapters = Adapters {
+                artifacts: None,
+                executor: &exec,
+                approved: None,
+            };
+            let mut fut = std::pin::pin!(run_one(
+                &pool,
+                adapters,
+                run,
+                Instant::now(),
+                false,
+                LeaseSettings {
+                    lease: Duration::from_secs(30),
+                    execution_timeout: Duration::from_secs(120),
+                },
+                shutdown_rx,
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("pending run_one must not complete while DB socket stalls"),
+                _ = accepted.notified() => {}
+            }
+        }
+        stalled_server.abort();
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.run")
+            .collect();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].dropped_attributes_count, 0);
+        let attrs = attributes(&spans[0].attributes);
+        assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+        assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+        assert_eq!(text(attrs["run.outcome"]), Some("aborted"));
+
+        let claimed = capture.events("worker.run.claimed");
+        assert_eq!(claimed.len(), 1, "{}", capture.text());
+        assert_eq!(claimed[0]["run_id"].as_str(), Some(RUN_ID));
+        assert_eq!(claimed[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+
+        let settled = capture.events("worker.run.settled");
+        assert_eq!(settled.len(), 1, "{}", capture.text());
+        assert_eq!(settled[0]["run_id"].as_str(), Some(RUN_ID));
+        assert_eq!(settled[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(settled[0]["run.outcome"].as_str(), Some("aborted"));
+        assert!(settled[0]["duration_us"].as_u64().is_some());
 
         capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
         collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);

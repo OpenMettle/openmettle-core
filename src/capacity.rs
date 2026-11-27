@@ -32,7 +32,7 @@ use crate::{
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, Row};
+use sqlx::{Connection, PgConnection, Row};
 use std::{
     fmt,
     time::{Duration, Instant},
@@ -249,6 +249,81 @@ pub(crate) fn store_error_outcome(error: &Error) -> CapacityOutcome {
     error_outcome(error)
 }
 
+/// RAII guard for one `capacity.grant` lifecycle span. Ensures `operation.outcome`, the
+/// `capacity.grant.completed` event, and the `openmettle.capacity.grants` counter are emitted
+/// strictly once — either at the caller's post-commit `finish` boundary or with
+/// [`CapacityOutcome::Error`] if the owning future is dropped mid-flight.
+pub(crate) struct CapacityGrantGuard<'a> {
+    span: tracing::Span,
+    run_id: Option<&'a str>,
+    grant_id: Option<String>,
+    operation: CapacityOperation,
+    started: Instant,
+    metrics: &'a metrics::Metrics,
+    finished: bool,
+}
+
+impl<'a> CapacityGrantGuard<'a> {
+    pub(crate) fn new(
+        span: tracing::Span,
+        run_id: Option<&'a str>,
+        grant_id: Option<&str>,
+        operation: CapacityOperation,
+        metrics: &'a metrics::Metrics,
+    ) -> Self {
+        Self {
+            span,
+            run_id,
+            grant_id: grant_id.map(str::to_owned),
+            operation,
+            started: Instant::now(),
+            metrics,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn set_grant_id(&mut self, grant_id: &str) {
+        self.span
+            .in_scope(|| telemetry::record_capacity_span_grant_id(grant_id));
+        self.grant_id = Some(grant_id.to_owned());
+    }
+
+    pub(crate) fn finish(mut self, outcome: CapacityOutcome) {
+        self.record(outcome, true);
+    }
+
+    pub(crate) fn finish_span_only(mut self, outcome: CapacityOutcome) {
+        self.record(outcome, false);
+    }
+
+    fn record(&mut self, outcome: CapacityOutcome, record_metric: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if record_metric {
+            self.metrics.record_capacity_grant(self.operation, outcome);
+        }
+        self.span.record("operation.outcome", outcome.as_str());
+        telemetry::capacity_grant_completed(
+            self.run_id,
+            self.grant_id.as_deref(),
+            self.operation,
+            outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for CapacityGrantGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let span = self.span.clone();
+            span.in_scope(|| self.record(CapacityOutcome::Error, true));
+        }
+    }
+}
+
 async fn group_observation_stale(c: &mut PgConnection, group_id: &str) -> Result<bool, Error> {
     let stale = sqlx::query_scalar::<_, bool>(
         "SELECT coalesce(
@@ -303,24 +378,20 @@ async fn resume_with_metrics(
     controller: &Controller,
     m: &metrics::Metrics,
 ) -> Result<bool, Error> {
-    let started = Instant::now();
+    if c.is_in_transaction() {
+        return resume_query(c, controller).await;
+    }
     let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Resume);
+    let guard_span = span.clone();
     async {
+        let guard = CapacityGrantGuard::new(guard_span, None, None, CapacityOperation::Resume, m);
         let result = resume_query(c, controller).await;
         let outcome = match &result {
             Ok(true) => CapacityOutcome::Resumed,
             Ok(false) => CapacityOutcome::Unavailable,
             Err(err) => error_outcome(err),
         };
-        m.record_capacity_grant(CapacityOperation::Resume, outcome);
-        tracing::Span::current().record("operation.outcome", outcome.as_str());
-        telemetry::capacity_grant_completed(
-            None,
-            None,
-            CapacityOperation::Resume,
-            outcome,
-            started.elapsed(),
-        );
+        guard.finish(outcome);
         result
     }
     .instrument(span)
@@ -330,6 +401,9 @@ async fn resume_with_metrics(
 /// Reopen bursts in the current epoch. Returns false while the group does not admit them: the
 /// epoch needs a fresh sample of its own covering every device and its chat floor, no unknown
 /// allocation, and an `Allocated` (or release) attestation for every live earlier-epoch grant.
+///
+/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`); callers
+/// composing an outer transaction own the commit boundary (use [`adapter::GroupCoordinator`]).
 pub async fn resume(c: &mut PgConnection, controller: &Controller) -> Result<bool, Error> {
     resume_with_metrics(c, controller, metrics::global()).await
 }
@@ -389,14 +463,28 @@ pub enum Decision {
 /// the run lease, controller lease or sample expires while the decision waits for its last lock,
 /// it returns `LeaseLost`, `Fenced` or `Expired`, raised by PostgreSQL: the caller's transaction,
 /// including writes it made earlier, is already aborted. Roll back on any `Err`.
+///
+/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`) so a
+/// rolled-back or dropped outer transaction can never emit durable `granted` telemetry; callers
+/// composing transactions should use [`adapter::GroupCoordinator`].
 pub async fn grant(
     c: &mut PgConnection,
     controller: &Controller,
     request: &GrantRequest<'_>,
 ) -> Result<Decision, Error> {
-    let started = Instant::now();
+    if c.is_in_transaction() {
+        return grant_inner(c, controller, request).await;
+    }
     let span = telemetry::capacity_grant_span(Some(request.run_id), None, CapacityOperation::Grant);
+    let guard_span = span.clone();
     async {
+        let mut guard = CapacityGrantGuard::new(
+            guard_span,
+            Some(request.run_id),
+            None,
+            CapacityOperation::Grant,
+            metrics::global(),
+        );
         let result = match grant_inner(&mut *c, controller, request).await {
             Ok(Decision::Unavailable) => {
                 match group_observation_stale(&mut *c, &controller.group_id).await {
@@ -411,36 +499,27 @@ pub async fn grant(
             }
             other => other,
         };
-        let (grant_id, outcome) = match &result {
+        let outcome = match &result {
             Ok(Decision::Grant { grant_id, state }) => {
-                telemetry::record_capacity_span_grant_id(grant_id);
-                let outcome = match state {
+                guard.set_grant_id(grant_id);
+                match state {
                     GrantState::Granted => CapacityOutcome::Granted,
                     GrantState::Releasing => CapacityOutcome::Releasing,
                     GrantState::UnknownAllocation => CapacityOutcome::UnknownAllocation,
                     GrantState::Released => CapacityOutcome::Released,
-                };
-                (Some(grant_id.as_str()), outcome)
+                }
             }
-            Ok(Decision::Insufficient) => (None, CapacityOutcome::Insufficient),
-            Ok(Decision::Unavailable) => (None, CapacityOutcome::Unavailable),
+            Ok(Decision::Insufficient) => CapacityOutcome::Insufficient,
+            Ok(Decision::Unavailable) => CapacityOutcome::Unavailable,
             Err(err) => {
                 if *err == Error::Expired {
                     metrics::global()
                         .record_capacity_stale_observation(CapacityStaleSurface::Controller);
                 }
-                (None, error_outcome(err))
+                error_outcome(err)
             }
         };
-        metrics::global().record_capacity_grant(CapacityOperation::Grant, outcome);
-        tracing::Span::current().record("operation.outcome", outcome.as_str());
-        telemetry::capacity_grant_completed(
-            Some(request.run_id),
-            grant_id,
-            CapacityOperation::Grant,
-            outcome,
-            started.elapsed(),
-        );
+        guard.finish(outcome);
         result
     }
     .instrument(span)
@@ -535,20 +614,22 @@ async fn reconcile_with_metrics(
     evidence: Evidence<'_>,
     m: &metrics::Metrics,
 ) -> Result<GrantState, Error> {
-    let started = Instant::now();
+    if c.is_in_transaction() {
+        return reconcile_inner(c, controller, grant_id, evidence).await;
+    }
     let span = telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+    let guard_span = span.clone();
     async {
-        let result = reconcile_inner(c, controller, grant_id, evidence).await;
-        let outcome = reconcile_outcome(&result, evidence);
-        m.record_capacity_grant(CapacityOperation::Reconcile, outcome);
-        tracing::Span::current().record("operation.outcome", outcome.as_str());
-        telemetry::capacity_grant_completed(
+        let guard = CapacityGrantGuard::new(
+            guard_span,
             None,
             Some(grant_id),
             CapacityOperation::Reconcile,
-            outcome,
-            started.elapsed(),
+            m,
         );
+        let result = reconcile_inner(c, controller, grant_id, evidence).await;
+        let outcome = reconcile_outcome(&result, evidence);
+        guard.finish(outcome);
         result
     }
     .instrument(span)
@@ -559,6 +640,9 @@ async fn reconcile_with_metrics(
 /// settled in the same transaction, only when every device of its footprint has confirmed. If
 /// the controller lease expires while any step waits for a lock, every change rolls back and it
 /// returns `Fenced`, with the caller's transaction already aborted.
+///
+/// Emits `capacity.grant` telemetry only in autocommit mode (`!c.is_in_transaction()`); callers
+/// composing an outer transaction own the commit boundary (use [`adapter::GroupCoordinator`]).
 pub async fn reconcile(
     c: &mut PgConnection,
     controller: &Controller,

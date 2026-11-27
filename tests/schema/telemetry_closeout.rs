@@ -1236,3 +1236,735 @@ async fn coordinator_resume_records_post_commit_error_and_never_resumed_when_com
     .unwrap();
     assert_eq!(ready_after_commit, Some(epoch));
 }
+
+#[derive(Default)]
+struct CapacityTraceRecorder {
+    state: std::sync::Mutex<CapacityTraceState>,
+}
+
+#[derive(Default)]
+struct CapacityTraceState {
+    next_id: u64,
+    active_depth: usize,
+    max_depth: usize,
+    spans: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, String>>,
+    closed_spans: Vec<std::collections::BTreeMap<String, String>>,
+    events: Vec<std::collections::BTreeMap<String, String>>,
+}
+
+struct FieldCollector<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for FieldCollector<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl tracing::Subscriber for CapacityTraceRecorder {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "openmettle_core::telemetry"
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut guard = self.state.lock().unwrap();
+        guard.next_id += 1;
+        let id = guard.next_id;
+        if span.metadata().name() == "capacity.grant" {
+            let mut fields = std::collections::BTreeMap::new();
+            span.record(&mut FieldCollector(&mut fields));
+            guard.active_depth += 1;
+            guard.max_depth = guard.max_depth.max(guard.active_depth);
+            guard.spans.insert(id, fields);
+        }
+        tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(fields) = guard.spans.get_mut(&span.into_u64()) {
+            values.record(&mut FieldCollector(fields));
+        }
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = std::collections::BTreeMap::new();
+        event.record(&mut FieldCollector(&mut fields));
+        if fields.get("event").map(String::as_str) == Some("capacity.grant.completed") {
+            self.state.lock().unwrap().events.push(fields);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn try_close(&self, id: tracing::span::Id) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(fields) = guard.spans.remove(&id.into_u64()) {
+            guard.active_depth = guard.active_depth.saturating_sub(1);
+            guard.closed_spans.push(fields);
+        }
+        true
+    }
+}
+
+async fn seed_capacity_group_and_claimed_runs(
+    db: &TestDb,
+    owner: &mut PgConnection,
+    group: &str,
+    gpu0: &str,
+    floor: i64,
+    count: usize,
+) -> (String, Vec<ClaimedRun>) {
+    use openmettle_core::quotas::{self, RunBudgetReservation};
+
+    providers(owner).await;
+    let alice = account(owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(db, &alice).await;
+    sqlx::query(
+        "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+         VALUES ('personal', 'usage_tokens', 1000000),
+                ('personal', 'device_reservations', 8)",
+    )
+    .execute(&mut *owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+         VALUES ($1::uuid, 60000)",
+    )
+    .bind(group)
+    .execute(&mut *owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+         VALUES ($1::uuid, $2::uuid, $3)",
+    )
+    .bind(gpu0)
+    .bind(group)
+    .bind(floor)
+    .execute(&mut *owner)
+    .await
+    .unwrap();
+
+    let conv = chat(db, &scope, "personal", &alice).await;
+    let branch: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&conv)
+    .fetch_one(&mut *owner)
+    .await
+    .unwrap();
+    let msg = message(&mut *owner, &scope, &conv, None).await.unwrap();
+    let mut api_conn = api(db).await;
+    let limits = queue::AdmissionLimits {
+        live_per_actor: 16,
+        live_per_scope: 16,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 4,
+    };
+    for i in 0..count {
+        let key = format!("cap-tel-run-{i}");
+        let mut tx = WriteTransaction::begin(&mut api_conn).await.unwrap();
+        let Admission::Admitted { run_id, .. } = queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &alice.user,
+                    conversation: &conv,
+                    branch: &branch,
+                    message: &msg,
+                    key: &key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: b"{}",
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: NOW,
+                cost_qualified: None,
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        assert!(
+            quotas::reserve_admitted_run_budget(
+                &mut tx,
+                &RunBudgetReservation {
+                    scope_id: &scope,
+                    scope_kind: "personal",
+                    actor_user_id: &alice.user,
+                    actor_approval_id: &alice.approval,
+                    run_id: &run_id,
+                    token_units: 100,
+                    per_round_cost_micros: None,
+                    round_limit: 1,
+                    requires_device_slot: true,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().await.unwrap();
+    }
+    let mut worker_conn = worker(db).await;
+    let mut claims = Vec::with_capacity(count);
+    for _ in 0..count {
+        claims.push(
+            queue::claim_next(&mut worker_conn, &OPEN, &LEASES)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    (scope, claims)
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn capacity_grant_outer_transaction_rollback_never_emits_granted_telemetry() {
+    use openmettle_core::{
+        capacity::{
+            self, Controller, Decision, DeviceBytes, GrantRequest, GrantState,
+            adapter::{
+                BackendDeviceConfig, CapacityWait, CoordinatorError, FencedBackend,
+                GroupCoordinator,
+            },
+        },
+        telemetry::metrics::{CapacityOperation, CapacityOutcome, Metrics},
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const GROUP: &str = "00000000-0000-4000-8000-00000000d011";
+    const GPU0: &str = "00000000-0000-4000-8000-00000000d0d1";
+    const GIB: i64 = 1 << 30;
+    const TOTAL: i64 = 24 * GIB;
+    const FLOOR: i64 = 16 * GIB;
+    const HEADROOM: i64 = GIB;
+
+    let db = TestDb::migrated_exclusive().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let (scope, claims) =
+        seed_capacity_group_and_claimed_runs(&db, &mut owner, GROUP, GPU0, FLOOR, 2).await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, WORKER))
+        .await
+        .unwrap();
+    let mut worker_conn = worker(&db).await;
+    let controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let backend = FencedBackend::new(
+        GROUP,
+        vec![BackendDeviceConfig {
+            device_id: GPU0.into(),
+            total_bytes: TOTAL,
+            safety_headroom_bytes: HEADROOM,
+            active_chat_floor_bytes: FLOOR,
+            backed_chat_floor_bytes: FLOOR,
+            reclaimable_bytes: 0,
+            unattributed_used_bytes: 0,
+        }],
+    )
+    .unwrap();
+    let registry = Arc::new(Metrics::new());
+    let coord = GroupCoordinator::with_metrics(pool, controller, backend, registry.clone());
+    coord.takeover_and_reconcile().await.unwrap();
+    let obs = coord.adapter().observe().unwrap();
+    let now_us: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+            .fetch_one(&mut worker_conn)
+            .await
+            .unwrap();
+    assert!(
+        capacity::publish(
+            &mut worker_conn,
+            coord.controller(),
+            &capacity::Observation {
+                revision: 1,
+                observed_at_us: now_us,
+                commit_watermark: 0,
+                devices: &obs,
+            },
+        )
+        .await
+        .unwrap()
+    );
+    assert!(coord.resume().await.unwrap());
+
+    let footprint = [DeviceBytes {
+        device_id: GPU0.into(),
+        bytes: 2 * GIB,
+    }];
+    let req0 = GrantRequest {
+        scope_id: &scope,
+        run_id: &claims[0].run_id,
+        claim_token: &claims[0].claim_token,
+        request_key: "outer-tx-rollback-grant",
+        profile: "synthetic-image",
+        footprint: &footprint,
+    };
+
+    // 1. Caller-owned `WriteTransaction` that calls `capacity::grant` and rolls back/drops MUST
+    //    NOT emit `outcome="granted"` on metrics, spans, or events.
+    let recorder = Arc::new(CapacityTraceRecorder::default());
+    let _sub_guard = tracing::subscriber::set_default(recorder.clone());
+    let before_global_granted =
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted);
+    {
+        let mut crashed = worker(&db).await;
+        let mut tx = WriteTransaction::begin(&mut crashed).await.unwrap();
+        let decision = capacity::grant(tx.connection().unwrap(), coord.controller(), &req0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision,
+            Decision::Grant {
+                state: GrantState::Granted,
+                ..
+            }
+        ));
+        drop(tx);
+    }
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        before_global_granted,
+        "rolled-back outer transaction must not emit global Granted metric"
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert!(
+            st.closed_spans.is_empty() && st.events.is_empty(),
+            "rolled-back outer transaction must not emit pre-commit capacity.grant span/event"
+        );
+    }
+    let grant_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.capacity_grants")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(grant_rows, 0);
+
+    // 2. Autocommit `capacity::grant` commits immediately and DOES emit `outcome="granted"`.
+    let autocommit_decision = capacity::grant(&mut worker_conn, coord.controller(), &req0)
+        .await
+        .unwrap();
+    let Decision::Grant {
+        grant_id: autocommit_grant_id,
+        state: GrantState::Granted,
+    } = autocommit_decision
+    else {
+        panic!("expected autocommit grant");
+    };
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        before_global_granted + 1
+    );
+    {
+        let mut st = recorder.state.lock().unwrap();
+        assert_eq!(st.closed_spans.len(), 1);
+        assert_eq!(
+            st.closed_spans[0].get("lease_id").map(String::as_str),
+            Some(autocommit_grant_id.as_str())
+        );
+        assert_eq!(
+            st.closed_spans[0]
+                .get("operation.outcome")
+                .map(String::as_str),
+            Some("granted")
+        );
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(
+            st.events[0].get("operation.outcome").map(String::as_str),
+            Some("granted")
+        );
+        st.closed_spans.clear();
+        st.events.clear();
+    }
+
+    // 3. Deferred commit failure on `GroupCoordinator::dispatch_grant`'s `confirm_dispatch_tx`
+    //    must record `Error`, NEVER `Granted`.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION openmettle.fail_confirm_commit_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             RAISE EXCEPTION 'simulated deferred commit failure on confirm_dispatch'
+                 USING ERRCODE = '40001';
+         END;
+         $$",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE CONSTRAINT TRIGGER fail_confirm_commit_test
+             AFTER UPDATE ON openmettle.capacity_grants
+             DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW
+             WHEN (NEW.dispatch_state = 'confirmed' AND OLD.dispatch_state IS DISTINCT FROM NEW.dispatch_state)
+             EXECUTE FUNCTION openmettle.fail_confirm_commit_for_test()",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let req1 = GrantRequest {
+        scope_id: &scope,
+        run_id: &claims[1].run_id,
+        claim_token: &claims[1].claim_token,
+        request_key: "confirm-commit-fail-grant",
+        profile: "synthetic-image",
+        footprint: &footprint,
+    };
+    let wait = CapacityWait::start();
+    assert_eq!(
+        coord.dispatch_grant(&req1, &wait).await,
+        Err(CoordinatorError::Store(capacity::Error::Database))
+    );
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        0,
+        "rolled-back confirm_dispatch commit must never record Granted"
+    );
+    assert_eq!(
+        registry.capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Error),
+        1
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert_eq!(st.max_depth, 1);
+        assert_eq!(st.closed_spans.len(), 1);
+        assert_eq!(
+            st.closed_spans[0]
+                .get("operation.outcome")
+                .map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(
+            st.events[0].get("operation.outcome").map(String::as_str),
+            Some("error")
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn takeover_and_reconcile_emits_correlated_capacity_grant_spans_and_events_post_commit() {
+    use openmettle_core::{
+        capacity::{
+            self, Controller, Decision, DeviceBytes, GrantRequest, GrantState,
+            adapter::{
+                BackendDeviceConfig, CapacityWait, CoordinatorError, DispatchOutcome,
+                FencedBackend, GroupCoordinator,
+            },
+        },
+        telemetry::metrics::{CapacityOperation, CapacityOutcome, Metrics},
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    const GROUP: &str = "00000000-0000-4000-8000-00000000d021";
+    const GPU0: &str = "00000000-0000-4000-8000-00000000d0d2";
+    const GIB: i64 = 1 << 30;
+    const TOTAL: i64 = 24 * GIB;
+    const FLOOR: i64 = 16 * GIB;
+    const HEADROOM: i64 = GIB;
+
+    let db = TestDb::migrated_exclusive().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let (scope, claims) =
+        seed_capacity_group_and_claimed_runs(&db, &mut owner, GROUP, GPU0, FLOOR, 2).await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(role_options(&db.0, WORKER))
+        .await
+        .unwrap();
+    let mut worker_conn = worker(&db).await;
+    let c1 = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let backend = Arc::new(
+        FencedBackend::new(
+            GROUP,
+            vec![BackendDeviceConfig {
+                device_id: GPU0.into(),
+                total_bytes: TOTAL,
+                safety_headroom_bytes: HEADROOM,
+                active_chat_floor_bytes: FLOOR,
+                backed_chat_floor_bytes: FLOOR,
+                reclaimable_bytes: 0,
+                unattributed_used_bytes: 0,
+            }],
+        )
+        .unwrap(),
+    );
+    let coord1 =
+        GroupCoordinator::with_metrics(pool.clone(), c1, backend.clone(), Arc::new(Metrics::new()));
+    coord1.takeover_and_reconcile().await.unwrap();
+    let obs = backend.observe().unwrap();
+    let now_us: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint")
+            .fetch_one(&mut worker_conn)
+            .await
+            .unwrap();
+    assert!(
+        capacity::publish(
+            &mut worker_conn,
+            coord1.controller(),
+            &capacity::Observation {
+                revision: 1,
+                observed_at_us: now_us,
+                commit_watermark: 0,
+                devices: &obs,
+            },
+        )
+        .await
+        .unwrap()
+    );
+    assert!(coord1.resume().await.unwrap());
+
+    let footprint = [DeviceBytes {
+        device_id: GPU0.into(),
+        bytes: 2 * GIB,
+    }];
+    // Grant 1 is dispatched onto the backend (exact match during Epoch 2 takeover -> reattested).
+    let DispatchOutcome::Dispatched {
+        grant_id: grant1, ..
+    } = coord1
+        .dispatch_grant(
+            &GrantRequest {
+                scope_id: &scope,
+                run_id: &claims[0].run_id,
+                claim_token: &claims[0].claim_token,
+                request_key: "takeover-live-grant",
+                profile: "synthetic-image",
+                footprint: &footprint,
+            },
+            &CapacityWait::start(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected dispatched grant 1");
+    };
+    // Grant 2 is committed in PostgreSQL only (not present on backend -> released as not_allocated).
+    let Decision::Grant {
+        grant_id: grant2,
+        state: GrantState::Granted,
+    } = capacity::grant(
+        &mut worker_conn,
+        coord1.controller(),
+        &GrantRequest {
+            scope_id: &scope,
+            run_id: &claims[1].run_id,
+            claim_token: &claims[1].claim_token,
+            request_key: "takeover-unbacked-grant",
+            profile: "synthetic-image",
+            footprint: &footprint,
+        },
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected durable grant 2");
+    };
+
+    // Expire Epoch 1 controller lease so Epoch 2 takes over.
+    sqlx::query(
+        "UPDATE openmettle.capacity_groups
+            SET controller_lease_until = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let c2 = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let registry2 = Arc::new(Metrics::new());
+    let coord2 =
+        GroupCoordinator::with_metrics(pool.clone(), c2, backend.clone(), registry2.clone());
+
+    let recorder = Arc::new(CapacityTraceRecorder::default());
+    let _sub_guard = tracing::subscriber::set_default(recorder.clone());
+
+    let report = coord2.takeover_and_reconcile().await.unwrap();
+    assert_eq!(report.attested, 1);
+    assert_eq!(report.released, 1);
+    assert_eq!(report.unknown, 0);
+    assert_eq!(
+        registry2.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Granted),
+        1
+    );
+    assert_eq!(
+        registry2.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::NotAllocated),
+        1
+    );
+
+    {
+        let mut st = recorder.state.lock().unwrap();
+        assert_eq!(
+            st.max_depth, 1,
+            "takeover_and_reconcile must emit zero nested capacity.grant spans"
+        );
+        assert_eq!(st.closed_spans.len(), 2, "{:?}", st.closed_spans);
+        assert_eq!(st.events.len(), 2, "{:?}", st.events);
+
+        let span_by_grant = |gid: &str| {
+            st.closed_spans
+                .iter()
+                .find(|s| s.get("lease_id").map(String::as_str) == Some(gid))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing span for grant {gid}: {:?}", st.closed_spans))
+        };
+        let event_by_grant = |gid: &str| {
+            st.events
+                .iter()
+                .find(|e| e.get("lease_id").map(String::as_str) == Some(gid))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing event for grant {gid}: {:?}", st.events))
+        };
+
+        let s1 = span_by_grant(&grant1);
+        let e1 = event_by_grant(&grant1);
+        assert_eq!(
+            s1.get("operation.kind").map(String::as_str),
+            Some("reconcile")
+        );
+        assert_eq!(
+            s1.get("operation.outcome").map(String::as_str),
+            Some("granted")
+        );
+        assert_eq!(
+            e1.get("operation.kind").map(String::as_str),
+            Some("reconcile")
+        );
+        assert_eq!(
+            e1.get("operation.outcome").map(String::as_str),
+            Some("granted")
+        );
+
+        let s2 = span_by_grant(&grant2);
+        let e2 = event_by_grant(&grant2);
+        assert_eq!(
+            s2.get("operation.kind").map(String::as_str),
+            Some("reconcile")
+        );
+        assert_eq!(
+            s2.get("operation.outcome").map(String::as_str),
+            Some("not_allocated")
+        );
+        assert_eq!(
+            e2.get("operation.kind").map(String::as_str),
+            Some("reconcile")
+        );
+        assert_eq!(
+            e2.get("operation.outcome").map(String::as_str),
+            Some("not_allocated")
+        );
+        st.closed_spans.clear();
+        st.events.clear();
+    }
+
+    // Deferred commit failure during Epoch 3 reattestation must emit `error`, NEVER `granted`.
+    sqlx::query(
+        "UPDATE openmettle.capacity_groups
+            SET controller_lease_until = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION openmettle.fail_reattest_commit_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             RAISE EXCEPTION 'simulated deferred commit failure on takeover reconcile'
+                 USING ERRCODE = '40001';
+         END;
+         $$",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE CONSTRAINT TRIGGER fail_reattest_commit_test
+             AFTER UPDATE ON openmettle.capacity_grants
+             DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW
+             WHEN (OLD.reconciled_epoch IS DISTINCT FROM NEW.reconciled_epoch)
+             EXECUTE FUNCTION openmettle.fail_reattest_commit_for_test()",
+    )
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let c3 = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let registry3 = Arc::new(Metrics::new());
+    let coord3 = GroupCoordinator::with_metrics(pool, c3, backend, registry3.clone());
+    assert_eq!(
+        coord3.takeover_and_reconcile().await,
+        Err(CoordinatorError::Store(capacity::Error::Database))
+    );
+    assert_eq!(
+        registry3.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Granted),
+        0
+    );
+    assert_eq!(
+        registry3.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error),
+        1
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert_eq!(st.closed_spans.len(), 1);
+        assert_eq!(
+            st.closed_spans[0].get("lease_id").map(String::as_str),
+            Some(grant1.as_str())
+        );
+        assert_eq!(
+            st.closed_spans[0]
+                .get("operation.outcome")
+                .map(String::as_str),
+            Some("error")
+        );
+        assert_eq!(st.events.len(), 1);
+        assert_eq!(
+            st.events[0].get("operation.outcome").map(String::as_str),
+            Some("error")
+        );
+    }
+}

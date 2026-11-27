@@ -1305,37 +1305,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         }
                     }
                 };
-                let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
                 let op_id = turn_dispatch.id().to_owned();
-                let op_span = worker_operation_span(
-                    &run.claim.run_id,
-                    &lease_id,
+                run_observed_inference(
+                    run,
                     &op_id,
-                    WorkerOperationKind::Inference,
-                );
-                let guard_span = op_span.clone();
-                let stop_rx = cx.stop.clone();
-                async {
-                    let guard = super::WorkerOperationGuard::new(
-                        guard_span,
-                        &run.claim.run_id,
-                        &lease_id,
-                        &op_id,
-                        WorkerOperationKind::Inference,
-                        Some(stop_rx),
-                    );
-                    let sent = turn_dispatch
-                        .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
-                        .await
-                        .map_err(inference::Error::step_result);
-                    let outcome = match &sent {
-                        Ok(_) => WorkerOperationOutcome::Ok,
-                        Err(step) => operation_outcome(step),
-                    };
-                    guard.finish(outcome);
-                    sent
-                }
-                .instrument(op_span)
+                    &cx.stop,
+                    turn_dispatch.send(RunStop::from_worker(run, cx.stop.clone()), |_| async {}),
+                )
                 .await?
             } else {
                 if cx.stop.borrow().is_some() {
@@ -1374,47 +1350,22 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         .map_err(|_| FAILED)?;
                     }
                 }
-                let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
                 let op_id = crate::telemetry::RequestId::generate()
                     .map(|id| id.to_string())
                     .unwrap_or_default();
-                let op_span = worker_operation_span(
-                    &run.claim.run_id,
-                    &lease_id,
+                run_observed_inference(
+                    run,
                     &op_id,
-                    WorkerOperationKind::Inference,
-                );
-                let guard_span = op_span.clone();
-                let stop_rx = cx.stop.clone();
-                async {
-                    let guard = super::WorkerOperationGuard::new(
-                        guard_span,
-                        &run.claim.run_id,
-                        &lease_id,
-                        &op_id,
-                        WorkerOperationKind::Inference,
-                        Some(stop_rx),
-                    );
-                    let sent = route
-                        .gateway
-                        .server(
-                            &self.catalog,
-                            &config.effective,
-                            &request,
-                            Credential::Bearer(&route.bearer),
-                            RunStop::from_worker(run, cx.stop.clone()),
-                            |_| async {},
-                        )
-                        .await
-                        .map_err(inference::Error::step_result);
-                    let outcome = match &sent {
-                        Ok(_) => WorkerOperationOutcome::Ok,
-                        Err(step) => operation_outcome(step),
-                    };
-                    guard.finish(outcome);
-                    sent
-                }
-                .instrument(op_span)
+                    &cx.stop,
+                    route.gateway.server(
+                        &self.catalog,
+                        &config.effective,
+                        &request,
+                        Credential::Bearer(&route.bearer),
+                        RunStop::from_worker(run, cx.stop.clone()),
+                        |_| async {},
+                    ),
+                )
                 .await?
             };
             let [answer]: [_; 1] = turn.answers.try_into().map_err(|_| FAILED)?;
@@ -1534,6 +1485,60 @@ impl<R: TurnRoutes> TurnExecutor<R> {
     }
 }
 
+fn inference_operation_outcome<T>(
+    result: &Result<T, inference::Error>,
+    stop: &watch::Receiver<Option<Stop>>,
+) -> WorkerOperationOutcome {
+    match result {
+        Ok(_) => WorkerOperationOutcome::Ok,
+        Err(inference::Error::Stopped(Stop::LeaseLost)) => WorkerOperationOutcome::LeaseLost,
+        Err(inference::Error::Stopped(_)) => {
+            if *stop.borrow() == Some(Stop::LeaseLost) {
+                WorkerOperationOutcome::LeaseLost
+            } else {
+                WorkerOperationOutcome::Stopped
+            }
+        }
+        Err(_) => WorkerOperationOutcome::Failed,
+    }
+}
+
+async fn run_observed_inference<T, Fut>(
+    run: &ActiveRun,
+    op_id: &str,
+    stop: &watch::Receiver<Option<Stop>>,
+    call: Fut,
+) -> Result<T, StepResult>
+where
+    Fut: std::future::Future<Output = Result<T, inference::Error>>,
+{
+    let lease_id = derive_run_lease_id(&run.claim.run_id, &run.claim.claim_token);
+    let op_span = worker_operation_span(
+        &run.claim.run_id,
+        &lease_id,
+        op_id,
+        WorkerOperationKind::Inference,
+    );
+    let guard_span = op_span.clone();
+    async {
+        let guard = super::WorkerOperationGuard::new(
+            guard_span,
+            &run.claim.run_id,
+            &lease_id,
+            op_id,
+            WorkerOperationKind::Inference,
+            Some(stop.clone()),
+        );
+        let raw = call.await;
+        let outcome = inference_operation_outcome(&raw, stop);
+        let sent = raw.map_err(inference::Error::step_result);
+        guard.finish(outcome);
+        sent
+    }
+    .instrument(op_span)
+    .await
+}
+
 impl<R: TurnRoutes> Executor for TurnExecutor<R> {
     async fn step(&self, run: &ActiveRun, cx: StepContext) -> StepResult {
         // The gateway observes stop itself. An in-flight tool keeps its runner's drain
@@ -1565,3 +1570,183 @@ impl<R: TurnRoutes> Executor for TurnExecutor<R> {
 #[cfg(test)]
 #[path = "schema_fixture.rs"]
 mod schema_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model_config::Selection,
+        provider_http::{
+            Trust,
+            fixture::{self, Ca, Reply, Server},
+            inference::{Protocol, Qualification, SchemaSubset, Timeouts},
+        },
+        telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        },
+    };
+    use serde_json::json;
+
+    /// When an inference round returns normally because `RunStop` observed `Stop::LeaseLost`,
+    /// `run_observed_inference` must preserve `operation.outcome = "lease_lost"` on both the
+    /// exported `worker.operation` span and `worker.operation.completed` event (matching mid-flight
+    /// drop semantics) while still returning `Err(StepResult::Stopped)`.
+    #[tokio::test]
+    async fn inference_return_on_lease_lost_records_lease_lost_outcome() {
+        const RUN_ID: &str = "11111111-1111-4111-8111-1111111111aa";
+        const OP_ID_LEASE: &str = "22222222-2222-4222-8222-2222222222aa";
+        const OP_ID_CANCEL: &str = "22222222-2222-4222-8222-2222222222bb";
+        const CLAIM_TOKEN: &str = "33333333-3333-4333-8333-3333333333aa";
+
+        let doc: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/conversation-catalog-v1.json"
+        ))
+        .unwrap();
+        let catalog = Catalog::load(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let effective = catalog
+            .resolve(
+                &Selection::default(),
+                &serde_json::from_value(json!({"preset": "study"})).unwrap(),
+                None,
+                |_, _| true,
+            )
+            .unwrap();
+        let ca = Ca::new();
+        let server =
+            Server::start(ca.leaf(fixture::HOST, false), |_| Reply::Stall(Vec::new())).await;
+        let mut gateway = Gateway::new(
+            &format!(
+                "https://{}:{}/v1/chat/completions",
+                fixture::HOST,
+                server.port
+            ),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            Qualification {
+                model: effective.model.clone(),
+                pin: effective.profile.clone(),
+                protocol: Protocol::Chat,
+                json: true,
+                sse: true,
+                functions: Some(SchemaSubset::Nested),
+                images: false,
+                parallel: true,
+                usage: true,
+                tool_separator_whitespace: true,
+            },
+            Timeouts {
+                setup: Duration::from_secs(3),
+                idle: Duration::from_secs(3),
+                overall: Duration::from_secs(6),
+            },
+        )
+        .unwrap();
+        gateway.fixture_lookup(Arc::new(fixture::loopback));
+
+        let lease_id = derive_run_lease_id(RUN_ID, CLAIM_TOKEN);
+        let run = ActiveRun {
+            claim: ClaimedRun {
+                scope_id: "44444444-4444-4444-8444-4444444444aa".to_owned(),
+                run_id: RUN_ID.to_owned(),
+                claim_token: CLAIM_TOKEN.to_owned(),
+                actor_approval_id: "55555555-5555-4555-8555-5555555555aa".to_owned(),
+                round_limit: 4,
+                lease_remaining: Duration::from_secs(30),
+                execution_remaining: Duration::from_secs(120),
+            },
+            state: ExecState::Running,
+            execution_deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let request = Request {
+            history: vec![History::User("synthetic prompt".into())],
+            tools: None,
+            parallel: None,
+            stream: true,
+        };
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        // 1. Normal return on `Stop::LeaseLost` -> `StepResult::Stopped`, outcome `"lease_lost"`.
+        let (tx_lease, rx_lease) = watch::channel(Some(Stop::LeaseLost));
+        let _keep_tx = tx_lease;
+        let res_lease = run_observed_inference(
+            &run,
+            OP_ID_LEASE,
+            &rx_lease,
+            gateway.server(
+                &catalog,
+                &effective,
+                &request,
+                Credential::Bearer("synthetic-bearer"),
+                RunStop::from_worker(&run, rx_lease.clone()),
+                |_| async {},
+            ),
+        )
+        .await;
+        assert!(matches!(res_lease, Err(StepResult::Stopped)));
+
+        // 2. Normal return on `Stop::Cancel` -> `StepResult::Stopped`, outcome `"stopped"`.
+        let (tx_cancel, rx_cancel) = watch::channel(Some(Stop::Cancel));
+        let _keep_tx2 = tx_cancel;
+        let res_cancel = run_observed_inference(
+            &run,
+            OP_ID_CANCEL,
+            &rx_cancel,
+            gateway.server(
+                &catalog,
+                &effective,
+                &request,
+                Credential::Bearer("synthetic-bearer"),
+                RunStop::from_worker(&run, rx_cancel.clone()),
+                |_| async {},
+            ),
+        )
+        .await;
+        assert!(matches!(res_cancel, Err(StepResult::Stopped)));
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "worker.operation")
+            .collect();
+        assert_eq!(spans.len(), 2);
+
+        let events = capture.events("worker.operation.completed");
+        assert_eq!(events.len(), 2, "{}", capture.text());
+
+        for (i, (expected_op, expected_outcome)) in
+            [(OP_ID_LEASE, "lease_lost"), (OP_ID_CANCEL, "stopped")]
+                .into_iter()
+                .enumerate()
+        {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["run_id"]), Some(RUN_ID));
+            assert_eq!(text(attrs["lease_id"]), Some(lease_id.as_str()));
+            assert_eq!(text(attrs["operation_id"]), Some(expected_op));
+            assert_eq!(text(attrs["operation.kind"]), Some("inference"));
+            assert_eq!(text(attrs["operation.outcome"]), Some(expected_outcome));
+
+            let ev = &events[i];
+            assert_eq!(ev["run_id"].as_str(), Some(RUN_ID));
+            assert_eq!(ev["lease_id"].as_str(), Some(lease_id.as_str()));
+            assert_eq!(ev["operation_id"].as_str(), Some(expected_op));
+            assert_eq!(ev["operation.kind"].as_str(), Some("inference"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+        collector.assert_absent(&[CLAIM_TOKEN.as_bytes()]);
+    }
+}

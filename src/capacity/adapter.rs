@@ -11,7 +11,10 @@
 //! using bounded `READ COMMITTED` transactions (`WriteTransaction::begin_bounded_pool`),
 //! serializes per-group controller operations, refuses `dispatch_grant` and `resume` until
 //! `takeover_and_reconcile` succeeds cleanly, and never discards database reconciliation errors.
-use super::{Controller, DeviceBytes, Error as StoreError, Evidence, GrantRequest, GrantState};
+use super::{
+    CapacityGrantGuard, Controller, DeviceBytes, Error as StoreError, Evidence, GrantRequest,
+    GrantState,
+};
 use crate::{
     runs::{self, WriteTransaction, bounded, is_canonical_uuid},
     telemetry::{
@@ -1396,66 +1399,11 @@ async fn confirm_dispatch_tx(
     Ok(())
 }
 
-struct CapacityGrantGuard<'a> {
-    span: tracing::Span,
-    run_id: Option<&'a str>,
-    grant_id: Option<&'a str>,
-    operation: CapacityOperation,
-    started: Instant,
-    metrics: &'a Metrics,
-    finished: bool,
-}
-
-impl<'a> CapacityGrantGuard<'a> {
-    fn new(
-        span: tracing::Span,
-        run_id: Option<&'a str>,
-        grant_id: Option<&'a str>,
-        operation: CapacityOperation,
-        metrics: &'a Metrics,
-    ) -> Self {
-        Self {
-            span,
-            run_id,
-            grant_id,
-            operation,
-            started: Instant::now(),
-            metrics,
-            finished: false,
-        }
-    }
-
-    fn finish(mut self, outcome: CapacityOutcome) {
-        self.record(outcome);
-    }
-
-    fn record(&mut self, outcome: CapacityOutcome) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        self.metrics.record_capacity_grant(self.operation, outcome);
-        self.span.record("operation.outcome", outcome.as_str());
-        telemetry::capacity_grant_completed(
-            self.run_id,
-            self.grant_id,
-            self.operation,
-            outcome,
-            self.started.elapsed(),
-        );
-    }
-}
-
-impl Drop for CapacityGrantGuard<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            let span = self.span.clone();
-            span.in_scope(|| self.record(CapacityOutcome::Error));
-        }
-    }
-}
-
-async fn reconcile_tx(
+/// Commits one `capacity_reconcile` write and records its `openmettle.capacity.grants` counter
+/// strictly after `tx.commit().await`, without opening a nested `capacity.grant` span. Used by
+/// coordinator flows (`dispatch_grant`, `release_grant`, `prepare_and_apply_release`) that already
+/// own an outer `capacity.grant` span.
+async fn reconcile_tx_post_commit(
     pool: &PgPool,
     controller: &Controller,
     grant_id: &str,
@@ -1480,6 +1428,68 @@ async fn reconcile_tx(
     let outcome = super::reconcile_outcome(&result, evidence);
     registry.record_capacity_grant(CapacityOperation::Reconcile, outcome);
     result
+}
+
+/// Commits one `capacity_reconcile` write inside its own correlated `capacity.grant` span and
+/// [`CapacityGrantGuard`], recording metric, span `operation.outcome`, and
+/// `capacity.grant.completed` strictly after `tx.commit().await` (or `Error` on drop). Used by
+/// `takeover_and_reconcile` where no outer `capacity.grant` span is active.
+async fn reconcile_tx_observed(
+    pool: &PgPool,
+    controller: &Controller,
+    grant_id: &str,
+    evidence: Evidence<'_>,
+    registry: &Metrics,
+) -> Result<GrantState, StoreError> {
+    let span = telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+    let guard_span = span.clone();
+    async {
+        let guard = CapacityGrantGuard::new(
+            guard_span,
+            None,
+            Some(grant_id),
+            CapacityOperation::Reconcile,
+            registry,
+        );
+        let result = async {
+            let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+                .await
+                .map_err(map_tx_error)?;
+            let state = super::reconcile_inner(
+                tx.connection().map_err(map_tx_error)?,
+                controller,
+                grant_id,
+                evidence,
+            )
+            .await?;
+            tx.commit().await.map_err(map_tx_error)?;
+            Ok(state)
+        }
+        .await;
+        let outcome = super::reconcile_outcome(&result, evidence);
+        guard.finish(outcome);
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+fn release_span_outcome(
+    result: &Result<(GrantState, Option<CapacityOutcome>), CoordinatorError>,
+) -> CapacityOutcome {
+    match result {
+        Ok((_, Some(outcome))) => *outcome,
+        Ok((GrantState::Granted, None)) => CapacityOutcome::Granted,
+        Ok((GrantState::Releasing, None)) => CapacityOutcome::Releasing,
+        Ok((GrantState::UnknownAllocation, None)) => CapacityOutcome::UnknownAllocation,
+        Ok((GrantState::Released, None)) => CapacityOutcome::Released,
+        Err(CoordinatorError::Store(err)) => super::store_error_outcome(err),
+        Err(CoordinatorError::Adapter(
+            AdapterError::StaleEpoch { .. } | AdapterError::Unfenced,
+        )) => CapacityOutcome::Fenced,
+        Err(CoordinatorError::Adapter(AdapterError::Unavailable)) => CapacityOutcome::Unavailable,
+        Err(CoordinatorError::Adapter(_)) => CapacityOutcome::Refused,
+    }
 }
 
 async fn load_grant_state_and_group_devices(
@@ -1662,18 +1672,43 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         grant_id: &str,
         extra_candidates: &[String],
     ) -> Result<GrantState, CoordinatorError> {
-        let prepared =
-            prepare_release_tx(&self.pool, &self.controller, grant_id, extra_candidates).await?;
-        self.apply_prepared_release(grant_id, prepared).await
+        let span =
+            telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+        let guard_span = span.clone();
+        async {
+            let guard = CapacityGrantGuard::new(
+                guard_span,
+                None,
+                Some(grant_id),
+                CapacityOperation::Reconcile,
+                self.metrics(),
+            );
+            let prepared =
+                match prepare_release_tx(&self.pool, &self.controller, grant_id, extra_candidates)
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        guard.finish(super::store_error_outcome(&err));
+                        return Err(CoordinatorError::Store(err));
+                    }
+                };
+            let result = self.apply_prepared_release(grant_id, prepared).await;
+            let outcome = release_span_outcome(&result);
+            guard.finish_span_only(outcome);
+            result.map(|(state, _)| state)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn apply_prepared_release(
         &self,
         grant_id: &str,
         prepared: PreparedRelease,
-    ) -> Result<GrantState, CoordinatorError> {
+    ) -> Result<(GrantState, Option<CapacityOutcome>), CoordinatorError> {
         if prepared.grant_state == GrantState::Released {
-            return Ok(GrantState::Released);
+            return Ok((GrantState::Released, None));
         }
 
         // Every rank sent to the backend MUST first be durably persisted in either
@@ -1696,7 +1731,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 return Err(CoordinatorError::Adapter(err));
             }
             Err(err) => {
-                reconcile_tx(
+                reconcile_tx_post_commit(
                     &self.pool,
                     &self.controller,
                     grant_id,
@@ -1744,11 +1779,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         .await;
         match commit_result {
             Ok(state) => {
+                let last = outcomes.last().copied();
                 for outcome in outcomes {
                     self.metrics()
                         .record_capacity_grant(CapacityOperation::Reconcile, outcome);
                 }
-                Ok(state)
+                Ok((state, last))
             }
             Err(err) => {
                 self.metrics().record_capacity_grant(
@@ -1830,7 +1866,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                     live.profile == durable.profile && live.footprint == durable.footprint
                 });
             if exact_match {
-                reconcile_tx(
+                reconcile_tx_observed(
                     &self.pool,
                     &self.controller,
                     &grant_id,
@@ -1859,7 +1895,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             // A `granted` row with partial, extra-rank, or byte/profile mismatch transitions to
             // `unknown_allocation` first so bursts stay closed even if release crashes mid-way.
             if durable.state == "granted" && backend_live.contains_key(&grant_id) {
-                reconcile_tx(
+                reconcile_tx_observed(
                     &self.pool,
                     &self.controller,
                     &grant_id,
@@ -1909,14 +1945,18 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         request: &GrantRequest<'_>,
         wait: &CapacityWait,
     ) -> Result<DispatchOutcome, CoordinatorError> {
-        let started = Instant::now();
         let span =
             telemetry::capacity_grant_span(Some(request.run_id), None, CapacityOperation::Grant);
+        let guard_span = span.clone();
         async {
-            let mut observed_grant_id: Option<String> = None;
-            let result = self
-                .dispatch_grant_inner(request, wait, &mut observed_grant_id)
-                .await;
+            let mut guard = CapacityGrantGuard::new(
+                guard_span,
+                Some(request.run_id),
+                None,
+                CapacityOperation::Grant,
+                self.metrics(),
+            );
+            let result = self.dispatch_grant_inner(request, wait, &mut guard).await;
             let outcome = match &result {
                 Ok(DispatchOutcome::Dispatched { .. }) => CapacityOutcome::Granted,
                 Ok(DispatchOutcome::Existing { state, .. }) => match state {
@@ -1933,14 +1973,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 )) => CapacityOutcome::Fenced,
                 Err(CoordinatorError::Adapter(_)) => CapacityOutcome::UnknownAllocation,
             };
-            tracing::Span::current().record("operation.outcome", outcome.as_str());
-            telemetry::capacity_grant_completed(
-                Some(request.run_id),
-                observed_grant_id.as_deref(),
-                CapacityOperation::Grant,
-                outcome,
-                started.elapsed(),
-            );
+            guard.finish_span_only(outcome);
             result
         }
         .instrument(span)
@@ -1951,7 +1984,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         &self,
         request: &GrantRequest<'_>,
         wait: &CapacityWait,
-        observed_grant_id: &mut Option<String>,
+        guard: &mut CapacityGrantGuard<'_>,
     ) -> Result<DispatchOutcome, CoordinatorError> {
         let _guard = self.op_lock.lock().await;
         if !self.reconciled_clean.load(Ordering::Acquire) {
@@ -1976,8 +2009,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
 
         match prepared {
             PreparedDispatch::AlreadySettled { grant_id, state } => {
-                telemetry::record_capacity_span_grant_id(&grant_id);
-                *observed_grant_id = Some(grant_id.clone());
+                guard.set_grant_id(&grant_id);
                 Ok(DispatchOutcome::Existing { grant_id, state })
             }
             PreparedDispatch::Insufficient => {
@@ -1998,8 +2030,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 grant_id,
                 is_replay,
             } => {
-                telemetry::record_capacity_span_grant_id(&grant_id);
-                *observed_grant_id = Some(grant_id.clone());
+                guard.set_grant_id(&grant_id);
                 let command = DispatchGrantCommand {
                     version: ADAPTER_CONTRACT_VERSION.to_owned(),
                     group_id: self.controller.group_id().to_owned(),
@@ -2035,7 +2066,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                         })
                     }
                     Ok(_) => {
-                        if let Err(err) = reconcile_tx(
+                        if let Err(err) = reconcile_tx_post_commit(
                             &self.pool,
                             &self.controller,
                             &grant_id,
@@ -2066,7 +2097,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                         Err(CoordinatorError::Adapter(err))
                     }
                     Err(err) => {
-                        if let Err(store_err) = reconcile_tx(
+                        if let Err(store_err) = reconcile_tx_post_commit(
                             &self.pool,
                             &self.controller,
                             &grant_id,
@@ -2100,10 +2131,17 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         request_key: &str,
         targets: &[DeviceBytes],
     ) -> Result<ReclaimKvResponse, CoordinatorError> {
-        let started = Instant::now();
         let span = telemetry::capacity_grant_span(None, None, CapacityOperation::Reclaim);
+        let guard_span = span.clone();
         async {
-            let _guard = self.op_lock.lock().await;
+            let guard = CapacityGrantGuard::new(
+                guard_span,
+                None,
+                None,
+                CapacityOperation::Reclaim,
+                self.metrics(),
+            );
+            let _lock = self.op_lock.lock().await;
             let command = ReclaimKvCommand {
                 version: ADAPTER_CONTRACT_VERSION.to_owned(),
                 group_id: self.controller.group_id().to_owned(),
@@ -2114,30 +2152,12 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             let target_map = match command.validate() {
                 Ok(map) => map,
                 Err(err) => {
-                    let outcome = CapacityOutcome::Refused;
-                    tracing::Span::current().record("operation.outcome", outcome.as_str());
-                    telemetry::capacity_grant_completed(
-                        None,
-                        None,
-                        CapacityOperation::Reclaim,
-                        outcome,
-                        started.elapsed(),
-                    );
+                    guard.finish_span_only(CapacityOutcome::Refused);
                     return Err(CoordinatorError::Adapter(err));
                 }
             };
             if let Err(err) = check_controller_tx(&self.pool, &self.controller).await {
-                let outcome = super::store_error_outcome(&err);
-                self.metrics()
-                    .record_capacity_grant(CapacityOperation::Reclaim, outcome);
-                tracing::Span::current().record("operation.outcome", outcome.as_str());
-                telemetry::capacity_grant_completed(
-                    None,
-                    None,
-                    CapacityOperation::Reclaim,
-                    outcome,
-                    started.elapsed(),
-                );
+                guard.finish(super::store_error_outcome(&err));
                 return Err(CoordinatorError::Store(err));
             }
             let result = self.adapter.reclaim_kv(command).await;
@@ -2159,19 +2179,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                             }) && seen.len() == target_map.len()
                         };
                     if !valid {
-                        self.metrics().record_capacity_grant(
-                            CapacityOperation::Reclaim,
-                            CapacityOutcome::Error,
-                        );
-                        tracing::Span::current()
-                            .record("operation.outcome", CapacityOutcome::Error.as_str());
-                        telemetry::capacity_grant_completed(
-                            None,
-                            None,
-                            CapacityOperation::Reclaim,
-                            CapacityOutcome::Error,
-                            started.elapsed(),
-                        );
+                        guard.finish(CapacityOutcome::Error);
                         return Err(CoordinatorError::Adapter(AdapterError::Invalid));
                     }
                     CapacityOutcome::Released
@@ -2187,16 +2195,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                     | AdapterError::Conflict,
                 ) => CapacityOutcome::Refused,
             };
-            self.metrics()
-                .record_capacity_grant(CapacityOperation::Reclaim, outcome);
-            tracing::Span::current().record("operation.outcome", outcome.as_str());
-            telemetry::capacity_grant_completed(
-                None,
-                None,
-                CapacityOperation::Reclaim,
-                outcome,
-                started.elapsed(),
-            );
+            guard.finish(outcome);
             result.map_err(CoordinatorError::Adapter)
         }
         .instrument(span)
@@ -2214,34 +2213,21 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         grant_id: &str,
         devices: &[String],
     ) -> Result<GrantState, CoordinatorError> {
-        let started = Instant::now();
         let span =
             telemetry::capacity_grant_span(None, Some(grant_id), CapacityOperation::Reconcile);
+        let guard_span = span.clone();
         async {
-            let result = self.release_grant_inner(grant_id, devices).await;
-            let outcome = match &result {
-                Ok(GrantState::Granted) => CapacityOutcome::Granted,
-                Ok(GrantState::Releasing) => CapacityOutcome::Releasing,
-                Ok(GrantState::UnknownAllocation) => CapacityOutcome::UnknownAllocation,
-                Ok(GrantState::Released) => CapacityOutcome::Released,
-                Err(CoordinatorError::Store(err)) => super::store_error_outcome(err),
-                Err(CoordinatorError::Adapter(
-                    AdapterError::StaleEpoch { .. } | AdapterError::Unfenced,
-                )) => CapacityOutcome::Fenced,
-                Err(CoordinatorError::Adapter(AdapterError::Unavailable)) => {
-                    CapacityOutcome::Unavailable
-                }
-                Err(CoordinatorError::Adapter(_)) => CapacityOutcome::Refused,
-            };
-            tracing::Span::current().record("operation.outcome", outcome.as_str());
-            telemetry::capacity_grant_completed(
+            let guard = CapacityGrantGuard::new(
+                guard_span,
                 None,
                 Some(grant_id),
                 CapacityOperation::Reconcile,
-                outcome,
-                started.elapsed(),
+                self.metrics(),
             );
-            result
+            let result = self.release_grant_inner(grant_id, devices).await;
+            let outcome = release_span_outcome(&result);
+            guard.finish_span_only(outcome);
+            result.map(|(state, _)| state)
         }
         .instrument(span)
         .await
@@ -2251,7 +2237,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         &self,
         grant_id: &str,
         devices: &[String],
-    ) -> Result<GrantState, CoordinatorError> {
+    ) -> Result<(GrantState, Option<CapacityOutcome>), CoordinatorError> {
         let _guard = self.op_lock.lock().await;
         if !is_canonical_uuid(grant_id) {
             return Err(CoordinatorError::Store(StoreError::Invalid));
@@ -2270,7 +2256,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
             return Err(CoordinatorError::Store(StoreError::Invalid));
         }
         if state == "released" {
-            return Ok(GrantState::Released);
+            return Ok((GrantState::Released, None));
         }
 
         // Durably commit `release_in_flight` (and caller target ranks) BEFORE inspecting backend
@@ -2280,7 +2266,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
         let mut prepared =
             prepare_release_tx(&self.pool, &self.controller, grant_id, &caller_devices).await?;
         if prepared.grant_state == GrantState::Released {
-            return Ok(GrantState::Released);
+            return Ok((GrantState::Released, None));
         }
 
         // Always inspect fenced backend inventory for any non-released grant so unexpected extra
@@ -2317,7 +2303,7 @@ impl<A: CapacityAdapter> GroupCoordinator<A> {
                 .get(grant_id)
                 .is_some_and(|live| live.footprint.keys().any(|d| !group_device_ids.contains(d)));
             if target_has_foreign || state == "granted" {
-                reconcile_tx(
+                reconcile_tx_post_commit(
                     &self.pool,
                     &self.controller,
                     grant_id,
@@ -3010,6 +2996,160 @@ mod tests {
             let ev = &events[i];
             assert_eq!(ev["operation.kind"].as_str(), Some("resume"));
             assert_eq!(ev["operation.outcome"].as_str(), Some(expected_outcome));
+            assert!(ev["duration_us"].as_u64().is_some());
+        }
+
+        capture.assert_absent(&[SECRET_CANARY]);
+        collector.assert_absent(&[SECRET_CANARY]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_tx_observed_and_takeover_release_emit_correlated_span_and_event_post_commit()
+    {
+        use crate::telemetry::{
+            Format, Process, Verbosity,
+            tests::{
+                Capture,
+                otlp::{Collector, attributes, finish, start_traces, text},
+            },
+        };
+        use sqlx::postgres::PgPoolOptions;
+        use tokio::net::TcpListener;
+
+        const SECRET_CANARY: &[u8; 32] = b"CANARY-reconcile-secret-01234567";
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let closed_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy_with(
+                format!("postgres://unused@127.0.0.1:{closed_port}/unused?sslmode=disable")
+                    .parse()
+                    .unwrap(),
+            );
+        closed_pool.close().await;
+
+        let controller = Controller {
+            group_id: GROUP.into(),
+            epoch: 2,
+            secret: *SECRET_CANARY,
+        };
+        let registry = Arc::new(Metrics::new());
+
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = start_traces(collector.destination(), Process::Worker);
+        let (capture, sub_guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+
+        // 1. `reconcile_tx_observed` (used by `takeover_and_reconcile` for reattestation and
+        //    mismatch marking) emits one correlated `capacity.grant` span + event + metric.
+        assert_eq!(
+            reconcile_tx_observed(
+                &closed_pool,
+                &controller,
+                GRANT1,
+                Evidence::Allocated,
+                &registry,
+            )
+            .await,
+            Err(StoreError::Database)
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error),
+            1
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Granted),
+            0
+        );
+
+        // 2. `prepare_and_apply_release` (used by `takeover_and_reconcile` for release/revocation)
+        //    emits one correlated `capacity.grant` span + event + metric with no nested span.
+        let coord = GroupCoordinator::with_metrics(
+            closed_pool,
+            controller,
+            backend_two_gpu(),
+            registry.clone(),
+        );
+        assert_eq!(
+            coord.prepare_and_apply_release(GRANT2, &[]).await,
+            Err(CoordinatorError::Store(StoreError::Database))
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error),
+            2
+        );
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Released),
+            0
+        );
+
+        // 3. Dropping a pending `reconcile_tx_observed` future against a stalled socket triggers
+        //    `CapacityGrantGuard::drop`, recording `error` with `lease_id == GRANT1`.
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_port = stalled_listener.local_addr().unwrap().port();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_tx = accepted.clone();
+        let stalled_server = tokio::spawn(async move {
+            let (_sock, _) = stalled_listener.accept().await.unwrap();
+            accepted_tx.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let stalled_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy_with(
+                format!("postgres://unused@127.0.0.1:{stalled_port}/unused?sslmode=disable")
+                    .parse()
+                    .unwrap(),
+            );
+        {
+            let mut fut = std::pin::pin!(reconcile_tx_observed(
+                &stalled_pool,
+                coord.controller(),
+                GRANT1,
+                Evidence::Allocated,
+                &registry,
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("stalled socket must keep reconcile pending"),
+                _ = accepted.notified() => {}
+            }
+        }
+        stalled_server.abort();
+        assert_eq!(
+            registry.capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Error),
+            3
+        );
+
+        drop(sub_guard);
+        finish(exporter).await;
+
+        let spans: Vec<_> = collector
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "capacity.grant")
+            .collect();
+        assert_eq!(spans.len(), 3);
+
+        let events = capture.events("capacity.grant.completed");
+        assert_eq!(events.len(), 3, "{}", capture.text());
+
+        for (i, expected_grant) in [GRANT1, GRANT2, GRANT1].into_iter().enumerate() {
+            let span = &spans[i];
+            assert_eq!(span.dropped_attributes_count, 0);
+            let attrs = attributes(&span.attributes);
+            assert_eq!(text(attrs["lease_id"]), Some(expected_grant));
+            assert_eq!(text(attrs["operation.kind"]), Some("reconcile"));
+            assert_eq!(text(attrs["operation.outcome"]), Some("error"));
+
+            let ev = &events[i];
+            assert_eq!(ev["lease_id"].as_str(), Some(expected_grant));
+            assert_eq!(ev["operation.kind"].as_str(), Some("reconcile"));
+            assert_eq!(ev["operation.outcome"].as_str(), Some("error"));
             assert!(ev["duration_us"].as_u64().is_some());
         }
 
