@@ -215,17 +215,31 @@ fn resolve_pg18_tools(
              ARG=\"$1\"\n\
              shift\n\
              I=$((I + 1))\n\
-             if [ \"$ARG\" = \"--port\" ] && [ \"$I\" -lt \"$COUNT\" ]; then\n\
-                 shift\n\
-                 I=$((I + 1))\n\
-                 set -- \"$@\" --port 5432\n\
-             elif [ \"$ARG\" = \"--host\" ] && [ \"$I\" -lt \"$COUNT\" ]; then\n\
-                 shift\n\
-                 I=$((I + 1))\n\
-                 set -- \"$@\" --host 127.0.0.1\n\
-             else\n\
-                 set -- \"$@\" \"$ARG\"\n\
-             fi\n\
+             case \"$ARG\" in\n\
+                 --port=*)\n\
+                     set -- \"$@\" --port=5432\n\
+                     ;;\n\
+                 --port)\n\
+                     if [ \"$I\" -lt \"$COUNT\" ]; then\n\
+                         shift\n\
+                         I=$((I + 1))\n\
+                     fi\n\
+                     set -- \"$@\" --port=5432\n\
+                     ;;\n\
+                 --host=*)\n\
+                     set -- \"$@\" --host=127.0.0.1\n\
+                     ;;\n\
+                 --host)\n\
+                     if [ \"$I\" -lt \"$COUNT\" ]; then\n\
+                         shift\n\
+                         I=$((I + 1))\n\
+                     fi\n\
+                     set -- \"$@\" --host=127.0.0.1\n\
+                     ;;\n\
+                 *)\n\
+                     set -- \"$@\" \"$ARG\"\n\
+                     ;;\n\
+             esac\n\
          done\n\
          if [ -n \"${{PGPASSFILE:-}}\" ] && [ -f \"$PGPASSFILE\" ]; then\n\
              sed -E 's/^[^:]*:[^:]*:/\\*:\\*:/' \"$PGPASSFILE\" | docker exec -i \\\n\
@@ -2929,6 +2943,157 @@ async fn staged_publishing_retry_without_sources_non_counting_telemetry_rpo_and_
         .await
         .unwrap();
     assert_eq!(obs_final.incomplete, 1);
+
+    // 6. P1 #1: Retry when `final_dir` ALREADY exists on disk (simulating a crash right after
+    //    `rename(staging_dir, final_dir)` before `fsync_dir(dest_root)` + `confirm_publication`)
+    //    verifies + syncs `final_dir`/`dest_root` and confirms `publishing -> succeeded`.
+    let (run3, bundle3, staging3, final3) = stage_run(
+        &owner_pool,
+        &dest,
+        &keyring,
+        "pub-retry-final-exists-3",
+        "publish retry final exists",
+    )
+    .await;
+    let run3_summary_text: String = sqlx::query_scalar(
+        "SELECT manifest_summary::text FROM openmettle.backup_runs WHERE id = $1::uuid",
+    )
+    .bind(&run3)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    let run3_summary: Value = serde_json::from_str(&run3_summary_text).unwrap();
+    let run3_meta = BackupMeta {
+        format: META_FORMAT.to_owned(),
+        installation_id: run3_summary["installation_id"].as_str().unwrap().to_owned(),
+        backup_run_id: run3.clone(),
+        completed_at: run3_summary["completed_at"].as_str().unwrap().to_owned(),
+        destination_domain: "offhost-pub".to_owned(),
+        encryption_key_id: keyring.active_key_id().to_owned(),
+        manifest_ciphertext_sha256: run3_summary["manifest_ciphertext_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        bundle_digest: bundle3.clone(),
+        state: "complete".to_owned(),
+    };
+    fs::write(
+        staging3.join("backup-meta.json"),
+        serde_json::to_vec_pretty(&run3_meta).unwrap(),
+    )
+    .unwrap();
+    fs::rename(&staging3, &final3).unwrap();
+    assert!(!staging3.exists() && final3.is_dir());
+
+    let retry3 = backup::capture_with_runner(
+        &owner_pool,
+        &keyring,
+        &CaptureOptions {
+            database_url: db.url(OWNER),
+            destination_root: dest.clone(),
+            destination_domain: "offhost-pub".to_owned(),
+            artifact_root: None,
+            operator_id: OPERATOR_1.to_owned(),
+            request_key: "pub-retry-final-exists-3".to_owned(),
+            reason: "publish retry final exists".to_owned(),
+            drain_timeout: Duration::from_secs(5),
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            require_separate_device: false,
+            graphiti_mode: GraphitiMode::NotProvisioned,
+            config_files: Vec::new(),
+            prune_policy: None,
+            release_on_success: true,
+            pg_dump_bin: None,
+            allow_local_test_paths: true,
+        },
+        Arc::new(PanicPgDumpRunner),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry3.backup_run_id, run3);
+    assert_eq!(retry3.backup_dir, final3);
+    assert!(retry3.released_maintenance);
+    let state3: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.backup_runs WHERE id = $1::uuid")
+            .bind(&run3)
+            .fetch_one(&owner_pool)
+            .await
+            .unwrap();
+    assert_eq!(state3, "succeeded");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn confirming_old_publishing_run_anchors_rpo_to_quiesced_at_not_completed_at() {
+    let db = TestDb::migrated().await;
+    let owner_pool = pool(&db, OWNER).await;
+    let worker_pool = pool(&db, WORKER).await;
+    let run_id = new_uuid(&db).await;
+
+    // Insert a staged `publishing` run whose captured recovery point (`quiesced_at`) is 25 hours
+    // old (past the default 86400s RPO target), and bind it to the active maintenance gate.
+    sqlx::query(
+        "INSERT INTO openmettle.backup_runs
+            (id, request_key, operator_id, state, started_at, lease_until, quiesced_at,
+             completed_at, destination_domain, encryption_key_id, bundle_digest, manifest_digest,
+             journal_origin_us, journal_seq, journal_chain_digest, failure_code,
+             opened_maintenance, manifest_summary)
+         VALUES
+            ($1::uuid, 'old-quiesced-pub-1', $2::uuid, 'publishing',
+             clock_timestamp() - interval '26 hours', NULL,
+             clock_timestamp() - interval '25 hours', NULL,
+             'offhost-rpo', 'bk-old', $3, $3, 1, 0, $3, NULL, true, '{}'::jsonb)",
+    )
+    .bind(&run_id)
+    .bind(OPERATOR_1)
+    .bind([0x55u8; 32].as_slice())
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE openmettle.backup_maintenance_gate
+            SET maintenance_active = true,
+                backup_run_id = $1::uuid,
+                entered_at = clock_timestamp() - interval '26 hours',
+                entered_by_operator_id = $2::uuid,
+                reason = 'delayed confirmation rpo test',
+                quiesced_at = clock_timestamp() - interval '25 hours',
+                rpo_tracking_armed_at = clock_timestamp() - interval '26 hours',
+                updated_at = clock_timestamp()
+          WHERE id",
+    )
+    .bind(&run_id)
+    .bind(OPERATOR_1)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+
+    // Confirming publication NOW sets `completed_at = clock_timestamp()`, while `quiesced_at`
+    // remains 25 hours ago.
+    let mut tx = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT openmettle.backup_confirm_publication($1::uuid, 'late confirmation')")
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // RPO overdue evaluation MUST anchor to `quiesced_at` (25h old), NOT `completed_at` (now),
+    // so `overdue` increments to 1 even though `succeeded` is 1.
+    let metrics = Metrics::new();
+    let obs = backup::observe_telemetry_into(&worker_pool, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(obs.succeeded, 1);
+    assert_eq!(
+        obs.overdue, 1,
+        "confirming a 25h-old publishing snapshot must NOT reset the 24h RPO clock"
+    );
 }
 
 #[tokio::test]

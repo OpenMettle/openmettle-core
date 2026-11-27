@@ -191,6 +191,10 @@ CREATE INDEX backup_runs_succeeded_completed_idx
     ON openmettle.backup_runs (completed_at DESC)
     WHERE state = 'succeeded';
 
+CREATE INDEX backup_runs_succeeded_quiesced_idx
+    ON openmettle.backup_runs (quiesced_at DESC)
+    WHERE state = 'succeeded';
+
 -- Enforce monotonic state transitions and strict terminal immutability on backup_runs.
 CREATE FUNCTION openmettle.enforce_backup_runs_transitions()
 RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
@@ -487,9 +491,12 @@ BEGIN
      WHERE r.id = e.id;
 
     -- 2. Evaluate RPO overdue state once tracking has been armed and persist durable count.
+    --    Anchor RPO age to the captured recovery point (`quiesced_at`), not publication
+    --    confirmation time (`completed_at`), so late confirmation of an old staged backup
+    --    never falsely resets the RPO clock.
     v_overdue := g.overdue_count;
     IF g.rpo_tracking_armed_at IS NOT NULL THEN
-        SELECT coalesce(max(r.completed_at), g.rpo_tracking_armed_at)
+        SELECT coalesce(max(r.quiesced_at), g.rpo_tracking_armed_at)
           INTO v_anchor
           FROM openmettle.backup_runs r
          WHERE r.state = 'succeeded';

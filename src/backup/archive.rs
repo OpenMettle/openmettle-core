@@ -534,29 +534,10 @@ pub(crate) fn write_file_0600(path: &Path, bytes: &[u8]) -> Result<(), ArchiveEr
     Ok(())
 }
 
-/// Create or truncate a `0600` regular file (without following symlinks), write all bytes, and
-/// `fsync` it. Used for atomic `backup-meta.json.tmp` replacement before renaming into place.
-pub(crate) fn write_file_0600_replace(path: &Path, bytes: &[u8]) -> Result<(), ArchiveError> {
-    let parent = path
-        .parent()
-        .ok_or(ArchiveError::Invalid("file path missing parent"))?;
-    let name = path
-        .file_name()
-        .ok_or(ArchiveError::Invalid("file path missing file name"))?;
-    let dir = open_dir_nofollow(at::CWD, parent)?;
-    let fd = at::openat(
-        &dir,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    let mut f = fs::File::from(fd);
-    if !f.metadata()?.is_file() {
-        return Err(ArchiveError::Invalid("expected a regular file"));
-    }
-    f.set_permissions(fs::Permissions::from_mode(0o600))?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+/// Open an existing regular file read-only without following symlinks and `fsync` its data/inode.
+pub(crate) fn fsync_regular_file_nofollow(path: &Path) -> Result<(), ArchiveError> {
+    let file = open_regular_nofollow(path)?;
+    file.sync_all()?;
     Ok(())
 }
 

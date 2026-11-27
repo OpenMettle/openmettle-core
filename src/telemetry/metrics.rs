@@ -1443,23 +1443,23 @@ impl Metrics {
         push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
 
         // 16: openmettle.backup.runs
-        // Emit all 4 closed outcome series (including 0) on `openmettle-worker` ONLY once durable
-        // totals have been seeded from PostgreSQL (`backup_runs_seeded`), so a restarted worker
-        // never exports a premature `0` ahead of pre-existing historical `failed`/`incomplete`/
-        // `overdue` totals (which would look like a fresh `0 -> N` increase to Prometheus), while
-        // still establishing a zero baseline immediately after startup seeding on clean DBs.
-        let backup_seeded =
-            role == Process::Worker && self.backup_runs_seeded.load(Ordering::Acquire);
+        // Gate ALL `openmettle.backup.runs` export strictly on `backup_runs_seeded` (`Acquire`),
+        // paired with `sync_backup_run_totals`'s `Release` store after all 4 slots are updated.
+        // This guarantees a concurrent export never emits a partial subset of slots mid-seed and
+        // restarted workers never export a premature `0` ahead of pre-existing historical
+        // `failed`/`incomplete`/`overdue` counts.
         let mut backup_points = Vec::new();
-        for &outcome in BackupRunOutcome::ALL {
-            let value = self.backup_runs[outcome.index()].load(Ordering::Relaxed);
-            if value > 0 || backup_seeded {
-                backup_points.push(counter_point(
-                    start,
-                    now,
-                    value,
-                    &[("outcome", outcome.as_str())],
-                ));
+        if self.backup_runs_seeded.load(Ordering::Acquire) {
+            for &outcome in BackupRunOutcome::ALL {
+                let value = self.backup_runs[outcome.index()].load(Ordering::Relaxed);
+                if value > 0 || role == Process::Worker {
+                    backup_points.push(counter_point(
+                        start,
+                        now,
+                        value,
+                        &[("outcome", outcome.as_str())],
+                    ));
+                }
             }
         }
         push_counter(&mut metrics, &DESCRIPTORS[16], backup_points);
@@ -1588,4 +1588,48 @@ fn push_histogram(
 
 pub(crate) fn quota_sweep_failed() {
     tracing::warn!(target: super::TARGET, event="worker.sweep.failed", role="worker", "error.type"="reconcile_stale_quotas");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_runs_never_exports_any_slot_before_seeded_flag_is_published() {
+        let store = Metrics::new();
+        // Simulate mid-seed partial counter update before `backup_runs_seeded` becomes `true`.
+        store.backup_runs[BackupRunOutcome::Failed.index()].store(3, Ordering::Relaxed);
+
+        for role in [Process::Worker, Process::Api] {
+            let encoded = store
+                .encode_otlp(role, Some("44444444-5555-4666-8777-888888888888"))
+                .expect("baseline dropped telemetry is always emitted");
+            assert!(
+                !encoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.backup.runs"),
+                "unseeded registry must never export openmettle.backup.runs for {role:?}"
+            );
+        }
+
+        store.mark_backup_runs_seeded();
+        let worker = store
+            .encode_otlp(
+                Process::Worker,
+                Some("44444444-5555-4666-8777-888888888888"),
+            )
+            .unwrap();
+        let metric = worker.resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter()
+            .find(|m| m.name == "openmettle.backup.runs")
+            .expect("seeded worker must emit openmettle.backup.runs");
+        match metric.data.as_ref().unwrap() {
+            metric::Data::Sum(sum) => {
+                assert_eq!(sum.data_points.len(), BackupRunOutcome::ALL.len())
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
+    }
 }
