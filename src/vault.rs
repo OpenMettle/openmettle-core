@@ -4143,11 +4143,15 @@ mod tests {
         }
     }
 
+    static OAUTH_REFRESH_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn https_refresh_client_records_oauth_refresh_provider_http_metrics() {
         use crate::provider_http::fixture::{Ca, HOST, Reply, Server, loopback, response};
         use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _metric_lock = OAUTH_REFRESH_METRIC_LOCK.lock().await;
 
         let ca = Ca::new();
         let step = Arc::new(AtomicUsize::new(0));
@@ -4261,6 +4265,8 @@ mod tests {
         use crate::provider_http::fixture::{Ca, HOST, Reply, Server, loopback};
         use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
         use tokio::sync::Notify;
+
+        let _metric_lock = OAUTH_REFRESH_METRIC_LOCK.lock().await;
 
         let ca = Ca::new();
         let arrived = Arc::new(Notify::new());

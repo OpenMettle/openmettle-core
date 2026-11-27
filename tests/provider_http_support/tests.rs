@@ -660,24 +660,23 @@ async fn connect_alternates_only_before_request_bytes() {
     );
 }
 
-/// Serializes tests that drop in-flight OIDC transport futures while asserting deltas on
-/// process-global `openmettle_provider_http_requests_total`.
-static OIDC_CANCEL_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const CANCEL_CHILD: &str = "OPENMETTLE_PROVIDER_HTTP_CANCEL_CHILD";
 
+/// Runs in an isolated child process so process-global OIDC provider metric assertions have zero
+/// contention with parallel `provider_http::tests::*` tests.
 #[tokio::test]
-async fn cancellation_closes_the_connection() {
+#[ignore = "child process of cancellation_closes_the_connection"]
+async fn cancellation_closes_the_connection_child() {
     use crate::telemetry::metrics::{self, ProviderOperation, ProviderOutcome};
 
-    let _metric_lock = OIDC_CANCEL_METRIC_LOCK.lock().await;
+    if std::env::var(CANCEL_CHILD).as_deref() != Ok("1") {
+        return;
+    }
     let ca = Ca::new();
     let server = Server::start(ca.leaf(fixture::HOST, false), |_| Reply::Stall(Vec::new())).await;
     let t = fixture::transport(server.port, &ca);
 
     // 1. Dropping an in-flight OIDC token request closes the socket and records `cancelled` (+1).
-    let before_token_cancelled =
-        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled);
-    let before_token_transport =
-        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Transport);
     let mut call = Box::pin(t.call(fixture::token_request(&fixture::url(server.port))));
     tokio::select! {
         _ = server.entered.notified() => (),
@@ -691,11 +690,11 @@ async fn cancellation_closes_the_connection() {
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     assert_eq!(
         metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled),
-        before_token_cancelled + 1
+        1
     );
     assert_eq!(
         metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Transport),
-        before_token_transport
+        0
     );
 
     // 2. Dropping in-flight OIDC discovery and JWKS fetches also records `cancelled` (+1 each).
@@ -710,8 +709,6 @@ async fn cancellation_closes_the_connection() {
     )
     .unwrap();
 
-    let before_disc_cancelled = metrics::global()
-        .provider_http_count(ProviderOperation::Discovery, ProviderOutcome::Cancelled);
     let mut disc = Box::pin(docs.fetch_discovery());
     tokio::select! {
         _ = server.entered.notified() => (),
@@ -724,11 +721,9 @@ async fn cancellation_closes_the_connection() {
     assert_eq!(
         metrics::global()
             .provider_http_count(ProviderOperation::Discovery, ProviderOutcome::Cancelled),
-        before_disc_cancelled + 1
+        1
     );
 
-    let before_jwks_cancelled =
-        metrics::global().provider_http_count(ProviderOperation::Jwks, ProviderOutcome::Cancelled);
     let mut jwks = Box::pin(docs.fetch_jwks());
     tokio::select! {
         _ = server.entered.notified() => (),
@@ -740,24 +735,42 @@ async fn cancellation_closes_the_connection() {
         .expect("dropping jwks closes the socket");
     assert_eq!(
         metrics::global().provider_http_count(ProviderOperation::Jwks, ProviderOutcome::Cancelled),
-        before_jwks_cancelled + 1
+        1
     );
 
     // 3. Admission refusal still records `refused` (+1) and does NOT record `cancelled`.
-    let before_token_refused =
-        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Refused);
-    let before_token_cancelled_after =
-        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled);
     let wrong_dest = fixture::token_request("https://wrong.example.test/oauth/token");
     assert_eq!(t.call(wrong_dest).await.unwrap_err(), Error::Destination);
     assert_eq!(
         metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Refused),
-        before_token_refused + 1
+        1
     );
     assert_eq!(
         metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Cancelled),
-        before_token_cancelled_after
+        1
     );
+    assert_eq!(
+        metrics::global().provider_http_count(ProviderOperation::Token, ProviderOutcome::Transport),
+        0
+    );
+}
+
+#[test]
+fn cancellation_closes_the_connection() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "provider_http::tests::cancellation_closes_the_connection_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(CANCEL_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed"), "{stdout}\n{stderr}");
 }
 
 /// Blocks lookups until released; counts entries.
@@ -802,7 +815,6 @@ impl Drop for Unblock {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_dns_lookups_keep_their_bounded_slots_until_finished() {
-    let _metric_lock = OIDC_CANCEL_METRIC_LOCK.lock().await;
     let ca = Ca::new();
     let gate = Arc::new(Gate::default());
     let _unblock = Unblock(gate.clone());
