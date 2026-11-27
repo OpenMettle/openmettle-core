@@ -1968,7 +1968,7 @@ async fn capacity_probe_failures_never_replace_committed_results() {
     let mut superuser = admin(Some(&db.0)).await;
     let mut owner = connect(&db.0, OWNER).await;
     let (scope, claims) =
-        seed_capacity_group_and_claimed_runs(&db, &mut owner, GROUP, GPU0, FLOOR, 1).await;
+        seed_capacity_group_and_claimed_runs(&db, &mut owner, GROUP, GPU0, FLOOR, 2).await;
 
     let mut worker_conn = worker(&db).await;
     let controller = Controller::acquire(&mut worker_conn, GROUP, Duration::from_secs(60))
@@ -2066,10 +2066,14 @@ async fn capacity_probe_failures_never_replace_committed_results() {
         st.events.clear();
     }
 
-    // 2. Revoking `EXECUTE` on `pg_catalog.pg_current_xact_id_if_assigned()` causes the post-write
-    //    autocommit confirmation probe to fail; autocommit `resume`, `grant`, and `reconcile` MUST
-    //    all still return `Ok(...)` and persist their state changes in PostgreSQL while cleanly
-    //    suppressing telemetry.
+    // 2. Revoking `EXECUTE` on `pg_catalog.pg_current_xact_id_if_assigned()` MUST NOT abort a
+    //    caller-owned literal `BEGIN` transaction OR break autocommit post-commit telemetry:
+    //    a) Under literal `BEGIN`, `capacity::resume`, `grant`, and `reconcile` keep the
+    //       connection healthy (subsequent `SELECT 1` succeeds without `25P02`), `COMMIT`
+    //       persists cleanly as observed from an independent connection, and zero pre-commit
+    //       spans/events/counters are emitted.
+    //    b) Still under revoked `EXECUTE`, autocommit `resume`, `grant`, and `reconcile` both
+    //       persist their state changes and emit post-commit telemetry cleanly.
     let before_resumed =
         metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed);
     let before_granted =
@@ -2090,12 +2094,46 @@ async fn capacity_probe_failures_never_replace_committed_results() {
     .await
     .unwrap();
 
+    // (a) Caller-owned literal `BEGIN` block must remain un-aborted and commit cleanly:
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut worker_conn)
+        .await
+        .unwrap();
     assert!(
         capacity::resume(&mut worker_conn, &controller)
             .await
             .unwrap()
     );
-    let ready: bool = sqlx::query_scalar(
+    let tx_decision = capacity::grant(&mut worker_conn, &controller, &req0)
+        .await
+        .unwrap();
+    let Decision::Grant {
+        grant_id: tx_grant_id,
+        state: GrantState::Granted,
+    } = tx_decision
+    else {
+        panic!("expected Ok(Decision::Grant {{ state: Granted }}) inside BEGIN");
+    };
+    let tx_reconciled = capacity::reconcile(
+        &mut worker_conn,
+        &controller,
+        &tx_grant_id,
+        Evidence::Releasing,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tx_reconciled, GrantState::Releasing);
+    let probe_select: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&mut worker_conn)
+        .await
+        .expect("caller-owned BEGIN transaction must not enter 25P02");
+    assert_eq!(probe_select, 1);
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut worker_conn)
+        .await
+        .unwrap();
+
+    let committed_ready: bool = sqlx::query_scalar(
         "SELECT ready_epoch IS NOT NULL AND ready_epoch = controller_epoch
            FROM openmettle.capacity_groups
           WHERE id = $1::uuid",
@@ -2104,9 +2142,54 @@ async fn capacity_probe_failures_never_replace_committed_results() {
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert!(ready, "resume must persist ready_epoch despite probe error");
+    assert!(
+        committed_ready,
+        "literal BEGIN commit must persist ready_epoch under revoked pg_current_xact_id_if_assigned"
+    );
+    let committed_grant_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
+            .bind(&tx_grant_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(committed_grant_state, "releasing");
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
+        before_resumed
+    );
+    assert_eq!(
+        metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
+        before_granted
+    );
+    assert_eq!(
+        metrics::global()
+            .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing),
+        before_releasing
+    );
+    {
+        let st = recorder.state.lock().unwrap();
+        assert!(
+            st.closed_spans.is_empty() && st.events.is_empty(),
+            "literal BEGIN block must not emit pre-commit spans or events"
+        );
+    }
 
-    let decision = capacity::grant(&mut worker_conn, &controller, &req0)
+    // (b) Autocommit calls under revoked `pg_current_xact_id_if_assigned()` still persist AND
+    //     emit post-commit telemetry without erroring.
+    let req1 = GrantRequest {
+        scope_id: &scope,
+        run_id: &claims[1].run_id,
+        claim_token: &claims[1].claim_token,
+        request_key: "probe-failure-resilience-grant-autocommit",
+        profile: "synthetic-image",
+        footprint: &footprint,
+    };
+    assert!(
+        capacity::resume(&mut worker_conn, &controller)
+            .await
+            .unwrap()
+    );
+    let decision = capacity::grant(&mut worker_conn, &controller, &req1)
         .await
         .unwrap();
     let Decision::Grant {
@@ -2114,7 +2197,7 @@ async fn capacity_probe_failures_never_replace_committed_results() {
         state: GrantState::Granted,
     } = decision
     else {
-        panic!("expected Ok(Decision::Grant {{ state: Granted }}) despite probe error");
+        panic!("expected Ok(Decision::Grant {{ state: Granted }}) in autocommit");
     };
     let persisted_granted: String =
         sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
@@ -2148,16 +2231,16 @@ async fn capacity_probe_failures_never_replace_committed_results() {
 
     assert_eq!(
         metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Resumed),
-        before_resumed
+        before_resumed + 1
     );
     assert_eq!(
         metrics::global().capacity_grant_count(CapacityOperation::Grant, CapacityOutcome::Granted),
-        before_granted
+        before_granted + 1
     );
     assert_eq!(
         metrics::global()
             .capacity_grant_count(CapacityOperation::Reconcile, CapacityOutcome::Releasing),
-        before_releasing
+        before_releasing + 1
     );
     assert_eq!(
         metrics::global().capacity_grant_count(CapacityOperation::Resume, CapacityOutcome::Error),
@@ -2174,10 +2257,8 @@ async fn capacity_probe_failures_never_replace_committed_results() {
     );
     {
         let st = recorder.state.lock().unwrap();
-        assert!(
-            st.closed_spans.is_empty() && st.events.is_empty(),
-            "failing autocommit probe must suppress telemetry rather than emitting spans/events"
-        );
+        assert_eq!(st.closed_spans.len(), 3);
+        assert_eq!(st.events.len(), 3);
     }
 }
 
