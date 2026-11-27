@@ -1001,10 +1001,10 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    while captured.lock().unwrap().is_empty() {
+    while captured.lock().unwrap().len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for metrics export"
+            "timed out waiting for baseline and live metrics exports"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1013,8 +1013,8 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
         .await;
 
     let requests = captured.lock().unwrap().clone();
-    assert!(!requests.is_empty());
-    let (head, body) = &requests[0];
+    assert!(requests.len() >= 2);
+    let (head, body) = &requests[1];
     assert!(
         head.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
         "unexpected request head: {head:?}"
@@ -1058,6 +1058,197 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
     };
     assert!(sum.is_monotonic);
     assert_eq!(sum.data_points.len(), 1);
+}
+
+fn find_counter_point(
+    req: &opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+    name: &str,
+    want_labels: &[(&str, &str)],
+) -> (i64, u64, u64) {
+    use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point::Value as NumVal};
+    let metric = req.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| panic!("missing metric {name}"));
+    let Some(metric::Data::Sum(sum)) = metric.data.as_ref() else {
+        panic!("expected Sum for {name}");
+    };
+    let dp = sum
+        .data_points
+        .iter()
+        .find(|dp| {
+            let map = attributes(&dp.attributes);
+            want_labels
+                .iter()
+                .all(|&(k, v)| map.get(k).and_then(|val| text(val)) == Some(v))
+        })
+        .unwrap_or_else(|| panic!("missing point {want_labels:?} in {name}"));
+    let Some(NumVal::AsInt(value)) = dp.value else {
+        panic!("expected AsInt in {name}");
+    };
+    (value, dp.start_time_unix_nano, dp.time_unix_nano)
+}
+
+#[tokio::test]
+async fn metrics_export_delivers_zero_baseline_before_immediate_startup_failures() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let ca = Ca::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        recorded.lock().unwrap().push(received.body.clone());
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    // Use a long periodic export interval (60s) so the live export does not run before shutdown,
+    // proving that the pre-captured zero baseline is delivered immediately on startup ahead of
+    // failures recorded right after `start_with_metrics` returns.
+    let tuning = Tuning {
+        interval: Duration::from_secs(60),
+        ..FAST
+    };
+    let dest = metrics_destination(server.port, &ca, tuning);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Worker, store.clone());
+
+    // Record 3 readiness failures, 3 MCP transport failures, and 1 slow queue exit immediately
+    // after exporter installation (before the 60s periodic export timer elapses).
+    for _ in 0..3 {
+        store.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(5));
+        store.record_provider_http(
+            metrics::ProviderOperation::Mcp,
+            metrics::ProviderOutcome::Transport,
+            Duration::from_millis(10),
+        );
+    }
+    store.record_run_queue_age(metrics::RunQueueAgeOutcome::Claimed, 75.0);
+
+    until(|| !captured.lock().unwrap().is_empty()).await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let bodies = captured.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "expected startup zero baseline + shutdown live flush"
+    );
+    let baseline = ExportMetricsServiceRequest::decode(bodies[0].as_slice()).unwrap();
+    let live = ExportMetricsServiceRequest::decode(bodies[1].as_slice()).unwrap();
+
+    for (name, labels, expected_live) in [
+        (
+            "openmettle.db.readiness.checks",
+            &[("outcome", "error")][..],
+            3i64,
+        ),
+        (
+            "openmettle.provider.http.requests",
+            &[("operation", "mcp"), ("outcome", "transport")][..],
+            3i64,
+        ),
+        (
+            "openmettle.runs.queue.slow_exits",
+            &[("outcome", "claimed")][..],
+            1i64,
+        ),
+    ] {
+        let (base_val, base_start, base_time) = find_counter_point(&baseline, name, labels);
+        let (live_val, live_start, live_time) = find_counter_point(&live, name, labels);
+        assert_eq!(base_val, 0, "baseline for {name} must be 0");
+        assert_eq!(
+            base_time, base_start,
+            "baseline for {name} must carry time_unix_nano == start_time_unix_nano"
+        );
+        assert_eq!(live_start, base_start);
+        assert_eq!(live_val, expected_live, "live value mismatch for {name}");
+        assert!(
+            live_time > base_time,
+            "live timestamp ({live_time}) must strictly exceed baseline ({base_time}) for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_export_retains_zero_baseline_across_initial_collector_outage() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let ca = Ca::new();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let healthy_srv = healthy.clone();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        if !healthy_srv.load(AtomicOrdering::Acquire) {
+            return Reply::Bytes(response(503, &[], b""));
+        }
+        recorded.lock().unwrap().push(received.body.clone());
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Api, store.clone());
+
+    // Wait for the initial baseline attempt to fail against the 503 collector.
+    until(|| store.dropped_count(metrics::DroppedSignal::MetricExports) >= 1).await;
+
+    // Record startup failures while the collector is still down.
+    for _ in 0..3 {
+        store.record_db_readiness(metrics::ReadinessOutcome::Timeout, Duration::from_millis(5));
+        store.record_provider_http(
+            metrics::ProviderOperation::Token,
+            metrics::ProviderOutcome::Timeout,
+            Duration::from_millis(10),
+        );
+    }
+
+    // Bring collector back up; pending_baseline MUST still arrive ahead of the live snapshot.
+    healthy.store(true, AtomicOrdering::Release);
+    until(|| captured.lock().unwrap().len() >= 2).await;
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let bodies = captured.lock().unwrap().clone();
+    assert!(bodies.len() >= 2);
+    let baseline = ExportMetricsServiceRequest::decode(bodies[0].as_slice()).unwrap();
+    let live = ExportMetricsServiceRequest::decode(bodies[1].as_slice()).unwrap();
+
+    for (name, labels, min_live) in [
+        (
+            "openmettle.db.readiness.checks",
+            &[("outcome", "timeout")][..],
+            3i64,
+        ),
+        (
+            "openmettle.provider.http.requests",
+            &[("operation", "token"), ("outcome", "timeout")][..],
+            3i64,
+        ),
+        (
+            "openmettle.telemetry.dropped",
+            &[("signal", "metric_exports")][..],
+            1i64,
+        ),
+    ] {
+        let (base_val, base_start, base_time) = find_counter_point(&baseline, name, labels);
+        let (live_val, live_start, live_time) = find_counter_point(&live, name, labels);
+        assert_eq!(base_val, 0, "retained baseline for {name} must stay 0");
+        assert_eq!(base_time, base_start);
+        assert_eq!(live_start, base_start);
+        assert!(
+            live_val >= min_live,
+            "live snapshot for {name} expected >= {min_live}, got {live_val}"
+        );
+        assert!(live_time > base_time);
+    }
 }
 
 #[tokio::test]

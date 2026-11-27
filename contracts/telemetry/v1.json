@@ -24,8 +24,8 @@
       "independent_from_authorization_audit": true,
       "requires_jurisdiction_retention_confirmation": true
     },
-    "max_data_point_streams": 532,
-    "max_prometheus_series_per_process": 1624,
+    "max_data_point_streams": 536,
+    "max_prometheus_series_per_process": 1628,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -462,6 +462,17 @@
       "semantics": "recorded_after_commit_for_queued_and_resumable_approved_waits",
       "max_series": 4,
       "buckets": [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0],
+      "labels": {
+        "outcome": ["claimed", "resumed", "cancelled", "expired"]
+      }
+    },
+    {
+      "name": "openmettle.runs.queue.slow_exits",
+      "prometheus_name": "openmettle_runs_queue_slow_exits_total",
+      "kind": "counter",
+      "unit": "{run}",
+      "semantics": "recorded_after_commit_for_queue_waits_exceeding_60s",
+      "max_series": 4,
       "labels": {
         "outcome": ["claimed", "resumed", "cancelled", "expired"]
       }

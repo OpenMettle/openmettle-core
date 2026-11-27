@@ -264,6 +264,7 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         "openmettle.storage.quota.drift",
         "openmettle.backup.runs",
         "openmettle.runs.queue.age",
+        "openmettle.runs.queue.slow_exits",
     ] {
         assert!(
             seen_otel.contains(implemented),
@@ -288,6 +289,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.provider.http.requests",
             "openmettle.telemetry.dropped",
             "openmettle.runs.queue.age",
+            "openmettle.runs.queue.slow_exits",
         ]
     );
     let assert_zero_sum = |metrics: &[opentelemetry_proto::tonic::metrics::v1::Metric],
@@ -326,6 +328,11 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         baseline_metrics,
         "openmettle.telemetry.dropped",
         DroppedSignal::ALL.len(),
+    );
+    assert_zero_sum(
+        baseline_metrics,
+        "openmettle.runs.queue.slow_exits",
+        RunQueueAgeOutcome::ALL.len(),
     );
     let api_queue_age = baseline_metrics
         .iter()
@@ -402,6 +409,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.quota.overdue.handoffs",
             "openmettle.storage.quota.drift",
             "openmettle.runs.queue.age",
+            "openmettle.runs.queue.slow_exits",
         ]
     );
 
@@ -422,6 +430,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
             "openmettle.storage.quota.drift",
             "openmettle.backup.runs",
             "openmettle.runs.queue.age",
+            "openmettle.runs.queue.slow_exits",
         ]
     );
     assert_zero_sum(
@@ -443,6 +452,11 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         worker_metrics,
         "openmettle.backup.runs",
         BackupRunOutcome::ALL.len(),
+    );
+    assert_zero_sum(
+        worker_metrics,
+        "openmettle.runs.queue.slow_exits",
+        RunQueueAgeOutcome::ALL.len(),
     );
 
     // An overdue handoff can be observed again on a later sweep.
@@ -504,6 +518,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
     for &outcome in RunQueueAgeOutcome::ALL {
         store.record_run_queue_age(outcome, 12.5);
+        store.record_run_queue_age(outcome, 75.0);
     }
 
     let request = store
@@ -777,7 +792,7 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         "openmettle_storage_quota_drift_total",
         "openmettle_backup_runs_total",
         "openmettle_gateway_failures_total",
-        "openmettle_runs_queue_age_seconds_bucket",
+        "openmettle_runs_queue_slow_exits_total",
     ] {
         assert!(
             found_metrics.contains(required),

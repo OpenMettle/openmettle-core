@@ -104,6 +104,28 @@ tests:
         alertname: OpenMettleDatabaseReadinessFailing
         exp_alerts: []
 
+  - name: database_readiness_failing_fires_on_startup_burst_between_eval_ticks_and_resolves
+    interval: 5s
+    input_series:
+      # Process starts between 30s rule evaluations: pre-captured 0 baseline at t=5s, 3 failures by t=10s.
+      - series: 'openmettle_db_readiness_checks_total{job="openmettle-api",instance="a",outcome="timeout"}'
+        values: '_ 0 3x120'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OpenMettleDatabaseReadinessFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-core
+              signal_contract: v1
+              outcome: timeout
+            exp_annotations:
+              summary: "OpenMettle database readiness checks are failing"
+              description: "Readiness probe /readyz recorded repeated non-ok database checks."
+      - eval_time: 6m
+        alertname: OpenMettleDatabaseReadinessFailing
+        exp_alerts: []
+
   - name: database_readiness_failing_silent_on_ok_or_below_threshold
     interval: 30s
     input_series:
@@ -254,6 +276,30 @@ tests:
         alertname: OpenMettleProviderTransportFailures
         exp_alerts: []
 
+  - name: provider_transport_failures_fires_on_startup_bursts_between_eval_ticks_and_resolves
+    interval: 5s
+    input_series:
+      # Process starts between 30s rule evaluations: pre-captured 0 baseline at t=5s, 3 failures
+      # by t=10s (entering pending at t=30s), and a second burst of 3 at t=4m00s so it fires at t=5m30s.
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-worker",instance="w",operation="mcp",outcome="transport"}'
+        values: '_ 0 3x45 6x120'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: OpenMettleProviderTransportFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-core
+              signal_contract: v1
+              operation: mcp
+              outcome: transport
+            exp_annotations:
+              summary: "OpenMettle outbound provider transport failures"
+              description: "Repeated outbound provider HTTP requests (OIDC, inference, MCP, or OAuth refresh) failed over hardened transports."
+      - eval_time: 10m
+        alertname: OpenMettleProviderTransportFailures
+        exp_alerts: []
+
   - name: provider_transport_failures_silent_on_ok_or_below_threshold
     interval: 30s
     input_series:
@@ -330,9 +376,7 @@ tests:
   - name: run_queue_high_age_fires_when_runs_wait_over_60s
     interval: 30s
     input_series:
-      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
-        values: '0x30'
-      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
         values: '0+1x30'
     alert_rule_test:
       - eval_time: 12m
@@ -350,9 +394,7 @@ tests:
   - name: run_queue_high_age_fires_on_single_slow_exit_from_zero_baseline_and_resolves
     interval: 30s
     input_series:
-      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
-        values: '0x40'
-      - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
         values: '0x10 1x30'
     alert_rule_test:
       - eval_time: 11m
@@ -370,9 +412,35 @@ tests:
         alertname: OpenMettleRunQueueHighAge
         exp_alerts: []
 
+  - name: run_queue_high_age_fires_when_worker_starts_between_eval_ticks
+    interval: 5s
+    input_series:
+      # Worker starts between 30s evaluation ticks: pre-captured 0 baseline at t=5s, first >60s
+      # slow exit at t=10s. Direct counter increase() preserves raw sample timestamps (unlike
+      # fixed-step subqueries) and fires by t=5m30s, then resolves once the step leaves [10m].
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
+        values: '_ 0 1x200'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: OpenMettleRunQueueHighAge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-worker
+              signal_contract: v1
+              outcome: claimed
+            exp_annotations:
+              summary: "OpenMettle runs waiting over 60s in durable work queue"
+              description: "One or more runs waited longer than 60 seconds in the durable work queue before leaving the queue over the last 10 minutes."
+      - eval_time: 11m
+        alertname: OpenMettleRunQueueHighAge
+        exp_alerts: []
+
   - name: run_queue_high_age_silent_when_all_runs_under_60s
     interval: 30s
     input_series:
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
+        values: '0x30'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
         values: '0+2x30'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
@@ -385,9 +453,10 @@ tests:
   - name: run_queue_high_age_silent_after_historical_slow_exits_followed_by_fast_exits
     interval: 30s
     input_series:
-      # 10 historical >60s exits followed exclusively by fast (<=60s) exits (+3 every 30s for 10m).
-      # Subtracting per-series cumulative buckets before increase() keeps (+Inf - le="60") flat at
-      # 10 and prevents asymmetric counter extrapolation from false-firing.
+      # 10 historical >60s exits followed exclusively by fast (<=60s) exits (+3 every 30s for 10m):
+      # openmettle_runs_queue_slow_exits_total stays constant at 10 while fast histogram buckets grow.
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
+        values: '10x40'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
         values: '0+3x20 60x20'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'
@@ -407,6 +476,8 @@ tests:
     interval: 30s
     input_series:
       # 10 historical >60s exits, steady fast exits (+3 every 30s), plus 1 new >60s exit at t=5m30s.
+      - series: 'openmettle_runs_queue_slow_exits_total{job="openmettle-worker",instance="w",outcome="claimed"}'
+        values: '10x10 11x30'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="60"}'
         values: '0+3x35'
       - series: 'openmettle_runs_queue_age_seconds_bucket{job="openmettle-worker",instance="w",outcome="claimed",le="+Inf"}'

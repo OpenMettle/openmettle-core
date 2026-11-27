@@ -73,16 +73,7 @@ groups:
 
       - alert: OpenMettleRunQueueHighAge
         expr: |
-          sum by (outcome) (
-            increase(
-              clamp_min(
-                openmettle_runs_queue_age_seconds_bucket{le="+Inf"}
-                - ignoring(le)
-                openmettle_runs_queue_age_seconds_bucket{le="60"},
-                0
-              )[10m:30s]
-            )
-          ) >= 1
+          sum by (outcome) (increase(openmettle_runs_queue_slow_exits_total[10m])) >= 1
         for: 5m
         labels:
           severity: warning

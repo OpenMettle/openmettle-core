@@ -403,10 +403,18 @@ fn start_inner(
     };
     let metrics = metric_endpoint.map(|endpoint| {
         let stop = Arc::new(Notify::new());
+        // Synchronously pre-capture the zero-valued startup baseline before returning so any
+        // failures recorded during the first export interval (`t = 0..interval`) are preceded by
+        // an explicit `(start_time_unix_nano, 0)` sample in Prometheus.
+        let pending_baseline = metrics
+            .as_ref()
+            .encode_zero_baseline(role, instance_id.as_deref())
+            .map(|request| request.encode_to_vec());
         let task = tokio::spawn(export_metrics(
             metrics,
             role,
             instance_id,
+            pending_baseline,
             stop.clone(),
             transport,
             endpoint,
@@ -488,17 +496,43 @@ async fn export_metrics(
     metrics: MetricsSource,
     role: Process,
     instance_id: Option<String>,
+    mut pending_baseline: Option<Vec<u8>>,
     stop: Arc<Notify>,
     transport: Arc<SharedTransport>,
     endpoint: Endpoint,
 ) {
     let interval = transport.tuning.interval;
+    // Deliver the pre-captured zero baseline immediately at startup (before the first sleep).
+    // If the collector is momentarily unreachable, retain `pending_baseline` so it is delivered
+    // ahead of the first live snapshot on a later cycle or shutdown flush.
+    if let Some(body) = pending_baseline.take()
+        && !post(&transport, &endpoint, body.clone()).await
+    {
+        metrics
+            .as_ref()
+            .record_dropped(DroppedSignal::MetricExports, 1);
+        metric_exports_dropped(1);
+        pending_baseline = Some(body);
+    }
     loop {
         let stopping = tokio::select! {
             biased;
             () = stop.notified() => true,
             () = tokio::time::sleep(interval) => false,
         };
+        if let Some(body) = pending_baseline.take()
+            && !post(&transport, &endpoint, body.clone()).await
+        {
+            metrics
+                .as_ref()
+                .record_dropped(DroppedSignal::MetricExports, 1);
+            metric_exports_dropped(1);
+            pending_baseline = Some(body);
+            if stopping {
+                return;
+            }
+            continue;
+        }
         send_metrics(
             &transport,
             &endpoint,

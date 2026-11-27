@@ -69,8 +69,8 @@ compliance/audit stores:
   `/healthz` and `/readyz`, `worker.run`, and `capacity.grant`) plus child `worker.operation`
   spans with parent-consistent always-on sampling (`Sampler::AlwaysOn` in `openmettle-core`;
   collectors may apply tail or head sampling downstream).
-- **Aggregate metrics independent of trace sampling:** All 18 v1 counters and histograms
-  in `contracts/telemetry/v1.json` (at most 532 data-point streams / 1,624 Prometheus
+- **Aggregate metrics independent of trace sampling:** All 19 v1 counters and histograms
+  in `contracts/telemetry/v1.json` (at most 536 data-point streams / 1,628 Prometheus
   series per process) are recorded directly in-process and exported independently of
   whether traces are enabled or downstream-sampled. Never reconstruct request, error, or
   queue counts by summing sampled traces.

@@ -344,7 +344,8 @@ run `INSERT` and an append for a run row the caller already holds.
   (`archive_project`/`delete_project`), `cancel_user_runs` (`disable_user`), and approval
   wait invalidation project PostgreSQL clock queue wait durations in SQL and record
   `openmettle.runs.queue.age` (`openmettle_runs_queue_age_seconds`, `QUEUE_AGE_BUCKETS` up to
-  `300.0` s) strictly **after transaction commit** (`claimed` from `runs.created_at`,
+  `300.0` s) and `openmettle.runs.queue.slow_exits` (`openmettle_runs_queue_slow_exits_total`,
+  incremented whenever wait age strictly exceeds `60.0` s) strictly **after transaction commit** (`claimed` from `runs.created_at`,
   `resumed` from `run_approval_decisions.decided_at`, `expired` from `runs.created_at` on
   `expire_queued` and from `run_approval_decisions.decided_at` on `expire_waits` for approved
   resumable waits, and `cancelled` only for runs cancelled while `queued` or while `waiting`

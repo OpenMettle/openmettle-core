@@ -270,6 +270,8 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
     assert_eq!(queue_age_delta(before_approve), [0, 0, 0, 0]);
     backdate_approved_wait(&mut owner, &claimed.run_id, &parked.approval_id).await;
     let before_resume_snap = metrics::global().run_queue_age_snapshot(RunQueueAgeOutcome::Resumed);
+    let before_resume_slow =
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Resumed);
     let resumed = queue::claim_next(&mut worker(&db).await, &OPEN, &LEASES)
         .await
         .unwrap()
@@ -277,6 +279,12 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
     assert_eq!(resumed.run_id, claimed.run_id);
     assert_eq!(queue_age_delta(before_approve), [0, 1, 0, 0]);
     assert_decided_age_delta(RunQueueAgeOutcome::Resumed, before_resume_snap);
+    assert_eq!(
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Resumed)
+            - before_resume_slow,
+        0,
+        "resumed wait measured from decided_at (~2s) must not increment slow_exits"
+    );
 
     // 3. Negative: cancelling an actively `running` run must NOT emit `cancelled` queue age.
     let before_running_cancel = queue_age_counts();
@@ -296,24 +304,31 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
     );
     assert_eq!(queue_age_delta(before_running_cancel), [0, 0, 0, 0]);
 
-    // 4. Expiring a queued run increments `expired` by 1.
+    // 4. Expiring a queued run with >60s wait increments both `expired` queue age and `slow_exits` (+1).
     let exp_req = request(&db, &alice_scope, "personal", &alice, "qa-expire").await;
     let exp_id = admitted(&db, &exp_req).await;
     owner_exec(
         &db,
         "UPDATE openmettle.runs
-            SET created_at = clock_timestamp() - interval '5 seconds',
+            SET created_at = clock_timestamp() - interval '75 seconds',
                 queue_expires_at = clock_timestamp() - interval '1 second'
           WHERE id = $1::uuid",
         &exp_id,
     )
     .await;
     let before_expire = queue_age_counts();
+    let before_expire_slow =
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Expired);
     let expired = queue::expire_queued(&mut worker(&db).await, 10)
         .await
         .unwrap();
     assert_eq!(expired, vec![exp_id]);
     assert_eq!(queue_age_delta(before_expire), [0, 0, 0, 1]);
+    assert_eq!(
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Expired)
+            - before_expire_slow,
+        1
+    );
 
     // 5. Caller `cancel_run` on a `queued` run increments `cancelled` by 1.
     let q_cancel_req = request(&db, &alice_scope, "personal", &alice, "qa-cancel-queued").await;
@@ -542,9 +557,18 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
     assert_eq!(queue_age_delta(before_disable), [0, 0, 1, 0]);
 
     // 12. Rollback boundary: a deferred constraint trigger fails `COMMIT` *after* `CANCEL_ONE`
-    // has already returned a `queue_age_s` row to Rust. No metric may be recorded!
+    // has already returned a `queue_age_s` (>60s) row to Rust. Neither queue age nor slow_exits
+    // may be recorded!
     let rb_req = request(&db, &alice_scope, "personal", &alice, "qa-rollback").await;
     let rb_id = admitted(&db, &rb_req).await;
+    owner_exec(
+        &db,
+        "UPDATE openmettle.runs
+            SET created_at = clock_timestamp() - interval '75 seconds'
+          WHERE id = $1::uuid",
+        &rb_id,
+    )
+    .await;
     install_deferred_commit_failure_trigger(
         &mut owner,
         "fail_cancel_commit_for_test",
@@ -553,6 +577,8 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
     )
     .await;
     let before_rollback = queue_age_counts();
+    let before_rollback_slow =
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Cancelled);
     let rb_err =
         queue::cancel_run(&mut api(&db).await, &alice_principal, &alice_scope, &rb_id).await;
     assert!(
@@ -560,6 +586,11 @@ async fn run_queue_age_records_post_commit_across_all_queue_exit_paths_and_exclu
         "expected deferred trigger to fail COMMIT, got {rb_err:?}"
     );
     assert_eq!(queue_age_delta(before_rollback), [0, 0, 0, 0]);
+    assert_eq!(
+        metrics::global().run_queue_slow_exits_count(RunQueueAgeOutcome::Cancelled)
+            - before_rollback_slow,
+        0
+    );
     let state_after: String =
         sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
             .bind(&rb_id)

@@ -50,7 +50,9 @@ It records:
   appended by store helpers before commit. Its reason is `requested` or `revoked`.
 - *Update, 27 November 2026:* `reserved_signals` is now empty (`[]`). V1-10 promoted
   `openmettle.runs.queue.age` (`openmettle_runs_queue_age_seconds`, `QUEUE_AGE_BUCKETS`,
-  `outcome ∈ {claimed, resumed, cancelled, expired}`) into the implemented v1 catalog. It
+  `outcome ∈ {claimed, resumed, cancelled, expired}`) and its companion slow-exit counter
+  `openmettle.runs.queue.slow_exits` (`openmettle_runs_queue_slow_exits_total`, incremented
+  post-commit when a queue wait strictly exceeds `60.0` s) into the implemented v1 catalog. It
   is recorded **strictly after transaction commit** (`claimed` from `runs.created_at`,
   `resumed` from `run_approval_decisions.decided_at`, `expired` from `runs.created_at` on
   `expire_queued` and from `run_approval_decisions.decided_at` on `expire_waits` for approved
@@ -77,13 +79,14 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
-  *Update, 27 November 2026:* the contract now defines **18** metrics, **532** data-point
-  streams and **1,624** Prometheus series per process (extending `ProviderOperation` to
+  *Update, 27 November 2026:* the contract now defines **19** metrics, **536** data-point
+  streams and **1,628** Prometheus series per process (extending `ProviderOperation` to
   `inference`, `mcp`, and `oauth_refresh`, adding `ProviderOutcome::Cancelled` for
   caller-cancelled/dropped in-flight calls, and promoting V1-10 `openmettle.runs.queue.age`
-  with `QUEUE_AGE_BUCKETS`, alongside V1-06 gateway failure/backfill signals, V1-17 overdue
-  handoffs and `openmettle.storage.quota.drift`, V1-18 capacity grant, stale observation and
-  wait duration signals, and V1-30 `openmettle.backup.runs`).
+  with `QUEUE_AGE_BUCKETS` plus `openmettle.runs.queue.slow_exits`, alongside V1-06 gateway
+  failure/backfill signals, V1-17 overdue handoffs and `openmettle.storage.quota.drift`,
+  V1-18 capacity grant, stale observation and wait duration signals, and V1-30
+  `openmettle.backup.runs`).
   `policy.max_data_point_streams` and `policy.max_prometheus_series_per_process` in
   `contracts/telemetry/v1.json` define the current ceilings; `tests/telemetry_contract.rs`
   checks them against `metrics::DESCRIPTORS`.
@@ -105,21 +108,25 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   random UUIDv4 `service.instance.id` generated at exporter startup so multi-replica API and
   worker processes produce disjoint Prometheus `instance` streams without exposing host, pod,
   or user identities.
-- When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
-  cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
-  (`DroppedSignal::ALL`) series from process startup, all 49 zero-initialized
-  `openmettle.gateway.failures` (`GatewayStep::ALL × GatewayCause::ALL`) series on
-  `openmettle-gateway` (omitted on `openmettle-api` and `openmettle-worker` when unrecorded),
-  all four zero-initialized `openmettle.runs.queue.age` (`RunQueueAgeOutcome::ALL`)
-  histogram points on `openmettle-api` and `openmettle-worker` (omitted on
-  `openmettle-gateway` when unrecorded), and, on `openmettle-worker`, the zero-initialized
-  `openmettle.quota.overdue.handoffs` series, all eight `openmettle.storage.quota.drift`
-  `QuotaDriftOutcome::ALL` series, and all four `openmettle.backup.runs`
-  `BackupRunOutcome::ALL` series, so Prometheus records a zero baseline before any first
-  collector outage, gateway failure burst, slow queue exit, hourly drift, or backup
-  failure/overdue event, encodes
+- When `OTLP_METRICS_ENDPOINT` is set, exporter startup synchronously pre-captures an
+  immutable zero-valued startup baseline at `time_unix_nano == start_time_unix_nano` and
+  delivers it immediately on task start (retaining it ahead of the first live snapshot if the
+  collector is momentarily unreachable) while subsequent periodic snapshots carry
+  `time_unix_nano >= start_time_unix_nano + 1ms` (strictly newer at Prometheus millisecond
+  resolution). Zero-initialized baselines cover all three `openmettle.telemetry.dropped`
+  (`DroppedSignal::ALL`) series on every role, all three `openmettle.db.readiness.checks`
+  (`ReadinessOutcome::ALL`) series on serving roles (`api`, `worker`, `gateway`), all 42
+  `openmettle.provider.http.requests` (`ProviderOperation::ALL × ProviderOutcome::ALL`)
+  series on `api` and `worker`, all 49 `openmettle.gateway.failures`
+  (`GatewayStep::ALL × GatewayCause::ALL`) series on `openmettle-gateway`, all four
+  `openmettle.runs.queue.age` histogram points and all four `openmettle.runs.queue.slow_exits`
+  counter series (`RunQueueAgeOutcome::ALL`) on `openmettle-api` and `openmettle-worker`, and,
+  on `openmettle-worker`, `openmettle.quota.overdue.handoffs`, all eight
+  `openmettle.storage.quota.drift` (`QuotaDriftOutcome::ALL`) series, and (strictly after
+  durable PostgreSQL seeding so restarts never fabricate `0 -> N` jumps) all four
+  `openmettle.backup.runs` (`BackupRunOutcome::ALL`) series. Requests are encoded as
   `ExportMetricsServiceRequest` via `opentelemetry-proto` (`metrics` feature enabled with zero
-  new crates in `Cargo.lock`), and POSTs with `Content-Type: application/x-protobuf` over the
+  new crates in `Cargo.lock`), and POSTed with `Content-Type: application/x-protobuf` over the
   ADR 0010 `Route`.
 - Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
   cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
@@ -139,8 +146,8 @@ collector outage transitions from zero baseline to `firing` and resolves cleanly
 including `inference`, `mcp`, and `oauth_refresh` across API and worker),
 `OpenMettleGatewayFailuresDetected`
 (`sum by (step, cause) (increase(openmettle_gateway_failures_total[5m])) >= 3` with
-`for: 2m`), `OpenMettleRunQueueHighAge` (detecting runs waiting over 60 seconds in
-`openmettle_runs_queue_age_seconds_bucket` over a 10-minute window with `for: 5m`),
+`for: 2m`), `OpenMettleRunQueueHighAge` (`sum by (outcome) (increase(openmettle_runs_queue_slow_exits_total[10m])) >= 1`
+with `for: 5m`, avoiding bucket subtraction extrapolation and fixed-step subquery stepping),
 `OpenMettleStorageQuotaDriftDetected`
 (`sum by (outcome) (increase(openmettle_storage_quota_drift_total{outcome!="healthy"}[3h])) > 0`
 with `for: 5m` so any non-healthy ledger mismatch, filesystem drift, quarantined row,

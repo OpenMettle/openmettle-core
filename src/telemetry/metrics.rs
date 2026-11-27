@@ -958,7 +958,29 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: Some(&QUEUE_AGE_BUCKETS),
     },
+    MetricDescriptor {
+        name: "openmettle.runs.queue.slow_exits",
+        prometheus_name: "openmettle_runs_queue_slow_exits_total",
+        kind: InstrumentKind::Counter,
+        unit: "{run}",
+        description: "Post-commit count of queued or approval-resumable runs that waited longer than 60 seconds before leaving the durable work queue.",
+        labels: &[LabelDescriptor {
+            name: "outcome",
+            values: RunQueueAgeOutcome::NAMES,
+        }],
+        buckets: None,
+    },
 ];
+
+/// Queue wait threshold in seconds above which `openmettle.runs.queue.slow_exits` increments
+/// (matching the `le="60"` histogram bound on `openmettle.runs.queue.age`: `<= 60.0` is fast,
+/// `> 60.0` is slow).
+pub const QUEUE_SLOW_EXIT_THRESHOLD_SECS: f64 = 60.0;
+
+/// Minimum offset in nanoseconds between the startup zero-baseline snapshot (`time == start`)
+/// and live OTLP exports (`time >= start + 1ms`) so millisecond-resolution Prometheus TSDB
+/// never treats a rapid live export as a duplicate timestamp.
+const MIN_LIVE_OFFSET_NANOS: u64 = 1_000_000;
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
 pub const fn max_total_series() -> usize {
@@ -1081,6 +1103,7 @@ pub struct Metrics {
     backup_runs: [AtomicU64; BACKUP_RUN_SLOTS],
     backup_runs_seeded: AtomicBool,
     run_queue_age: [HistogramSlot; RUN_QUEUE_AGE_SLOTS],
+    run_queue_slow_exits: [AtomicU64; RUN_QUEUE_AGE_SLOTS],
 }
 
 static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::new);
@@ -1126,6 +1149,7 @@ impl Metrics {
             backup_runs: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_runs_seeded: AtomicBool::new(false),
             run_queue_age: std::array::from_fn(|_| HistogramSlot::new()),
+            run_queue_slow_exits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -1275,11 +1299,19 @@ impl Metrics {
 
     pub fn record_run_queue_age(&self, outcome: RunQueueAgeOutcome, age_seconds: f64) {
         self.run_queue_age[outcome.index()].observe_seconds(&QUEUE_AGE_BUCKETS, age_seconds);
+        if age_seconds.is_finite() && age_seconds > QUEUE_SLOW_EXIT_THRESHOLD_SECS {
+            self.run_queue_slow_exits[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Snapshot cumulative `(count, sum_seconds, bucket_counts)` for one queue-age outcome.
     pub fn run_queue_age_snapshot(&self, outcome: RunQueueAgeOutcome) -> (u64, f64, Vec<u64>) {
         self.run_queue_age[outcome.index()].snapshot()
+    }
+
+    /// Snapshot cumulative slow queue-exit (`> 60s`) count for one outcome.
+    pub fn run_queue_slow_exits_count(&self, outcome: RunQueueAgeOutcome) -> u64 {
+        self.run_queue_slow_exits[outcome.index()].load(Ordering::Relaxed)
     }
 
     /// Snapshot cumulative outbound provider HTTP request count for `(operation, outcome)`.
@@ -1292,15 +1324,117 @@ impl Metrics {
         self.provider_requests[idx].load(Ordering::Relaxed)
     }
 
-    /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
-    /// Returns `None` when nothing has been recorded yet so idle processes send no empty batch.
+    /// Encodes the immutable zero-valued startup baseline for `role` at
+    /// `time_unix_nano == start_time_unix_nano`, without reading live counters and without
+    /// emitting `openmettle.backup.runs` (which remains gated on durable PostgreSQL seeding).
+    pub fn encode_zero_baseline(
+        &self,
+        role: Process,
+        instance_id: Option<&str>,
+    ) -> Option<ExportMetricsServiceRequest> {
+        let start = self.start_time_unix_nano;
+        let now = start;
+        let mut metrics = Vec::new();
+
+        if matches!(role, Process::Api | Process::Worker | Process::Gateway) {
+            let db_points = ReadinessOutcome::ALL
+                .iter()
+                .map(|outcome| counter_point(start, now, 0, &[("outcome", outcome.as_str())]))
+                .collect();
+            push_counter(&mut metrics, &DESCRIPTORS[2], db_points);
+        }
+
+        if matches!(role, Process::Api | Process::Worker) {
+            let mut prov_points =
+                Vec::with_capacity(ProviderOperation::ALL.len() * ProviderOutcome::ALL.len());
+            for &op in ProviderOperation::ALL {
+                for &outcome in ProviderOutcome::ALL {
+                    prov_points.push(counter_point(
+                        start,
+                        now,
+                        0,
+                        &[("operation", op.as_str()), ("outcome", outcome.as_str())],
+                    ));
+                }
+            }
+            push_counter(&mut metrics, &DESCRIPTORS[4], prov_points);
+        }
+
+        let drop_points = DroppedSignal::ALL
+            .iter()
+            .map(|signal| counter_point(start, now, 0, &[("signal", signal.as_str())]))
+            .collect();
+        push_counter(&mut metrics, &DESCRIPTORS[7], drop_points);
+
+        if role == Process::Worker {
+            push_counter(
+                &mut metrics,
+                &DESCRIPTORS[9],
+                vec![counter_point(start, now, 0, &[])],
+            );
+        }
+
+        if role == Process::Gateway {
+            let mut failures = Vec::with_capacity(GatewayStep::ALL.len() * GatewayCause::ALL.len());
+            for step in GatewayStep::ALL {
+                for cause in GatewayCause::ALL {
+                    failures.push(counter_point(
+                        start,
+                        now,
+                        0,
+                        &[("step", step.as_str()), ("cause", cause.as_str())],
+                    ));
+                }
+            }
+            push_counter(&mut metrics, &DESCRIPTORS[10], failures);
+        }
+
+        if role == Process::Worker {
+            let drift_points = QuotaDriftOutcome::ALL
+                .iter()
+                .map(|outcome| counter_point(start, now, 0, &[("outcome", outcome.as_str())]))
+                .collect();
+            push_counter(&mut metrics, &DESCRIPTORS[15], drift_points);
+        }
+
+        if matches!(role, Process::Api | Process::Worker) {
+            let queue_age_hpoints = RunQueueAgeOutcome::ALL
+                .iter()
+                .map(|outcome| {
+                    histogram_point(
+                        start,
+                        now,
+                        0,
+                        0.0,
+                        vec![0; BUCKET_SLOTS],
+                        &QUEUE_AGE_BUCKETS,
+                        &[("outcome", outcome.as_str())],
+                    )
+                })
+                .collect();
+            push_histogram(&mut metrics, &DESCRIPTORS[17], queue_age_hpoints);
+
+            let slow_exit_points = RunQueueAgeOutcome::ALL
+                .iter()
+                .map(|outcome| counter_point(start, now, 0, &[("outcome", outcome.as_str())]))
+                .collect();
+            push_counter(&mut metrics, &DESCRIPTORS[18], slow_exit_points);
+        }
+
+        wrap_otlp(role, instance_id, metrics)
+    }
+
+    /// Encodes every non-zero cumulative metric series (plus role-scoped zero baselines) as an
+    /// OTLP `ExportMetricsServiceRequest`. Live sample timestamps are strictly newer than
+    /// `start_time_unix_nano` by at least 1 ms so millisecond-resolution Prometheus TSDB never
+    /// collides with the startup zero baseline.
     pub fn encode_otlp(
         &self,
         role: Process,
         instance_id: Option<&str>,
     ) -> Option<ExportMetricsServiceRequest> {
-        let now = unix_nanos().max(self.start_time_unix_nano);
         let start = self.start_time_unix_nano;
+        let now = unix_nanos().max(start.saturating_add(MIN_LIVE_OFFSET_NANOS));
         let mut metrics = Vec::with_capacity(DESCRIPTORS.len());
 
         // 0: openmettle.http.server.requests
@@ -1629,35 +1763,63 @@ impl Metrics {
         }
         push_histogram(&mut metrics, &DESCRIPTORS[17], queue_age_hpoints);
 
-        if metrics.is_empty() {
-            return None;
+        // 18: openmettle.runs.queue.slow_exits
+        // Always emit all 4 closed outcome counters (including 0) on `openmettle-api` and
+        // `openmettle-worker` from startup so `increase(openmettle_runs_queue_slow_exits_total[10m])`
+        // detects the very first >60s wait (even when a worker starts between 30s evaluation ticks)
+        // without fixed-step subqueries or bucket subtraction. These 4 streams are already counted
+        // in `max_series: 4`.
+        let mut slow_exit_points = Vec::new();
+        for &outcome in RunQueueAgeOutcome::ALL {
+            let value = self.run_queue_slow_exits[outcome.index()].load(Ordering::Relaxed);
+            if value > 0 || matches!(role, Process::Api | Process::Worker) {
+                slow_exit_points.push(counter_point(
+                    start,
+                    now,
+                    value,
+                    &[("outcome", outcome.as_str())],
+                ));
+            }
         }
-        let mut resource_attributes =
-            vec![kv("service.name", &format!("openmettle-{}", role.as_str()))];
-        if let Some(id) = instance_id {
-            resource_attributes.push(kv("service.instance.id", id));
-        }
-        Some(ExportMetricsServiceRequest {
-            resource_metrics: vec![ResourceMetrics {
-                resource: Some(Resource {
-                    attributes: resource_attributes,
+        push_counter(&mut metrics, &DESCRIPTORS[18], slow_exit_points);
+
+        wrap_otlp(role, instance_id, metrics)
+    }
+}
+
+fn wrap_otlp(
+    role: Process,
+    instance_id: Option<&str>,
+    metrics: Vec<Metric>,
+) -> Option<ExportMetricsServiceRequest> {
+    if metrics.is_empty() {
+        return None;
+    }
+    let mut resource_attributes =
+        vec![kv("service.name", &format!("openmettle-{}", role.as_str()))];
+    if let Some(id) = instance_id {
+        resource_attributes.push(kv("service.instance.id", id));
+    }
+    Some(ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: TARGET.to_owned(),
+                    version: CONTRACT_VERSION.to_owned(),
+                    attributes: Vec::new(),
                     dropped_attributes_count: 0,
-                    entity_refs: Vec::new(),
                 }),
-                scope_metrics: vec![ScopeMetrics {
-                    scope: Some(InstrumentationScope {
-                        name: TARGET.to_owned(),
-                        version: CONTRACT_VERSION.to_owned(),
-                        attributes: Vec::new(),
-                        dropped_attributes_count: 0,
-                    }),
-                    metrics,
-                    schema_url: String::new(),
-                }],
+                metrics,
                 schema_url: String::new(),
             }],
-        })
-    }
+            schema_url: String::new(),
+        }],
+    })
 }
 
 fn kv(key: &str, value: &str) -> KeyValue {
@@ -1955,6 +2117,161 @@ mod tests {
                     .any(|m| m.name == "openmettle.provider.http.requests"),
                 "unrecorded openmettle.provider.http.requests must stay omitted on {role:?}"
             );
+        }
+    }
+
+    #[test]
+    fn run_queue_slow_exits_counts_only_strictly_over_60s_and_emits_zero_baselines_on_api_and_worker_only()
+     {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+        for role in [Process::Api, Process::Worker] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            let slow = encoded.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .find(|m| m.name == "openmettle.runs.queue.slow_exits")
+                .unwrap_or_else(|| {
+                    panic!("expected zero-baseline openmettle.runs.queue.slow_exits on {role:?}")
+                });
+            match slow.data.as_ref().unwrap() {
+                metric::Data::Sum(sum) => {
+                    assert_eq!(sum.data_points.len(), RunQueueAgeOutcome::ALL.len());
+                    assert!(sum.data_points.iter().all(|dp| {
+                        matches!(
+                            dp.value,
+                            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0))
+                        )
+                    }));
+                }
+                other => panic!("expected Sum, got {other:?}"),
+            }
+        }
+        for role in [Process::Gateway, Process::Migrate] {
+            let encoded = store.encode_otlp(role, instance).unwrap();
+            assert!(
+                !encoded.resource_metrics[0].scope_metrics[0]
+                    .metrics
+                    .iter()
+                    .any(|m| m.name == "openmettle.runs.queue.slow_exits"),
+                "unrecorded openmettle.runs.queue.slow_exits must stay omitted on {role:?}"
+            );
+        }
+
+        // Fast and non-finite/boundary ages (`<= 60.0s`, negative, NaN, +Inf) must NOT increment.
+        for age in [-5.0, 0.0, 12.5, 59.999, 60.0, f64::NAN, f64::INFINITY] {
+            store.record_run_queue_age(RunQueueAgeOutcome::Claimed, age);
+        }
+        assert_eq!(
+            store.run_queue_slow_exits_count(RunQueueAgeOutcome::Claimed),
+            0
+        );
+
+        // Strictly `> 60.0s` increments the matching outcome only.
+        store.record_run_queue_age(RunQueueAgeOutcome::Claimed, 60.001);
+        store.record_run_queue_age(RunQueueAgeOutcome::Claimed, 125.0);
+        store.record_run_queue_age(RunQueueAgeOutcome::Resumed, 61.0);
+        assert_eq!(
+            store.run_queue_slow_exits_count(RunQueueAgeOutcome::Claimed),
+            2
+        );
+        assert_eq!(
+            store.run_queue_slow_exits_count(RunQueueAgeOutcome::Resumed),
+            1
+        );
+        assert_eq!(
+            store.run_queue_slow_exits_count(RunQueueAgeOutcome::Cancelled),
+            0
+        );
+        assert_eq!(
+            store.run_queue_slow_exits_count(RunQueueAgeOutcome::Expired),
+            0
+        );
+    }
+
+    #[test]
+    fn encode_zero_baseline_matches_fresh_registry_and_precedes_live_timestamps() {
+        let store = Metrics::new();
+        let instance = Some("44444444-5555-4666-8777-888888888888");
+
+        // Fresh baseline matches untouched `encode_otlp` metric set for every role.
+        for role in [
+            Process::Api,
+            Process::Worker,
+            Process::Gateway,
+            Process::Migrate,
+        ] {
+            let zero = store.encode_zero_baseline(role, instance).unwrap();
+            let live = store.encode_otlp(role, instance).unwrap();
+            let zero_metrics = &zero.resource_metrics[0].scope_metrics[0].metrics;
+            let live_metrics = &live.resource_metrics[0].scope_metrics[0].metrics;
+            let zero_names: Vec<&str> = zero_metrics.iter().map(|m| m.name.as_str()).collect();
+            let live_names: Vec<&str> = live_metrics.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(zero_names, live_names, "baseline mismatch for {role:?}");
+            assert!(!zero_names.contains(&"openmettle.backup.runs"));
+
+            for (zm, lm) in zero_metrics.iter().zip(live_metrics.iter()) {
+                match (zm.data.as_ref().unwrap(), lm.data.as_ref().unwrap()) {
+                    (metric::Data::Sum(zsum), metric::Data::Sum(lsum)) => {
+                        assert_eq!(zsum.data_points.len(), lsum.data_points.len());
+                        for (zdp, ldp) in zsum.data_points.iter().zip(lsum.data_points.iter()) {
+                            assert_eq!(zdp.start_time_unix_nano, zdp.time_unix_nano);
+                            assert_eq!(zdp.start_time_unix_nano, ldp.start_time_unix_nano);
+                            assert!(
+                                ldp.time_unix_nano
+                                    >= zdp.time_unix_nano.saturating_add(MIN_LIVE_OFFSET_NANOS),
+                                "live point timestamp must advance >=1ms past baseline"
+                            );
+                        }
+                    }
+                    (metric::Data::Histogram(zhist), metric::Data::Histogram(lhist)) => {
+                        assert_eq!(zhist.data_points.len(), lhist.data_points.len());
+                        for (zdp, ldp) in zhist.data_points.iter().zip(lhist.data_points.iter()) {
+                            assert_eq!(zdp.start_time_unix_nano, zdp.time_unix_nano);
+                            assert_eq!(zdp.start_time_unix_nano, ldp.start_time_unix_nano);
+                            assert!(
+                                ldp.time_unix_nano
+                                    >= zdp.time_unix_nano.saturating_add(MIN_LIVE_OFFSET_NANOS)
+                            );
+                        }
+                    }
+                    other => panic!("unexpected metric data pair {other:?}"),
+                }
+            }
+        }
+
+        // Even after failures and backup seeding are recorded, `encode_zero_baseline` stays all-zero
+        // and continues omitting `openmettle.backup.runs`.
+        store.record_db_readiness(ReadinessOutcome::Error, Duration::from_millis(5));
+        store.record_provider_http(
+            ProviderOperation::Mcp,
+            ProviderOutcome::Transport,
+            Duration::from_millis(5),
+        );
+        store.record_run_queue_age(RunQueueAgeOutcome::Claimed, 90.0);
+        store.sync_backup_run_totals(1, 2, 0, 0);
+        let zero_after = store
+            .encode_zero_baseline(Process::Worker, instance)
+            .unwrap();
+        let zero_metrics = &zero_after.resource_metrics[0].scope_metrics[0].metrics;
+        assert!(
+            !zero_metrics
+                .iter()
+                .any(|m| m.name == "openmettle.backup.runs")
+        );
+        for m in zero_metrics {
+            match m.data.as_ref().unwrap() {
+                metric::Data::Sum(sum) => assert!(sum.data_points.iter().all(|dp| {
+                    matches!(
+                        dp.value,
+                        Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0))
+                    )
+                })),
+                metric::Data::Histogram(hist) => {
+                    assert!(hist.data_points.iter().all(|dp| dp.count == 0));
+                }
+                other => panic!("unexpected metric data {other:?}"),
+            }
         }
     }
 }
